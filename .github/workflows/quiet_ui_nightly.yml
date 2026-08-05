@@ -1,0 +1,74 @@
+# Builds the quiet-ui branch on a schedule.
+#
+# This file lives on the default branch because GitHub runs scheduled workflows
+# only from there, which is why the equivalent `schedule:` cannot go in the copy
+# of quiet_ui_build.yml that lives on quiet-ui. It checks out quiet-ui and
+# builds that; nothing here builds main.
+#
+# It exists because the nightly rebase routine cannot reliably ask for a build
+# itself: `gh` is not authenticated in its sandbox, so its dispatch step fails
+# silently and the branch gets rebased with no dmg to show for it. A schedule
+# needs nothing from the routine.
+name: quiet-ui nightly build
+
+on:
+  schedule:
+    # 02:30 UTC on weeknights, after the 01:00 rebase routine has pushed.
+    - cron: "30 2 * * 1-5"
+  workflow_dispatch:
+
+concurrency:
+  group: quiet-ui-build
+  cancel-in-progress: false
+
+jobs:
+  bundle-mac:
+    runs-on: macos-15
+    timeout-minutes: 300
+    env:
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: quiet-ui
+          fetch-depth: 2
+
+      # A night where upstream had not moved and nothing was queued leaves the
+      # branch untouched, and rebuilding the same commit costs two hours of a
+      # runner for an identical dmg. A manual run always builds.
+      - id: freshness
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          age=$(( $(date +%s) - $(git log -1 --format=%ct) ))
+          if [ "$age" -lt 82800 ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "quiet-ui has not moved in $((age / 3600))h; skipping" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - if: steps.freshness.outputs.build == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - if: steps.freshness.outputs.build == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: quiet-ui
+          workspaces: ". -> target"
+
+      - name: Bundle
+        if: steps.freshness.outputs.build == 'true'
+        run: ./script/bundle-mac aarch64-apple-darwin
+
+      - if: steps.freshness.outputs.build == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Zed-quiet-ui-aarch64
+          path: target/aarch64-apple-darwin/release/Zed-aarch64.dmg
+          if-no-files-found: error
+          retention-days: 7
