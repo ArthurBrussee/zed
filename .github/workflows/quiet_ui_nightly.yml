@@ -9,12 +9,17 @@
 # itself: `gh` is not authenticated in its sandbox, so its dispatch step fails
 # silently and the branch gets rebased with no dmg to show for it. A schedule
 # needs nothing from the routine.
+#
+# The hour is set by what happens either side of it. The rebase routine starts
+# at 22:15 UTC and takes about two hours, the bundle takes another two and a
+# bit, and GitHub's scheduler is not punctual: a run asked for at 02:30 once
+# started at 05:33, which is how a dmg meant for breakfast arrived at 09:43
+# local. Starting at 00:45 absorbs that delay and still lands before morning.
 name: quiet-ui nightly build
 
 on:
   schedule:
-    # 02:30 UTC on weeknights, after the 01:00 rebase routine has pushed.
-    - cron: "30 2 * * 1-5"
+    - cron: "45 0 * * 1-5"
   workflow_dispatch:
 
 concurrency:
@@ -25,29 +30,36 @@ jobs:
   bundle-mac:
     runs-on: macos-15
     timeout-minutes: 300
+    permissions:
+      # For the marker tag written at the end.
+      contents: write
     env:
       CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v4
         with:
           ref: quiet-ui
-          fetch-depth: 2
+          fetch-depth: 1
 
-      # A night where upstream had not moved and nothing was queued leaves the
-      # branch untouched, and rebuilding the same commit costs two hours of a
-      # runner for an identical dmg. A manual run always builds.
+      # `quiet-ui-built` marks the commit the last successful bundle came from.
+      # A night where the routine found nothing to do, or a day already built by
+      # hand, leaves the branch on that commit, and rebuilding it would spend
+      # two hours of a runner on an identical dmg. Comparing commits rather than
+      # timestamps means a manual build earlier in the day also counts. Asking
+      # for a run by hand always builds: that is what asking means.
       - id: freshness
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "build=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          age=$(( $(date +%s) - $(git log -1 --format=%ct) ))
-          if [ "$age" -lt 82800 ]; then
-            echo "build=true" >> "$GITHUB_OUTPUT"
-          else
+          head=$(git rev-parse HEAD)
+          built=$(git ls-remote origin refs/tags/quiet-ui-built | cut -f1)
+          if [ "$head" = "$built" ]; then
             echo "build=false" >> "$GITHUB_OUTPUT"
-            echo "quiet-ui has not moved in $((age / 3600))h; skipping" >> "$GITHUB_STEP_SUMMARY"
+            echo "quiet-ui is unchanged since the last build; skipping" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
           fi
 
       - if: steps.freshness.outputs.build == 'true'
@@ -72,3 +84,9 @@ jobs:
           path: target/aarch64-apple-darwin/release/Zed-aarch64.dmg
           if-no-files-found: error
           retention-days: 7
+
+      # Only once the artifact exists: a failed bundle must leave the marker
+      # where it was, so the next night tries the same commit again.
+      - name: Mark this commit as built
+        if: steps.freshness.outputs.build == 'true'
+        run: git push --force origin "HEAD:refs/tags/quiet-ui-built"
