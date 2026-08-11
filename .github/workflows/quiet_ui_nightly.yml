@@ -85,6 +85,44 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      # An artifact is a poor place to keep the thing you actually want to
+      # install: it needs a GitHub login, it arrives zipped, and it expires
+      # after a week. A release at a fixed tag is one public URL that always
+      # points at last night's build:
+      #
+      #   https://github.com/ArthurBrussee/zed/releases/download/quiet-ui-latest/Zed-quiet-ui.dmg
+      #
+      # The release is replaced rather than added to, so the tag follows the
+      # commit that was built and the link never changes.
+      - name: Publish the build
+        if: steps.freshness.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp target/aarch64-apple-darwin/release/Zed-aarch64.dmg Zed-quiet-ui.dmg
+          cat > notes.md <<NOTES
+          Built from \`quiet-ui\` at $(git rev-parse --short HEAD), $(date -u +'%Y-%m-%d %H:%M') UTC.
+
+          Apple silicon, and unsigned, so macOS refuses it until the quarantine
+          flag is off. To install (or reinstall) it:
+
+          \`\`\`bash
+          curl -fL -o /tmp/Zed-quiet-ui.dmg https://github.com/$GITHUB_REPOSITORY/releases/download/quiet-ui-latest/Zed-quiet-ui.dmg
+          hdiutil attach -quiet /tmp/Zed-quiet-ui.dmg
+          app=\$(ls -d /Volumes/Zed/*.app | head -1)
+          rm -rf "/Applications/\$(basename "\$app")"
+          cp -R "\$app" /Applications/
+          hdiutil detach -quiet /Volumes/Zed
+          xattr -dr com.apple.quarantine "/Applications/\$(basename "\$app")"
+          \`\`\`
+          NOTES
+          gh release delete quiet-ui-latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          gh release create quiet-ui-latest Zed-quiet-ui.dmg \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$(git rev-parse HEAD)" \
+            --title "quiet-ui $(date -u +%Y-%m-%d)" \
+            --notes-file notes.md
+
       # Only once the artifact exists: a failed bundle must leave the marker
       # where it was, so the next night tries the same commit again.
       - name: Mark this commit as built
