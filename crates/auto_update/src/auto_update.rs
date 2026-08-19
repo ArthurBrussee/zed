@@ -184,6 +184,8 @@ pub struct AutoUpdater {
     dismissed_status: Option<AutoUpdateStatus>,
 }
 
+mod quiet_ui_update;
+
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct ReleaseAsset {
     pub version: String,
@@ -273,8 +275,15 @@ pub fn init(client: Arc<Client>, cx: &mut App) {
     let auto_updater = cx.new(|cx| {
         let updater = AutoUpdater::new(version, client, cx);
 
+        // Dev does not poll upstream, because upstream has nothing to offer a
+        // build somebody made themselves. This fork publishes its own, so a
+        // released fork build polls for those; a debug build is still somebody
+        // working on the source and is left alone.
         let poll_for_updates = ReleaseChannel::try_global(cx)
-            .map(|channel| channel.poll_for_updates())
+            .map(|channel| {
+                channel.poll_for_updates()
+                    || (channel == ReleaseChannel::Dev && !cfg!(debug_assertions))
+            })
             .unwrap_or(false);
 
         if option_env!("ZED_UPDATE_EXPLANATION").is_none()
@@ -749,8 +758,17 @@ impl AutoUpdater {
             cx.notify();
         });
 
-        let fetched_release_data =
-            Self::get_release_asset(&this, release_channel, None, "zed", OS, ARCH, cx).await?;
+        // This fork publishes its own builds and has no account with zed.dev's
+        // release endpoint, so it asks its own release where the newest dmg is.
+        // Dev is the channel the fork builds under; a debug build is somebody
+        // working on the source and has no business being offered a dmg.
+        let fetched_release_data = if release_channel == ReleaseChannel::Dev
+            && !cfg!(debug_assertions)
+        {
+            quiet_ui_update::fetch_release(client.clone(), &installed_version).await?
+        } else {
+            Self::get_release_asset(&this, release_channel, None, "zed", OS, ARCH, cx).await?
+        };
         let fetched_version = fetched_release_data.clone().version;
         let app_commit_sha = Ok(cx.update(|cx| AppCommitSha::try_global(cx).map(|sha| sha.full())));
         let newer_version = Self::check_if_fetched_version_is_newer(
@@ -864,7 +882,10 @@ impl AutoUpdater {
         let fetched_version = fetched_version.parse::<Version>()?;
 
         match release_channel {
-            ReleaseChannel::Nightly => {
+            // The fork's version number never moves, so only the commit can say
+            // whether the build on the other end is a different one. That is
+            // exactly what Nightly asks.
+            ReleaseChannel::Nightly | ReleaseChannel::Dev => {
                 let should_download = if let AutoUpdateStatus::Updated { version } = status {
                     fetched_version != version
                 } else {

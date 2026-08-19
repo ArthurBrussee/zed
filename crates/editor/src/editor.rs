@@ -109,8 +109,8 @@ pub use element::{
 pub use git::blame::{BlameRenderer, GitBlame};
 pub use git::{
     DiffHunkDelegate, ResolvedDiffHunk, ResolvedDiffHunks, RestoreOnlyDiffHunkDelegate,
-    RestoreOnlyUnstagedDiffHunkDelegate, UncommittedDiffHunkDelegate, render_diff_hunk_controls,
-    set_blame_renderer,
+    RestoreOnlyUnstagedDiffHunkDelegate, TakenReviewComment, UncommittedDiffHunkDelegate,
+    render_diff_hunk_controls, set_blame_renderer,
 };
 pub(crate) use git::{DiffHunkKey, StoredReviewComment};
 use git::{DiffReviewDragState, DiffReviewOverlay, InlineBlamePopover};
@@ -2721,6 +2721,10 @@ impl Editor {
 
         if self.signature_help_state.has_multiple_signatures() {
             key_context.add("showing_signature_help");
+        }
+
+        if self.show_diff_review_button(cx) {
+            key_context.add("diff_review");
         }
 
         // Disable vim contexts when a sub-editor (e.g. rename/inline assistant) is focused.

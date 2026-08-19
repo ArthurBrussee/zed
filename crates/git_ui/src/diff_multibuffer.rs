@@ -1,5 +1,5 @@
 use crate::{
-    conflict_view,
+    conflict_view, generated_file,
     git_panel::{GitPanel, GitStatusEntry},
     git_panel_settings::GitPanelSettings,
 };
@@ -52,6 +52,12 @@ pub struct DiffMultibuffer {
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
     pending_scroll: Option<PathKey>,
+    /// Paths whose contents proved to be generated. The path alone decides for
+    /// most of them, but a generator header can only be read once the buffer
+    /// has loaded, so that verdict is remembered here: the sort key has to
+    /// answer the same way every time it is asked, including from navigation
+    /// that never opens the buffer.
+    generated_paths: HashSet<RepoPath>,
     review_comment_count: usize,
     empty_label: SharedString,
     _task: Task<Result<()>>,
@@ -164,6 +170,7 @@ impl DiffMultibuffer {
             multibuffer,
             buffer_subscriptions: Default::default(),
             pending_scroll: None,
+            generated_paths: HashSet::default(),
             review_comment_count: 0,
             empty_label: empty_label.into(),
             _task: task,
@@ -214,7 +221,9 @@ impl DiffMultibuffer {
             return;
         };
         let repo = git_repo.read(cx);
-        let path_key = project_diff_path_key(repo, &entry.repo_path, entry.status, cx);
+        let is_generated = self.is_generated(&entry.repo_path);
+        let path_key =
+            project_diff_path_key(repo, &entry.repo_path, entry.status, is_generated, cx);
 
         self.move_to_path(path_key, window, cx)
     }
@@ -239,7 +248,9 @@ impl DiffMultibuffer {
             .status_for_path(&repo_path)
             .map(|entry| entry.status)
             .unwrap_or(FileStatus::Untracked);
-        let path_key = project_diff_path_key(&git_repo.read(cx), &repo_path, status, cx);
+        let is_generated = self.is_generated(&repo_path);
+        let path_key =
+            project_diff_path_key(&git_repo.read(cx), &repo_path, status, is_generated, cx);
         self.move_to_path(path_key, window, cx)
     }
 
@@ -429,6 +440,47 @@ impl DiffMultibuffer {
         }
     }
 
+    /// Whether this path's diff is machine-written. Cheap and always
+    /// answerable: the recorded verdict only ever adds to what the path itself
+    /// already says.
+    fn is_generated(&self, repo_path: &RepoPath) -> bool {
+        generated_file::path_is_generated(repo_path) || self.generated_paths.contains(repo_path)
+    }
+
+    /// Reads a freshly loaded buffer's header for a generator marker and
+    /// remembers the answer, so later callers that have no buffer still get it.
+    fn record_generated(
+        &mut self,
+        repo_path: &RepoPath,
+        display_buffer: &Entity<Buffer>,
+        cx: &App,
+    ) -> bool {
+        if self.is_generated(repo_path) {
+            return true;
+        }
+        if generated_file::text_is_generated_header(&display_buffer.read(cx).snapshot()) {
+            self.generated_paths.insert(repo_path.clone());
+            return true;
+        }
+        false
+    }
+
+    fn path_key_for(
+        &self,
+        repo_path: &RepoPath,
+        file_status: FileStatus,
+        cx: &App,
+    ) -> Option<PathKey> {
+        let repo = self.branch_diff.read(cx).repo()?;
+        Some(project_diff_path_key(
+            &repo.read(cx),
+            repo_path,
+            file_status,
+            self.is_generated(repo_path),
+            cx,
+        ))
+    }
+
     #[instrument(skip_all)]
     fn register_buffer(
         &mut self,
@@ -442,6 +494,14 @@ impl DiffMultibuffer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<BufferId> {
+        // A generator marker in the file's header is only readable now that the
+        // buffer has loaded, so the key computed before the load can still
+        // place the file among the hand-written ones.
+        let is_generated = self.record_generated(&repo_path, &display_buffer, cx);
+        let path_key = self
+            .path_key_for(&repo_path, file_status, cx)
+            .unwrap_or(path_key);
+
         let diff_subscription = cx.subscribe_in(&diff, window, {
             let repo_path = repo_path.clone();
             let path_key = path_key.clone();
@@ -560,6 +620,7 @@ impl DiffMultibuffer {
                 }
                 if is_excerpt_newly_added
                     && (file_status.is_deleted()
+                        || is_generated
                         || (file_status.is_untracked()
                             && GitPanelSettings::get_global(cx).collapse_untracked_diff))
                 {
@@ -641,6 +702,7 @@ impl DiffMultibuffer {
                         &repo,
                         &diff_buffer.repo_path,
                         diff_buffer.file_status,
+                        this.is_generated(&diff_buffer.repo_path),
                         cx,
                     );
                     previous_paths.remove(&path_key);
@@ -864,6 +926,32 @@ impl DiffMultibuffer {
         }
         result
     }
+
+    /// Of [`Self::excerpt_file_paths`], those whose excerpts are folded shut.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn folded_excerpt_file_paths(&self, cx: &App) -> Vec<String> {
+        let editor = self.editor().read(cx).rhs_editor().clone();
+        let multibuffer = editor.read(cx).buffer().clone();
+        let snapshot = multibuffer.read(cx).snapshot(cx);
+        let mut result = Vec::new();
+        let mut last_buffer_id = None;
+        for excerpt in snapshot.excerpts() {
+            let buffer_id = excerpt.context.start.buffer_id;
+            if last_buffer_id == Some(buffer_id) {
+                continue;
+            }
+            last_buffer_id = Some(buffer_id);
+            if !editor.read(cx).is_buffer_folded(buffer_id, cx) {
+                continue;
+            }
+            if let Some(buffer) = multibuffer.read(cx).buffer(buffer_id)
+                && let Some(file) = buffer.read(cx).file()
+            {
+                result.push(file.path().as_unix_str().to_string());
+            }
+        }
+        result
+    }
 }
 
 impl EventEmitter<EditorEvent> for DiffMultibuffer {}
@@ -951,6 +1039,10 @@ impl Render for DiffMultibuffer {
 const CONFLICT_SORT_PREFIX: u64 = 1;
 const TRACKED_SORT_PREFIX: u64 = 2;
 const NEW_SORT_PREFIX: u64 = 3;
+/// Generated files sort below every other group, whatever the grouping
+/// settings say, because nobody reads a regenerated lockfile before the code
+/// that changed it.
+const GENERATED_SORT_PREFIX: u64 = 4;
 
 /// Computes a stable [`PathKey`] for a buffer in the project diff.
 ///
@@ -969,10 +1061,13 @@ pub(crate) fn project_diff_path_key(
     repo: &Repository,
     repo_path: &RepoPath,
     status: FileStatus,
+    is_generated: bool,
     cx: &App,
 ) -> PathKey {
     let settings = GitPanelSettings::get_global(cx);
-    let sort_prefix = if settings.group_by != GitPanelGroupBy::Status {
+    let sort_prefix = if is_generated {
+        GENERATED_SORT_PREFIX
+    } else if settings.group_by != GitPanelGroupBy::Status {
         TRACKED_SORT_PREFIX
     } else if repo.had_conflict_on_last_merge_head_change(repo_path) {
         CONFLICT_SORT_PREFIX

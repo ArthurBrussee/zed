@@ -9302,7 +9302,7 @@ impl Render for Workspace {
                                                                         this.child(p.border_l_1())
                                                                     },
                                                                 ),
-                                                        ),
+                                                        )
                                                 )
                                                 .children(self.render_dock(
                                                     DockPosition::Right,
@@ -9369,7 +9369,7 @@ impl Render for Workspace {
                                                                                 )
                                                                             },
                                                                         ),
-                                                                ),
+                                                                )
                                                         ),
                                                 )
                                                 .child(div().w_full().children(self.render_dock(
@@ -9436,7 +9436,7 @@ impl Render for Workspace {
                                                                                 )
                                                                             },
                                                                         ),
-                                                                ),
+                                                                )
                                                         )
                                                         .children(self.render_dock(
                                                             DockPosition::Right,
@@ -9488,7 +9488,7 @@ impl Render for Workspace {
                                                     &self.bottom_dock,
                                                     window,
                                                     cx,
-                                                )),
+                                                ))
                                         )
                                         .children(self.render_dock(
                                             DockPosition::Right,
@@ -9523,6 +9523,9 @@ impl Render for Workspace {
                             }))
                             .children(self.render_notifications(window, cx)),
                     )
+                    // The status bar is a full-width row under the whole
+                    // workspace (docks included), not tucked inside the center
+                    // column.
                     .when(self.status_bar_visible(cx), |parent| {
                         parent.child(self.status_bar.clone())
                     })
