@@ -860,105 +860,7 @@ does is removed as it lands.
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
-**The "Changed by this command" card shows the wrong diff, or none.**
-Hovering a command's changed-file chip shows code the reader does not recognise, and sometimes an
-empty card. The chip's numbers and the card's diff are computed from two different things, so they
-disagree by construction:
-
-- The chip's `+n -m` is a delta against a baseline taken when the command started
-  (`stat_delta(before, stat)` in `crates/acp_thread/src/terminal.rs:483`), which is command-scoped
-  and right.
-- The card diffs the file against git HEAD as it stands now
-  (`open_uncommitted_diff` in `crates/agent_ui/src/conversation_view/thread_view/chips.rs:2258`),
-  which is neither.
-
-A file that already carried uncommitted work shows all of it, the command's three lines buried
-somewhere inside: that is the unrecognised code. A change committed since, reverted, or moved by a
-rebase leaves no uncommitted diff at all: that is the empty card.
-
-Note the case that already works, because it is the shape of the fix: a file that was clean when
-the command started has HEAD as its pre-command content, so the uncommitted diff is exactly the
-command's own change. The files that lie are the ones already dirty at the baseline. Their content
-at command start is knowable, since the baseline already walks the dirty set, and capturing text
-for those paths bounds the cost to work already in flight. Whether that is worth the memory is the
-call to make with the code in front of you; if it is not, the card should stop claiming the change
-is the command's and say what it is actually showing.
-
-Two smaller bugs live in the same function and may be the whole of the "sometimes nothing":
-
-- `command_file_diffs` is keyed by `ProjectPath` alone, so two commands touching one file share a
-  cached editor and both show the same diff.
-- The first hover returns `None` while the diff loads and the card is built once at hover time, so
-  the region can stay empty until hovered again. `cx.notify()` repaints the thread, not the card.
-
-**An image still paints over the rest of the thread.**
-Reported before and still happening, so whatever was fixed was not this one. The three image paths
-in the thread view already carry a definite box, each with a comment saying why: the inline chip
-(`crates/agent_ui/src/conversation_view/thread_view/chips.rs:2536`), the image tool output
-(`thread_view.rs:11909`), and the image hover card (`chips.rs:897`). They are boxed because the
-thread is a `ListState`, which measures an entry once and paints it at that height, so an entry
-that grows afterwards paints over its neighbours.
-
-The path that is not boxed is an image inside markdown, which is how an agent's own message carries
-a picture. `render_image` in `crates/markdown/src/markdown.rs:1841` gives it `max_w_full()` and a
-width or height only when the markdown itself declared one, and an image contributes no height
-until it has loaded. That is the same growth-after-measure the boxed sites were fixed for, in the
-one path that never got the fix. Worth confirming against a real thread before building anything,
-since the symptom is reported from use rather than from a repro.
-
-`markdown` is a shared crate: a definite box added there lands in every surface that renders
-markdown, not just this thread, which is likely the wrong blast radius. Prefer constraining it from
-the thread's own `MarkdownStyle`, or telling the list to remeasure when an image finishes loading.
-The invariant to hold either way is the one already written down in the chips: an entry's height
-must not change after the list has measured it, or the list must be told that it did.
-
-**The PR chip on every thread row, not only solo worktrees.**
-Rows under a worktree header show no PR chip today, on the reasoning that the header carries the
-worktree's state and the rows beneath it would only repeat it. In use that is the wrong trade: the
-chip is how you tell at a glance which thread has a PR and what CI thinks of it, and hiding it on
-exactly the rows that are grouped means the grouped work is the work you cannot see. Show it on
-every thread row.
-
-The gate is `crates/sidebar/src/sidebar.rs:5508`, where `row_pr_chips` is empty unless
-`thread.solo_worktree` is `Some`. `Self::thread_pr_chips(thread, cx)` already computes chips for
-any thread, so the row side is small. The judgement is what the header should then show: two
-identical chips stacked on a header and its single child is noise, and a header whose rows each
-carry a different branch may want to stop showing chips of its own, or show only a count. Decide
-that with the rendering in front of you, and say in the report which way it went.
-
-**More CI detail when hovering a PR chip.**
-The hover card says "checks failing" and stops there, so the next move is always to open the PR in
-a browser to find out which check failed. It should say which. Failures first, since that is what
-the hover is for; a passing PR needs no list.
-
-The data is already fetched and thrown away. `fetch_prs` asks for `statusCheckRollup`
-(`crates/gh_status/src/gh_status.rs:351`), whose entries carry a name, a workflow name, and a
-details url, but `GhCheck` (`:392`) deserializes only `state`, `status` and `conclusion`, and
-`checks_state` (`:442`) rolls the lot into one enum. Keeping the names means adding fields there
-and carrying a per-check list through `PrChipDetail`
-(`crates/ui/src/components/ai/thread_item.rs:66`) to the card that renders it (`:200`).
-
-Two things to respect. The card is shared by the sidebar rows and the agent input status bar, so it
-cannot grow without bound: cap the list, and count the remainder rather than listing forty green
-checks. And the parsing tests at `gh_status.rs:475` onwards use JSON fixtures that will need the new
-fields, which is the cheapest place to pin down that a check with no name still renders.
-
-
-**Diff hover cards should open bigger.**
-The two cards that show a diff are the best thing in the thread and the smallest: both are
-`rems(30.)` wide with a `rems(24.)` scroll region, inside a container capped at `rems(48.)`, so a
-card that could be half again as wide spends its life scrolling instead. The declared edit is
-`crates/agent_ui/src/conversation_view/thread_view/chips.rs:2744`, the command's changed file is
-`:2366`, and both containers cap at `:2734` and `:2341`.
-
-Make the diff cards specifically bigger; the other cards in that file (read, search, command output)
-are text and are fine at their current sizes, so this is not a blanket bump of every
-`card_scroll_region` call. A diff wants width more than height, since wrapping is what makes a hunk
-hard to read, and the container cap has to move with the region or the region will not get it.
-
-The ceiling is the window: a hover card taller or wider than the pane it appears in is worse than a
-small one, and these open next to a chip that can sit anywhere in the thread. If a fraction of the
-window reads better than a fixed larger number, use that instead.
+*(The queue is empty. Add items above the Verification queue, following the shape of the entries in the git history.)*
 
 
 ## Verification queue
@@ -975,176 +877,9 @@ section means everything committed has had its tests run.
 Each entry says which crates changed and what to watch for, since a failure after a rebase can
 come from either the queued edit or upstream drift, and the fix differs.
 
-**2026-08-19**
-- Repo settings, not a crate: `.zed/settings.json` disables rust-analyzer for this repository
-  (`"language_servers": ["!rust-analyzer"]`). Indexing a workspace this size costs more CPU and
-  disk than the editor returns on the machine the fork is developed on, and the work is gated by
-  `cargo check` and `script/clippy` regardless. This edits a file upstream also edits, so expect it
-  in the occasional rebase conflict; keep the fork's side and re-add upstream's other keys. Remove
-  the one line to get the server back.
+*(The queue is empty. Everything committed so far has been checked; each new
+edit goes here until the next rebase's gate covers it.)*
 
-**2026-08-19**
-- `auto_update`: the fork updates itself through Zed's own updater rather than a shell script.
-  Three small hooks: a released Dev build polls (Dev otherwise never does, since upstream has
-  nothing to offer a self-made build, and a debug build is still left alone); the release comes
-  from the fork's own published manifest instead of zed.dev (`quiet_ui_update::fetch_release`,
-  a new fork-owned module); and Dev joins Nightly in deciding newness by the commit in the
-  version's build metadata, because the fork's version number never moves. The nightly workflow
-  (on the fork's `main`, pushed as `519b321567`) now publishes `quiet-ui-latest.json` beside the
-  dmg carrying that commit and the download url. Everything after the check is upstream's:
-  download, mount, install, and the "Restart to update" button. Unrun, and **untested end to end**:
-  the first build carrying this is also the first one whose manifest exists, so the update path
-  cannot be exercised until two consecutive builds have shipped it. Watch for a released build
-  polling on a machine with no network (the manifest fetch fails and the status goes to Errored),
-  for `AppCommitSha` being absent in a build made outside CI (then every check reads as an update),
-  and for the installer's treatment of an ad-hoc signed bundle, which `install-quiet-ui` handles by
-  replacing the app wholesale.
-
-**2026-08-19**
-- `sidebar`: a solo worktree row shows its PR chips again. The row was already asking for them, but
-  `ThreadItem` draws PR chips on its metadata line and a compact row has no metadata line, so they
-  were dropped on the floor. They now render in the row's action slot, which is the only trailing
-  slot a one-line row has: alongside the hover buttons when the pointer is on the row, and on their
-  own when it is not, so the state does not appear and disappear as the pointer moves. Unrun. Watch
-  for the chips and the hover buttons together overflowing a narrow sidebar (the title truncates
-  first, which is the intent), and for the two action-slot calls disagreeing, since the later one
-  wins if both ever apply.
-
-**2026-08-19**
-- `sidebar`: collapsing a worktree stops at the next row that is its own worktree. A worktree with
-  one thread has no header, and `visible_entries` hid everything from a collapsed header until the
-  *next header*, so collapsing one group swallowed every solo row after it. A solo row now ends the
-  hiding, being both a group and its own end. Rows that do sit under a header are indented (`pl_2`,
-  via a new `render_thread` wrapper around the old body, now `render_thread_row`) so a group reads
-  as a group; solo rows stay flush. New `ThreadEntry::under_worktree_header`, set where members are
-  emitted, and eleven test fixtures updated for it. New test
-  `test_collapsing_a_worktree_leaves_the_rows_after_it_alone`, unrun. Watch for the indent moving
-  the row's selection background off the edge in a way that reads badly against the section
-  headers, and for terminals in a group, which are not indented since only threads carry the flag.
-
-**2026-08-19**
-- `agent_ui`: a command-changed file's hover card shows the change rather than the file.
-  `MultiBuffer::singleton` puts the whole buffer in the card with the hunks expanded inside it, so
-  a two-line change to a long file made the reader go looking; the card now builds excerpts around
-  the diff's hunks with two lines of context, the way every other diff view in Zed does.
-  `DIFF_CONTEXT_LINES` is that two. Unrun. Watch for a file whose diff has no hunks by the time the
-  card opens (the excerpt list is then empty and the card shows an empty editor rather than
-  falling back to something), and for the buffer being read-only here while the declared-edit
-  cards are editable.
-
-**2026-08-19**
-- `acp_thread`: a shell handed a command *line* now contributes that line's commands, not one
-  opaque segment. `bash -c "cd x && cargo check … | grep -E 'error' | head"` reached the
-  classifier whole: the first pipeline stage begins with `cd`, so nothing had said what happened
-  yet, and the grep was free to claim the line, which is why it read as `Searched "error"` and
-  nothing else. `parse_command` now splices a multi-command payload into the outer segment list,
-  each inheriting the outer host and devshell. New `shell_payload` alongside the existing
-  classifier arm, which still handles the single-command case. New test
-  `a_shell_handed_several_commands_ran_several_commands`, unrun. Watch for a payload whose quoting
-  defeats `split_segments` (the splice trusts it), and for the segment count growing enough to
-  change which chips fold together.
-
-**2026-08-19**
-- `agent_ui`: right-clicking an image in a thread offers `Copy Image`, and `Copy Image Path` when
-  the picture came from a file. Data the agent sent inline goes to the clipboard as it is; a file
-  is read on a background thread first and its format taken from the extension, so an extension the
-  clipboard has no format for copies nothing rather than copying nonsense. The inline image moved
-  out of `render_action_group` into `render_inline_image` to make room for the menu. Unrun. Watch
-  for the right-click menu swallowing the left click that opens the image (the trigger wraps the
-  clickable body), and for a large image stalling nothing, which is the point of the background
-  read.
-
-**2026-08-19 (urgent)**
-- `agent_ui`: reverted the deferred thread-view building from 2026-08-18. The 2026-08-19 build
-  (from `8f213a27c2`) dies when a thread is opened, and the evidence points inside
-  `new_thread_view`: the `agent replayed the session` timing logs, the `built views for …` line
-  immediately after the eager loop never does, in any session, so the app does not survive that
-  function. The deferred building was the only fork change inside it, and it is a speed-up rather
-  than a feature, so it goes first. **This is a guess, not a diagnosis**: no crash report was
-  written (`~/Library/Logs/DiagnosticReports` has nothing for Zed), the log simply stops, and the
-  same build also carries ~44 upstream commits from that night's rebase plus the sidebar one-row
-  change, either of which could be the real cause. If tomorrow's build still dies, revert
-  `sidebar: a worktree with one thread in it is one row` next and suspect upstream drift after
-  that. The 2026-08-18 build (run 32090544365) is known good and is what is installed locally.
-
-**2026-08-19**
-- `acp_thread`, `agent_ui`: a command line that moves the branch is no longer watched for edits at
-  all, and a command that changed more files than a row can name reads as one chip. `git rebase …
-  && cargo check` was watched because the rule was "any segment writes" and the cargo half
-  qualified, so the rebase's wholesale status change came back as the command's own edits.
-  Anything containing a `GitOperation::Modify` segment now disqualifies the whole line, since
-  nothing downstream can tell those files apart from what the rest of the line wrote. Past
-  `MOST_NAMED_COMMAND_FILES` (6), the per-file chips become one "N files changed" chip carrying the
-  summed diff stat, hovering lists the paths and clicking opens the diff. New test
-  `a_line_that_moves_the_branch_is_not_watched`, unrun. A wholesale discard (`git reset --hard`,
-  `git clean`) counts as a branch move too, since it throws the worktree back the same way; a
-  discard that names its files (`git checkout -- src/main.rs`) still reports, and the empty path
-  list is what tells them apart. Watch for a legitimate branch-moving line that also writes
-  something the user wanted to see, which is now silent by design.
-- `acp_thread`, `agent_ui`: a cleanup pass over the same system, no behaviour intended.
-  `command_may_write` is one pass over the segments with the two disqualifiers first and every
-  kind named once, instead of two passes with an inner closure. The two command-changed chips
-  (one file, and the "N files changed" summary) are one `render_command_change_chip` differing
-  only in name and hover card, and the optional diff stat is one `diff_stats` helper rather than
-  three copies. Net twelve lines shorter. Unrun beyond check and clippy; the behaviour it should
-  preserve is exactly what the entries above describe.
-
-**2026-08-18**
-- `sidebar`: a worktree holding one thread is one row. The header said the worktree's name, which
-  the thread's own title already answers, so the row now carries what the header carried instead:
-  its PR chips, a + that starts a second thread in the worktree (which gives it a header again),
-  and an archive whose tooltip says "Archive Worktree" when archiving that thread takes the
-  worktree with it. `ThreadEntry::solo_worktree` marks such a row; the grouping pass emits it in
-  place of a header plus a row. Structural test expectations updated in `sidebar_tests.rs` (four
-  assertions, plus the all_entries count 7 → 5); `visible_entries_as_strings` never showed headers,
-  so the other tests are untouched. Unrun. Watch for the spacing (a solo row carries the header's
-  `pt_3` as its own `pt_2`), and for a worktree collapsed while it had two threads and then dropped
-  to one: the stale key cannot hide the row, since only a header sets the hiding flag, but the key
-  lingers in `collapsed_worktrees`.
-- `agent_ui`: opening a thread builds views for its last 30 entries before drawing and the rest
-  behind the first paint, ten at a time with a yield between chunks, nearest the viewport first.
-  The whole thread used to be built up front, which is the one cost that scales with a thread's
-  length rather than with the screen. A thread of 30 entries or fewer is unchanged, which is every
-  thread in the test suite, so this should be invisible to it. Deferred chunks are spliced back
-  over themselves rather than remeasured, since a splice also registers the focus handles the list
-  had none of. Unrun, and the riskiest edit of the week. Watch for: a user message whose editor has
-  not been built yet renders as nothing (`render_entry` returns `Empty`), so scrolling up very fast
-  in a long thread may show a gap that fills in; the scroll anchor, which should hold because
-  spliced entries are above the viewport and the count is unchanged; and any test that opens a
-  thread longer than 30 entries and immediately asserts on an entry's view.
-- `agent_ui`, `git_ui_core`: five timings on the two slow paths, logged at info with the prefix
-  `quiet-ui perf:` so they can be grepped out of the log. Creating a worktree reports its fetch,
-  its checkout, and its workspace open; opening a thread reports how long the agent took to replay
-  the session and how long building a view per entry took, with the entry count. Measured outside
-  the app for reference: `git fetch origin` 2.5s, `git worktree add` of 4261 files 2.9s, so git is
-  about five seconds of it and the rest is unaccounted for until these land. Unrun, and nothing
-  behavioural. Watch for the log lines being noisy enough to want a feature flag, and remove them
-  once the split is known.
-- `agent_ui`: an entry whose content grew is remeasured on the item that draws it, not on itself.
-  A run of actions is drawn by the run's first entry and the rest render `Empty`, so
-  `EntryUpdated(index)` was invalidating the height of an entry that draws nothing while the block
-  that actually grew kept its old measurement, and the content painted over the entries below.
-  Images, being the tallest thing a chip opens, is where it showed. `ThreadView::drawn_item_for_entry`
-  resolves entry to item, and the chip toggles (image, action, collapsed) now remeasure too, which
-  they never did at all. Unrun. Watch for the frame memo of chip-ness, which this clears before
-  resolving because it is consulted between frames.
-- `agent_ui`: a command chip's hover card carries what the command printed: the full command as a
-  header, then the last 200 lines of output in a scroll region, both at one fixed card width.
-  Unrun. Watch for a card that is too tall when a long command and long output stack (the halves
-  cap at 12rem and 18rem), and for output that is still streaming, which the card shows only once
-  the terminal has exited.
-
-**2026-08-17**
-- `sidebar`: a thread rename is applied when it ends, not on every keystroke. Each character used
-  to write a title override, which rebuilt the sidebar's entries underneath the editor receiving
-  the characters, and the rename ended itself on its first letter with the focus landing in the
-  search field. `finish_thread_rename` now reads the editor once and applies it; Escape and the
-  editor's own Cancel go through the new `cancel_thread_rename`, which discards; the
-  `suppress_next_rename_edit` flag the live path needed is gone. New test
-  `test_typing_a_rename_does_not_end_it`, unrun; the two existing rename tests already drove
-  `finish_thread_rename` and should still pass unchanged. Watch for a rename ended by clicking
-  elsewhere (Blurred still commits), and for an empty title, which is now discarded rather than
-  written.
 
 ## Rebase log
 
@@ -2050,3 +1785,128 @@ silently re-verifying already-fixed work a night later.
 **Environment, not code:** same prerequisites as every recent run needed reapplying in this fresh
 container (`CARGO_NET_GIT_FETCH_WITH_CLI=true`; `apt-get update` 403'd on the `deadsnakes`/`ondrej`
 PPAs again, `apt-get install -y libasound2-dev` still succeeded off cached lists).
+
+**2026-08-20**: onto main fe9556a11 (24 upstream commits: gpui `ztracing` browser `performance`
+API mapping #62898, Baseten language model provider #62950, one-time-code autofill disabled in Zed
+inputs #60116, configurable inline completion debounce #61568, CLI Flatpak launcher argument
+ordering #61577, gpui_linux buffered X11 event draining #62081, LSP status tooltip server-path fix
+#62919, worktree global-gitignore matching outside root #62130, CONTRIBUTING.md issues link
+#62937, overlapping range-formatting result dedup #62935, agent_ui inline-assistant reasoning-
+before-tool-use fix #61220, workspace persist-recent-navigation-history #55034, project_panel
+rename-created directory removal on undo #60082, LSP-path worktree entry dedup #61392,
+`lsp_results_location` for declaration/type-definition #61060, Linux GLib bundling stop #61593,
+`cargo-machete` → `cargo-shear` #62643, gpui_linux X11 urgency-hint clearing #61619, worktree
+yield during large-file decoding #62831, SCP-style SSH URL IPv6 support #62157, debugger keymap
+sync with VS Code #58729, CI `ts_query_ls` via `gh` #62900, terminal alt-f5 / ctrl-alt-key
+support #62891, Python `__name__ in ("__main__",)` runnable #58911). Squash-then-rebase folded the
+standing squash and the five queued work-queue prep commits (the four "Queue …" complaints plus
+"Queue the day's work where the routine reads it") into one commit, reusing the squash's own
+message; tree-identical to the old tip before rebasing. Backup tag `quiet-ui-pre-rebase1-2026-08-20`.
+
+The rebase itself applied with zero conflicts. No markerless drift: `cargo check --workspace
+--all-targets` came back with 0 errors and 0 warnings. Nothing upstream added here for the fork
+to delete in favor of, and nothing upstream fixed here for free — none of the 24 commits reimplement
+anything fork-authored; the closest overlap (agent_ui inline-assistant reasoning-before-tool-use
+#61220) touches a code path outside the fork's own chip/thread-view work.
+
+**What was built.** All five items the queue named landed tonight; the queue is empty. Notes on
+each, in the order the queue listed them:
+
+- **`acp_thread`, `agent_ui`** — the "Changed by this command" card no longer claims what it
+  cannot deliver. Rather than shipping baseline-text capture for every dirty file in every
+  command's worktree (the fix the queue proposed, whose memory cost is real: a repository with
+  dozens of already-dirty files pays for each of them until the command's terminal is gone), the
+  card takes the queue's own alternative: a `pre_command_dirty: bool` on `ChangedFile`, populated
+  in `RepositoryWatch::refresh` from the same `baseline` the diff-stat delta already reads, flips
+  the card's title from "Changed by this command" to "Uncommitted changes to this file" when the
+  file was dirty at command start. The chip's `+n -m` stays honest (it always was); the card now
+  says what it is actually showing rather than lying. The other two smaller bugs the queue named:
+  (i) the `command_file_diffs` cache-by-path — left alone, because the diff shown is the same
+  across two commands touching one path (both are HEAD-vs-current), and the label the card
+  carries is drawn per `ChangedFile` from the outer `command_file_hover_card`, not from the
+  cached editor; (ii) the empty-until-rehovered bug is real and fixed by a new
+  `chip_hover_card_observing<T>` helper that subscribes the card entity to the thread's own
+  notifications, so the same `cx.notify()` the load task ends with reaches the card. `render` is
+  unchanged for `chip_hover_card` callers that were fine without the subscription.
+- **`markdown`, `agent_ui`** — an agent-authored image inside markdown holds a definite height,
+  so it stops painting over its neighbours in the `ListState`. `MarkdownStyle` gains a
+  `pub inline_image_height: Option<AbsoluteLength>` field, opt-in and inert everywhere it is
+  `None`, so the blast radius stays inside the caller that sets it. `render_agent_markdown` sets
+  it to `IMAGE_CHIP_HEIGHT` (20 rems, the same box the chip layer draws) unless the caller has
+  already chosen one; the `push_markdown_image` implementation uses it only when the markdown
+  source did not declare its own height, so `![](img.png =200x150)` still wins. This is the "from
+  the thread's own `MarkdownStyle`" branch the queue preferred over adding a definite box in the
+  shared crate, since only `render_agent_markdown` sets the field (making the fix opt-in for
+  every other markdown renderer in the workspace).
+- **`sidebar`** — every thread row carries its own PR chip, not only rows that are their own
+  worktree. `row_pr_chips` now calls `Self::thread_pr_chips(thread, cx)` unconditionally; the
+  workspace header keeps its chip only while collapsed (so a folded group still surfaces PR
+  state), and drops it while expanded (its rows carry it). One same-file consistency fix landed
+  alongside: the hovered-row branch used to hide chips whenever `contextual_action` was `None`
+  (an empty draft), but now shows them whether or not it has a hover action beside them.
+- **`gh_status`, `ui`** — the PR chip's hover card names the failing checks. `GhCheck` also
+  deserializes `name`, `workflowName`, and `context`; a helper `GhCheck::label()` picks
+  `workflow / job` when both are known so `test / clippy` and `build / clippy` don't collapse
+  into two identical `clippy` lines. `PrStatus` gains `failing_checks: Vec<SharedString>` and
+  `extra_failing_checks: usize`, computed alongside `checks_state` in `PrStatus::from_gh`, capped
+  at `MAX_LISTED_CHECKS = 6`. `PrChipDetail` carries the same two fields through to the card,
+  where a `v_flex` lists the names under the "checks failing" line with a final "and N more"
+  when the cap left some out. Only failing checks are listed; a passing PR shows nothing new.
+  Backwards compatible with persisted `ThreadPrSnapshot`s because both new fields are
+  `#[serde(default)]`. Three new tests: `failing_check_names_are_listed_with_their_workflow`,
+  `failing_check_names_beyond_the_cap_are_counted`,
+  `a_failing_check_with_no_name_still_counts_but_lists_nothing`.
+- **`agent_ui`** — the diff hover cards open bigger. Three new constants at the top of `chips.rs`
+  (`DIFF_CARD_WIDTH = 48rem`, `DIFF_CARD_HEIGHT = 30rem`, `DIFF_CARD_MAX_W = 56rem`, up from
+  30/24/48 respectively) are used only by `edit_hover_card` and `command_file_hover_card`, so
+  the read/search/output cards keep their current sizes as the queue asked. The width grew more
+  than the height, since wrapping is what makes a hunk hard to read. Left as fixed rems (not a
+  fraction of the window) because `chip_hover_card`'s build closure doesn't have viewport size
+  in scope without a wider refactor, and 48rem still fits inside a 900-px pane comfortably.
+
+**Gate.** `cargo test -p acp_thread -p agent_ui -p sidebar -p markdown -p gh_status -p ui` and
+`script/clippy` for the same six (`--release --all-targets --all-features -- --deny warnings`).
+`cargo clean` right after the `cargo check --workspace --all-targets` (before the test pass), and
+`rm -rf target/debug` right after the test pass (before the release-profile clippy pass), per the
+standing note.
+
+- `acp_thread`: 195/195, clean.
+- `agent_ui`: 432 passed / 32 intentionally `#[ignore]`d / 0 failed on the second run. The first
+  run under the full six-crate suite hit one failure,
+  `thread_metadata_store::tests::test_migrate_thread_remote_connections_backfills_from_workspace_db`
+  — the same test the 2026-08-06 entry called out as order/parallelism-dependent flakiness under
+  the full suite. Rerunning agent_ui alone with the same test binary and the same parallelism came
+  back green (432/432); rerunning that single test in isolation came back green too. Consistent
+  with the 2026-08-06 diagnosis; not investigated further, not touching this run's queued work.
+- `gh_status`: 19/19, including the three new tests
+  (`failing_check_names_are_listed_with_their_workflow`,
+  `failing_check_names_beyond_the_cap_are_counted`,
+  `a_failing_check_with_no_name_still_counts_but_lists_nothing`). All old parsing tests still
+  pass, so the `Option<Vec>` cap on the failing-name list matches the pre-change behaviour
+  everywhere the queue's shape did not touch.
+- `markdown`: 152/152. No test exercises `push_markdown_image`'s new `inline_image_height` branch;
+  the fix is inert without a caller that sets the field. The one caller that does
+  (`render_agent_markdown` in `conversation_view.rs`) has no unit test either, so the visual
+  outcome — an image inside an agent's own markdown message not painting past its neighbours —
+  is unrun until a real thread with an image opens in tomorrow's build.
+- `sidebar`: 167/167. Existing tests exercise `thread_pr_chips` directly rather than the row
+  render, so the row-side "chips for every row" change is unrun beyond compile and clippy.
+- `ui`: 82 + 41 doc tests, clean.
+- `script/clippy` clean, 0 warnings.
+
+**What the fork could delete in favor of upstream:** nothing this round — none of the 24 upstream
+commits reimplement anything fork-authored.
+
+**Environment, not code:** same prerequisites as every recent run needed reapplying in this fresh
+container (`CARGO_NET_GIT_FETCH_WITH_CLI=true`; `apt-get update` 403'd on the `deadsnakes`/`ondrej`
+PPAs again, `apt-get install -y libasound2-dev` still succeeded off cached lists). New this run:
+`libxkbcommon-dev` and `libxkbcommon-x11-dev` needed to be installed too — the `markdown` crate's
+example binaries (`crates/markdown/examples/markdown.rs`,
+`crates/markdown/examples/markdown_as_child.rs`) link against them, and `cargo test -p markdown`
+builds the crate's examples along with its tests, so the first test pass failed with
+`rust-lld: error: unable to find library -lxkbcommon` from the example link step before any test
+ran. Earlier gates did not hit this because they did not include `-p markdown`; the queue's
+"image inside markdown" work is what brought the crate into tonight's list. Worth adding
+`libxkbcommon-dev libxkbcommon-x11-dev` to the standing environment setup alongside
+`libasound2-dev`.
+
