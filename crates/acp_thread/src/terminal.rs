@@ -433,6 +433,11 @@ pub struct ChangedFile {
     pub path: ProjectPath,
     pub added: u32,
     pub deleted: u32,
+    /// Whether the file already carried uncommitted changes when the command
+    /// started. A hover card cannot honestly claim its whole diff is this
+    /// command's when there was already a diff to show; the label switches on
+    /// this flag instead.
+    pub pre_command_dirty: bool,
 }
 
 /// The repository's view of its working copy: what each path's status is, and
@@ -504,11 +509,20 @@ impl RepositoryWatch {
                     let path = repository.repo_path_to_project_path(repo_path, cx)?;
                     let worktree = project.read(cx).worktree_for_id(path.worktree_id, cx)?;
                     let abs_path = worktree.read(cx).absolutize(&path.path);
+                    // A file the baseline already knew was moving keeps its
+                    // history; the hover card labels itself differently for
+                    // those than for a file this command dirtied from clean,
+                    // since only the second case is the command's whole diff.
+                    let pre_command_dirty = baseline
+                        .get(repo_path)
+                        .and_then(|(_, stat)| *stat)
+                        .is_some_and(|stat| stat.added + stat.deleted > 0);
                     Some((
                         ChangedFile {
                             path,
                             added: delta.added,
                             deleted: delta.deleted,
+                            pre_command_dirty,
                         },
                         abs_path,
                     ))

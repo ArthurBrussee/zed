@@ -19,6 +19,20 @@ use crate::entry_view_state::diff_editor_text_style_refinement;
 /// halves share one width rather than each sizing to its own content.
 const CARD_WIDTH: Rems = Rems(30.);
 
+/// A diff wants width more than height: wrapping is what makes a hunk hard to
+/// read, and a card that could be half again as wide spends its life scrolling
+/// instead. Kept together with `DIFF_CARD_HEIGHT` and `DIFF_CARD_MAX_W` so a
+/// declared edit and a command-changed file open at the same size.
+const DIFF_CARD_WIDTH: Rems = Rems(48.);
+/// A diff card's scroll region cannot be taller than this. Bigger than the
+/// text cards get, because there is more to read at once and the enterable
+/// card scrolls for what still doesn't fit.
+const DIFF_CARD_HEIGHT: Rems = Rems(30.);
+/// The container ceiling has to move with the scroll region or the region
+/// won't get it. Sized to hold `DIFF_CARD_WIDTH` plus the card's own padding
+/// without cropping.
+const DIFF_CARD_MAX_W: Rems = Rems(56.);
+
 /// How much of a command's output the card carries. The end is where a command
 /// says how it went; the whole thing is one click away in the chip itself.
 const OUTPUT_TAIL_LINES: usize = 200;
@@ -214,6 +228,29 @@ pub(super) fn chip_hover_card(
     move |_window, cx| {
         let build = build.clone();
         cx.new(|_| ChipHoverCard { build }).into()
+    }
+}
+
+/// A chip hover card whose body loads asynchronously: the card observes an
+/// entity and re-renders when it notifies, so a body that returns `None` while
+/// something loads gets a real chance to fill in once the load completes. A
+/// plain `chip_hover_card` re-renders only when the card itself notifies, so
+/// an `entity.notify()` on the thread cannot reach it.
+pub(super) fn chip_hover_card_observing<T: 'static>(
+    observed: WeakEntity<T>,
+    build: impl Fn(&mut Window, &mut App) -> AnyElement + 'static,
+) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView {
+    let build: std::rc::Rc<dyn Fn(&mut Window, &mut App) -> AnyElement> = std::rc::Rc::new(build);
+    move |_window, cx| {
+        let build = build.clone();
+        let observed = observed.clone();
+        cx.new(|cx| {
+            if let Some(entity) = observed.upgrade() {
+                cx.observe(&entity, |_, _, cx| cx.notify()).detach();
+            }
+            ChipHoverCard { build }
+        })
+        .into()
     }
 }
 
@@ -2319,6 +2356,13 @@ impl ThreadView {
     /// The card behind a command-changed file: which file, how much of it
     /// moved, and the change itself. An edit nobody declared is still an edit,
     /// and reading it should not mean opening a tab.
+    ///
+    /// The diff shown is the file's uncommitted diff against HEAD, not the
+    /// slice of it this command wrote. When the file was clean when the command
+    /// started, HEAD is the pre-command content, so the uncommitted diff is the
+    /// command's own change; when it was already dirty, the card carries the
+    /// wider diff and the label says so. Either way the card is honest about
+    /// what it is showing.
     pub(super) fn command_file_hover_card(
         &self,
         file: &acp_thread::ChangedFile,
@@ -2327,18 +2371,30 @@ impl ThreadView {
         let path = file.path.clone();
         let full: SharedString = path.path.as_unix_str().to_string().into();
         let stats = diff_stats(file.added, file.deleted);
+        let pre_command_dirty = file.pre_command_dirty;
         let this = cx.entity().downgrade();
 
-        chip_hover_card(move |window, cx| {
+        // The build closure fetches the editor by path each frame; on the first
+        // frame the load is still running and it returns `None`, and the load
+        // task ends by notifying the thread view. The observing variant of the
+        // hover card wraps that notify around to the card itself, so the empty
+        // frame is replaced the moment the editor is ready rather than only on
+        // the reader's next hover.
+        chip_hover_card_observing(this.clone(), move |window, cx| {
             let editor = this
                 .update(cx, |this, cx| {
                     this.command_file_diff_editor(&path, window, cx)
                 })
                 .ok()
                 .flatten();
+            let heading = if pre_command_dirty {
+                "Uncommitted changes to this file"
+            } else {
+                "Changed by this command"
+            };
             v_flex()
                 .gap_1p5()
-                .max_w(rems(48.))
+                .max_w(DIFF_CARD_MAX_W)
                 .child(
                     h_flex()
                         .gap_1p5()
@@ -2360,11 +2416,15 @@ impl ThreadView {
                             )
                         }),
                 )
-                .child(Label::new("Changed by this command").size(LabelSize::XSmall))
+                .child(Label::new(heading).size(LabelSize::XSmall))
                 .when_some(editor, |this, editor| {
                     this.child(
-                        card_scroll_region("command-file-hover-diff", rems(30.), rems(24.))
-                            .child(editor),
+                        card_scroll_region(
+                            "command-file-hover-diff",
+                            DIFF_CARD_WIDTH,
+                            DIFF_CARD_HEIGHT,
+                        )
+                        .child(editor),
                     )
                 })
                 .into_any_element()
@@ -2731,7 +2791,7 @@ impl ThreadView {
         Some(chip_hover_card(move |_window, _cx| {
             v_flex()
                 .gap_1p5()
-                .max_w(rems(48.))
+                .max_w(DIFF_CARD_MAX_W)
                 .child(
                     Label::new(path.clone())
                         .size(LabelSize::XSmall)
@@ -2741,7 +2801,7 @@ impl ThreadView {
                 .child(
                     // The card is enterable, so a long diff can be scrolled
                     // rather than merely clipped.
-                    card_scroll_region("edit-hover-diff", rems(30.), rems(24.))
+                    card_scroll_region("edit-hover-diff", DIFF_CARD_WIDTH, DIFF_CARD_HEIGHT)
                         .child(editor.clone()),
                 )
                 .into_any_element()
