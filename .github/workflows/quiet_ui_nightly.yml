@@ -100,6 +100,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cp target/aarch64-apple-darwin/release/Zed-aarch64.dmg Zed-quiet-ui.dmg
+          # What the app's own updater reads. It needs two things: the commit
+          # this dmg came from, which is the only way to tell a new build from
+          # the running one (the version number never moves), and where the dmg
+          # is. A plain asset rather than the GitHub API: no token, no rate
+          # limit, and nothing to get right about user agents.
+          cat > quiet-ui-latest.json <<JSON
+          {
+            "sha": "$(git rev-parse HEAD)",
+            "url": "https://github.com/$GITHUB_REPOSITORY/releases/download/quiet-ui-latest/Zed-quiet-ui.dmg",
+            "built_at": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          }
+          JSON
           cat > notes.md <<NOTES
           Built from \`quiet-ui\` at $(git rev-parse --short HEAD), $(date -u +'%Y-%m-%d %H:%M') UTC.
 
@@ -117,7 +129,7 @@ jobs:
           \`\`\`
           NOTES
           gh release delete quiet-ui-latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
-          gh release create quiet-ui-latest Zed-quiet-ui.dmg \
+          gh release create quiet-ui-latest Zed-quiet-ui.dmg quiet-ui-latest.json \
             --repo "$GITHUB_REPOSITORY" \
             --target "$(git rev-parse HEAD)" \
             --title "quiet-ui $(date -u +%Y-%m-%d)" \
