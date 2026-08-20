@@ -2394,13 +2394,20 @@ impl Sidebar {
     ) -> AnyElement {
         let group = SharedString::from(format!("workspace-header-{ix}"));
         let is_collapsed = self.collapsed_worktrees.contains(&header.key);
-        // PR state belongs to the worktree (PR == branch == worktree); the
-        // lead thread's entry supplies the same chips its row used to carry.
-        let pr_chips = header
-            .lead_thread
-            .as_ref()
-            .map(|thread| Self::thread_pr_chips(thread, cx))
-            .unwrap_or_default();
+        // PR state belongs to the worktree (PR == branch == worktree); its rows
+        // carry the chip themselves, and while they are visible the header's
+        // copy would only stack a second identical chip on top. Once the group
+        // folds those rows away the header carries the chip again, so the fold
+        // is not also a way of losing sight of a failing PR.
+        let pr_chips = if is_collapsed {
+            header
+                .lead_thread
+                .as_ref()
+                .map(|thread| Self::thread_pr_chips(thread, cx))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let member_sessions = header.member_sessions.clone();
 
         h_flex()
@@ -5503,12 +5510,13 @@ impl Sidebar {
         let is_hovered = self.hovered_thread_index == Some(ix);
         let is_selected = is_active;
         let is_draft = thread.draft.is_some();
-        // A row under a header leaves the PR state to the header; a row that is
-        // its own worktree carries it.
-        let row_pr_chips = match thread.solo_worktree {
-            Some(_) => Self::thread_pr_chips(thread, cx),
-            None => Vec::new(),
-        };
+        // Every thread row carries its own PR chip. Hiding it on rows under a
+        // header meant the header alone reported PR state for its threads,
+        // which read fine when a worktree held one branch and one CI story but
+        // was hostile the moment the row was where you were looking to decide
+        // which thread had the failing PR. The header keeps its chip only when
+        // it is collapsed and the rows are not visible.
+        let row_pr_chips = Self::thread_pr_chips(thread, cx);
         let is_archived = thread.metadata.archived;
         // Only Active-section rows are open as tabs, so only they get a
         // close-the-tab affordance.
@@ -5773,14 +5781,25 @@ impl Sidebar {
                     }
                 };
 
-                this.when_some(contextual_action, |this, action| {
-                    this.action_slot(h_flex().gap_0p5().children(pr_chips).child(action))
+                // Chips ride in the action slot whether or not there is a
+                // hover action beside them: a hovered row with chips but no
+                // action (an empty draft) used to lose its chips to this
+                // branch's `when_some`.
+                let has_action = contextual_action.is_some();
+                let has_chips = !row_pr_chips.is_empty();
+                this.when(has_action || has_chips, |this| {
+                    let slot = h_flex().gap_0p5().children(pr_chips);
+                    let slot = match contextual_action {
+                        Some(action) => slot.child(action),
+                        None => slot,
+                    };
+                    this.action_slot(slot)
                 })
             })
-            // A row that IS its worktree carries the PR state its header would
-            // have carried, and carries it whether or not the pointer is here.
-            // The chips ride in the action slot because a compact row draws no
-            // metadata line, which is where `ThreadItem` puts them.
+            // Every thread row carries its PR chips whether the pointer is on
+            // it or not; the chips ride in the action slot because a compact
+            // row draws no metadata line, which is where `ThreadItem` puts
+            // them.
             .when(!row_pr_chips.is_empty() && !(is_hovered && !is_renaming), |this| {
                 this.action_slot(h_flex().gap_0p5().children(row_pr_chips.clone().into_iter().enumerate().map(
                     |(chip_ix, chip)| {
