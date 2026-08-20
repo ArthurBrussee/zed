@@ -16148,6 +16148,8 @@ async fn test_archived_thread_keeps_its_persisted_pr_badge(cx: &mut TestAppConte
                         state: gh_status::PrState::Merged,
                         checks: gh_status::ChecksState::Passing,
                         review: gh_status::ReviewState::Approved,
+                        failing_checks: Vec::new(),
+                        extra_failing_checks: 0,
                     }],
                 },
                 cx,

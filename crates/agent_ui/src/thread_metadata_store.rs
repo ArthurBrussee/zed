@@ -2161,6 +2161,8 @@ mod tests {
                 state: gh_status::PrState::Merged,
                 checks: gh_status::ChecksState::Passing,
                 review: gh_status::ReviewState::Approved,
+                failing_checks: Vec::new(),
+                extra_failing_checks: 0,
             }],
         };
         db.save_pr_snapshot(thread_id, snapshot.clone())

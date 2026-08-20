@@ -71,6 +71,14 @@ pub struct PrChipDetail {
     pub checks: SharedString,
     pub checks_icon: Option<(IconName, Color)>,
     pub review: SharedString,
+    /// The names of failing checks the card should list under the "checks
+    /// failing" line, most useful ones first. Empty when the PR is passing or
+    /// when the check data carried no names; capped by the producer so the
+    /// card cannot grow without bound.
+    pub failing_checks: Vec<SharedString>,
+    /// How many failing checks the card is not listing. Zero when everything
+    /// failing is listed; used to draw an "and N more" line below.
+    pub extra_failing_checks: usize,
 }
 
 /// The renderable pill for a [`ThreadItemPrChip`], shared by the sidebar rows
@@ -221,6 +229,28 @@ impl RenderOnce for PrChip {
                                         .color(Color::Muted),
                                 ),
                         )
+                        // Names the failing checks, so the card answers the
+                        // question a reader would open a browser to answer.
+                        .when(!detail.failing_checks.is_empty(), |this| {
+                            let extra = detail.extra_failing_checks;
+                            this.child(
+                                v_flex()
+                                    .gap_0p5()
+                                    .children(detail.failing_checks.into_iter().map(|name| {
+                                        Label::new(name)
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted)
+                                            .truncate()
+                                    }))
+                                    .when(extra > 0, |this| {
+                                        this.child(
+                                            Label::new(format!("and {extra} more"))
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
+                                        )
+                                    }),
+                            )
+                        })
                         .into_any_element()
                 })),
                 None => this.tooltip(Tooltip::text(chip.tooltip)),
@@ -1192,6 +1222,8 @@ impl Component for ThreadItem {
                                         checks: "checks passing".into(),
                                         checks_icon: Some((IconName::Check, Color::Success)),
                                         review: "approved".into(),
+                                        failing_checks: Vec::new(),
+                                        extra_failing_checks: 0,
                                     }),
                                 },
                                 ThreadItemPrChip {
@@ -1209,6 +1241,8 @@ impl Component for ThreadItem {
                                         checks: "checks pending".into(),
                                         checks_icon: Some((IconName::ArrowCircle, Color::Warning)),
                                         review: "review required".into(),
+                                        failing_checks: Vec::new(),
+                                        extra_failing_checks: 0,
                                     }),
                                 },
                             ])

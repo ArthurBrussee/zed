@@ -40,7 +40,23 @@ pub struct PrStatus {
     pub state: PrState,
     pub checks: ChecksState,
     pub review: ReviewState,
+    /// Names of failing/errored checks, so a hover card can say which check
+    /// failed rather than only that some did. Capped at [`MAX_LISTED_CHECKS`];
+    /// the count of the ones over the cap is in `extra_failing_checks`. Empty
+    /// when the PR has no failing checks or when the check data carries no
+    /// names to report.
+    #[serde(default)]
+    pub failing_checks: Vec<SharedString>,
+    /// How many failing checks the PR carries beyond what `failing_checks`
+    /// listed. Zero when everything failing is listed. Read alongside
+    /// `failing_checks` for a "and N more" line.
+    #[serde(default)]
+    pub extra_failing_checks: usize,
 }
+
+/// A hover card cannot grow without bound; a workflow with forty checks would
+/// eat the surface it sits on. The card lists this many and counts the rest.
+pub const MAX_LISTED_CHECKS: usize = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PrState {
@@ -327,6 +343,18 @@ fn pr_chip(pr: &PrStatus) -> ThreadItemPrChip {
             checks: checks_label.into(),
             checks_icon: checks,
             review: review_label.into(),
+            // A hover card that says "checks failing" and stops there is a
+            // hover card that sends the reader to a browser to find out which.
+            // Names are only listed when a failure is what needs pointing at;
+            // a passing PR has nothing to name.
+            failing_checks: match pr.checks {
+                ChecksState::Failing => pr.failing_checks.clone(),
+                _ => Vec::new(),
+            },
+            extra_failing_checks: match pr.checks {
+                ChecksState::Failing => pr.extra_failing_checks,
+                _ => 0,
+            },
         }),
     }
 }
@@ -349,6 +377,12 @@ struct WatchedBranch {
 }
 
 const GH_JSON_FIELDS: &str = "number,url,title,state,isDraft,reviewDecision,statusCheckRollup";
+
+// The gh CLI selects `statusCheckRollup` as a whole subtree, so requesting
+// `--json statusCheckRollup` already returns each check's `name`,
+// `workflowName`, `context`, `state`, `status`, and `conclusion`; the additional
+// fields the fork needs for the hover card are parsed out in `GhCheck` without
+// widening `GH_JSON_FIELDS`.
 
 async fn fetch_prs(repo_path: &Path, branch: &str) -> Result<Vec<PrStatus>> {
     let output = util::command::new_command("gh")
@@ -386,7 +420,9 @@ struct GhPr {
 }
 
 /// One statusCheckRollup entry. Commit statuses report `state`; check runs
-/// report `status` while running and `conclusion` once complete.
+/// report `status` while running and `conclusion` once complete. A check run
+/// carries a `name` (its job name) and a `workflowName` (its workflow's own
+/// name); a commit status carries a `context` in place of both.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GhCheck {
@@ -396,6 +432,12 @@ struct GhCheck {
     status: Option<String>,
     #[serde(default)]
     conclusion: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    workflow_name: Option<String>,
+    #[serde(default)]
+    context: Option<String>,
 }
 
 impl GhCheck {
@@ -406,19 +448,61 @@ impl GhCheck {
             .or(self.status.as_deref())
             .unwrap_or("")
     }
+
+    /// A one-line name for a hover card. A check run says `workflow / job` when
+    /// both are known so `test / clippy` and `build / clippy` don't collapse
+    /// into two identical `clippy` lines; a commit status carries its own
+    /// context. Empty when nothing named the check.
+    fn label(&self) -> Option<String> {
+        if let Some(name) = self.name.as_deref().filter(|n| !n.is_empty()) {
+            return Some(match self.workflow_name.as_deref().filter(|w| !w.is_empty()) {
+                Some(workflow) if workflow != name => format!("{workflow} / {name}"),
+                _ => name.to_string(),
+            });
+        }
+        self.context
+            .as_deref()
+            .filter(|c| !c.is_empty())
+            .map(str::to_string)
+    }
 }
 
 impl PrStatus {
     fn from_gh(pr: GhPr) -> Self {
+        let checks = pr.status_check_rollup.as_deref().unwrap_or(&[]);
+        let (failing_checks, extra_failing_checks) = failing_check_names(checks);
         Self {
             number: pr.number,
             url: pr.url.into(),
             title: pr.title.into(),
             state: pr_state(&pr.state, pr.is_draft),
-            checks: checks_state(pr.status_check_rollup.as_deref().unwrap_or(&[])),
+            checks: checks_state(checks),
             review: review_state(pr.review_decision.as_deref()),
+            failing_checks,
+            extra_failing_checks,
         }
     }
+}
+
+/// The names of the checks that failed, capped at [`MAX_LISTED_CHECKS`], plus
+/// how many the cap left out. A failing check with no name at all is counted
+/// silently; there is no line to draw for it. The order is the rollup's own
+/// order, so a check the user recognises stays where they last saw it.
+fn failing_check_names(checks: &[GhCheck]) -> (Vec<SharedString>, usize) {
+    let mut named: Vec<SharedString> = Vec::new();
+    let mut extra = 0;
+    for check in checks {
+        if !matches!(check.outcome(), "FAILURE" | "ERROR") {
+            continue;
+        }
+        let Some(label) = check.label() else { continue };
+        if named.len() < MAX_LISTED_CHECKS {
+            named.push(label.into());
+        } else {
+            extra += 1;
+        }
+    }
+    (named, extra)
 }
 
 fn pr_state(state: &str, is_draft: bool) -> PrState {
@@ -487,6 +571,8 @@ mod tests {
                 state: PrState::Open,
                 checks: ChecksState::Passing,
                 review: ReviewState::Approved,
+                failing_checks: Vec::new(),
+                extra_failing_checks: 0,
             }]
         );
     }
@@ -526,6 +612,80 @@ mod tests {
         }]"#;
         let prs = parse_pr_list(json).unwrap();
         assert_eq!(prs[0].checks, ChecksState::Pending);
+    }
+
+    #[test]
+    fn failing_check_names_are_listed_with_their_workflow() {
+        let json = r#"[{
+            "number": 100,
+            "url": "https://example.com/100",
+            "title": "t",
+            "state": "OPEN",
+            "statusCheckRollup": [
+                {"__typename": "CheckRun", "name": "clippy", "workflowName": "ci", "status": "COMPLETED", "conclusion": "FAILURE"},
+                {"__typename": "CheckRun", "name": "clippy", "workflowName": "release", "status": "COMPLETED", "conclusion": "FAILURE"},
+                {"__typename": "CheckRun", "name": "unit", "workflowName": "unit", "status": "COMPLETED", "conclusion": "FAILURE"},
+                {"__typename": "CheckRun", "name": "build", "workflowName": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                {"__typename": "StatusContext", "context": "dco", "state": "ERROR"}
+            ]
+        }]"#;
+        let prs = parse_pr_list(json).unwrap();
+        assert_eq!(prs[0].checks, ChecksState::Failing);
+        assert_eq!(
+            prs[0].failing_checks,
+            vec![
+                SharedString::from("ci / clippy"),
+                SharedString::from("release / clippy"),
+                SharedString::from("unit"),
+                SharedString::from("dco"),
+            ],
+            "workflow name disambiguates two checks named the same; a status \
+             context stands in for its context; a job whose name equals its \
+             workflow name reads once"
+        );
+        assert_eq!(prs[0].extra_failing_checks, 0);
+    }
+
+    #[test]
+    fn failing_check_names_beyond_the_cap_are_counted() {
+        // MAX_LISTED_CHECKS is 6; 8 failures leave 2 unreported.
+        let checks = (0..8)
+            .map(|ix| {
+                format!(
+                    r#"{{"__typename": "CheckRun", "name": "job-{ix}", "status": "COMPLETED", "conclusion": "FAILURE"}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(
+            r#"[{{
+                "number": 200,
+                "url": "https://example.com/200",
+                "title": "t",
+                "state": "OPEN",
+                "statusCheckRollup": [{checks}]
+            }}]"#
+        );
+        let prs = parse_pr_list(&json).unwrap();
+        assert_eq!(prs[0].failing_checks.len(), MAX_LISTED_CHECKS);
+        assert_eq!(prs[0].extra_failing_checks, 8 - MAX_LISTED_CHECKS);
+    }
+
+    #[test]
+    fn a_failing_check_with_no_name_still_counts_but_lists_nothing() {
+        let json = r#"[{
+            "number": 300,
+            "url": "https://example.com/300",
+            "title": "t",
+            "state": "OPEN",
+            "statusCheckRollup": [
+                {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "FAILURE"}
+            ]
+        }]"#;
+        let prs = parse_pr_list(json).unwrap();
+        assert_eq!(prs[0].checks, ChecksState::Failing);
+        assert!(prs[0].failing_checks.is_empty());
+        assert_eq!(prs[0].extra_failing_checks, 0);
     }
 
     #[test]
@@ -588,6 +748,8 @@ mod tests {
             state: PrState::Open,
             checks: ChecksState::Passing,
             review: ReviewState::None,
+            failing_checks: Vec::new(),
+            extra_failing_checks: 0,
         }
     }
 
