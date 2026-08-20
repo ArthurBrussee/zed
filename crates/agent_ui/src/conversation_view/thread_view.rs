@@ -66,8 +66,10 @@ const TITLE_REQUEST_MESSAGE_LEN: usize = 2000;
 
 /// The height an inline image occupies in the transcript, whatever the image's
 /// own dimensions are. Big enough to read a screenshot, small enough that a
-/// picture does not push the conversation off screen.
-const IMAGE_CHIP_HEIGHT: Rems = Rems(20.);
+/// picture does not push the conversation off screen. Read by
+/// `render_agent_markdown` in `conversation_view.rs` so an agent-authored
+/// image inside markdown holds the same box as an image the chip layer draws.
+pub(super) const IMAGE_CHIP_HEIGHT: Rems = Rems(20.);
 
 #[derive(Default)]
 struct ThreadFeedbackState {

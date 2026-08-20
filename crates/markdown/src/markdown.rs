@@ -36,7 +36,7 @@ use gpui::{
     AnyElement, App, BorderStyle, Bounds, ClipboardItem, CursorStyle, DispatchPhase, Edges, Entity,
     FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId, Hitbox, Hsla, Image,
     ImageFormat, ImageSource, KeyContext, Length, MouseButton, MouseDownEvent, MouseEvent,
-    MouseMoveEvent, MouseUpEvent, Point, ScrollHandle, Stateful, StrikethroughStyle,
+    MouseMoveEvent, MouseUpEvent, ObjectFit, Point, ScrollHandle, Stateful, StrikethroughStyle,
     StyleRefinement, StyledImage, StyledText, Subscription, Task, TextAlign, TextLayout, TextRun,
     TextStyle, TextStyleRefinement, WrappedLineLayout, actions, canvas, img, point, quad, relative,
 };
@@ -128,6 +128,14 @@ pub struct MarkdownStyle {
     /// Prefix web links (http/https destinations) with a small globe glyph,
     /// so they read as leaving the editor.
     pub web_link_globe: bool,
+    /// A definite height for an inline image whose source did not declare one.
+    /// A `ListState` measures an entry once and paints it at that height, so an
+    /// entry that grows after its image loads paints over the entries below.
+    /// A caller that renders markdown inside such a list can name a height
+    /// here, and the wrapper will hold it whether the image has loaded or not.
+    /// `None` leaves images at their intrinsic size, which is what a document
+    /// or preview wants.
+    pub inline_image_height: Option<AbsoluteLength>,
 }
 
 impl Default for MarkdownStyle {
@@ -154,6 +162,7 @@ impl Default for MarkdownStyle {
             table_columns_min_size: false,
             soft_break_as_hard_break: false,
             web_link_globe: false,
+            inline_image_height: None,
         }
     }
 }
@@ -1797,6 +1806,10 @@ impl MarkdownElement {
             .map(|link| link.destination_url.clone());
         let fallback_opens_image_url = enclosing_link_url.is_none();
 
+        // Only fall back to the style's fixed height when the markdown source
+        // did not declare a height of its own. A source that names one
+        // (`![](x.png =200x150)`) is respected as before.
+        let inline_image_height = self.style.inline_image_height.filter(|_| height.is_none());
         let image_element = {
             let wrapper = div().id(("markdown-image-link", range.start)).min_w_0();
             let wrapper = if !self.style.prevent_mouse_interaction
@@ -1837,24 +1850,33 @@ impl MarkdownElement {
             } else {
                 wrapper
             };
-            wrapper.child(
-                img(source)
-                    .id(("markdown-image", range.start))
-                    .min_w_0()
-                    .max_w_full()
-                    .rounded_md()
-                    .mr_1()
-                    .mb_1()
-                    .when_some(height, |this, height| this.h(height))
-                    .when_some(width, |this, width| this.w(width))
-                    .with_fallback(move || {
-                        image_fallback_element(
-                            dest_url.clone(),
-                            alt_text.clone(),
-                            fallback_opens_image_url,
-                        )
-                    }),
-            )
+            wrapper
+                .when_some(inline_image_height, |this, h| this.h(h))
+                .child(
+                    img(source)
+                        .id(("markdown-image", range.start))
+                        .min_w_0()
+                        .max_w_full()
+                        .rounded_md()
+                        .mr_1()
+                        .mb_1()
+                        .when_some(height, |this, height| this.h(height))
+                        .when_some(width, |this, width| this.w(width))
+                        // The wrapper holds a definite height; the image fits
+                        // inside it while preserving its aspect ratio. Without
+                        // this, an image would either stretch to the wrapper
+                        // or overflow past its neighbours.
+                        .when_some(inline_image_height, |this, _| {
+                            this.size_full().object_fit(ObjectFit::Contain)
+                        })
+                        .with_fallback(move || {
+                            image_fallback_element(
+                                dest_url.clone(),
+                                alt_text.clone(),
+                                fallback_opens_image_url,
+                            )
+                        }),
+                )
         };
 
         builder.push_image_child(image_element);

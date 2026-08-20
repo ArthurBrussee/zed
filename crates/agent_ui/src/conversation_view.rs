@@ -4469,7 +4469,7 @@ impl Render for ConversationView {
 
 fn render_agent_markdown(
     markdown: Entity<Markdown>,
-    style: MarkdownStyle,
+    mut style: MarkdownStyle,
     workspace: &WeakEntity<Workspace>,
     code_span_resolver: &AgentCodeSpanResolver,
     cx: &App,
@@ -4477,6 +4477,17 @@ fn render_agent_markdown(
     let workspace = workspace.clone();
     let worktree_roots = code_span_resolver.worktree_roots(cx);
     let resolver = code_span_resolver.clone();
+    // An agent-authored image inside markdown holds a definite height, the same
+    // one an image the chip layer draws holds. The transcript is a `ListState`
+    // that measures an entry once and paints it at that height; without a
+    // definite height an image contributes zero until it loads and then grows
+    // past its neighbours. Callers can override by setting `inline_image_height`
+    // themselves before render.
+    if style.inline_image_height.is_none() {
+        style.inline_image_height = Some(gpui::AbsoluteLength::Rems(
+            thread_view::IMAGE_CHIP_HEIGHT,
+        ));
+    }
     MarkdownElement::new(markdown, style)
         .code_block_renderer(markdown::CodeBlockRenderer::Default {
             copy_button_visibility: markdown::CopyButtonVisibility::VisibleOnHover,
