@@ -860,6 +860,29 @@ does is removed as it lands.
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**Closing a thread selects a ghost new thread.**
+Close a thread and the panel lands on an empty "new thread" that nobody asked for, instead of the
+next open thread or nothing at all. What it should do: activate whatever other thread is open, and
+when none is, show the placeholder and select nothing.
+
+The code already claims to do that, in two comments that the behaviour contradicts:
+`local_thread_tab_removed` says "Closing never creates a replacement tab: an emptied pane stays
+empty and shows the placeholder" (`crates/agent_ui/src/agent_panel.rs:5508`), and
+`ensure_pane_has_thread_tab` says it "runs only at workspace load: closing tabs never re-creates
+one" (`:5539`). So either a caller is reaching `activate_draft` on a path that the comments did not
+anticipate, or the ghost is not a tab at all and the sidebar is selecting an empty draft row on its
+own. Establish which before changing anything, because the two have different fixes and the comments
+are evidence about intent, not about what runs.
+
+Both close paths go through `pane.remove_item(item_id, false, false, ..)`
+(`agent_panel.rs:5448`, `crates/sidebar/src/sidebar.rs:2122`). The draft activations that are not
+workspace load are at `agent_panel.rs:2504`, `:2753`, `:3106`, `:4397` and `:6641`, and
+`remove_thread_internal` takes an `activate_draft_after_remove` flag that does exactly this on
+purpose for its own callers. One of those is the likely path.
+
+Worth a test in whichever crate can reach it: closing one of two open threads activates the other,
+and closing the last one leaves nothing selected.
+
 **Check the update path actually works, before trusting it.**
 No update button has ever appeared, and the parts that can be checked from the code all look right,
 so what is left is the parts that cannot. Verify it end to end rather than reasoning about it.
