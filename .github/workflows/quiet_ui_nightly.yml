@@ -11,7 +11,7 @@
 # needs nothing from the routine.
 #
 # The hour is set by what happens either side of it. The rebase routine starts
-# at 22:15 UTC and takes about two hours, the bundle takes another two and a
+# at 19:00 UTC and writes the queue's code before it rebases, the bundle takes two and a
 # bit, and GitHub's scheduler is not punctual: a run asked for at 02:30 once
 # started at 05:33, which is how a dmg meant for breakfast arrived at 09:43
 # local. Starting at 00:45 absorbs that delay and still lands before morning.
