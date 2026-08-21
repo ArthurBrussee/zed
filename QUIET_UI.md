@@ -860,6 +860,27 @@ does is removed as it lands.
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**Check the update path actually works, before trusting it.**
+No update button has ever appeared, and the parts that can be checked from the code all look right,
+so what is left is the parts that cannot. Verify it end to end rather than reasoning about it.
+
+What is already confirmed, so do not re-derive it: the published dmg embeds its commit
+(`38f733f610...` is in the binary of the 2026-08-21 11:54 build, so `AppCommitSha` is populated);
+the manifest carries the same sha; `fetch_release` puts it in build metadata as `quiet-ui.<sha>`
+and `check_if_fetched_version_is_newer` reads it back with `build.as_str().rsplit('.').next()`,
+which matches; and `auto_update` is not disabled in settings. The reason nothing appeared on
+2026-08-21 is mundane: the installed app was the 2026-08-20 04:22 build, which predates the updater
+entirely and has no polling code.
+
+What is unverified and needs a real run: that a released Dev build polls at all (the `cfg!` gate is
+compiled, never observed); that the callout appears; that `install_release` accepts an ad-hoc signed
+bundle, which is the most likely thing to break, since the installer replaces an app whose signature
+macOS never approved; and that the restart lands on the new build rather than the old one.
+
+If any of that cannot be checked from a Linux sandbox, say so and say what would check it, rather
+than reporting it as working. A note in the log that this remains unproven is worth more than an
+assumption.
+
 **Creating a worktree takes too long.**
 Measured, not guessed: the flow logs its three phases, and `~/Library/Logs/Zed/Zed.log` on
 2026-08-21 has three creations in it.
