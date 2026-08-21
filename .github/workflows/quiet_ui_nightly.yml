@@ -115,18 +115,19 @@ jobs:
           cat > notes.md <<NOTES
           Built from \`quiet-ui\` at $(git rev-parse --short HEAD), $(date -u +'%Y-%m-%d %H:%M') UTC.
 
-          Apple silicon, and unsigned, so macOS refuses it until the quarantine
-          flag is off. To install (or reinstall) it:
+          Download **Zed-quiet-ui.dmg** below, open it, and drag **Zed Dev** to
+          Applications, replacing the copy already there. It installs alongside a
+          normal Zed rather than over it.
 
-          \`\`\`bash
-          curl -fL -o /tmp/Zed-quiet-ui.dmg https://github.com/$GITHUB_REPOSITORY/releases/download/quiet-ui-latest/Zed-quiet-ui.dmg
-          hdiutil attach -quiet /tmp/Zed-quiet-ui.dmg
-          app=\$(ls -d /Volumes/Zed/*.app | head -1)
-          rm -rf "/Applications/\$(basename "\$app")"
-          cp -R "\$app" /Applications/
-          hdiutil detach -quiet /Volumes/Zed
-          xattr -dr com.apple.quarantine "/Applications/\$(basename "\$app")"
-          \`\`\`
+          The build is unsigned, so the first launch is refused: macOS says it
+          cannot verify the developer. Open **System Settings > Privacy &
+          Security**, scroll to Security, and press **Open Anyway**. That is once
+          per machine, not once per update.
+
+          After that the app updates itself. It checks this release, offers the
+          new build in the app, and installs it when you say so.
+
+          Apple silicon only.
           NOTES
           gh release delete quiet-ui-latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
           gh release create quiet-ui-latest Zed-quiet-ui.dmg quiet-ui-latest.json \
