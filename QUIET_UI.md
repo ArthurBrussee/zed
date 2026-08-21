@@ -860,7 +860,28 @@ does is removed as it lands.
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
-*(The queue is empty. Add items above the Verification queue, following the shape of the entries in the git history.)*
+**Creating a worktree takes too long.**
+Measured, not guessed: the flow logs its three phases, and `~/Library/Logs/Zed/Zed.log` on
+2026-08-21 has three creations in it.
+
+    fetched 3007ms   checked out 10652ms   workspace opened 15856ms   (29.5s)
+    fetched 1526ms   checked out  3439ms   workspace opened  1862ms   ( 6.8s)
+    fetched 1985ms   checked out  4938ms   workspace opened  2564ms   ( 9.5s)
+
+Seven seconds on a good run, thirty on a bad one, for something done many times a day. The phases
+are serial and each is waited through before the window appears
+(`crates/git_ui_core/src/worktree_service.rs:1051` onwards, where the timing lines are).
+
+The fork did diverge here, which answers the open question: upstream passed a bool where the fork
+now has `WorktreeWorkspaceActivation`, and the `Immediate` variant it added transfers the source
+workspace's open files and dock layout into the new window. That transfer is inside the phase whose
+worst measurement is the 15.9s outlier, so it is the first thing to suspect. The fetch is the other
+obvious candidate: 1.5 to 3 seconds spent before anything else starts, every time, whether or not
+the base branch has moved.
+
+Keep this bounded. Take the phase that measures worst, find the cheapest change that moves it, and
+leave the rest; a rewrite of upstream's worktree service would eat the night. Keep the timing lines
+in place whatever happens, since they are what made this a measurement instead of a complaint.
 
 
 ## Verification queue
