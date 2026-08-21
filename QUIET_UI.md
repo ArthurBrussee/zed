@@ -883,6 +883,28 @@ purpose for its own callers. One of those is the likely path.
 Worth a test in whichever crate can reach it: closing one of two open threads activates the other,
 and closing the last one leaves nothing selected.
 
+**A sidebar row's PR chips still hide, and the age label can go.**
+Last night's change made every row compute chips, but a compact row's chips ride in the action slot,
+and `ThreadItem::render` draws that slot only inside `.when(self.hovered, ..)`
+(`crates/ui/src/components/ai/thread_item.rs:731`). So the sidebar's own non-hovered branch
+(`crates/sidebar/src/sidebar.rs:5803`) hands over chips that are never drawn, and the state you want
+at a glance is the one state you have to hover to see. Non-compact rows are fine: they draw their
+chips in the metadata line at `thread_item.rs:818`, which is not hover-gated.
+
+Chips should be visible whether or not the pointer is on the row. Make room the way the complaint
+suggests: the compact row trails an age after the title (`:725`, the "2m" / "4h"), and that is
+worth less than PR state, so drop it from compact rows rather than trying to fit both.
+
+They must also sit over the title correctly. The hovered slot already draws a `GradientFade` behind
+itself (`:737`) so the title dissolves under it instead of colliding; an always-visible slot needs
+that same treatment, not a bare overlay, or a long thread title will run into the chips.
+
+**The stop button overlaps the message text.**
+While the agent is generating, the Stop button is positioned `absolute().top_0().right_0()` on top
+of the message editor (`crates/agent_ui/src/conversation_view/thread_view.rs:4973`), so anything
+typed into that corner is painted over. Either reserve the space while generating, or put the
+button somewhere it cannot cover text: the input status bar underneath is already a row of its own.
+
 **Check the update path actually works, before trusting it.**
 No update button has ever appeared, and the parts that can be checked from the code all look right,
 so what is left is the parts that cannot. Verify it end to end rather than reasoning about it.
