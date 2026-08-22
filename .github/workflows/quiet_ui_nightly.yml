@@ -129,10 +129,23 @@ jobs:
 
           Apple silicon only.
           NOTES
-          gh release delete quiet-ui-latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
-          gh release create quiet-ui-latest Zed-quiet-ui.dmg quiet-ui-latest.json \
+          # Never delete before creating. A failure between the two leaves no
+          # release at all, which takes out the in-app updater and
+          # install-quiet-ui together: both read this tag. That happened on
+          # 2026-08-21, when the create came back 403 after the delete had
+          # already succeeded. Replacing the assets in place leaves the previous
+          # build standing if anything here fails.
+          if ! gh release view quiet-ui-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create quiet-ui-latest \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$(git rev-parse HEAD)" \
+              --title "quiet-ui $(date -u +%Y-%m-%d)" \
+              --notes-file notes.md
+          fi
+          gh release upload quiet-ui-latest Zed-quiet-ui.dmg quiet-ui-latest.json \
+            --repo "$GITHUB_REPOSITORY" --clobber
+          gh release edit quiet-ui-latest \
             --repo "$GITHUB_REPOSITORY" \
-            --target "$(git rev-parse HEAD)" \
             --title "quiet-ui $(date -u +%Y-%m-%d)" \
             --notes-file notes.md
 
