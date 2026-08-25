@@ -73,6 +73,23 @@ jobs:
           shared-key: quiet-ui
           workspaces: ". -> target"
 
+      # A release build of the whole workspace, plus the restored cache, fills
+      # this runner: the 2026-08-25 build died with ENOSPC part way through
+      # `project`, after two hours of compiling. None of what this removes is
+      # used to bundle a macOS Zed, and the active Xcode is left alone.
+      - name: Make room on the runner
+        if: steps.freshness.outputs.build == 'true'
+        run: |
+          df -h / | tail -1
+          active=$(xcode-select -p 2>/dev/null | sed 's|/Contents/Developer||')
+          for app in /Applications/Xcode*.app; do
+            [ "$app" = "$active" ] && continue
+            sudo rm -rf "$app" || true
+          done
+          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* || true
+          sudo rm -rf ~/Library/Developer/CoreSimulator/Caches || true
+          df -h / | tail -1
+
       - name: Bundle
         if: steps.freshness.outputs.build == 'true'
         run: ./script/bundle-mac aarch64-apple-darwin
