@@ -3890,6 +3890,20 @@ impl AgentPanel {
         if !self.has_open_project(cx) {
             return;
         }
+        // A new worktree is a new piece of work and opens with an empty
+        // message. A draft holding typed text is released from the ephemeral
+        // slot first, so the text stays where it was typed — in that draft's
+        // own tab — and `ensure_draft` below builds a fresh one to stamp the
+        // worktree choice onto. `activate_additional_new_thread` does this
+        // release itself, but only after a fast path that focuses the
+        // ephemeral draft as it stands, and that path is how a half-written
+        // message became the new worktree's opening message.
+        if let Some(draft) = self.draft_thread.clone()
+            && self.draft_has_content(&draft, cx)
+        {
+            self.draft_thread = None;
+            self._draft_editor_observation = None;
+        }
         // Always a fresh draft: the user is asking for a NEW worktree, so the
         // one-agent-per-worktree focus shortcut is not what they want here.
         self.activate_additional_new_thread(true, source, window, cx);
@@ -10188,6 +10202,92 @@ mod tests {
                 "the preview dies at send; the real session takes over"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_asking_for_a_worktree_does_not_take_the_message_you_were_writing(
+        cx: &mut TestAppContext,
+    ) {
+        // A new worktree is a new piece of work: it opens with an empty
+        // message. Text already typed stays where it was typed.
+        let (panel, mut cx) = setup_panel(cx).await;
+        let cx = &mut cx;
+
+        let _stub_connection =
+            crate::test_support::set_stub_agent_connection(StubAgentConnection::new());
+        panel.update_in(cx, |panel, window, cx| {
+            panel.selected_agent = Agent::Stub;
+            panel.activate_draft(true, AgentThreadSource::AgentPanel, window, cx);
+        });
+        cx.run_until_parked();
+        crate::test_support::type_draft_prompt(&panel, "meant for this worktree", cx);
+        let first_draft = panel.read_with(cx, |panel, _cx| {
+            panel.draft_thread.clone().expect("a draft exists")
+        });
+
+        // A second draft, also typed into. The first leaves the ephemeral slot
+        // when it is asked for; the second takes its place.
+        panel.update_in(cx, |panel, window, cx| {
+            panel.activate_additional_new_thread(true, AgentThreadSource::AgentPanel, window, cx);
+        });
+        cx.run_until_parked();
+        crate::test_support::type_draft_prompt(&panel, "and this one too", cx);
+        let typed_in = panel.read_with(cx, |panel, _cx| {
+            panel.draft_thread.clone().expect("the second draft exists")
+        });
+        assert_ne!(typed_in.entity_id(), first_draft.entity_id());
+
+        // Now look at the first draft again. The ephemeral slot still holds the
+        // second one, with its text, and it is no longer what is on screen —
+        // which is the shape that let `+` hand a written message to a worktree.
+        panel.update_in(cx, |panel, window, cx| {
+            panel.set_base_view(
+                BaseView::AgentThread {
+                    conversation_view: first_draft.clone(),
+                },
+                true,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.new_worktree_draft(
+                zed_actions::NewWorktreeBranchTarget::CurrentBranch,
+                AgentThreadSource::AgentPanel,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let worktree_draft = panel.read_with(cx, |panel, _cx| {
+            panel
+                .draft_thread
+                .clone()
+                .expect("the worktree draft exists")
+        });
+        assert_ne!(
+            worktree_draft.entity_id(),
+            typed_in.entity_id(),
+            "the new worktree must not reuse the draft the message was typed into"
+        );
+        assert_eq!(
+            crate::test_support::draft_prompt_text(&panel, cx),
+            "",
+            "the new worktree's draft opens empty"
+        );
+        let kept = typed_in.read_with(cx, |view, cx| {
+            view.unstarted_message_editor()
+                .expect("the draft still owns its composer")
+                .read(cx)
+                .text(cx)
+        });
+        assert_eq!(
+            kept, "and this one too",
+            "the text stays in the draft it was typed into"
+        );
     }
 
     #[gpui::test]
