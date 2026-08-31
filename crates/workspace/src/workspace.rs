@@ -2487,6 +2487,10 @@ impl Workspace {
             return;
         };
 
+        if is_global {
+            self.share_global_panel_size(panel_key, size_state, cx);
+        }
+
         let kvp = db::kvp::KeyValueStore::global(cx);
         cx.background_spawn(async move {
             let scope = kvp.scoped(dock::PANEL_SIZE_STATE_KEY);
@@ -2495,6 +2499,47 @@ impl Workspace {
                 .await
         })
         .detach_and_log_err(cx);
+    }
+
+    /// Hands a globally-sized panel's new size to every other open workspace.
+    /// The stored value is only read when a panel is added, which happens once
+    /// as a window is built, so without this a resize reaches the workspaces
+    /// opened afterwards and none of the ones already on screen — which is
+    /// every worktree the user is actually switching between.
+    fn share_global_panel_size(
+        &self,
+        panel_key: &str,
+        size_state: dock::PanelSizeState,
+        cx: &mut App,
+    ) {
+        let others: Vec<WeakEntity<Workspace>> = self
+            .app_state
+            .workspace_store
+            .read(cx)
+            .workspaces
+            .iter()
+            .map(|(_, workspace)| workspace.clone())
+            // The workspace being resized already has the size, and pushing it
+            // back mid-drag would fight the drag.
+            .filter(|workspace| workspace != &self.weak_self)
+            .collect();
+
+        for workspace in others {
+            let Some(workspace) = workspace.upgrade() else {
+                continue;
+            };
+            workspace.update(cx, |workspace, cx| {
+                for dock in [
+                    workspace.left_dock.clone(),
+                    workspace.bottom_dock.clone(),
+                    workspace.right_dock.clone(),
+                ] {
+                    dock.update(cx, |dock, cx| {
+                        dock.set_size_state_for_panel_key(panel_key, size_state, cx)
+                    });
+                }
+            });
+        }
     }
 
     pub fn set_panel_size_state<T: Panel>(
@@ -15046,6 +15091,75 @@ mod tests {
                 "a per-workspace panel size should not leak between workspaces"
             );
         }
+    }
+
+    #[gpui::test]
+    async fn test_a_global_panel_size_reaches_workspaces_that_are_already_open(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+
+        // One AppState, as the running app has: its workspace store is the
+        // registry every open workspace lands in, and the thing a shared size
+        // has to travel through. `Workspace::test_new` builds a private
+        // AppState per workspace, so it cannot express two workspaces that
+        // know about each other.
+        let app_state = cx.update(|cx| AppState::test(cx));
+
+        // Two worktree windows, both open before either is resized. Reading
+        // the stored value back in a workspace opened afterwards passes with
+        // or without the sharing, which is why both exist up front here.
+        let project_a = Project::test(fs.clone(), [], cx).await;
+        let project_b = Project::test(fs.clone(), [], cx).await;
+        let window_a = cx.add_window(|window, cx| {
+            Workspace::new(Default::default(), project_a, app_state.clone(), window, cx)
+        });
+        let window_b = cx.add_window(|window, cx| {
+            Workspace::new(Default::default(), project_b, app_state.clone(), window, cx)
+        });
+
+        for window in [&window_a, &window_b] {
+            window
+                .update(cx, |workspace, _window, _cx| {
+                    workspace.set_random_database_id();
+                    workspace.bounds.size.width = px(800.);
+                })
+                .unwrap();
+        }
+
+        window_b
+            .update(cx, |workspace, window, cx| {
+                let panel = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+                workspace.add_panel(panel, window, cx);
+            })
+            .unwrap();
+
+        let state = dock::PanelSizeState {
+            size: Some(px(420.)),
+            flex: None,
+        };
+        window_a
+            .update(cx, |workspace, _window, cx| {
+                workspace.persist_panel_size_state(TestPanel::panel_key(), true, state, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        window_b
+            .update(cx, |workspace, _window, cx| {
+                let left_dock = workspace.left_dock().read(cx);
+                let stored = left_dock
+                    .panel::<TestPanel>()
+                    .and_then(|panel| left_dock.stored_panel_size_state(&panel));
+                assert_eq!(
+                    stored.and_then(|state| state.size),
+                    Some(px(420.)),
+                    "a globally-sized panel's width should reach a workspace that was \
+                     already open when it was resized"
+                );
+            })
+            .unwrap();
     }
 
     #[gpui::test]

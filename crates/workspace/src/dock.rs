@@ -1070,6 +1070,29 @@ impl Dock {
         }
     }
 
+    /// Applies a size to whichever panel in this dock carries `panel_key`,
+    /// rather than to a panel handle we already have. A globally-sized panel is
+    /// resized in one workspace and has to land in all the others, where the
+    /// panel is a different entity with the same key.
+    pub fn set_size_state_for_panel_key(
+        &mut self,
+        panel_key: &str,
+        size_state: PanelSizeState,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if let Some(entry) = self
+            .panel_entries
+            .iter_mut()
+            .find(|entry| entry.panel.panel_key() == panel_key)
+        {
+            entry.size_state = size_state;
+            cx.notify();
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn toggle_panel_flexible_size(
         &mut self,
         panel: &dyn PanelHandle,
