@@ -5330,9 +5330,12 @@ async fn test_rename_selected_thread_action_renames_terminal(cx: &mut TestAppCon
             .expect("renamed terminal metadata should exist");
         assert_eq!(metadata.custom_title.as_deref(), Some(renamed_title));
     });
+    // Upstream's version of this expectation leads with a `v [my-project]`
+    // project header. This fork deleted project headers; a workspace with only
+    // a terminal in it draws the terminal's row and nothing above it.
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
-        vec!["v [my-project]", "  Renamed Terminal  <== selected"]
+        vec!["  Renamed Terminal  <== selected"]
     );
 }
 

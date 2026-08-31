@@ -859,105 +859,41 @@ does is removed as it lands.
 
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
-
 **A red test: the sidebar property test leaks a ThreadStore handle at teardown.**
 `sidebar_tests::property_test::test_sidebar_invariants` fails on gpui's leaked-handle assertion
 ("Leaked handle for entity `agent::thread_store::ThreadStore`"), with a minimal failing input of one
-operation. This is the one thing tonight's gate could not get to green, and it is first in the queue
-because a red test hides the next one.
+operation. Still red, still first, because a red test hides the next one.
 
-It is not this fork's edit and it is not a flake. It reproduces at the rebase commit with none of the
-2026-08-30 queue work applied, it is deterministic across runs and in isolation, and the 2026-08-24
-entry records this suite green at 169 — so it arrived with that night's 90 upstream commits.
+**The frightening reading is ruled out, which is what the 2026-08-30 entry asked to settle early.**
+The detector reports *every* entity still holding a handle (`LeakDetector::drop` iterates the whole
+`entity_handles` map), and it reports exactly one: the `ThreadStore` that the test's own
+`init_global` puts in a *global*. No `Workspace`, no `AgentPanel`, no `MultiWorkspace`. So this is
+not "a real memory leak in the running app every time a workspace closes" — nothing that owns a
+window is being retained. It is one global-held entity outliving the harness's own check.
 
-The lead, not yet followed: upstream's `Flush all persistence threads for the rest for various
-shutdown cases` (#63213) rewrote teardown in exactly the way that would do this. It deleted the
-`on_app_will_quit` entity hook outright, moved shutdown from `cx.spawn` to `cx.background_spawn`, and
-changed 131 lines of `multi_workspace.rs` and 219 of `workspace.rs`. A detached background task
-holding a strong `Entity` clone past the entity map's teardown is the shape that produces this
-message. Start by reading that commit against `multi_workspace.rs`, and run with `LEAK_BACKTRACE=1`
-(it names the allocation site, which is `ThreadStore::init_global` in the test's own setup — that
-identifies the leaked entity, not who is still holding it, so the holder is the thing to find).
+**What the 2026-08-31 run learned, so the next one does not re-spend it:**
 
-Worth settling early whether this is harness-only or real: the leaked entity is the one
-`init_global` puts in a *global*, and a global living to the end of the app is normal, which is why
-the 2026-08-30 run judged it non-blocking. If instead a workspace or its agent panel is being
-retained, that is a real memory leak in the running app every time a workspace closes, and it
-matters much more than its one red test suggests.
+- `LEAK_BACKTRACE=1` is useless here. It is read, and the handle's recorded backtrace comes back
+  empty, so the message names the entity and nothing about who holds it. `RUST_BACKTRACE=full`
+  only adds the panic's own stack. Do not spend a run on it again.
+- That panic stack is still worth reading: `TestAppContext` drop -> `App` drop ->
+  `EntityRefCounts` drop -> `LeakDetector::drop`, with no `App::shutdown()` anywhere in it.
+  `HeadlessAppContext::drop` calls `shutdown()` deliberately, with the comment "so windows are
+  closed and entity handles are released before the LeakDetector runs". `TestAppContext` has no
+  equivalent, so whatever upstream's #63213 moved out of synchronous teardown never runs here.
+  That is the shape to chase, and it is upstream's, not this fork's.
+- One suspect was followed and cleared: `agent_ui::thread_metadata_store::migrate_thread_metadata`
+  captures a strong `Entity<ThreadStore>` and holds it across `thread_store_ready.await`, which is
+  exactly the shape that produces this. Downgrading it to a weak handle did **not** fix the test,
+  and the same task holds `Entity<ThreadMetadataStore>`, which does not leak — so the task is not
+  what is still parked. The change was reverted rather than left in the diff unproven.
+- The other 169 sidebar tests call `ThreadStore::init_global` too and pass, so it is not
+  init_global on its own, and not a plain globals-drop-order problem.
 
-**Where a tool's output says so, show real progress.**
-A running chip now shows the last line its command printed, which is the general case and covers
-every tool. `pnpm`, `cargo` and friends also print counts that mean something ("Compiling 214/512",
-"Tests 31 of 88"). Parsing those into a small determinate indicator is the nicer version, but only
-where the parse is confident: a wrong progress bar is worse than none, and the last-line fallback
-must stay for everything unrecognised. Keep the patterns next to the existing command parsing in
-`crates/acp_thread/src/command_parse.rs`, which already knows what a line is running, and unit-test
-each one against a real captured line rather than an invented one.
-
-That last rule is what stopped the 2026-08-24 run from building it: nothing was installed to capture
-real output from, so every pattern would have been written from memory — which is exactly the way to
-get a wrong one.
-
-**The blocker is gone.** The 2026-08-30 container has `pnpm` and `pytest` (still no `vitest`), and
-these are captured from real runs in it, not remembered:
-
-    test_mod0.py ......                                                      [ 25%]
-    test_mod1.py ......                                                      [ 50%]
-    test_mod3.py ......                                                      [100%]
-
-    Progress: resolved 1, reused 0, downloaded 0, added 0
-    Progress: resolved 2, reused 0, downloaded 2, added 2, done
-
-What those two show is not the same thing, and the difference decides the work. `pytest` prints a
-real fraction — a trailing `[ NN%]` on every file line — which is a determinate indicator and the
-one confident pattern to build first. `pnpm` prints counts with **no denominator**: "resolved 2" is
-not 2 of anything, so nothing determinate can be made of it and the last-line fallback is already
-the right answer for it. Do not invent a total for it.
-
-`cargo` remains uncapturable for this purpose, as the 2026-08-24 run found: its count lives in a
-progress bar that does not survive being captured (`script -qc` yields only `Compiling gpui v0.2.2
-(...)` lines, no `N/M`).
-
-So the job is now: one pattern, `pytest`'s percent, unit-tested against the lines above, with the
-last-line fallback kept for everything else. It was left in the queue on 2026-08-30 because it is
-the last entry and the night's runway went to the six above it, not because it is still blocked.
-
-
-## Verification queue
-
-Where the day's edits go unverified. `cargo check` and `script/clippy` run here as usual; what
-does not is the test suites, which rebuild the world in the test profile on the laptop that is
-also running the editor. Targeted runs still happen when a change turns on one, so an entry
-below means the crate's suite has not run in full, not that nothing was checked.
-
-The nightly routine is the gate. It runs the suites listed here after rebasing, fixes what
-broke, folds the findings into that night's rebase log entry, and empties this section. An empty
-section means everything committed has had its tests run.
-
-Each entry says which crates changed and what to watch for, since a failure after a rebase can
-come from either the queued edit or upstream drift, and the fix differs.
-
-**The shared thread width only reaches windows that open afterwards.**
-`AgentPanel::size_is_global()` returns true and both sides use it: `panel_size_scope_key` writes and
-reads `global:{panel_key}` (`crates/workspace/src/dock.rs:1276`), so the stored width is genuinely
-one value now. It still does not work in use, and the reason looks like *when* it is read rather
-than *where* it is stored.
-
-The persisted size is applied in `add_panel`, as the panel is registered into a workspace
-(`crates/workspace/src/workspace.rs:2662`). That happens once, when a window is built. Every
-worktree window already open keeps the width it has in memory, so resizing the thread in one
-worktree updates the global key and changes nothing anywhere else until those windows are opened
-again. Switching between windows that are already open — which is what "switching worktrees" means
-in practice — shows exactly the old behaviour.
-
-So the width needs to reach open windows too: when a globally-sized panel is resized, every other
-open workspace's dock should take the new size. Work out where that belongs (an observation on the
-stored value, or the resize path telling the other workspaces) and make sure the window doing the
-resizing is not fought by its own update mid-drag.
-
-Verify it the way it is used, with two worktree windows already open: resize in one, look at the
-other. A test that opens a fresh workspace and reads the value back will pass against the current
-code and prove nothing.
+Next thread to pull: what differs between this proptest's app teardown and a plain `#[gpui::test]`
+one, given both go through `TestAppContext`. Proptest runs the body many times in one process
+(20 cases plus shrinking), so App instances are created and dropped repeatedly; that is the one
+structural difference left that has not been ruled out.
 
 **Make `+` fast enough to press without thinking.**
 Belongs with the entry below, and is the thing that decides whether it was a good idea: once `+`
@@ -985,7 +921,6 @@ Two directions, in the order they are worth trying:
 The checkout itself is git writing files and is not going to get much faster, which is why the spare
 is the interesting idea and the fetch is the cheap one. Do the cheap one regardless; do the spare if
 the measurements still say the wait is what stops it being pressed.
-
 **Delete the draft-worktree concept: `+` makes the worktree there and then.**
 A thread waiting for its worktree is a state worth being rid of. Pressing `+` should create the
 worktree immediately and leave an ordinary thread in an ordinary worktree that happens to have no
@@ -1016,58 +951,30 @@ worktree sends *there* rather than making a second one, because that worktree wa
 thread. The comment at `conversation_view.rs:1208` explains it. Losing that would make `+` inside a
 worktree spawn another worktree, which is not the simplification being asked for.
 
-**An unsent message follows you into the new-worktree draft.**
-Type a message, do not send it, then ask for a new worktree: the text is sitting in that draft too.
-A new worktree is a new piece of work, and inheriting a half-written message meant for something
-else is a good way to send it to the wrong place.
 
-`new_worktree_draft` goes through `activate_additional_new_thread` and then `ensure_draft`
-(`crates/agent_ui/src/agent_panel.rs:3885`, `:2602`, `:4158`), and `ensure_draft` returns the
-existing draft when `agent_matches || has_editor_content || !draft_is_active`. That middle term is
-the suspect: a draft holding typed text is reused rather than replaced, and
-`new_worktree_draft` then stamps the worktree choice onto it, so the message you were writing
-becomes the new worktree's opening message.
+## Verification queue
 
-`activate_additional_new_thread` looks like it means to prevent exactly this, releasing a draft with
-content from the ephemeral slot so a fresh one gets made (`:2635`), which suggests the leak happens
-on a path that does not go through that release, or that the release happens too late to matter.
-Establish which by trying both orders: typing in the new-thread draft and then asking for a
-worktree, and typing in a real thread's editor and then asking. They may not both leak, and the fix
-differs.
+Where the day's edits go unverified. `cargo check` and `script/clippy` run here as usual; what
+does not is the test suites, which rebuild the world in the test profile on the laptop that is
+also running the editor. Targeted runs still happen when a change turns on one, so an entry
+below means the crate's suite has not run in full, not that nothing was checked.
 
-Whatever the cause, the rule is that asking for a new worktree gives you an empty message. Text
-already typed stays where it was typed, and is not moved or copied.
+The nightly routine is the gate. It runs the suites listed here after rebasing, fixes what
+broke, folds the findings into that night's rebase log entry, and empties this section. An empty
+section means everything committed has had its tests run.
 
-**The worktree groups are what is out of order now.**
-Rows inside a group follow their tabs since last night's fix, and the groups themselves do not: the
-group order is decided by `group_rows_by_workspace`, which emits a cluster the first time it sees a
-row belonging to it (`crates/sidebar/src/sidebar.rs:1716`). Fed rows sorted by tab position, that
-already means "the group whose first tab comes first" — so if the order is still wrong at the group
-level, establish what it is actually keyed on before changing it, because the comment above it still
-describes the newest-row ordering it had when rows arrived newest-first.
+Each entry says which crates changed and what to watch for, since a failure after a rebase can
+come from either the queued edit or upstream drift, and the fix differs.
 
-The rule to land on: a group sits where its earliest tab sits, and inside it the rows sit in their
-tab order.
+**Empty.** Nothing is waiting on a suite.
 
-There is a case that rule cannot express, and it is worth saying out loud rather than discovering
-later. Tabs from two worktrees can interleave — A, B, A — and a grouped list cannot show that
-without splitting a group in two. Grouping wins by default: keeping a worktree's threads together is
-worth more than reproducing an interleaving exactly. If that turns out to be the wrong trade in use,
-the alternative is to stop grouping the Active section and list the tabs flat, each row naming its
-worktree, which does reproduce the order exactly.
-
-Do not build subtabs or a dropdown for this. They were raised as ideas for the same problem and they
-are a redesign of the tab strip, not an ordering fix; note in the log if the flat list starts looking
-necessary.
-
-**The working spinner should not take the model's place.**
-A running thread replaces its agent glyph with the spinner
-(`crates/ui/src/components/ai/thread_item.rs:616`), so while it works you cannot see which model is
-running. Both are wanted at once: put the spinner on the right of the row and leave the agent glyph
-where it is. The right edge already carries the chips line and, on a solo worktree, a size, so place
-it among those without letting the row change shape when a thread starts or stops.
-
-
+**A note on where entries land.** Every complaint written on 2026-08-31 was appended here rather
+than to the Work queue above — five commits, all inserting right after this preamble. They are
+plans, not unverified edits ("Make `+` fast enough to press without thinking" names no changed
+crate and describes no edit), so the 2026-08-31 run built them as Work queue items and moved the
+two it did not reach up there. If the insertion point is coming from habit or a snippet, it wants
+to be the Work queue's preamble instead; an entry filed here is read as "run this crate's suite
+and delete it", which would have thrown six feature requests away.
 
 ## Rebase log
 
