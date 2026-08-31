@@ -613,15 +613,24 @@ impl RenderOnce for ThreadItem {
             None
         };
 
-        let icon = if self.status == AgentThreadStatus::Running {
-            icon_container()
-                .child(agent_running_indicator())
-                .into_any_element()
-        } else if let Some(status_icon) = status_icon {
-            icon_container().child(status_icon).into_any_element()
+        // The agent glyph keeps the leading slot. Which model is working is
+        // worth seeing while it works, and the status used to sit on top of it.
+        let icon = icon_container().child(agent_icon).into_any_element();
+
+        // ...so the status goes to the right end of the title row instead. The
+        // slot is always drawn, empty or not, so the row does not change shape
+        // when a thread starts or stops.
+        let status_indicator = if self.status == AgentThreadStatus::Running {
+            Some(agent_running_indicator().into_any_element())
         } else {
-            icon_container().child(agent_icon).into_any_element()
+            status_icon.map(|icon| icon.into_any_element())
         };
+        let status_slot = h_flex()
+            .id(SharedString::from(format!("status-{}", self.id)))
+            .size_4()
+            .flex_none()
+            .justify_center()
+            .children(status_indicator);
 
         let title = self.title;
         let highlight_positions = self.highlight_positions;
@@ -739,6 +748,7 @@ impl RenderOnce for ThreadItem {
                     .when(self.is_truncated && opaque_window, |this| {
                         this.child(gradient_overlay)
                     })
+                    .child(status_slot)
                     // The slot holds the row's buttons, hover-gated by whoever
                     // fills it. The PR chips are not in here: the title row
                     // cannot hold several of anything, and a row can carry

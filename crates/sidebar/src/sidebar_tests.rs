@@ -16993,7 +16993,7 @@ async fn test_active_worktree_groups_follow_the_tab_strip(cx: &mut TestAppContex
     let (sidebar, panel_a) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
     cx.run_until_parked();
 
-    let mut open_thread = |panel: &Entity<AgentPanel>, cx: &mut gpui::VisualTestContext| {
+    let open_thread = |panel: &Entity<AgentPanel>, cx: &mut gpui::VisualTestContext| {
         let connection = StubAgentConnection::new();
         connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
             acp::ContentChunk::new("Done".into()),
