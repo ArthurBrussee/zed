@@ -16980,3 +16980,67 @@ fn test_collapsing_a_worktree_leaves_the_rows_after_it_alone(cx: &mut TestAppCon
         "the collapsed group hides its own rows and nothing else"
     );
 }
+
+#[gpui::test]
+async fn test_active_worktree_groups_follow_the_tab_strip(cx: &mut TestAppContext) {
+    // A group sits where its earliest tab sits, and inside it the rows sit in
+    // their tab order. Workspace A's threads are opened first and B's last, so
+    // A's group leads even though B's thread is the most recent one — which is
+    // what the group order used to be decided by.
+    let project_a = init_test_project_with_agent_panel("/project-a", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a.clone(), window, cx));
+    let (sidebar, panel_a) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    cx.run_until_parked();
+
+    let mut open_thread = |panel: &Entity<AgentPanel>, cx: &mut gpui::VisualTestContext| {
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("Done".into()),
+        )]);
+        open_thread_with_connection(panel, connection, cx);
+        send_message(panel, cx);
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, cx| panel.active_thread_id(cx).unwrap())
+    };
+
+    let thread_a1 = open_thread(&panel_a, cx);
+    let thread_a2 = open_thread(&panel_a, cx);
+
+    let fs = cx.update(|_, cx| <dyn fs::Fs>::global(cx));
+    fs.as_fake()
+        .insert_tree("/project-b", serde_json::json!({ "src": {} }))
+        .await;
+    let project_b = project::Project::test(fs, ["/project-b".as_ref()], cx).await;
+    let workspace_b = multi_workspace.update_in(cx, |mw, window, cx| {
+        mw.test_add_workspace(project_b.clone(), window, cx)
+    });
+    let panel_b = add_agent_panel(&workspace_b, cx);
+    cx.run_until_parked();
+
+    let thread_b = open_thread(&panel_b, cx);
+
+    sidebar.update_in(cx, |sidebar, _window, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+
+    let active_thread_ids = sidebar.read_with(cx, |sidebar, _cx| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(ix, _)| sidebar.section_of_entry(*ix) == Some(SidebarSection::OpenInZed))
+            .filter_map(|(_, entry)| match entry {
+                ListEntry::Thread(thread) => Some(thread.metadata.thread_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    });
+
+    assert_eq!(
+        active_thread_ids,
+        vec![thread_a1, thread_a2, thread_b],
+        "the worktree opened first leads, and its rows keep their tab order, \
+         even though the other worktree's thread is the newest"
+    );
+}

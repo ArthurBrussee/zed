@@ -1523,12 +1523,18 @@ impl Sidebar {
         // alive. Otherwise closing a thread leaves it sitting in Active.
         let mut open_thread_ids: HashSet<agent_ui::ThreadId> = HashSet::new();
         let mut tabbed_threads: HashSet<agent_ui::ThreadId> = HashSet::new();
-        // Where each tabbed thread sits in its own pane. The Active section is
+        // Where each tabbed thread sits in the tab strip. The Active section is
         // sorted by this so a row is where its tab is: the tabs are the order
         // the user arranged, and reading the list to find the row for the tab
         // in front of you is work the sidebar can do instead. A thread can be
         // tabbed in more than one workspace, so the first pane that claims it
         // wins rather than the last.
+        //
+        // Positions come from the WHOLE strip, foreign proxies included, which
+        // is one order spanning every workspace. Numbering only a pane's own
+        // real tabs gave every pane's first tab position 0, so each worktree's
+        // group tied on its first row and the groups fell back to the time
+        // sort — rows followed their tabs and the groups they sat in did not.
         let mut tab_positions: HashMap<agent_ui::ThreadId, usize> = HashMap::default();
         for workspace in &workspaces {
             if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
@@ -1538,10 +1544,14 @@ impl Sidebar {
                         .active_conversation_view()
                         .map(|conversation_view| conversation_view.read(cx).parent_id()),
                 );
-                let tabs = agent_panel.open_thread_tab_ids(cx);
-                for (position, thread_id) in tabs.iter().enumerate() {
-                    tab_positions.entry(*thread_id).or_insert(position);
+                for (position, thread_id) in agent_panel
+                    .thread_tab_ids_in_pane_order(cx)
+                    .into_iter()
+                    .enumerate()
+                {
+                    tab_positions.entry(thread_id).or_insert(position);
                 }
+                let tabs = agent_panel.open_thread_tab_ids(cx);
                 open_thread_ids.extend(tabs.iter().copied());
                 tabbed_threads.extend(tabs);
             }
@@ -1722,8 +1732,14 @@ impl Sidebar {
     }
 
     /// Clusters a section's rows by workspace, inserting a header above each
-    /// workspace's rows. Rows arrive sorted newest-first; clusters keep the
-    /// order of their newest row.
+    /// workspace's rows. A cluster is emitted where its first row appears, so
+    /// it takes the order of whatever the rows were sorted by: the earliest
+    /// tab in Active, the newest row in the time-sorted sections.
+    ///
+    /// Tabs from two worktrees can interleave (A, B, A) and a grouped list
+    /// cannot show that without splitting a group in two. Grouping wins:
+    /// keeping a worktree's threads together is worth more than reproducing an
+    /// interleaving exactly.
     fn group_rows_by_workspace(rows: Vec<ListEntry>) -> Vec<ListEntry> {
         fn workspace_key(entry: &ListEntry) -> Option<String> {
             let ListEntry::Thread(thread) = entry else {
@@ -1900,12 +1916,10 @@ impl Sidebar {
                 .collect::<Vec<_>>()
         };
 
-        // Active follows the pane. Positions are per-pane, so two workspaces
-        // both showing their first tab tie and fall back to the time sort;
-        // grouping then pulls them into their own worktrees anyway, which is
-        // what keeps tab order meaningful when several workspaces are on
-        // screen at once. A row with no tab sorts after every row that has
-        // one, by time.
+        // Active follows the tab strip. Positions span every workspace, so a
+        // group sits where its earliest tab sits and its rows sit in their tab
+        // order. A row with no tab sorts after every row that has one, by
+        // time.
         //
         // An empty draft stays pinned above all of it. Its tab is wherever the
         // pane happened to put it, which for a draft the user just asked for is

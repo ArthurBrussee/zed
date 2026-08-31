@@ -5545,6 +5545,27 @@ impl AgentPanel {
             .collect()
     }
 
+    /// Every thread this pane shows a tab for, in strip order: its own threads
+    /// and the proxies standing in for the other workspaces'. Every pane
+    /// mirrors every workspace's threads in one insertion order, so this reads
+    /// as a global tab order, which is what the sidebar sorts Active by.
+    /// [`Self::open_thread_tab_ids`] is the narrower question — which threads
+    /// are open *here* — and stays the answer for membership.
+    pub fn thread_tab_ids_in_pane_order(&self, cx: &App) -> Vec<ThreadId> {
+        self.thread_pane
+            .read(cx)
+            .items()
+            .filter_map(|item| {
+                if let Some(tab) = item.downcast::<crate::thread_tab::ThreadTab>() {
+                    Some(tab.read(cx).thread_id(cx))
+                } else {
+                    item.downcast::<crate::thread_tab::ForeignThreadTab>()
+                        .map(|proxy| proxy.read(cx).thread_id())
+                }
+            })
+            .collect()
+    }
+
     /// Whether any tab-hosted conversation view is still alive.
     fn has_live_tab_thread(&self) -> bool {
         self.active_tab_thread.is_some()
