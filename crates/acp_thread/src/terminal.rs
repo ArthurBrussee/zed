@@ -1,12 +1,19 @@
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::Result;
 use collections::HashMap;
-use futures::{FutureExt as _, future::Shared};
-use gpui::{App, AppContext, AsyncApp, Context, Entity, Task};
+use futures::{FutureExt as _, StreamExt as _, future::Shared};
+use git::{
+    repository::RepoPath,
+    status::{DiffStat, FileStatus},
+};
+use gpui::{App, AppContext, AsyncApp, Context, Entity, Subscription, Task};
 use http_proxy::Allowlist;
 use language::LanguageRegistry;
 use markdown::Markdown;
-use project::Project;
+use project::{
+    Project, ProjectPath,
+    git_store::{Repository, RepositoryEvent},
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap as StdHashMap,
@@ -16,7 +23,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant, SystemTime},
 };
 use task::Shell;
 use util::get_default_system_shell_preferring_bash;
@@ -399,6 +406,247 @@ pub(crate) async fn prepare_sandbox_wrap(
     ))
 }
 
+/// How long to keep listening after a command exits for the repository to say
+/// anything at all. The status arrives on debounced filesystem events, so the
+/// last of what a command wrote lands some time after it ends; generous enough
+/// for a large rewrite on a cold worktree.
+const FIRST_CHANGE_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// How long the repository has to stay silent, once a command has ended and
+/// something has been reported, before the watch ends. Short, because by then
+/// the events are already flowing.
+const QUIET_AFTER_CHANGE: Duration = Duration::from_millis(750);
+
+/// How many times a finished command's repository may move before the watch
+/// gives up. Only a worktree someone else is also writing to reaches this.
+const SETTLE_ROUNDS: usize = 30;
+
+/// How far outside a command's own run a write may sit and still be counted as
+/// its doing. The window is recorded around the command rather than by it, and
+/// a file's timestamp is only as fine as the filesystem keeps it.
+const WRITE_WINDOW_GRACE: Duration = Duration::from_secs(2);
+
+/// How big a picture a command wrote may be before the chip declines to draw
+/// it. Screenshots and plots are well under this; a multi-gigapixel export is
+/// not something to decode on the way to painting a frame.
+const MAX_OUTPUT_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
+
+/// A file a command changed, as the repository saw it, and how much of it moved
+/// while the command ran.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChangedFile {
+    pub path: ProjectPath,
+    pub added: u32,
+    pub deleted: u32,
+    /// Whether the file already carried uncommitted changes when the command
+    /// started. A hover card cannot honestly claim its whole diff is this
+    /// command's when there was already a diff to show; the label switches on
+    /// this flag instead.
+    pub pre_command_dirty: bool,
+}
+
+/// The repository's view of its working copy: what each path's status is, and
+/// how much of it differs. The diff stat is part of the identity because a file
+/// that was already modified keeps the same status when a command changes it
+/// again, and only the amount of change moves.
+type StatusSnapshot = HashMap<RepoPath, (FileStatus, Option<DiffStat>)>;
+
+fn status_snapshot(repository: &Entity<Repository>, cx: &App) -> StatusSnapshot {
+    repository
+        .read(cx)
+        .cached_status()
+        .map(|entry| (entry.repo_path, (entry.status, entry.unstaged_diff_stat)))
+        .collect()
+}
+
+/// The state a running watch keeps: where the repository stood when the command
+/// started, and what has been reported since, so that each of the repository's
+/// updates costs only the work that update actually changed.
+struct RepositoryWatch {
+    repository: Entity<Repository>,
+    project: Entity<Project>,
+    fs: Arc<dyn project::Fs>,
+    baseline: StatusSnapshot,
+    started_at: SystemTime,
+    candidates: Vec<(RepoPath, DiffStat)>,
+    reported: Vec<ChangedFile>,
+}
+
+impl RepositoryWatch {
+    /// Brings the terminal's account of what its command changed up to date
+    /// with the repository. `ended_at` is when the command exited, or `None`
+    /// while it is still running.
+    async fn refresh(
+        &mut self,
+        ended_at: Option<SystemTime>,
+        terminal: &gpui::WeakEntity<Terminal>,
+        cx: &mut AsyncApp,
+    ) {
+        let repository = self.repository.clone();
+        let baseline = &self.baseline;
+        let mut changed: Vec<(RepoPath, DiffStat)> = cx.update(|cx| {
+            status_snapshot(&repository, cx)
+                .iter()
+                .filter(|(path, state)| baseline.get(*path) != Some(state))
+                .map(|(path, (_, stat))| {
+                    let before = baseline.get(path).and_then(|(_, stat)| *stat);
+                    (path.clone(), stat_delta(before, *stat))
+                })
+                .collect()
+        });
+        // The status is a map, so its order is nobody's to depend on. Sorting
+        // gives the chips a stable order and makes this comparable with what
+        // the last update saw.
+        changed.sort_by(|(left, _), (right, _)| left.cmp(right));
+        if changed == self.candidates {
+            return;
+        }
+        self.candidates = changed;
+
+        // Where on disk each candidate lives, so the filesystem can be asked
+        // when it was written.
+        let project = self.project.clone();
+        let candidates: Vec<(ChangedFile, PathBuf)> = cx.update(|cx| {
+            let repository = repository.read(cx);
+            self.candidates
+                .iter()
+                .filter_map(|(repo_path, delta)| {
+                    let path = repository.repo_path_to_project_path(repo_path, cx)?;
+                    let worktree = project.read(cx).worktree_for_id(path.worktree_id, cx)?;
+                    let abs_path = worktree.read(cx).absolutize(&path.path);
+                    // A file the baseline already knew was moving keeps its
+                    // history; the hover card labels itself differently for
+                    // those than for a file this command dirtied from clean,
+                    // since only the second case is the command's whole diff.
+                    let pre_command_dirty = baseline
+                        .get(repo_path)
+                        .and_then(|(_, stat)| *stat)
+                        .is_some_and(|stat| stat.added + stat.deleted > 0);
+                    Some((
+                        ChangedFile {
+                            path,
+                            added: delta.added,
+                            deleted: delta.deleted,
+                            pre_command_dirty,
+                        },
+                        abs_path,
+                    ))
+                })
+                .collect()
+        });
+
+        // A repository's status is only ever as current as its last filesystem
+        // event, so edits made just before this command started can still be
+        // arriving as it runs, and edits made after it ends arrive while its
+        // status is still being watched. Neither is this command's doing, and
+        // the file's own timestamp is what separates them: what this command
+        // wrote, it wrote while it ran.
+        let ended_at = ended_at.unwrap_or_else(SystemTime::now);
+        let window = self
+            .started_at
+            .checked_sub(WRITE_WINDOW_GRACE)
+            .unwrap_or(self.started_at)
+            ..=ended_at.checked_add(WRITE_WINDOW_GRACE).unwrap_or(ended_at);
+        let fs = self.fs.clone();
+        let confirmed = cx
+            .background_spawn(async move {
+                let mut confirmed = Vec::new();
+                for (file, abs_path) in candidates {
+                    // A file with no timestamp to read was deleted or is
+                    // unreachable; nothing vouches for it either way, and a
+                    // deletion is worth reporting.
+                    let within = match fs.metadata(&abs_path).await {
+                        Ok(Some(metadata)) => window.contains(&metadata.mtime.timestamp_for_user()),
+                        _ => true,
+                    };
+                    if within {
+                        confirmed.push(file);
+                    }
+                }
+                confirmed
+            })
+            .await;
+        if confirmed == self.reported {
+            return;
+        }
+        self.reported = confirmed.clone();
+
+        terminal
+            .update(cx, |terminal, cx| {
+                terminal.changed_files = confirmed;
+                cx.notify();
+            })
+            .ok();
+    }
+}
+
+/// How much of a file a command moved: the growth of its unstaged diff stat
+/// while the command ran. A file that was already dirty counts only what is
+/// new, and one that just became dirty counts all of it.
+fn stat_delta(before: Option<DiffStat>, after: Option<DiffStat>) -> DiffStat {
+    let before = before.unwrap_or_default();
+    let after = after.unwrap_or_default();
+    DiffStat {
+        added: after.added.saturating_sub(before.added),
+        deleted: after.deleted.saturating_sub(before.deleted),
+    }
+}
+
+/// Whether it is worth watching the repository around this command: whether it
+/// could change anything, and whether what changed could be told apart from
+/// everything else that happened while it ran.
+///
+/// Three answers, in the order they are decided:
+///
+/// * **Unattributable.** A line that moves the branch rewrites whatever those
+///   commits touched, and nothing downstream can separate those files from the
+///   ones the rest of the line wrote, so one such segment disqualifies the
+///   whole line: `git rebase … && cargo check` is not a report about
+///   `cargo check`. Throwing the worktree away wholesale (`reset --hard`,
+///   `clean`) reads the same way. What git did is the git panel's to show.
+/// * **Only looking.** Reads, searches, listings and lookups are the bulk of
+///   what an agent runs and change nothing, so watching them would cost a
+///   subscription and a task each for an answer that is always empty.
+/// * **Might write.** Everything else, including anything the parser could not
+///   read: a script says nothing about the files it rewrites, which is the
+///   whole reason for watching rather than reading.
+fn command_may_write(command: &str) -> bool {
+    use crate::command_parse::{DestructiveOperation, GitOperation, SegmentKind};
+
+    let mut may_write = false;
+    for segment in &crate::command_parse::parse_command(command).segments {
+        match &segment.kind {
+            SegmentKind::Git {
+                operation: GitOperation::Modify,
+                ..
+            } => return false,
+            // A discard that names its files is a change with names on it and
+            // stays reportable; one that names none is the wholesale kind.
+            SegmentKind::Destructive {
+                operation: DestructiveOperation::DiscardChanges,
+                paths,
+            } if paths.is_empty() => return false,
+
+            SegmentKind::Noop
+            | SegmentKind::Read { .. }
+            | SegmentKind::Search { .. }
+            | SegmentKind::ListDirectory { .. }
+            | SegmentKind::Lookup { .. }
+            | SegmentKind::CountLines { .. }
+            | SegmentKind::Wait { .. }
+            | SegmentKind::Git { .. } => {}
+
+            SegmentKind::WriteFile { .. }
+            | SegmentKind::EditInPlace { .. }
+            | SegmentKind::Destructive { .. }
+            | SegmentKind::InlineScript { .. }
+            | SegmentKind::GitHub { .. }
+            | SegmentKind::Run { .. } => may_write = true,
+        }
+    }
+    may_write
+}
+
 pub struct Terminal {
     id: acp::TerminalId,
     command: Entity<Markdown>,
@@ -412,11 +660,50 @@ pub struct Terminal {
     /// (e.g., clicking the Stop button). This is set before kill() is called
     /// so that code awaiting wait_for_exit() can check it deterministically.
     user_stopped: Arc<AtomicBool>,
+    /// How a display-only terminal learns its command ended: the agent that ran
+    /// it reports the exit, since there is no process here to wait on.
+    reported_exit: Option<futures::channel::oneshot::Sender<Option<ExitStatus>>>,
     /// The live sandbox (Seatbelt policy file and/or network proxy) kept alive
     /// until the sandboxed command exits. `None` when the command isn't
     /// sandboxed or after it finishes. Dropping it tears down the proxy on a
     /// background thread (see `sandbox::Sandbox`'s `Drop`).
     _sandbox: Option<SandboxConfigHandle>,
+    /// Whether this command could write anything, decided once from its text.
+    /// A command that only looks around is not worth watching a repository for.
+    may_write: bool,
+    /// Kept alive for as long as the watch below runs: the repository's own
+    /// account of when its status moved.
+    _repository_events: Option<Subscription>,
+    /// Files this command changed, as the repository saw them rather than as
+    /// the command described itself. A script handed to an interpreter says
+    /// nothing about what it wrote; the worktree does. Empty until the command
+    /// has exited and the git status has settled.
+    changed_files: Vec<ChangedFile>,
+    /// Kept alive for the duration of the watch above.
+    _changed_paths_task: Option<Task<()>>,
+    /// Pictures this command's own output named and the disk vouched for.
+    /// These usually land outside the repository, so the watch above cannot
+    /// find them. Empty until the command has exited.
+    output_images: Vec<PathBuf>,
+    /// Kept alive for the duration of the check above.
+    _output_images_task: Option<Task<()>>,
+    /// When the command started, on the clock a file's timestamp is kept on.
+    /// `started_at` is an `Instant`, which cannot be compared with an mtime.
+    started_at_wall: SystemTime,
+}
+
+/// A process status standing in for one reported by an agent rather than one
+/// waited on here. The UI only ever asks it for its code and whether it
+/// succeeded, which this answers the same way a real one does.
+fn exit_status_from_code(code: u32) -> ExitStatus {
+    #[cfg(unix)]
+    {
+        std::os::unix::process::ExitStatusExt::from_raw((code as i32) << 8)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::process::ExitStatusExt::from_raw(code)
+    }
 }
 
 pub struct TerminalOutput {
@@ -438,7 +725,17 @@ impl Terminal {
         sandbox: Option<SandboxConfigHandle>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let command_task = terminal.read(cx).wait_for_completed_task(cx);
+        // A display-only terminal mirrors a process Zed never started, so it
+        // has no task to wait on and `wait_for_completed_task` is instantly
+        // ready with nothing. Waiting on that would end the command the moment
+        // it began: no exit status, and a duration of zero however long it
+        // really ran. Those exits arrive as reports instead.
+        let command_task = terminal
+            .read(cx)
+            .task()
+            .is_some()
+            .then(|| terminal.read(cx).wait_for_completed_task(cx));
+        let (reported_exit_tx, reported_exit) = futures::channel::oneshot::channel();
         // Tear the sandbox down on a GPUI background thread when this entity is
         // released, rather than relying on `Sandbox`'s `Drop` (which would spawn
         // a throwaway thread) on whatever thread releases us. `on_release` hands
@@ -456,8 +753,9 @@ impl Terminal {
             id,
             _sandbox: sandbox,
             command: cx.new(|cx| {
+                // The bash tag gives the command shell syntax highlighting.
                 Markdown::new(
-                    format!("```\n{}\n```", command_label).into(),
+                    format!("```bash\n{}\n```", command_label).into(),
                     Some(language_registry.clone()),
                     None,
                     cx,
@@ -469,9 +767,20 @@ impl Terminal {
             output: None,
             output_byte_limit,
             user_stopped: Arc::new(AtomicBool::new(false)),
+            reported_exit: Some(reported_exit_tx),
+            may_write: command_may_write(command_label),
+            _repository_events: None,
+            changed_files: Vec::new(),
+            _changed_paths_task: None,
+            output_images: Vec::new(),
+            _output_images_task: None,
+            started_at_wall: SystemTime::now(),
             _output_task: cx
                 .spawn(async move |this, cx| {
-                    let exit_status = command_task.await;
+                    let exit_status = match command_task {
+                        Some(command_task) => command_task.await,
+                        None => reported_exit.await.ok().flatten(),
+                    };
 
                     this.update(cx, |this, cx| {
                         let (content, original_content_len) = this.truncated_output(cx);
@@ -519,10 +828,237 @@ impl Terminal {
         self._output_task.clone()
     }
 
+    /// Files this command changed, once it has finished and the repository has
+    /// caught up. Empty for a command that changed nothing, that ran outside a
+    /// repository, or that has not exited yet.
+    pub fn changed_files(&self) -> &[ChangedFile] {
+        &self.changed_files
+    }
+
+    pub fn output_images(&self) -> &[PathBuf] {
+        &self.output_images
+    }
+
+    /// Finds the pictures this command made, so the thread can show them
+    /// instead of a path and a line of `file` output.
+    ///
+    /// The command's output names the candidates and the disk decides: a path
+    /// counts only if it resolves to a file small enough to draw that was
+    /// written while the command ran. That last test is the same one that
+    /// separates a command's own writes from everything else on disk, and it
+    /// is what makes a path a result rather than a mention — the output of a
+    /// script that prints a name it never wrote to fails it.
+    fn watch_output_images(&mut self, fs: Arc<dyn project::Fs>, cx: &mut Context<Self>) {
+        let exited = self.wait_for_exit();
+        let working_dir = self.working_dir.clone();
+        let started_at = self.started_at_wall;
+        self._output_images_task = Some(cx.spawn(async move |this, cx| {
+            exited.await;
+            let named = this
+                .read_with(cx, |this, _cx| {
+                    this.output
+                        .as_ref()
+                        .map(|output| crate::command_output::image_paths_in_output(&output.content))
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+            if named.is_empty() {
+                return;
+            }
+
+            let window = started_at
+                .checked_sub(WRITE_WINDOW_GRACE)
+                .unwrap_or(started_at)
+                ..=SystemTime::now()
+                    .checked_add(WRITE_WINDOW_GRACE)
+                    .unwrap_or_else(SystemTime::now);
+            let found = cx
+                .background_spawn(async move {
+                    let mut found = Vec::new();
+                    for name in named {
+                        let path = PathBuf::from(&name);
+                        // A relative path is relative to where the command ran.
+                        // With no working directory there is nothing to resolve
+                        // it against, and guessing would draw the wrong file.
+                        let path = if path.is_absolute() {
+                            path
+                        } else if let Some(working_dir) = working_dir.as_ref() {
+                            working_dir.join(path)
+                        } else {
+                            continue;
+                        };
+                        let Ok(Some(metadata)) = fs.metadata(&path).await else {
+                            continue;
+                        };
+                        if metadata.is_dir
+                            || metadata.is_fifo
+                            || metadata.len > MAX_OUTPUT_IMAGE_BYTES
+                            || !window.contains(&metadata.mtime.timestamp_for_user())
+                        {
+                            continue;
+                        }
+                        found.push(path);
+                    }
+                    found
+                })
+                .await;
+            if found.is_empty() {
+                return;
+            }
+            this.update(cx, |this, cx| {
+                this.output_images = found;
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Watches the repository around this command: what it changes is whatever
+    /// the status says changed while it ran. The watch follows the repository's
+    /// own events, so files appear as they land rather than once at the end,
+    /// and it keeps listening past the command's exit for the events its last
+    /// writes are still owed.
+    ///
+    /// This is deliberately not an attempt to read the command. A script handed
+    /// to `python3 -` describes nothing about the files it rewrites, and the
+    /// same is true of a formatter, a codegen step, or a `sed -i`. The worktree
+    /// knows regardless of what ran.
+    ///
+    /// What it cannot see: anything git ignores, anything outside the
+    /// repository, and a second edit to an already-dirty file that happens to
+    /// leave its line counts unchanged. Another process writing to the same
+    /// worktree at the same time would be misattributed to this command.
+    pub fn watch_repository(&mut self, project: Entity<Project>, cx: &mut Context<Self>) {
+        // Most of what an agent runs is looking, not writing. Watching those
+        // would cost a subscription and a task each for an answer that is
+        // always empty.
+        if !self.may_write {
+            return;
+        }
+
+        // A picture a command wrote is worth showing wherever it landed, which
+        // is usually outside the repository entirely, so this does not wait on
+        // finding one below.
+        self.watch_output_images(project.read(cx).fs().clone(), cx);
+
+        // The working directory is a hint, not a requirement: agents often
+        // report none at all, and a command is free to `cd` somewhere else in
+        // its first breath. When it points into a repository, that repository
+        // is the one being written to (the innermost, so a command inside a
+        // submodule is watched by the one it actually changes). Otherwise the
+        // project's own repository is the thing worth watching, since a change
+        // anywhere else is one this window cannot show.
+        let git_store = project.read(cx).git_store().clone();
+        let containing = self.working_dir.as_ref().and_then(|working_dir| {
+            git_store
+                .read(cx)
+                .repositories()
+                .values()
+                .filter(|repository| {
+                    repository
+                        .read(cx)
+                        .abs_path_to_repo_path(working_dir)
+                        .is_some()
+                })
+                .max_by_key(|repository| repository.read(cx).work_directory_abs_path.clone())
+                .cloned()
+        });
+        let Some(repository) = containing.or_else(|| project.read(cx).active_repository(cx)) else {
+            return;
+        };
+        let exited = self.wait_for_exit();
+        let mut watch = RepositoryWatch {
+            baseline: status_snapshot(&repository, cx),
+            fs: project.read(cx).fs().clone(),
+            repository: repository.clone(),
+            project,
+            started_at: SystemTime::now(),
+            candidates: Vec::new(),
+            reported: Vec::new(),
+        };
+
+        // Wake on the repository's own account of itself rather than by asking
+        // it every so often. A status arrives as an event, so what a command
+        // changed can be shown the moment it lands, including while the command
+        // is still running.
+        let (mut moved_tx, mut moved_rx) = futures::channel::mpsc::channel(1);
+        self._repository_events = Some(cx.subscribe(&repository, move |_, _, event, _| {
+            if matches!(event, RepositoryEvent::StatusesChanged) {
+                // A channel that is already full says what this would: the
+                // repository moved and has not been looked at yet.
+                moved_tx.try_send(()).ok();
+            }
+        }));
+
+        self._changed_paths_task = Some(cx.spawn(async move |this, cx| {
+            let mut exited = exited.fuse();
+            let mut ended_at = None;
+
+            // A command still running is worth reporting on as it goes: a
+            // formatter or a codegen step names its files as they land rather
+            // than all at once at the end.
+            loop {
+                let listening = futures::select_biased! {
+                    _ = exited => {
+                        ended_at = Some(SystemTime::now());
+                        true
+                    }
+                    moved = moved_rx.next() => moved.is_some(),
+                };
+                watch.refresh(ended_at, &this, cx).await;
+                if ended_at.is_some() || !listening {
+                    break;
+                }
+            }
+            if ended_at.is_none() {
+                return;
+            }
+
+            // The status arrives on debounced filesystem events, so the last of
+            // what a command wrote lands after it has already ended. Keep
+            // listening until the repository goes quiet: briefly once it has
+            // said something, and for as long as a cold status scan takes when
+            // it has not.
+            for _ in 0..SETTLE_ROUNDS {
+                let quiet = if watch.reported.is_empty() {
+                    FIRST_CHANGE_TIMEOUT
+                } else {
+                    QUIET_AFTER_CHANGE
+                };
+                let moved = futures::select_biased! {
+                    moved = moved_rx.next() => moved.is_some(),
+                    _ = cx.background_executor().timer(quiet).fuse() => false,
+                };
+                if !moved {
+                    break;
+                }
+                watch.refresh(ended_at, &this, cx).await;
+            }
+        }));
+    }
+
+    /// Records the end of a command Zed did not run: a display-only terminal
+    /// mirrors an agent's own process, so its exit only ever arrives as a
+    /// report. This is what gives such a command its status and its duration.
+    pub fn report_exit(&mut self, status: &acp::TerminalExitStatus) {
+        self.finish(status.exit_code.map(exit_status_from_code));
+    }
+
+    /// Ends the wait for a command with no task of ours to watch. Does nothing
+    /// once the command has already ended.
+    fn finish(&mut self, exit_status: Option<ExitStatus>) {
+        if let Some(reported_exit) = self.reported_exit.take() {
+            reported_exit.send(exit_status).ok();
+        }
+    }
+
     pub fn kill(&mut self, cx: &mut App) {
         self.terminal.update(cx, |terminal, _cx| {
             terminal.kill_active_task();
         });
+        // A killed command has ended even when there is no task whose
+        // completion would say so.
+        self.finish(None);
     }
 
     /// Marks this terminal as stopped by user action and then kills it.
@@ -584,7 +1120,7 @@ impl Terminal {
 
     pub fn update_command_label(&self, label: &str, cx: &mut App) {
         self.command.update(cx, |command, cx| {
-            command.replace(format!("```\n{}\n```", label), cx);
+            command.replace(format!("```bash\n{}\n```", label), cx);
         });
     }
 
@@ -598,6 +1134,19 @@ impl Terminal {
 
     pub fn output(&self) -> Option<&TerminalOutput> {
         self.output.as_ref()
+    }
+
+    /// The last thing the command has printed, for a surface that has to say
+    /// something while it is still running. [`Self::output`] is only filled on
+    /// exit, so a running command has nothing there; the live text is in the
+    /// terminal itself, which is where the final output comes from too.
+    ///
+    /// Reading it walks the terminal's grid, so callers sample rather than ask
+    /// on every frame.
+    pub fn last_output_line(&self, cx: &App) -> Option<String> {
+        let line = self.terminal.read(cx).last_n_non_empty_lines(1).pop()?;
+        let line = output_line_excerpt(&line);
+        (!line.is_empty()).then(|| line.to_owned())
     }
 
     pub fn inner(&self) -> &Entity<terminal::Terminal> {
@@ -666,11 +1215,112 @@ pub async fn create_terminal_entity(
         .await
 }
 
+/// One line of terminal output, cut down to something a single-line box can
+/// hold: no surrounding whitespace, no carriage-return leftovers from a
+/// progress line that redrew itself, and short enough that laying it out costs
+/// nothing however much the command printed.
+fn output_line_excerpt(line: &str) -> &str {
+    const MAX_CHARS: usize = 160;
+
+    // A line rewritten in place (`\r`) is really its last revision; the grid
+    // usually resolves that, but a line that arrived in one write does not.
+    let line = line.rsplit('\r').next().unwrap_or(line).trim();
+    match line.char_indices().nth(MAX_CHARS) {
+        Some((end, _)) => line[..end].trim_end(),
+        None => line,
+    }
+}
+
 // Disable pagers so agent/terminal commands don't hang behind interactive UIs
 pub(crate) fn disable_pagers_through_env(env: &mut collections::HashMap<String, String>) {
     env.insert("PAGER".into(), "".into());
     // Override user core.pager (e.g. delta) which Git prefers over PAGER
     env.insert("GIT_PAGER".into(), "cat".into());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_running_commands_last_line_is_shown_as_it_stands() {
+        // Real lines from a test run and a build, which is what the chip is
+        // there to distinguish from a hang.
+        assert_eq!(
+            output_line_excerpt("   Compiling gpui v0.1.0 (/home/x/zed/crates/gpui)  "),
+            "Compiling gpui v0.1.0 (/home/x/zed/crates/gpui)"
+        );
+        assert_eq!(output_line_excerpt(" Tests  31 of 88 "), "Tests  31 of 88");
+
+        // A progress line redrawing itself is worth only its last revision.
+        assert_eq!(
+            output_line_excerpt("Downloading 12%\rDownloading 47%\rDownloading 92%"),
+            "Downloading 92%"
+        );
+
+        // However much it printed, the chip gets one boxful.
+        let long = "x".repeat(400);
+        assert_eq!(output_line_excerpt(&long).chars().count(), 160);
+
+        // Nothing to say reads as nothing, not as an empty box.
+        assert!(output_line_excerpt("   ").is_empty());
+        assert!(output_line_excerpt("").is_empty());
+    }
+
+    #[test]
+    fn a_line_that_moves_the_branch_is_not_watched() {
+        // A rebase rewrites whatever those commits touched, and the check that
+        // follows it cannot be told apart from the rebase.
+        assert!(!command_may_write(
+            "git rebase --onto upstream/main HEAD~3 && cargo check -p acp_thread"
+        ));
+        assert!(!command_may_write("git checkout main && pnpm install"));
+        assert!(!command_may_write("git stash && cargo test"));
+
+        // Throwing the worktree away wholesale reads the same way.
+        assert!(!command_may_write("git reset --hard origin/main && cargo build"));
+        assert!(!command_may_write("git clean -fd"));
+
+        // Discarding named files is a change with names on it, so it is still
+        // worth watching.
+        assert!(command_may_write("git checkout -- src/main.rs"));
+
+        // Reading git says nothing about the worktree either way, and is
+        // already excluded.
+        assert!(!command_may_write("git status --short"));
+        assert!(!command_may_write("git diff HEAD~1"));
+
+        // A line that only works is still watched.
+        assert!(command_may_write("cargo fmt --all"));
+        assert!(command_may_write("sed -i '' 's/a/b/' src/main.rs"));
+    }
+
+    #[test]
+    fn a_change_is_measured_from_where_the_file_already_was() {
+        let stat = |added, deleted| Some(DiffStat { added, deleted });
+
+        // A file nothing had touched counts all of its change.
+        assert_eq!(
+            stat_delta(None, stat(7, 2)),
+            DiffStat {
+                added: 7,
+                deleted: 2
+            }
+        );
+
+        // One that was already dirty counts only what this command added to
+        // it, not how far it has drifted from HEAD in total.
+        assert_eq!(
+            stat_delta(stat(10, 4), stat(13, 4)),
+            DiffStat {
+                added: 3,
+                deleted: 0
+            }
+        );
+
+        // A command that put lines back is not credited with removing them.
+        assert_eq!(stat_delta(stat(10, 4), stat(6, 4)), DiffStat::default());
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

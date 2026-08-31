@@ -192,6 +192,25 @@ impl Diff {
         !self.multibuffer().read(cx).is_empty()
     }
 
+    /// The edited buffer and its diff against the tool call's base text,
+    /// e.g. for computing added/removed line stats.
+    pub fn buffer_and_diff(&self, cx: &App) -> Option<(Entity<Buffer>, Entity<BufferDiff>)> {
+        match self {
+            Self::Pending(PendingDiff {
+                new_buffer, diff, ..
+            }) => Some((new_buffer.clone(), diff.clone())),
+            Self::Finalized(FinalizedDiff {
+                new_buffer,
+                multibuffer,
+                ..
+            }) => {
+                let buffer_id = new_buffer.read(cx).remote_id();
+                let diff = multibuffer.read(cx).diff_for(buffer_id)?;
+                Some((new_buffer.clone(), diff))
+            }
+        }
+    }
+
     pub fn needs_update(&self, old_text: &str, new_text: &str, cx: &App) -> bool {
         match self {
             Diff::Pending(PendingDiff {

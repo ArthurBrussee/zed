@@ -38,7 +38,6 @@ use crate::{
 };
 use buffer_diff::{DiffHunkStatus, DiffHunkStatusKind};
 use collections::{BTreeMap, HashMap, HashSet};
-use feature_flags::{DiffReviewFeatureFlag, FeatureFlagAppExt as _};
 use git::{Oid, blame::BlameEntry, commit::ParsedCommitMessage};
 use gpui::{
     Action, Along, AnyElement, App, AppContext, AvailableSpace, Axis as ScrollbarAxis, BorderStyle,
@@ -530,6 +529,7 @@ impl EditorElement {
         register_action(editor, window, Editor::collapse_all_diff_hunks);
         register_action(editor, window, Editor::toggle_all_diff_hunks);
         register_action(editor, window, Editor::toggle_review_comments_expanded);
+        register_action(editor, window, Editor::add_review_comment_action);
         register_action(editor, window, Editor::submit_diff_review_comment_action);
         register_action(editor, window, Editor::edit_review_comment);
         register_action(editor, window, Editor::delete_review_comment);
@@ -2553,11 +2553,7 @@ impl EditorElement {
         snapshot: &EditorSnapshot,
         cx: &App,
     ) -> Option<(DisplayRow, Option<u32>)> {
-        if !cx.has_flag::<DiffReviewFeatureFlag>() {
-            return None;
-        }
-
-        let show_diff_review_button = self.editor.read(cx).show_diff_review_button();
+        let show_diff_review_button = self.editor.read(cx).show_diff_review_button(cx);
         if !show_diff_review_button {
             return None;
         }

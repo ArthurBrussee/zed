@@ -268,18 +268,98 @@ pub fn open_thread_with_custom_connection<C>(
 }
 
 pub fn send_message(panel: &Entity<AgentPanel>, cx: &mut VisualTestContext) {
-    let thread_view = panel.read_with(cx, |panel, cx| panel.active_thread_view(cx).unwrap());
-    let message_editor = thread_view.read_with(cx, |view, _cx| view.message_editor.clone());
+    // This drives the current-worktree flow; drafts default to a new
+    // worktree, so pin the choice. Worktree tests drive `send_draft` and set
+    // their own.
+    let conversation_view =
+        panel.read_with(cx, |panel, _| panel.active_conversation_view().cloned());
+    if let Some(conversation_view) = conversation_view {
+        conversation_view.update(cx, |conversation_view, cx| {
+            conversation_view.set_draft_worktree_choice(
+                crate::conversation_view::DraftWorktreeChoice::Current,
+                cx,
+            );
+        });
+    }
+    let message_editor = draft_message_editor(panel, cx);
     message_editor.update_in(cx, |editor, window, cx| {
         editor.set_text("Hello", window, cx);
     });
-    thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+    // Sending an unstarted draft goes through the composer's own Send event
+    // (this is the moment the agent starts); a started thread sends directly.
+    let thread_view = panel.read_with(cx, |panel, cx| panel.active_thread_view(cx));
+    if let Some(thread_view) = thread_view {
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+    } else {
+        message_editor.update(cx, |_editor, cx| {
+            cx.emit(crate::message_editor::MessageEditorEvent::Send)
+        });
+    }
+    cx.run_until_parked();
+}
+
+/// The active draft's composer: the unstarted draft's own editor, or the
+/// thread view's once a session has started.
+pub fn draft_message_editor(
+    panel: &Entity<AgentPanel>,
+    cx: &VisualTestContext,
+) -> Entity<crate::message_editor::MessageEditor> {
+    panel.read_with(cx, |panel, cx| {
+        let conversation_view = panel.active_conversation_view().expect("an active view");
+        conversation_view
+            .read(cx)
+            .unstarted_message_editor()
+            .cloned()
+            .unwrap_or_else(|| {
+                panel
+                    .active_thread_view(cx)
+                    .expect("a thread view once started")
+                    .read(cx)
+                    .message_editor
+                    .clone()
+            })
+    })
+}
+
+/// The active draft composer's current text.
+pub fn draft_prompt_text(panel: &Entity<AgentPanel>, cx: &VisualTestContext) -> String {
+    let editor = draft_message_editor(panel, cx);
+    editor.read_with(cx, |editor, cx| editor.text(cx))
+}
+
+/// Sends whatever is in the active draft's composer, the way Enter does. For
+/// an unstarted draft this is the moment the agent (and worktree) is created.
+pub fn send_draft(panel: &Entity<AgentPanel>, cx: &mut VisualTestContext) {
+    let message_editor = draft_message_editor(panel, cx);
+    let thread_view = panel.read_with(cx, |panel, cx| panel.active_thread_view(cx));
+    if let Some(thread_view) = thread_view {
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+    } else {
+        message_editor.update(cx, |_editor, cx| {
+            cx.emit(crate::message_editor::MessageEditorEvent::Send)
+        });
+    }
     cx.run_until_parked();
 }
 
 pub fn type_draft_prompt(panel: &Entity<AgentPanel>, text: &str, cx: &mut VisualTestContext) {
-    let thread_view = panel.read_with(cx, |panel, cx| panel.active_thread_view(cx).unwrap());
-    let message_editor = thread_view.read_with(cx, |view, _cx| view.message_editor.clone());
+    // An unstarted draft owns its composer directly; a started thread's
+    // composer lives on the thread view.
+    let message_editor = panel.read_with(cx, |panel, cx| {
+        let conversation_view = panel.active_conversation_view().expect("an active view");
+        conversation_view
+            .read(cx)
+            .unstarted_message_editor()
+            .cloned()
+            .unwrap_or_else(|| {
+                panel
+                    .active_thread_view(cx)
+                    .expect("a thread view once started")
+                    .read(cx)
+                    .message_editor
+                    .clone()
+            })
+    });
     message_editor.update_in(cx, |editor, window, cx| {
         editor.set_text(text, window, cx);
     });

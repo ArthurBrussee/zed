@@ -83,6 +83,7 @@ members = [
     "crates/fs_benchmarks",
     "crates/fuzzy",
     "crates/fuzzy_nucleo",
+    "crates/gh_status",
     "crates/git",
     "crates/git_hosting_providers",
     "crates/git_ui",
@@ -351,6 +352,7 @@ file_icons = { path = "crates/file_icons" }
 fs = { path = "crates/fs" }
 fuzzy = { path = "crates/fuzzy" }
 fuzzy_nucleo = { path = "crates/fuzzy_nucleo" }
+gh_status = { path = "crates/gh_status" }
 git = { path = "crates/git" }
 git_hosting_providers = { path = "crates/git_hosting_providers" }
 git_ui = { path = "crates/git_ui" }
@@ -1002,7 +1004,9 @@ scratch = { path = "corgi-patches/scratch" }
 
 [profile.dev]
 split-debuginfo = "unpacked"
-incremental = true
+# The incremental cache regrows to 80GB+ within days on this fork and has
+# filled the disk repeatedly; whole-crate rebuilds are the cheaper trade.
+incremental = false
 codegen-units = 16
 debug = "limited"
 

@@ -31,7 +31,6 @@ use feature_flags::{FeatureFlagAppExt as _, PanicFeatureFlag};
 use fs::Fs;
 use futures::FutureExt as _;
 use futures::{StreamExt, channel::mpsc, select_biased};
-use git_ui::branch_diff::BranchDiffToolbar;
 use git_ui::commit_view::CommitViewToolbar;
 use git_ui::git_panel::GitPanel;
 use git_ui::project_diff::ProjectDiffToolbar;
@@ -1524,8 +1523,6 @@ fn initialize_pane(
             toolbar.add_item(staged_diff_toolbar, window, cx);
             let unstaged_diff_toolbar = cx.new(|cx| UnstagedDiffToolbar::new(workspace, cx));
             toolbar.add_item(unstaged_diff_toolbar, window, cx);
-            let branch_diff_toolbar = cx.new(BranchDiffToolbar::new);
-            toolbar.add_item(branch_diff_toolbar, window, cx);
             let solo_diff_git_toolbar = cx.new(SoloDiffGitToolbar::new);
             toolbar.add_item(solo_diff_git_toolbar, window, cx);
             let commit_view_toolbar = cx.new(|_| CommitViewToolbar::new());
@@ -6147,6 +6144,7 @@ mod tests {
                 false,
                 cx,
             );
+            gh_status::init(cx);
 
             repl::init(app_state.fs.clone(), cx);
             repl::notebook::init(cx);
