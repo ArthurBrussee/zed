@@ -2103,6 +2103,11 @@ impl ThreadView {
             // command printing at speed cannot reflow the chip grid under the
             // list's measured heights.
             .when_some(running_tail, |this, tail| {
+                // Where the line states a real fraction of the work — pytest's
+                // trailing `[ 50%]` — say so as a fraction. Everything else,
+                // including the tools that print counts with no denominator,
+                // keeps the line itself.
+                let progress = acp_thread::progress_fraction(&tail);
                 this.child(
                     div()
                         .flex_none()
@@ -2111,12 +2116,35 @@ impl ThreadView {
                         .whitespace_nowrap()
                         .line_clamp(1)
                         .text_ellipsis()
-                        .child(
-                            Label::new(tail)
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted)
-                                .buffer_font(cx),
-                        ),
+                        .map(|this| match progress {
+                            Some(fraction) => this.child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(
+                                        div().flex_1().child(
+                                            ui::ProgressBar::new(
+                                                ("command-progress", entry_ix),
+                                                fraction,
+                                                1.0,
+                                                cx,
+                                            )
+                                            .fg_color(cx.theme().colors().text_accent),
+                                        ),
+                                    )
+                                    .child(
+                                        Label::new(format!("{}%", (fraction * 100.0).round()))
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted)
+                                            .buffer_font(cx),
+                                    ),
+                            ),
+                            None => this.child(
+                                Label::new(tail)
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted)
+                                    .buffer_font(cx),
+                            ),
+                        }),
                 )
             })
             .when_some(first_error, |this, location| {

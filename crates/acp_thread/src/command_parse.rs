@@ -1922,6 +1922,32 @@ fn classify_stage(stage: &str) -> SegmentKind {
     }
 }
 
+
+/// A determinate progress reading that a running command printed about itself,
+/// as a fraction in `0.0..=1.0`.
+///
+/// Only a stated fraction qualifies. A wrong progress bar is worse than none,
+/// so a tool that merely counts is left to the last-line fallback: `pnpm`
+/// prints "resolved 2, reused 0, downloaded 2" with no denominator, so "2" is
+/// not 2 of anything, and `cargo` keeps its `N/M` in a progress bar that does
+/// not survive being captured.
+pub fn progress_fraction(line: &str) -> Option<f32> {
+    pytest_percent(line)
+}
+
+/// `pytest` ends every file's line with the run's running total, right
+/// aligned: `test_mod1.py ......      [ 50%]`.
+fn pytest_percent(line: &str) -> Option<f32> {
+    let inside = line.trim_end().strip_suffix(']')?.rsplit_once('[')?.1.trim();
+    let digits = inside.strip_suffix('%')?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let percent: u32 = digits.parse().ok()?;
+    (percent <= 100).then(|| percent as f32 / 100.0)
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2919,6 +2945,55 @@ mod tests {
         assert_eq!(classify_command("echo hi > log.txt"), CommandClass::Other);
         assert_eq!(classify_command("rg foo 2>/dev/null"), CommandClass::Search);
         assert_eq!(classify_command("cat foo.rs 2>&1"), CommandClass::Read);
+    }
+
+    // Real lines, captured from `pytest` and `pnpm` runs in the container that
+    // built this, not remembered.
+    #[test]
+    fn pytest_states_a_real_fraction() {
+        assert_eq!(
+            progress_fraction(
+                "test_mod0.py ......                                                      [ 25%]"
+            ),
+            Some(0.25)
+        );
+        assert_eq!(
+            progress_fraction(
+                "test_mod1.py ......                                                      [ 50%]"
+            ),
+            Some(0.5)
+        );
+        assert_eq!(
+            progress_fraction(
+                "test_mod3.py ......                                                      [100%]"
+            ),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn a_count_without_a_denominator_is_not_progress() {
+        // pnpm counts what it has done, not what it has left, so there is no
+        // fraction to be had and the last line stands on its own.
+        assert_eq!(
+            progress_fraction("Progress: resolved 1, reused 0, downloaded 0, added 0"),
+            None
+        );
+        assert_eq!(
+            progress_fraction("Progress: resolved 2, reused 0, downloaded 2, added 2, done"),
+            None
+        );
+        // cargo's count lives in a progress bar that captures as nothing.
+        assert_eq!(progress_fraction("   Compiling gpui v0.2.2 (/home/user/zed/crates/gpui)"), None);
+    }
+
+    #[test]
+    fn a_trailing_bracket_that_is_not_a_percentage_is_ignored() {
+        assert_eq!(progress_fraction("running [4 tests]"), None);
+        assert_eq!(progress_fraction("thread 'main' panicked at [src/lib.rs]"), None);
+        assert_eq!(progress_fraction("almost [ 101%]"), None);
+        assert_eq!(progress_fraction("empty [%]"), None);
+        assert_eq!(progress_fraction("nothing here at all"), None);
     }
 
     #[test]
