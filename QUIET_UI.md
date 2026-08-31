@@ -2741,3 +2741,178 @@ as the 2026-08-06 entry warned. What worked better than cleaning between phases:
   disturb it. Stale *test binaries* (`target/debug/deps/<crate>-<hash>`, no extension) are also pure
   output and safe to delete mid-build; `.rlib`/`.rmeta` are inputs and are not.
 - `rm -rf target/debug` before the release-profile clippy, as always.
+
+**2026-08-31**: onto main ce48461ea (21 upstream commits). A working night by every trigger:
+both queues held entries, the fork carried eighteen commits on the merge base, and the branch had
+moved that afternoon. Squash-then-rebase folded the standing squash and the seventeen above it
+(the 2026-08-30 run's work and record, plus five of Arthur's queue-writing commits) into one,
+reusing the squash's own message; tree-identical to the old tip before rebasing.
+
+**Upstream built what this fork had hand-rolled, which is the most valuable thing a rebase can
+find.** One file conflicted, `sidebar.rs`, in eight hunks, all of them from one upstream commit:
+`sidebar: Add title renaming for Terminal Threads` (#63494). It adds a generic rename to the
+sidebar — `RenameTarget::{Thread, Terminal}`, one `rename_editor`, `start_renaming_entry`,
+`finish_entry_rename`, `render_rename_title_editor` — where this fork had its own thread-only
+version (`renaming_thread_id`, `thread_rename_editor`, `finish_thread_rename`,
+`cancel_thread_rename`). Upstream's is a superset: it renames terminals too, and it was already
+wired at every call site the fork uses, including the fork's own row context menu, because those
+merged cleanly onto it. So the fork's version is deleted and upstream's is what remains.
+
+One thing was kept, and it is the reason this was not a straight "take theirs". Upstream applies
+the new title on every `BufferEdited`, one write per character, with a `suppress_next_rename_edit`
+flag to swallow the seeding edit. That is the bug this fork already fixed and left a comment
+about: each write rebuilds the sidebar's entries underneath the editor receiving them, which is
+how a rename used to end itself on its first letter and drop focus into the search field. So the
+fork's behaviour rides on upstream's shape: `finish_entry_rename` writes the title once, at the
+end, generic over the target; `cancel_entry_rename` is its discarding counterpart, so Escape still
+throws the edit away where upstream's Escape keeps it. `suppress_next_rename_edit` went with the
+per-keystroke path that needed it. The fork's own test for the write-once behaviour was ported to
+the new API rather than deleted.
+
+**One markerless drift, found by the compiler.** Upstream's `RenameTarget::from_entry` matches
+`ListEntry::ProjectHeader { .. }`, a variant this fork deleted when project headers went; it
+arrived by clean auto-merge inside a hunk that had no conflict, so nothing flagged it. Matched the
+fork's `SectionHeader`/`WorkspaceHeader` instead. After that, `cargo check --workspace
+--all-targets` came back with 0 errors and 0 warnings.
+
+**Where the day's entries were filed, which nearly cost six of them.** All five of Arthur's
+2026-08-31 commits appended to the *Verification queue*, each inserting immediately after that
+section's preamble. Their content is Work queue content — complaints about the running app, naming
+no changed crate and describing no edit ("Make `+` fast enough to press without thinking"). Read
+literally, this section says "run these crates' suites and delete the entries", which would have
+thrown away six feature requests. They were built as Work queue items instead, the two not reached
+were moved up there, and a note now sits in the Verification queue saying where such entries want
+to go. The Verification queue held no genuine unverified edit this round, so the gate's package
+set is the core crates plus everything touched tonight.
+
+**Built, five.**
+
+*The shared thread width only reaches windows that open afterwards.* The entry's diagnosis was
+exactly right and the code confirmed it: `size_is_global` makes the stored width one value, but
+`persisted_panel_size_state` is read in `add_panel`, which runs once as a window is built. Every
+worktree window already open keeps the width it has in memory. A resize now also hands the size to
+every other live workspace, found through `AppState::workspace_store` (the registry every
+`Workspace::new` inserts itself into), skipping the resizing workspace so a drag is not fought by
+its own update. The test is the one the entry asked for and warned about: two workspaces both open
+*before* the resize, resize one, read the other. Writing it exposed why the existing
+`test_a_global_panel_size_is_shared_across_workspaces` proves nothing — `Workspace::test_new`
+builds a private `AppState`, and with it a private `workspace_store`, per workspace, so no two
+test workspaces have ever known about each other. The new test builds both from one `AppState`, as
+the running app does, and it fails against the old code.
+
+*An unsent message follows you into the new-worktree draft.* The entry asked which of two orders
+leaks, and said the fix differs. Only one does. Typing into the new-thread draft while looking at
+it and then asking for a worktree already worked: `activate_additional_new_thread` releases a draft
+holding text from the ephemeral slot, and a fresh one gets made. A test written for that order
+passes against the unfixed code, which is how it was ruled out. The leak is the fast path above
+that release — "pressing `+` should just focus the ephemeral draft" — which returns early with the
+draft as it stands, and is reached whenever the slot holds a written draft that is *not* what is on
+screen. `new_worktree_draft` then stamped the worktree choice onto it. The release now happens on
+the worktree path before that call. The test reproduces the real shape (two drafts, the second
+written into, then looking at the first) and fails without the fix.
+
+*The worktree groups are what is out of order now.* The entry said to establish what the order is
+actually keyed on before changing it, and that was the whole job. `tab_positions` held each tab's
+index *within its own pane*, so every pane's first tab was position 0; every group therefore tied
+on its first row and fell through to `Reverse(display_time)` — the newest-row ordering the stale
+comment above `group_rows_by_workspace` still described. Positions now come from the whole tab
+strip including the foreign proxies, which every pane mirrors in one global insertion order, so a
+group sits where its earliest tab sits and its rows keep their tab order. `open_thread_tab_ids`
+stays the narrower question (which threads are open in *this* pane) that section membership wants.
+The interleaving case the entry raised is now written down where the clustering happens: grouping
+wins, no subtabs were built.
+
+*The working spinner should not take the model's place.* The leading slot always draws the agent
+logo now, and the status glyph moved to the right end of the title row in a slot that is always
+present, so a row does not change shape when a thread starts or stops. Scope note: the entry names
+the spinner, but the amber needs-action dot and the accent unread dot occupied that same slot and
+hid the logo the same way, so all three moved — one rule rather than a spinner-shaped exception.
+**No test:** `thread_item.rs` is a render component with no tests and no logic to extract; the
+change is which slot an element sits in, and asserting the status-to-glyph mapping would not test
+placement. Said here rather than covered by an assertion that proves nothing.
+
+*Where a tool's output says so, show real progress.* Built to the entry's own rule, one pattern
+only. `acp_thread::progress_fraction` reads pytest's trailing `[ NN%]` — a stated fraction — and
+the running chip draws a determinate bar in the same fixed-width box it used for the last line;
+everything else keeps the last line. pnpm is deliberately not parsed: "resolved 2, reused 0" counts
+with no denominator, so there is nothing determinate in it, exactly as the entry says. Unit-tested
+against the lines captured in the entry, plus the negative cases (a trailing `[4 tests]`, a path in
+brackets, `[ 101%]`).
+
+**Not built, and why.** *Make `+` fast* and *delete the draft-worktree concept* are the two that
+remain, and they are left together on purpose: the first entry says itself that it "belongs with
+the entry below, and is the thing that decides whether it was a good idea", since the seven-to-
+thirty-second cost only lands on every press once `+` creates the worktree there and then. Today
+it lands on first send instead. The second is a twenty-eight-reference removal across `agent_ui`
+plus a disk-cleanup obligation for abandoned worktrees — more than the runway left after the
+five above, and the worst possible thing to leave half-done before a gate. The first entry's
+"cheap one, do it regardless" half (create from the local ref, fetch behind it) was read and
+deliberately skipped too: today a fetch failure aborts creation and toasts with a log, so moving
+the fetch off the critical path means deciding what a *later* failure does and adding the "your
+base was behind" notice the entry asks for — a real behaviour change around git errors, on a path
+that cannot be exercised here without a remote. Better done with measurements, as the entry asks,
+than guessed at 22:00.
+
+**The red test, and the question the last entry asked to settle.**
+`sidebar_tests::property_test::test_sidebar_invariants` is still red and was not fixed, but the
+frightening reading is now ruled out. gpui's `LeakDetector::drop` iterates the *whole*
+`entity_handles` map and reports every entity still held; it reports exactly one, the `ThreadStore`
+the test's own `init_global` puts in a global. No `Workspace`, no `AgentPanel`, no
+`MultiWorkspace`. So this is not "a real memory leak in the running app every time a workspace
+closes" — nothing owning a window is retained, and the thing that outlives the check is a global,
+which in a running app is meant to live to the end anyway.
+
+Three things were learned and are written into the queue entry so the next run does not re-buy
+them. `LEAK_BACKTRACE=1` is useless here: it is read, and the handle's recorded backtrace comes
+back empty, naming the entity and nothing about its holder. The panic stack is worth reading
+instead — `TestAppContext` drop straight to `App` drop to `LeakDetector::drop`, with no
+`App::shutdown()` anywhere in it, where `HeadlessAppContext::drop` calls `shutdown()` deliberately
+"so windows are closed and entity handles are released before the LeakDetector runs"; that is the
+seam upstream's #63213 would have moved work out of. And one suspect was followed and cleared:
+`migrate_thread_metadata` holds a strong `Entity<ThreadStore>` across `thread_store_ready.await`,
+which is precisely this shape, but downgrading it to a weak handle did not fix the test, and the
+same task holds an `Entity<ThreadMetadataStore>` that does not leak. That change was **reverted
+rather than left in the diff**, since an unproven edit to upstream code is exactly what this fork
+should not be carrying.
+
+**What the fork could delete in favour of upstream:** its whole sidebar thread-rename
+implementation, described above — deleted this round, and it came back as more than it was, since
+upstream's renames terminals too.
+
+**Gate.** `cargo test --no-fail-fast -p acp_thread -p agent_ui -p sidebar -p ui -p workspace`
+(the three core crates plus everything touched tonight; the Verification queue held no real
+entries): 208 + 446 [32 intentionally `#[ignore]`d] + 170 + 82 + 262 + 41 = **1209 passed, 1
+failed** — the leaked-handle property test above, which was red before tonight's work and is not
+this fork's edit. Then `./script/clippy -p acp_thread -p agent_ui -p sidebar -p ui -p workspace -p
+gpui_macros` (`--release --all-targets --all-features -- --deny warnings`), clean, 0 warnings, in
+4m19s.
+
+**That `-p gpui_macros` is load-bearing, and it is a tooling fact worth keeping.** This is the
+first night `ui` has been in the clippy set — the fork touched it, so it had to be — and selecting
+it alone fails in a way that looks like fork breakage and is not: `ui/src/traits/styled_ext.rs`
+(untouched by this fork) calls `gpui_macros::derive_inspector_reflection`, which is gated behind
+`#[cfg(any(feature = "inspector", debug_assertions))]`. `script/clippy` builds `--release`, where
+`debug_assertions` is off, and `--all-features` only applies to the packages *selected*, so nothing
+in the set turned on `gpui_macros/inspector` and the macro was configured out. `cargo check` never
+sees it, because the dev profile satisfies the cfg on `debug_assertions` alone. Adding
+`-p gpui_macros` (a tiny proc-macro crate) puts `--all-features` on the crate that owns the gate
+and the whole set builds. `-p gpui` would work too — `gpui/inspector = ["gpui_macros/inspector"]` —
+but it drags `screen-capture`, `profiler` and `bench-support` in with it. Keep `gpui_macros` in the
+selection for as long as `ui` is in it.
+
+One test failed on the first round and it was upstream drift, the recurring shape the 2026-07-25
+entry already names: upstream's own `test_rename_selected_thread_action_renames_terminal`, which
+arrived with the terminal-rename feature adopted above, ends by asserting a `v [my-project]`
+project header this fork deleted. Everything the test is about — the rename reaching the terminal
+and the metadata store — passed. Expectation adapted, per precedent.
+
+**Environment, and one new thing worth knowing.** The usual prerequisites were needed again in
+this fresh container (`CARGO_NET_GIT_FETCH_WITH_CLI=true`; `apt-get update` 403'd on the
+`deadsnakes`/`ondrej` PPAs as always while `apt-get install -y libasound2-dev` succeeded off the
+cached lists; `libxkbcommon-dev` and `libxkbcommon-x11-dev` per the last entry). **New: the
+container clones only the default branch.** This session opened on a detached HEAD at `main` with
+no `quiet-ui` ref and no `QUIET_UI.md` on disk, which reads exactly like the branch having been
+lost. It has not: `git fetch origin quiet-ui:quiet-ui` brings it back, and `git ls-remote --heads
+origin` is the check worth running before believing anything is missing. The disk advice from last
+time held — `CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0` for the test pass, one package
+set all night, `rm -rf target/debug` (16GB) before the release clippy.
