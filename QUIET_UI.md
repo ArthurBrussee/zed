@@ -860,6 +860,31 @@ does is removed as it lands.
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**Say whether a PR can actually be merged, not just whether CI passed.**
+Green checks and an unmergeable PR look identical today. A branch that is behind its base, or
+conflicting, or blocked on a required review, reads as ready when it is not, and the only way to
+find out is to open it.
+
+The data is one field away. `GH_JSON_FIELDS` (`crates/gh_status/src/gh_status.rs:409`) asks for
+`number,url,title,state,isDraft,reviewDecision,statusCheckRollup`; adding `mergeable` and
+`mergeStateStatus` gets both the yes/no and the reason (`BEHIND`, `DIRTY`, `BLOCKED`, `UNSTABLE`,
+`CLEAN`). `PrStatus` (`:36`) then carries it the way `failing_checks` already does, and both
+surfaces that render the chip get it for free.
+
+Two things to get right:
+
+- `mergeable` is computed lazily by GitHub and comes back `UNKNOWN` on the first ask surprisingly
+  often, resolving a second later. Never render "unknown" as a state: treat it as "not yet known",
+  show what you would have shown without it, and let the next poll settle it. A chip that flickers
+  between "can merge" and "unknown" is worse than one that says nothing.
+- The chip is small and already carries a PR state colour and a checks glyph. A third independent
+  signal will not fit as a third glyph. Prefer letting mergeability change what the existing chip
+  says — checks passing but not mergeable is not "green" — and put the reason in the hover card,
+  next to the failing check names, where there is room for a sentence.
+
+Keep persisted snapshots working: `ThreadPrSnapshot` must stay readable when the new fields are
+absent, the way the check-name fields were added with `#[serde(default)]`.
+
 **PR chips go stale, and a push should be a reason to look again.**
 The chips lag reality often enough to be untrusted. There is already a 60-second poll over every
 watched branch (`POLL_INTERVAL`, `crates/gh_status/src/gh_status.rs:12`), so a minute of lag is the
