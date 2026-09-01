@@ -859,6 +859,30 @@ does is removed as it lands.
 
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
+
+**One chip for a whole run of looking around, whatever kind it is.**
+Reading, searching, checking git and reading diffs are all the same thing from the reader's side:
+the agent looking before it acts. They should collapse into one chip together, not a chip per kind
+and not a run broken in two by an unrelated quiet call.
+
+Most of this exists. `pending_low_value` accumulates every call whose `low_value_class` is `Some`
+(`crates/agent_ui/src/conversation_view/thread_view/chips.rs:558`), and the collapsed chip counts
+them by class into one label, so `Read`, `Search`, `ReadDiff` and `GitInfo` already share a chip
+(`:1433`). What to work out is why runs still break in use, and the candidates are all in the same
+function:
+
+- A call whose command classifies as `Other` is not quiet, so it splits the run. Anything ordinary
+  that looks around but is not recognised — `gh pr view`, `git log`, a `jq` over a file — ends a run
+  and starts another. Widening what counts as looking is most of this item.
+- A call reporting changed files is excluded deliberately (`sed -n` folds away, `sed -i` does not),
+  which is right, but that detection has been wrong before: a read-only command credited with a file
+  it did not write splits a run for no reason the reader can see.
+- A tool call carrying an image flushes the run before it (`:550`). That one is deliberate and
+  should stay.
+
+Take a real thread and find which of these actually splits runs before changing anything, then widen
+the classification rather than special-casing the symptom. The label already handles the mixed case
+("read 3 files, searched 2 places, checked git twice"), so nothing new is needed there.
 **A red test: the sidebar property test leaks a ThreadStore handle at teardown.**
 `sidebar_tests::property_test::test_sidebar_invariants` fails on gpui's leaked-handle assertion
 ("Leaked handle for entity `agent::thread_store::ThreadStore`"), with a minimal failing input of one
