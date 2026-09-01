@@ -86,11 +86,12 @@ jobs:
           sudo rm -rf ~/Library/Developer/CoreSimulator/Caches || true
           df -h / | tail -1
 
-      - if: steps.freshness.outputs.build == 'true'
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: quiet-ui
-          workspaces: ". -> target"
+      # No build cache. Restoring one was killing the runner outright: two runs
+      # on 2026-09-01 died six minutes in with no failed step and no logs, and
+      # a cache big enough to hold a release build of this workspace does not
+      # fit alongside the build that reads it. A cold build takes longer than a
+      # warm one and finishes, which is the trade that matters for a nightly
+      # nobody is watching.
 
       - name: Bundle
         if: steps.freshness.outputs.build == 'true'
