@@ -860,6 +860,29 @@ does is removed as it lands.
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**PR chips go stale, and a push should be a reason to look again.**
+The chips lag reality often enough to be untrusted. There is already a 60-second poll over every
+watched branch (`POLL_INTERVAL`, `crates/gh_status/src/gh_status.rs:12`), so a minute of lag is the
+most the design allows — which means what is being seen is refreshes not happening at all, and the
+interval is not the thing to change first.
+
+Start with the way a branch stops refreshing entirely. `refresh_branch` returns early while
+`refresh_task.is_some()` (`:189`), and the task clears only when `finish_refresh` runs. `fetch_prs`
+shells out to `gh` with no timeout and no kill, so one invocation that hangs — a network that goes
+away mid-call, an auth prompt, a proxy that never answers — wedges that branch's chip for the life
+of the process, quietly, while every other branch keeps updating. Give the command a timeout, treat
+the timeout as a failed refresh, and let the next poll try again.
+
+Then the trigger being asked for: a push means the world changed, so ask again rather than waiting
+out the minute. The repository already emits events the sidebar listens to, and `refresh_now`
+(`:161`) is public and currently called by nothing outside this crate. Wire it to a push, and while
+there consider the other two cheap moments — the window regaining focus, and a thread finishing a
+turn — since both are exactly when someone looks at the chips.
+
+A pending run is worth polling harder than a settled one: checks that are in progress change within
+a minute or two and then stop changing for hours. If that is easy where the poll lives, do it; if it
+turns the loop into a state machine, leave it and say so.
+
 **One chip for a whole run of looking around, whatever kind it is.**
 Reading, searching, checking git and reading diffs are all the same thing from the reader's side:
 the agent looking before it acts. They should collapse into one chip together, not a chip per kind
