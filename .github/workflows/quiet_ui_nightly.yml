@@ -67,16 +67,12 @@ jobs:
         with:
           node-version: "24"
 
-      - if: steps.freshness.outputs.build == 'true'
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: quiet-ui
-          workspaces: ". -> target"
-
-      # A release build of the whole workspace, plus the restored cache, fills
-      # this runner: the 2026-08-25 build died with ENOSPC part way through
-      # `project`, after two hours of compiling. None of what this removes is
-      # used to bundle a macOS Zed, and the active Xcode is left alone.
+      # Runs BEFORE the cache is restored, because restoring it is what runs out
+      # of room: on 2026-09-01 two runs died six minutes in with no failed step
+      # and no logs, which is a lost runner, not a build error. A release build
+      # of the whole workspace plus the restored target directory does not fit
+      # otherwise. None of what this removes is used to bundle a macOS Zed, and
+      # the active Xcode is left alone.
       - name: Make room on the runner
         if: steps.freshness.outputs.build == 'true'
         run: |
@@ -89,6 +85,12 @@ jobs:
           sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* || true
           sudo rm -rf ~/Library/Developer/CoreSimulator/Caches || true
           df -h / | tail -1
+
+      - if: steps.freshness.outputs.build == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: quiet-ui
+          workspaces: ". -> target"
 
       - name: Bundle
         if: steps.freshness.outputs.build == 'true'
