@@ -176,7 +176,10 @@ impl RenderOnce for SandboxStatusTooltip {
                 .gap_1()
                 .child(div().opacity(0.5).child(settings.render(cx)))
                 .child(Divider::horizontal())
-                .child(Label::new("Sandboxing is disabled for this thread").size(LabelSize::Small))
+                .child(
+                    Label::new("Sandboxing is disabled for this conversation")
+                        .size(LabelSize::Small),
+                )
                 .into_any_element(),
             SandboxStatusTooltip::Enabled { settings, thread } => v_flex()
                 .gap_2()

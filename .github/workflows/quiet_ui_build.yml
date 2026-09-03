@@ -1,0 +1,52 @@
+# Builds the quiet-ui fork into a runnable macOS app, so the laptop does not
+# have to. Dispatch only: the nightly rebase routine triggers it after pushing,
+# which gives one build a night off the freshly rebased branch, and anyone can
+# ask for one by hand. It deliberately does not build on push, because most
+# pushes are small fixes that do not need two hours of a runner.
+#
+# A `schedule:` here would never fire: GitHub runs scheduled workflows only from
+# a repository's default branch, and this lives on quiet-ui.
+name: quiet-ui build
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: quiet-ui-build
+  # Queue rather than cancel. A build costs over two hours, so a second request
+  # should wait its turn instead of throwing away the first one's work.
+  cancel-in-progress: false
+
+jobs:
+  bundle-mac:
+    # GitHub's own Apple silicon runner: free for public repositories, and the
+    # same architecture as the machine that runs the result.
+    runs-on: macos-15
+    timeout-minutes: 300
+    env:
+      CARGO_INCREMENTAL: 0
+      # No Apple secrets on this fork, so `script/bundle-mac` builds unsigned.
+      # First launch needs a right-click Open, or the quarantine bit stripped.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      # Zed's target directory dwarfs the 10GB cache limit, so this keeps the
+      # registry and whatever dependencies fit rather than the whole build.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: quiet-ui
+
+      # Installs its own cargo-bundle, generates licenses, adds the target.
+      - name: Bundle
+        run: ./script/bundle-mac aarch64-apple-darwin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Zed-quiet-ui-aarch64
+          path: target/aarch64-apple-darwin/release/Zed-aarch64.dmg
+          if-no-files-found: error
+          retention-days: 7

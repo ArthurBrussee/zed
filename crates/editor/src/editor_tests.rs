@@ -42592,10 +42592,57 @@ async fn test_diff_review_button_shown_when_ai_enabled(cx: &mut TestAppContext) 
     });
 
     // The show_diff_review_button flag should be true
-    editor.update(cx, |editor, _cx| {
+    editor.update(cx, |editor, cx| {
         assert!(
-            editor.show_diff_review_button(),
+            editor.show_diff_review_button(cx),
             "show_diff_review_button should be true"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_diff_review_button_auto_enabled_on_plain_editor(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/root"), json!({ "file.txt": "hello\nworld\n" }))
+        .await;
+
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let cx = &mut VisualTestContext::from_window(*window, cx);
+
+    // A plain project file editor: never a diff, never explicitly enabled.
+    let editor = workspace
+        .update_in(cx, |workspace, window, cx| {
+            workspace.open_abs_path(
+                PathBuf::from(path!("/root/file.txt")),
+                OpenOptions::default(),
+                window,
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .downcast::<Editor>()
+        .unwrap();
+
+    editor.update(cx, |editor, cx| {
+        assert!(
+            editor.show_diff_review_button(cx),
+            "a plain project file editor auto-enables the review affordance"
+        );
+    });
+
+    // A mini editor (auto-height, no project file) does not.
+    let mini = cx.new_window_entity(|window, cx| Editor::auto_height(1, 4, window, cx));
+    mini.update(cx, |editor, cx| {
+        assert!(
+            !editor.show_diff_review_button(cx),
+            "auto-height mini editors do not get the review affordance"
         );
     });
 }

@@ -1,7 +1,7 @@
 use crate::{CommonAnimationExt, DiffStat, GradientFade, HighlightedLabel, Tooltip, prelude::*};
 
 use gpui::{
-    Animation, AnimationExt, ClickEvent, Hsla, MouseButton, SharedString,
+    Animation, AnimationExt, ClickEvent, FontWeight, Hsla, MouseButton, SharedString,
     WindowBackgroundAppearance, pulsating_between,
 };
 use itertools::Itertools as _;
@@ -14,6 +14,16 @@ pub enum AgentThreadStatus {
     Running,
     WaitingForConfirmation,
     Error,
+}
+
+/// The one "agent running" glyph: sidebar rows, thread tabs, and the thread
+/// view's generating indicator all render this same rotating accent spinner.
+pub fn agent_running_indicator() -> AnyElement {
+    Icon::new(IconName::LoadCircle)
+        .size(IconSize::Small)
+        .color(Color::Accent)
+        .with_rotate_animation(2)
+        .into_any_element()
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -32,6 +42,271 @@ pub struct ThreadItemWorktreeInfo {
     pub kind: WorktreeKind,
 }
 
+/// A prominent, clickable pull-request badge rendered in the row's metadata
+/// line: a pill with the PR number, a state icon/color (open, draft, merged,
+/// closed) and an optional CI/checks glyph (passing, failing, pending).
+/// Clicking it opens `url` when one is set; badges without a URL (e.g. the
+/// "no PR" indicator) are inert and rendered muted.
+#[derive(Clone)]
+pub struct ThreadItemPrChip {
+    pub label: SharedString,
+    pub state_icon: IconName,
+    pub state_color: Color,
+    pub checks: Option<(IconName, Color)>,
+    pub url: Option<SharedString>,
+    pub tooltip: SharedString,
+    /// The badge's hover card. Without it the badge falls back to the plain
+    /// `tooltip` text (the inert "no PR" pill has nothing to detail).
+    pub detail: Option<PrChipDetail>,
+}
+
+/// What a PR badge shows on hover: the pull request's title and number, its
+/// state, its checks, and its review state.
+#[derive(Clone)]
+pub struct PrChipDetail {
+    pub title: SharedString,
+    pub number: u64,
+    pub state: SharedString,
+    pub state_color: Color,
+    pub checks: SharedString,
+    pub checks_icon: Option<(IconName, Color)>,
+    pub review: SharedString,
+    /// The names of failing checks the card should list under the "checks
+    /// failing" line, most useful ones first. Empty when the PR is passing or
+    /// when the check data carried no names; capped by the producer so the
+    /// card cannot grow without bound.
+    pub failing_checks: Vec<SharedString>,
+    /// How many failing checks the card is not listing. Zero when everything
+    /// failing is listed; used to draw an "and N more" line below.
+    pub extra_failing_checks: usize,
+    /// Why GitHub will not merge this pull request, when it will not: behind
+    /// its base, conflicting with it, or held by branch protection. `None`
+    /// when it can merge, and when mergeability is not yet known. Drawn on its
+    /// own line, since the state/checks/review row has no room for a sentence.
+    pub merge_blocker: Option<SharedString>,
+}
+
+/// The renderable pill for a [`ThreadItemPrChip`], shared by the sidebar rows
+/// and the agent input status bar so both read as the same badge.
+#[derive(IntoElement)]
+pub struct PrChip {
+    id: ElementId,
+    chip: ThreadItemPrChip,
+    large: bool,
+    surface: Option<Hsla>,
+}
+
+impl PrChip {
+    pub fn new(id: impl Into<ElementId>, chip: ThreadItemPrChip) -> Self {
+        Self {
+            id: id.into(),
+            chip,
+            large: false,
+            surface: None,
+        }
+    }
+
+    /// A larger label for surfaces with more space than a sidebar row (the
+    /// agent input status bar).
+    pub fn large(mut self, large: bool) -> Self {
+        self.large = large;
+        self
+    }
+
+    /// The opaque colour the pill sits on. A fill is composited over it so the
+    /// pill covers what it overlaps whatever alpha the theme's element colours
+    /// carry. Defaults to the panel background, which is where every one of
+    /// these is drawn.
+    pub fn surface(mut self, surface: Hsla) -> Self {
+        self.surface = Some(surface);
+        self
+    }
+}
+
+impl RenderOnce for PrChip {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let chip = self.chip;
+        let clickable = chip.url.is_some();
+        // Both fills are composited over the surface the pill sits on. A fill
+        // that keeps any alpha of its own lets a long title read straight
+        // through the pill, and `element_background` is a theme colour: the
+        // default themes make it opaque, a user's theme need not.
+        let surface = self.surface.unwrap_or_else(|| cx.theme().colors().panel_background);
+        // A real PR badge is filled and bordered so it reads as a control; the
+        // inert "no PR" pill keeps the same geometry (so a row does not change
+        // shape when a PR lands) and a quieter fill. Quiet is a muted fill, not
+        // no fill.
+        let (label_color, label_weight, border_color, fill) = if clickable {
+            (
+                Color::Default,
+                FontWeight::MEDIUM,
+                cx.theme().colors().border,
+                cx.theme().colors().element_background,
+            )
+        } else {
+            (
+                Color::Muted,
+                FontWeight::NORMAL,
+                cx.theme().colors().border.opacity(0.5),
+                cx.theme().colors().element_background.opacity(0.5),
+            )
+        };
+        let background = surface.blend(fill);
+        let label_size = if self.large {
+            LabelSize::Default
+        } else {
+            LabelSize::Small
+        };
+
+        h_flex()
+            .id(self.id)
+            .min_w_0()
+            .flex_shrink_0()
+            .h(rems_from_px(24_f32))
+            .px_1p5()
+            .gap_1()
+            .rounded_md()
+            .border_1()
+            .border_color(border_color)
+            .bg(background)
+            .when(clickable, |this| {
+                this.hover(|s| s.bg(cx.theme().colors().element_hover))
+            })
+            .child(
+                Icon::new(chip.state_icon)
+                    .size(IconSize::Small)
+                    .color(chip.state_color),
+            )
+            .child(
+                Label::new(chip.label)
+                    .size(label_size)
+                    .weight(label_weight)
+                    .color(label_color),
+            )
+            .when_some(chip.checks, |this, (icon, color)| {
+                this.child(Icon::new(icon).size(IconSize::Small).color(color))
+            })
+            .map(|this| match chip.detail {
+                Some(detail) => this.tooltip(Tooltip::element(move |_, _| {
+                    let detail = detail.clone();
+                    v_flex()
+                        .gap_1()
+                        .w_96()
+                        .child(
+                            // The title wraps within the card; the number stays
+                            // pinned beside it rather than pushing it wider.
+                            h_flex()
+                                .w_full()
+                                .min_w_0()
+                                .gap_1()
+                                .items_start()
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .child(Label::new(detail.title)),
+                                )
+                                .child(
+                                    Label::new(format!("#{}", detail.number))
+                                        .color(Color::Muted),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_1p5()
+                                .child(
+                                    h_flex()
+                                        .gap_0p5()
+                                        .child(
+                                            Icon::new(IconName::PullRequest)
+                                                .size(IconSize::XSmall)
+                                                .color(detail.state_color),
+                                        )
+                                        .child(
+                                            Label::new(detail.state)
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
+                                        ),
+                                )
+                                .when(!detail.checks.is_empty(), |this| {
+                                    this.child(
+                                        h_flex()
+                                            .gap_0p5()
+                                            .when_some(detail.checks_icon, |this, (icon, color)| {
+                                                this.child(
+                                                    Icon::new(icon)
+                                                        .size(IconSize::XSmall)
+                                                        .color(color),
+                                                )
+                                            })
+                                            .child(
+                                                Label::new(detail.checks)
+                                                    .size(LabelSize::Small)
+                                                    .color(Color::Muted),
+                                            ),
+                                    )
+                                })
+                                .child(
+                                    Label::new(detail.review)
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                ),
+                        )
+                        // Green checks and an unmergeable PR look identical on
+                        // the pill; this is where the difference gets said.
+                        .when_some(detail.merge_blocker, |this, reason| {
+                            this.child(
+                                h_flex()
+                                    .gap_0p5()
+                                    .child(
+                                        Icon::new(IconName::Warning)
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Warning),
+                                    )
+                                    .child(
+                                        Label::new(reason)
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
+                                    ),
+                            )
+                        })
+                        // Names the failing checks, so the card answers the
+                        // question a reader would open a browser to answer.
+                        .when(!detail.failing_checks.is_empty(), |this| {
+                            let extra = detail.extra_failing_checks;
+                            this.child(
+                                v_flex()
+                                    .gap_0p5()
+                                    .children(detail.failing_checks.into_iter().map(|name| {
+                                        Label::new(name)
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted)
+                                            .truncate()
+                                    }))
+                                    .when(extra > 0, |this| {
+                                        this.child(
+                                            Label::new(format!("and {extra} more"))
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
+                                        )
+                                    }),
+                            )
+                        })
+                        .into_any_element()
+                })),
+                None => this.tooltip(Tooltip::text(chip.tooltip)),
+            })
+            .when_some(chip.url, |this, url| {
+                this.cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        cx.open_url(&url);
+                    })
+            })
+    }
+}
+
 #[derive(IntoElement, RegisterComponent)]
 pub struct ThreadItem {
     id: ElementId,
@@ -46,6 +321,9 @@ pub struct ThreadItem {
     title_generating: bool,
     highlight_positions: Vec<usize>,
     timestamp: SharedString,
+    /// The disk this row's worktree occupies, when it is worth saying. Empty
+    /// for a row that is not a worktree of its own, or whose worktree is small.
+    size: SharedString,
     notified: bool,
     status: AgentThreadStatus,
     selected: bool,
@@ -58,6 +336,7 @@ pub struct ThreadItem {
     project_paths: Option<Arc<[PathBuf]>>,
     project_name: Option<SharedString>,
     worktrees: Vec<ThreadItemWorktreeInfo>,
+    pr_chips: Vec<ThreadItemPrChip>,
     is_remote: bool,
     archived: bool,
     on_click: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
@@ -81,6 +360,7 @@ impl ThreadItem {
             title_generating: false,
             highlight_positions: Vec::new(),
             timestamp: "".into(),
+            size: "".into(),
             notified: false,
             status: AgentThreadStatus::default(),
             selected: false,
@@ -93,6 +373,7 @@ impl ThreadItem {
             project_paths: None,
             project_name: None,
             worktrees: Vec::new(),
+            pr_chips: Vec::new(),
             is_remote: false,
             archived: false,
             on_click: None,
@@ -100,6 +381,11 @@ impl ThreadItem {
             action_slot: None,
             base_bg: None,
         }
+    }
+
+    pub fn size(mut self, size: impl Into<SharedString>) -> Self {
+        self.size = size.into();
+        self
     }
 
     pub fn timestamp(mut self, timestamp: impl Into<SharedString>) -> Self {
@@ -196,6 +482,11 @@ impl ThreadItem {
 
     pub fn worktrees(mut self, worktrees: Vec<ThreadItemWorktreeInfo>) -> Self {
         self.worktrees = worktrees;
+        self
+    }
+
+    pub fn pr_chips(mut self, pr_chips: Vec<ThreadItemPrChip>) -> Self {
+        self.pr_chips = pr_chips;
         self
     }
 
@@ -298,7 +589,15 @@ impl RenderOnce for ThreadItem {
                 .when(!icon_visible, |this| this.invisible())
         };
         let icon_color = self.icon_color.unwrap_or(Color::Muted);
-        let agent_icon = if let Some(icon_char) = self.icon_char {
+        // An archived thread wears the archive glyph in place of its agent
+        // logo: the row is otherwise identical to a live one, and this is the
+        // only thing that marks the state.
+        let agent_icon = if self.archived {
+            Icon::new(IconName::Archive)
+                .color(icon_color)
+                .size(IconSize::Small)
+                .into_any_element()
+        } else if let Some(icon_char) = self.icon_char {
             Label::new(icon_char)
                 .size(LabelSize::Small)
                 .color(icon_color)
@@ -315,45 +614,50 @@ impl RenderOnce for ThreadItem {
                 .into_any_element()
         };
 
-        let status_icon = if self.status == AgentThreadStatus::Error {
+        // Read-state glyph: nothing when read, a dot when updated since last
+        // viewed, a stronger amber dot when the thread needs action
+        // (confirmation, elicitation, or error; the tooltip disambiguates).
+        let status_icon = if matches!(
+            self.status,
+            AgentThreadStatus::Error | AgentThreadStatus::WaitingForConfirmation
+        ) {
             Some(
-                Icon::new(IconName::Close)
+                Icon::new(IconName::Circle)
                     .size(IconSize::Small)
-                    .color(Color::Error),
-            )
-        } else if self.status == AgentThreadStatus::WaitingForConfirmation {
-            Some(
-                Icon::new(IconName::Warning)
-                    .size(IconSize::XSmall)
                     .color(Color::Warning),
             )
         } else if self.notified {
             Some(
                 Icon::new(IconName::Circle)
-                    .size(IconSize::Small)
+                    .size(IconSize::XSmall)
                     .color(Color::Accent),
             )
         } else {
             None
         };
 
-        let icon = if self.status == AgentThreadStatus::Running {
-            icon_container()
-                .child(
-                    Icon::new(IconName::LoadCircle)
-                        .size(IconSize::Small)
-                        .color(Color::Muted)
-                        .with_rotate_animation(2),
-                )
-                .into_any_element()
-        } else if let Some(status_icon) = status_icon {
-            icon_container().child(status_icon).into_any_element()
+        // The agent glyph keeps the leading slot. Which model is working is
+        // worth seeing while it works, and the status used to sit on top of it.
+        let icon = icon_container().child(agent_icon).into_any_element();
+
+        // ...so the status goes to the right end of the title row instead. The
+        // slot is always drawn, empty or not, so the row does not change shape
+        // when a thread starts or stops.
+        let status_indicator = if self.status == AgentThreadStatus::Running {
+            Some(agent_running_indicator().into_any_element())
         } else {
-            icon_container().child(agent_icon).into_any_element()
+            status_icon.map(|icon| icon.into_any_element())
         };
+        let status_slot = h_flex()
+            .id(SharedString::from(format!("status-{}", self.id)))
+            .size_4()
+            .flex_none()
+            .justify_center()
+            .children(status_indicator);
 
         let title = self.title;
         let highlight_positions = self.highlight_positions;
+        let title_label_color = self.title_label_color;
 
         let title_label = if let Some(title_slot) = self.title_slot {
             title_slot
@@ -370,12 +674,12 @@ impl RenderOnce for ThreadItem {
                 .into_any_element()
         } else if highlight_positions.is_empty() {
             Label::new(title)
-                .when_some(self.title_label_color, |label, color| label.color(color))
+                .when_some(title_label_color, |label, color| label.color(color))
                 .when(!opaque_window, |label| label.truncate())
                 .into_any_element()
         } else {
             HighlightedLabel::new(title, highlight_positions)
-                .when_some(self.title_label_color, |label, color| label.color(color))
+                .when_some(title_label_color, |label, color| label.color(color))
                 .when(!opaque_window, |label| label.truncate())
                 .into_any_element()
         };
@@ -403,6 +707,8 @@ impl RenderOnce for ThreadItem {
         let has_project_paths = project_paths.is_some();
         let has_timestamp = !self.timestamp.is_empty();
         let timestamp = self.timestamp;
+        let has_size = !self.size.is_empty();
+        let size = self.size;
 
         let show_tooltip = matches!(
             self.status,
@@ -413,15 +719,20 @@ impl RenderOnce for ThreadItem {
             .worktrees
             .into_iter()
             .filter(|wt| wt.kind == WorktreeKind::Linked)
-            .filter(|wt| wt.worktree_name.is_some() || wt.branch_name.is_some())
+            .filter(|wt| wt.worktree_name.is_some())
             .collect();
 
         let has_worktree = !linked_worktrees.is_empty();
 
+        let pr_chips = self.pr_chips;
+        let has_pr_chips = !pr_chips.is_empty();
+
         let has_metadata = has_project_name
             || has_project_paths
             || has_worktree
+            || has_pr_chips
             || has_diff_stats
+            || has_size
             || has_timestamp;
 
         v_flex()
@@ -460,27 +771,32 @@ impl RenderOnce for ThreadItem {
                     .when(self.is_truncated && opaque_window, |this| {
                         this.child(gradient_overlay)
                     })
-                    .when(self.hovered, |this| {
-                        this.when_some(self.action_slot, |this, slot| {
-                            this.child(
-                                h_flex()
-                                    .relative()
-                                    .pr_1p5()
-                                    .when(opaque_window, |this| {
-                                        this.child(
-                                            GradientFade::new(base_bg, hover_bg, hover_bg)
-                                                .width(px(120.0))
-                                                .right(px(8.))
-                                                .gradient_stop(0.90)
-                                                .group_name("thread-item"),
-                                        )
-                                    })
-                                    .child(slot)
-                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                        cx.stop_propagation()
-                                    }),
-                            )
-                        })
+                    .child(status_slot)
+                    // The slot holds the row's buttons, hover-gated by whoever
+                    // fills it. The PR chips are not in here: the title row
+                    // cannot hold several of anything, and a row can carry
+                    // several chips, so they get the metadata line below where
+                    // there is always room. The fade keeps a long title
+                    // dissolving under the buttons instead of colliding.
+                    .when_some(self.action_slot, |this, slot| {
+                        this.child(
+                            h_flex()
+                                .relative()
+                                .pr_1p5()
+                                .when(opaque_window, |this| {
+                                    this.child(
+                                        GradientFade::new(base_bg, hover_bg, hover_bg)
+                                            .width(px(120.0))
+                                            .right(px(8.))
+                                            .gradient_stop(0.90)
+                                            .group_name("thread-item"),
+                                    )
+                                })
+                                .child(slot)
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation()
+                                }),
+                        )
                     }),
             )
             .when(has_metadata, |this| {
@@ -488,13 +804,6 @@ impl RenderOnce for ThreadItem {
                     h_flex()
                         .gap_1p5()
                         .child(icon_container()) // Icon Spacing
-                        .when(self.archived, |this| {
-                            this.child(
-                                Icon::new(IconName::Archive).size(IconSize::XSmall).color(
-                                    Color::Custom(cx.theme().colors().icon_muted.opacity(0.5)),
-                                ),
-                            )
-                        })
                         .when(
                             has_project_name || has_project_paths || has_worktree,
                             |this| {
@@ -519,7 +828,7 @@ impl RenderOnce for ThreadItem {
                                 })
                                 .children(
                                     linked_worktrees.into_iter().map(|wt| {
-                                        let worktree_label = wt.worktree_name.clone().map(|name| {
+                                        let worktree_label = wt.worktree_name.map(|name| {
                                             if wt.highlight_positions.is_empty() {
                                                 Label::new(name)
                                                     .size(LabelSize::Small)
@@ -538,63 +847,52 @@ impl RenderOnce for ThreadItem {
                                             }
                                         });
 
-                                        // When only the branch is shown, lead with a branch icon;
-                                        // otherwise keep the worktree icon (which "covers" both the
-                                        // worktree and any accompanying branch).
-                                        let chip_icon = if wt.worktree_name.is_none()
-                                            && wt.branch_name.is_some()
-                                        {
-                                            IconName::GitBranch
-                                        } else {
-                                            IconName::GitWorktree
-                                        };
-
-                                        let branch_label = wt.branch_name.map(|branch| {
-                                            Label::new(branch)
-                                                .size(LabelSize::Small)
-                                                .color(Color::Muted)
-                                                .truncate()
-                                                .into_any_element()
-                                        });
-
-                                        let show_separator =
-                                            worktree_label.is_some() && branch_label.is_some();
-
                                         h_flex()
                                             .min_w_0()
                                             .gap_0p5()
                                             .child(
-                                                Icon::new(chip_icon)
+                                                Icon::new(IconName::GitWorktree)
                                                     .size(IconSize::XSmall)
                                                     .color(Color::Muted),
                                             )
                                             .when_some(worktree_label, |this, label| {
                                                 this.child(label)
                                             })
-                                            .when(show_separator, |this| {
-                                                this.child(
-                                                    Label::new("/")
-                                                        .size(LabelSize::Small)
-                                                        .color(separator_color)
-                                                        .flex_shrink_0(),
-                                                )
-                                            })
-                                            .when_some(branch_label, |this, label| {
-                                                this.child(label)
-                                            })
                                     }),
                                 )
                             },
                         )
+                        .when(has_pr_chips, |this| {
+                            this.when(
+                                has_project_name || has_project_paths || has_worktree,
+                                |this| this.child(dot_separator()),
+                            )
+                            .children(pr_chips.into_iter().enumerate().map(|(chip_ix, chip)| {
+                                PrChip::new(("pr-chip", chip_ix), chip).surface(base_bg)
+                            }))
+                        })
                         .when(
-                            (has_project_name || has_project_paths || has_worktree)
-                                && (has_diff_stats || has_timestamp),
+                            (has_project_name || has_project_paths || has_worktree || has_pr_chips)
+                                && (has_diff_stats || has_size || has_timestamp),
                             |this| this.child(dot_separator()),
                         )
                         .when(has_diff_stats, |this| {
                             this.child(DiffStat::new(diff_stat_id, added_count, removed_count))
                         })
-                        .when(has_diff_stats && has_timestamp, |this| {
+                        .when(has_diff_stats && (has_size || has_timestamp), |this| {
+                            this.child(dot_separator())
+                        })
+                        // What the worktree costs to keep, next to how old it
+                        // is: a row that stands in for its own worktree has no
+                        // header to carry this.
+                        .when(has_size, |this| {
+                            this.child(
+                                Label::new(size.clone())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                        })
+                        .when(has_size && has_timestamp, |this| {
                             this.child(dot_separator())
                         })
                         .when(has_timestamp, |this| {
@@ -616,7 +914,7 @@ impl RenderOnce for ThreadItem {
                                 .size(IconSize::Small)
                                 .color(Color::Error),
                         )
-                        .child(Label::new("Thread has an Error"))
+                        .child(Label::new("Agent Hit an Error"))
                         .into_any_element(),
                     AgentThreadStatus::WaitingForConfirmation => h_flex()
                         .gap_1()
@@ -641,7 +939,7 @@ impl Component for ThreadItem {
 
     fn description() -> &'static str {
         "A row representing an agent thread in a list, showing its title, status, \
-        timestamp, and contextual metadata such as worktree and branch information."
+        timestamp, and contextual metadata such as worktree and pull request information."
     }
 
     fn preview(_window: &mut Window, cx: &mut App) -> AnyElement {
@@ -949,6 +1247,65 @@ impl Component for ThreadItem {
                             .added(15)
                             .removed(4)
                             .timestamp("8h"),
+                    )
+                    .into_any_element(),
+            ),
+            single_example(
+                "PR Chips",
+                container()
+                    .child(
+                        ThreadItem::new("ti-5m", "Thread with pull request status")
+                            .icon(IconName::AiClaude)
+                            .worktrees(vec![ThreadItemWorktreeInfo {
+                                worktree_name: Some("jade-glen".into()),
+                                full_path: "/worktrees/jade-glen/zed".into(),
+                                highlight_positions: Vec::new(),
+                                kind: WorktreeKind::Linked,
+                                branch_name: Some("fix-scrolling".into()),
+                            }])
+                            .pr_chips(vec![
+                                ThreadItemPrChip {
+                                    label: "#10461".into(),
+                                    state_icon: IconName::PullRequest,
+                                    state_color: Color::Success,
+                                    checks: Some((IconName::Check, Color::Success)),
+                                    url: Some("https://example.com/pull/10461".into()),
+                                    tooltip: "Fix things (checks passing)".into(),
+                                    detail: Some(PrChipDetail {
+                                        title: "Fix things".into(),
+                                        number: 10461,
+                                        state: "open".into(),
+                                        state_color: Color::Success,
+                                        checks: "checks passing".into(),
+                                        checks_icon: Some((IconName::Check, Color::Success)),
+                                        review: "approved".into(),
+                                        failing_checks: Vec::new(),
+                                        extra_failing_checks: 0,
+                                        merge_blocker: None,
+                                    }),
+                                },
+                                ThreadItemPrChip {
+                                    label: "#10502".into(),
+                                    state_icon: IconName::PullRequest,
+                                    state_color: Color::Muted,
+                                    checks: Some((IconName::ArrowCircle, Color::Warning)),
+                                    url: Some("https://example.com/pull/10502".into()),
+                                    tooltip: "Follow-up (checks pending)".into(),
+                                    detail: Some(PrChipDetail {
+                                        title: "Follow-up".into(),
+                                        number: 10502,
+                                        state: "draft".into(),
+                                        state_color: Color::Muted,
+                                        checks: "checks pending".into(),
+                                        checks_icon: Some((IconName::ArrowCircle, Color::Warning)),
+                                        review: "review required".into(),
+                                        failing_checks: Vec::new(),
+                                        extra_failing_checks: 0,
+                                        merge_blocker: Some("behind base branch".into()),
+                                    }),
+                                },
+                            ])
+                            .timestamp("2h"),
                     )
                     .into_any_element(),
             ),

@@ -2470,37 +2470,76 @@ impl Workspace {
     pub fn persisted_panel_size_state(
         &self,
         panel_key: &'static str,
+        is_global: bool,
         cx: &App,
     ) -> Option<dock::PanelSizeState> {
-        dock::Dock::load_persisted_size_state(self, panel_key, cx)
+        dock::Dock::load_persisted_size_state(self, panel_key, is_global, cx)
     }
 
     pub fn persist_panel_size_state(
         &self,
         panel_key: &str,
+        is_global: bool,
         size_state: dock::PanelSizeState,
         cx: &mut App,
     ) {
-        let Some(workspace_id) = self
-            .database_id()
-            .map(|id| i64::from(id).to_string())
-            .or(self.session_id())
-        else {
+        let Some(scope_key) = dock::Dock::panel_size_scope_key(self, panel_key, is_global) else {
             return;
         };
 
+        if is_global {
+            self.share_global_panel_size(panel_key, size_state, cx);
+        }
+
         let kvp = db::kvp::KeyValueStore::global(cx);
-        let panel_key = panel_key.to_string();
         cx.background_spawn(async move {
             let scope = kvp.scoped(dock::PANEL_SIZE_STATE_KEY);
             scope
-                .write(
-                    format!("{workspace_id}:{panel_key}"),
-                    serde_json::to_string(&size_state)?,
-                )
+                .write(scope_key, serde_json::to_string(&size_state)?)
                 .await
         })
         .detach_and_log_err(cx);
+    }
+
+    /// Hands a globally-sized panel's new size to every other open workspace.
+    /// The stored value is only read when a panel is added, which happens once
+    /// as a window is built, so without this a resize reaches the workspaces
+    /// opened afterwards and none of the ones already on screen — which is
+    /// every worktree the user is actually switching between.
+    fn share_global_panel_size(
+        &self,
+        panel_key: &str,
+        size_state: dock::PanelSizeState,
+        cx: &mut App,
+    ) {
+        let others: Vec<WeakEntity<Workspace>> = self
+            .app_state
+            .workspace_store
+            .read(cx)
+            .workspaces
+            .iter()
+            .map(|(_, workspace)| workspace.clone())
+            // The workspace being resized already has the size, and pushing it
+            // back mid-drag would fight the drag.
+            .filter(|workspace| workspace != &self.weak_self)
+            .collect();
+
+        for workspace in others {
+            let Some(workspace) = workspace.upgrade() else {
+                continue;
+            };
+            workspace.update(cx, |workspace, cx| {
+                for dock in [
+                    workspace.left_dock.clone(),
+                    workspace.bottom_dock.clone(),
+                    workspace.right_dock.clone(),
+                ] {
+                    dock.update(cx, |dock, cx| {
+                        dock.set_size_state_for_panel_key(panel_key, size_state, cx)
+                    });
+                }
+            });
+        }
     }
 
     pub fn set_panel_size_state<T: Panel>(
@@ -2519,7 +2558,7 @@ impl Workspace {
         });
 
         if did_set {
-            self.persist_panel_size_state(T::panel_key(), size_state, cx);
+            self.persist_panel_size_state(T::panel_key(), T::size_is_global(), size_state, cx);
         }
 
         did_set
@@ -2665,18 +2704,23 @@ impl Workspace {
         let dock_position = panel.position(window, cx);
         let dock = self.dock_at_position(dock_position);
         let any_panel = panel.to_any();
-        let persisted_size_state =
-            self.persisted_panel_size_state(T::panel_key(), cx)
-                .or_else(|| {
-                    load_legacy_panel_size(T::panel_key(), dock_position, self, cx).map(|size| {
-                        let state = dock::PanelSizeState {
-                            size: Some(size),
-                            flex: None,
-                        };
-                        self.persist_panel_size_state(T::panel_key(), state, cx);
-                        state
-                    })
-                });
+        let persisted_size_state = self
+            .persisted_panel_size_state(T::panel_key(), T::size_is_global(), cx)
+            .or_else(|| {
+                load_legacy_panel_size(T::panel_key(), dock_position, self, cx).map(|size| {
+                    let state = dock::PanelSizeState {
+                        size: Some(size),
+                        flex: None,
+                    };
+                    self.persist_panel_size_state(
+                        T::panel_key(),
+                        T::size_is_global(),
+                        state,
+                        cx,
+                    );
+                    state
+                })
+            });
 
         dock.update(cx, |dock, cx| {
             let index = dock.add_panel(panel.clone(), self.weak_self.clone(), window, cx);
@@ -2710,6 +2754,17 @@ impl Workspace {
 
     pub fn status_bar_visible(&self, cx: &App) -> bool {
         StatusBarSettings::get_global(cx).show
+    }
+
+    /// The status bar, when it is showing. It is a child of the CENTER column
+    /// rather than a full-width row under the whole workspace: what it reports
+    /// — diagnostics, language servers, the active buffer — belongs to the
+    /// worktree, not to the window, and the docks beside the centre (the
+    /// threads sidebar, the agent panel) have none of it. They run to the
+    /// window bottom instead.
+    fn render_status_bar(&self, cx: &App) -> Option<AnyElement> {
+        self.status_bar_visible(cx)
+            .then(|| self.status_bar.clone().into_any_element())
     }
 
     pub fn multi_workspace(&self) -> Option<&WeakEntity<MultiWorkspace>> {
@@ -9512,7 +9567,8 @@ impl Render for Workspace {
                                                                         this.child(p.border_l_1())
                                                                     },
                                                                 ),
-                                                        ),
+                                                        )
+                                                        .children(self.render_status_bar(cx))
                                                 )
                                                 .children(self.render_dock(
                                                     DockPosition::Right,
@@ -9579,7 +9635,8 @@ impl Render for Workspace {
                                                                                 )
                                                                             },
                                                                         ),
-                                                                ),
+                                                                )
+                                                                .children(self.render_status_bar(cx))
                                                         ),
                                                 )
                                                 .child(div().w_full().children(self.render_dock(
@@ -9646,7 +9703,8 @@ impl Render for Workspace {
                                                                                 )
                                                                             },
                                                                         ),
-                                                                ),
+                                                                )
+                                                                .children(self.render_status_bar(cx))
                                                         )
                                                         .children(self.render_dock(
                                                             DockPosition::Right,
@@ -9698,7 +9756,8 @@ impl Render for Workspace {
                                                     &self.bottom_dock,
                                                     window,
                                                     cx,
-                                                )),
+                                                ))
+                                                .children(self.render_status_bar(cx))
                                         )
                                         .children(self.render_dock(
                                             DockPosition::Right,
@@ -9733,9 +9792,6 @@ impl Render for Workspace {
                             }))
                             .children(self.render_notifications(window, cx)),
                     )
-                    .when(self.status_bar_visible(cx), |parent| {
-                        parent.child(self.status_bar.clone())
-                    })
                     .child(self.toast_layer.clone()),
             )
     }
@@ -14993,6 +15049,127 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_a_global_panel_size_is_shared_across_workspaces(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let state = dock::PanelSizeState {
+            size: Some(px(420.)),
+            flex: None,
+        };
+
+        // One workspace writes a width. Every worktree of a project is its own
+        // workspace with its own id, so this is the one that gets resized.
+        {
+            let project = Project::test(fs.clone(), [], cx).await;
+            let (multi_workspace, cx) =
+                cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+            let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+            workspace.update(cx, |workspace, _cx| workspace.set_random_database_id());
+
+            workspace.update(cx, |workspace, cx| {
+                workspace.persist_panel_size_state(TestPanel::panel_key(), true, state, cx);
+                workspace.persist_panel_size_state(TestPanel::panel_key(), false, state, cx);
+            });
+            cx.run_until_parked();
+        }
+
+        // A different workspace reads it back. A global size is a preference
+        // and follows the user; a per-workspace one stays where it was set.
+        {
+            let project = Project::test(fs.clone(), [], cx).await;
+            let (multi_workspace, cx) =
+                cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+            let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+            workspace.update(cx, |workspace, _cx| workspace.set_random_database_id());
+
+            let (global, per_workspace) = workspace.read_with(cx, |workspace, cx| {
+                (
+                    workspace.persisted_panel_size_state(TestPanel::panel_key(), true, cx),
+                    workspace.persisted_panel_size_state(TestPanel::panel_key(), false, cx),
+                )
+            });
+            assert_eq!(
+                global.and_then(|state| state.size),
+                Some(px(420.)),
+                "a global panel size should carry into another workspace"
+            );
+            assert_eq!(
+                per_workspace, None,
+                "a per-workspace panel size should not leak between workspaces"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_a_global_panel_size_reaches_workspaces_that_are_already_open(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+
+        // One AppState, as the running app has: its workspace store is the
+        // registry every open workspace lands in, and the thing a shared size
+        // has to travel through. `Workspace::test_new` builds a private
+        // AppState per workspace, so it cannot express two workspaces that
+        // know about each other.
+        let app_state = cx.update(|cx| AppState::test(cx));
+
+        // Two worktree windows, both open before either is resized. Reading
+        // the stored value back in a workspace opened afterwards passes with
+        // or without the sharing, which is why both exist up front here.
+        let project_a = Project::test(fs.clone(), [], cx).await;
+        let project_b = Project::test(fs.clone(), [], cx).await;
+        let window_a = cx.add_window(|window, cx| {
+            Workspace::new(Default::default(), project_a, app_state.clone(), window, cx)
+        });
+        let window_b = cx.add_window(|window, cx| {
+            Workspace::new(Default::default(), project_b, app_state.clone(), window, cx)
+        });
+
+        for window in [&window_a, &window_b] {
+            window
+                .update(cx, |workspace, _window, _cx| {
+                    workspace.set_random_database_id();
+                    workspace.bounds.size.width = px(800.);
+                })
+                .unwrap();
+        }
+
+        window_b
+            .update(cx, |workspace, window, cx| {
+                let panel = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+                workspace.add_panel(panel, window, cx);
+            })
+            .unwrap();
+
+        let state = dock::PanelSizeState {
+            size: Some(px(420.)),
+            flex: None,
+        };
+        window_a
+            .update(cx, |workspace, _window, cx| {
+                workspace.persist_panel_size_state(TestPanel::panel_key(), true, state, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        window_b
+            .update(cx, |workspace, _window, cx| {
+                let left_dock = workspace.left_dock().read(cx);
+                let stored = left_dock
+                    .panel::<TestPanel>()
+                    .and_then(|panel| left_dock.stored_panel_size_state(&panel));
+                assert_eq!(
+                    stored.and_then(|state| state.size),
+                    Some(px(420.)),
+                    "a globally-sized panel's width should reach a workspace that was \
+                     already open when it was resized"
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     async fn test_panel_size_state_persistence(cx: &mut gpui::TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
@@ -15023,7 +15200,7 @@ mod tests {
             cx.run_until_parked();
 
             let persisted = workspace.read_with(cx, |workspace, cx| {
-                workspace.persisted_panel_size_state(TestPanel::panel_key(), cx)
+                workspace.persisted_panel_size_state(TestPanel::panel_key(), TestPanel::size_is_global(), cx)
             });
             assert_eq!(
                 persisted.and_then(|s| s.size),
@@ -15085,7 +15262,7 @@ mod tests {
 
             let persisted = workspace
                 .read_with(cx, |workspace, cx| {
-                    workspace.persisted_panel_size_state(TestPanel::panel_key(), cx)
+                    workspace.persisted_panel_size_state(TestPanel::panel_key(), TestPanel::size_is_global(), cx)
                 })
                 .expect("flexible panel state should be persisted to KVP");
             assert_eq!(

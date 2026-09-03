@@ -276,7 +276,7 @@ impl Render for WorktreeFetchFailedToast {
                                 focused_dock,
                                 RemoteBranchFetchMode::UseLocal,
                                 // User-initiated retry of a foreground create.
-                                true,
+                                WorktreeWorkspaceActivation::Immediate,
                                 cx,
                             );
                             task.detach_and_log_err(cx);
@@ -692,17 +692,49 @@ pub fn handle_create_worktree(
     fallback_focused_dock: Option<DockPosition>,
     cx: &mut gpui::Context<Workspace>,
 ) {
-    let task = create_worktree_workspace_inner(
+    let task =
+        create_worktree_workspace_foreground(workspace, action, window, fallback_focused_dock, cx);
+    task.detach_and_log_err(cx);
+}
+
+/// Same as [`handle_create_worktree`], but returns a `Task` resolving to the
+/// new (foregrounded) workspace so the caller can continue setup there, e.g.
+/// spawning an agent thread in it.
+pub fn create_worktree_workspace_foreground(
+    workspace: &mut Workspace,
+    action: &zed_actions::CreateWorktree,
+    window: &mut gpui::Window,
+    fallback_focused_dock: Option<DockPosition>,
+    cx: &mut gpui::Context<Workspace>,
+) -> Task<anyhow::Result<CreatedWorktreeWorkspace>> {
+    create_worktree_workspace_inner(
         workspace,
         action,
         window,
         fallback_focused_dock,
         RemoteBranchFetchMode::Fetch,
         // The user explicitly asked to create a worktree, so foreground it.
-        true,
+        WorktreeWorkspaceActivation::Immediate,
         cx,
-    );
-    task.detach_and_log_err(cx);
+    )
+}
+
+/// How a newly created worktree workspace is brought into the window.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum WorktreeWorkspaceActivation {
+    /// Switch to it as soon as it opens, inheriting the source workspace's
+    /// open files and dock layout.
+    Immediate,
+    /// Keep the user where they are; the workspace is a clean checkout.
+    Background,
+}
+
+impl WorktreeWorkspaceActivation {
+    /// Whether the new workspace inherits the source workspace's open files
+    /// and dock layout, as opposed to opening as a clean checkout.
+    fn transfers_state(self) -> bool {
+        matches!(self, Self::Immediate)
+    }
 }
 
 /// Outcome of [`create_worktree_workspace`].
@@ -747,7 +779,7 @@ pub fn create_worktree_workspace(
         fallback_focused_dock,
         RemoteBranchFetchMode::Fetch,
         // Agent-created worktree workspaces open in the background.
-        false,
+        WorktreeWorkspaceActivation::Background,
         cx,
     )
 }
@@ -758,7 +790,7 @@ fn create_worktree_workspace_inner(
     window: &mut gpui::Window,
     fallback_focused_dock: Option<DockPosition>,
     remote_branch_fetch_mode: RemoteBranchFetchMode,
-    activate: bool,
+    activation: WorktreeWorkspaceActivation,
     cx: &mut gpui::Context<Workspace>,
 ) -> Task<anyhow::Result<CreatedWorktreeWorkspace>> {
     let project = workspace.project().clone();
@@ -861,7 +893,7 @@ fn create_worktree_workspace_inner(
             workspace_handle.clone(),
             window_handle,
             remote_connection_options,
-            activate,
+            activation,
             &mut cx,
         )
         .await;
@@ -975,7 +1007,7 @@ async fn do_create_worktree(
     workspace: WeakEntity<Workspace>,
     window_handle: Option<gpui::WindowHandle<MultiWorkspace>>,
     remote_connection_options: Option<RemoteConnectionOptions>,
-    activate: bool,
+    activation: WorktreeWorkspaceActivation,
     cx: &mut AsyncWindowContext,
 ) -> anyhow::Result<CreatedWorktreeWorkspace> {
     // List existing worktrees from all repos to detect name collisions
@@ -1016,6 +1048,10 @@ async fn do_create_worktree(
         }
     }
 
+    // The three phases of making a worktree, each of which the user waits
+    // through before the window appears: fetching the base branch, checking the
+    // tree out, and opening the workspace over it.
+    let fetch_started = std::time::Instant::now();
     if remote_branch_fetch_mode.should_fetch()
         && let Some((remote_name, branch_name)) = remote_branch_to_fetch(&branch_target)
     {
@@ -1037,6 +1073,11 @@ async fn do_create_worktree(
             .into());
         }
     }
+
+    log::info!(
+        "quiet-ui perf: worktree base fetched in {:.0}ms",
+        fetch_started.elapsed().as_secs_f64() * 1000.
+    );
 
     let mut rng = rand::rng();
 
@@ -1062,7 +1103,12 @@ async fn do_create_worktree(
         .map(|(repo, path, _)| (repo.clone(), path.clone()))
         .collect();
 
+    let checkout_started = std::time::Instant::now();
     let created_paths = await_and_rollback_on_failure(creation_infos, fs, cx).await?;
+    log::info!(
+        "quiet-ui perf: worktree checked out in {:.0}ms",
+        checkout_started.elapsed().as_secs_f64() * 1000.
+    );
 
     // Record each created worktree so thread archival can later verify that
     // Zed created it before deleting it from disk. Failures are non-fatal:
@@ -1087,6 +1133,7 @@ async fn do_create_worktree(
     let has_non_git = !non_git_paths.is_empty();
     all_paths.extend(non_git_paths.iter().cloned());
 
+    let open_started = std::time::Instant::now();
     let workspace = open_worktree_workspace(
         all_paths,
         path_remapping,
@@ -1097,10 +1144,14 @@ async fn do_create_worktree(
         window_handle,
         remote_connection_options,
         WorktreeOperation::Create,
-        activate,
+        activation,
         cx,
     )
     .await?;
+    log::info!(
+        "quiet-ui perf: worktree workspace opened in {:.0}ms",
+        open_started.elapsed().as_secs_f64() * 1000.
+    );
 
     Ok(CreatedWorktreeWorkspace {
         workspace,
@@ -1138,7 +1189,7 @@ async fn do_switch_worktree(
         remote_connection_options,
         WorktreeOperation::Switch,
         // Switching is always an explicit, foreground user action.
-        true,
+        WorktreeWorkspaceActivation::Immediate,
         cx,
     )
     .await
@@ -1149,30 +1200,37 @@ async fn do_switch_worktree(
 /// work (e.g., the `create_thread` agent tool spawns a thread inside it).
 async fn open_worktree_workspace(
     all_paths: Vec<PathBuf>,
-    path_remapping: Vec<(PathBuf, PathBuf)>,
-    non_git_paths: Vec<PathBuf>,
+    // Kept in the signature, and unused: upstream remaps the source
+    // workspace's open files into the new worktree with these, which this fork
+    // does not do. Keeping the parameters keeps the call sites upstream's.
+    _path_remapping: Vec<(PathBuf, PathBuf)>,
+    _non_git_paths: Vec<PathBuf>,
     has_non_git: bool,
     previous_state: PreviousWorkspaceState,
     workspace: WeakEntity<Workspace>,
     window_handle: Option<gpui::WindowHandle<MultiWorkspace>>,
     remote_connection_options: Option<RemoteConnectionOptions>,
     operation: WorktreeOperation,
-    activate: bool,
+    activation: WorktreeWorkspaceActivation,
     cx: &mut AsyncWindowContext,
 ) -> anyhow::Result<Entity<Workspace>> {
     let window_handle = window_handle
         .ok_or_else(|| anyhow!("No window handle available for workspace creation"))?;
 
+    // Measured from the same point as the caller's "workspace opened" line, so
+    // the two together say how much of the open phase the user actually waits
+    // through and how much of it settles behind the window.
+    let open_started = std::time::Instant::now();
+
     let focused_dock = previous_state.focused_dock;
 
     let is_creating_new_worktree = matches!(operation, WorktreeOperation::Create);
 
-    // When `activate` is false the new workspace is opened in the background
-    // (e.g. the agent's `create_thread` tool), so it should be a clean
-    // checkout rather than inheriting the source workspace's open files and
-    // dock layout. The state transfer only applies when we're foregrounding
-    // a freshly-created worktree for the user.
-    let transfer_state = is_creating_new_worktree && activate;
+    // A background open (e.g. the agent's `create_thread` tool) is a clean
+    // checkout rather than an inheritance of the source workspace's open files
+    // and dock layout; the transfer only makes sense when the user is being
+    // moved into the new worktree.
+    let transfer_state = is_creating_new_worktree && activation.transfers_state();
 
     let source_for_transfer = if transfer_state {
         Some(workspace.clone())
@@ -1235,6 +1293,83 @@ async fn open_worktree_workspace(
         task.await.log_err();
     }
 
+    maybe_propagate_worktree_trust(&workspace, &new_workspace, &all_paths, cx);
+
+    if transfer_state {
+        window_handle.update(cx, |_multi_workspace, window, cx| {
+            new_workspace.update(cx, |workspace, cx| {
+                if has_non_git {
+                    struct WorktreeCreationToast;
+                    let toast_id =
+                        workspace::notifications::NotificationId::unique::<WorktreeCreationToast>();
+                    workspace.show_toast(
+                        workspace::Toast::new(
+                            toast_id,
+                            "Some project folders are not git repositories. \
+                             They were included as-is without creating a worktree.",
+                        ),
+                        cx,
+                    );
+                }
+
+                // Upstream reopens every file the source workspace had open,
+                // remapped into the new worktree, so a branch switch continues
+                // where you were. Here a new worktree is a new thread's
+                // workspace: it starts on an empty editor, and the agent opens
+                // what it needs. Twenty inherited tabs are twenty things to
+                // close.
+                if focused_dock.is_none() {
+                    workspace.focus_center_pane(window, cx);
+                }
+            });
+        })?;
+    }
+
+    // Clear the creation status on the SOURCE workspace so its title bar
+    // stops showing the loading indicator immediately.
+    workspace
+        .update(cx, |ws, cx| {
+            ws.set_active_worktree_creation(None, false, cx);
+        })
+        .ok();
+
+    // Show the window here rather than after the project has settled. The
+    // scan below is the phase that measured worst — it walks the whole
+    // checkout, which on a large repository is most of the wait — and none of
+    // it is anything the user is looking at. Zed opens a folder this way
+    // everywhere else: the window comes up and fills in.
+    let activate_now = activation == WorktreeWorkspaceActivation::Immediate;
+    window_handle.update(cx, |multi_workspace, window, cx| {
+        if activate_now {
+            multi_workspace.activate(new_workspace.clone(), source_for_transfer, window, cx);
+        } else {
+            // Background open: register the new workspace as a retained tab
+            // but leave the user where they are.
+            multi_workspace.add(new_workspace.clone(), window, cx);
+        }
+
+        if activate_now
+            && is_creating_new_worktree
+            && let Some(dock_position) = focused_dock
+        {
+            new_workspace.update(cx, |workspace, cx| {
+                let dock = workspace.dock_at_position(dock_position);
+                if let Some(panel) = dock.read(cx).active_panel() {
+                    panel.activation_focus_handle(cx).focus(window, cx);
+                }
+            });
+        }
+    })?;
+
+    log::info!(
+        "quiet-ui perf: worktree window shown in {:.0}ms",
+        open_started.elapsed().as_secs_f64() * 1000.
+    );
+
+    // The caller is handed a workspace whose project has finished scanning and
+    // whose repositories have reported in — the agent's `create_thread` tool
+    // opens a thread against them the moment this returns — so the waits stay,
+    // they just no longer stand between the user and the window.
     new_workspace
         .update(cx, |workspace, cx| {
             workspace.project().read(cx).wait_for_initial_scan(cx)
@@ -1258,130 +1393,15 @@ async fn open_worktree_workspace(
         })
         .await;
 
-    maybe_propagate_worktree_trust(&workspace, &new_workspace, &all_paths, cx);
-
-    if transfer_state {
+    if is_creating_new_worktree {
+        // Setup hooks run against a scanned project, foreground or background:
+        // the worktree was created either way.
         window_handle.update(cx, |_multi_workspace, window, cx| {
             new_workspace.update(cx, |workspace, cx| {
-                if has_non_git {
-                    struct WorktreeCreationToast;
-                    let toast_id =
-                        workspace::notifications::NotificationId::unique::<WorktreeCreationToast>();
-                    workspace.show_toast(
-                        workspace::Toast::new(
-                            toast_id,
-                            "Some project folders are not git repositories. \
-                             They were included as-is without creating a worktree.",
-                        ),
-                        cx,
-                    );
-                }
-
-                // Remap every previously-open file path into the new worktree.
-                let remap_path = |original_path: PathBuf| -> Option<PathBuf> {
-                    let best_match = path_remapping
-                        .iter()
-                        .filter_map(|(old_root, new_root)| {
-                            original_path.strip_prefix(old_root).ok().map(|relative| {
-                                (old_root.components().count(), new_root.join(relative))
-                            })
-                        })
-                        .max_by_key(|(depth, _)| *depth);
-
-                    if let Some((_, remapped_path)) = best_match {
-                        return Some(remapped_path);
-                    }
-
-                    for non_git in &non_git_paths {
-                        if original_path.starts_with(non_git) {
-                            return Some(original_path);
-                        }
-                    }
-                    None
-                };
-
-                let remapped_active_path =
-                    previous_state.active_file_path.and_then(|p| remap_path(p));
-
-                let mut paths_to_open: Vec<PathBuf> = Vec::new();
-                let mut seen = HashSet::default();
-                for path in previous_state.open_file_paths {
-                    if let Some(remapped) = remap_path(path) {
-                        if remapped_active_path.as_ref() != Some(&remapped)
-                            && seen.insert(remapped.clone())
-                        {
-                            paths_to_open.push(remapped);
-                        }
-                    }
-                }
-
-                if let Some(active) = &remapped_active_path {
-                    if seen.insert(active.clone()) {
-                        paths_to_open.push(active.clone());
-                    }
-                }
-
-                if !paths_to_open.is_empty() {
-                    let should_focus_center = focused_dock.is_none();
-                    let open_task = workspace.open_paths(
-                        paths_to_open,
-                        workspace::OpenOptions {
-                            focus: Some(false),
-                            ..Default::default()
-                        },
-                        None,
-                        window,
-                        cx,
-                    );
-                    cx.spawn_in(window, async move |workspace, cx| {
-                        for item in open_task.await.into_iter().flatten() {
-                            item.log_err();
-                        }
-                        if should_focus_center {
-                            workspace.update_in(cx, |workspace, window, cx| {
-                                workspace.focus_center_pane(window, cx);
-                            })?;
-                        }
-                        anyhow::Ok(())
-                    })
-                    .detach_and_log_err(cx);
-                }
+                workspace.run_create_worktree_tasks(window, cx);
             });
         })?;
     }
-
-    // Clear the creation status on the SOURCE workspace so its title bar
-    // stops showing the loading indicator immediately.
-    workspace
-        .update(cx, |ws, cx| {
-            ws.set_active_worktree_creation(None, false, cx);
-        })
-        .ok();
-
-    window_handle.update(cx, |multi_workspace, window, cx| {
-        if activate {
-            multi_workspace.activate(new_workspace.clone(), source_for_transfer, window, cx);
-        } else {
-            // Background open: register the new workspace as a retained tab
-            // but leave the user where they are.
-            multi_workspace.add(new_workspace.clone(), window, cx);
-        }
-
-        if is_creating_new_worktree {
-            new_workspace.update(cx, |workspace, cx| {
-                // Run create-worktree setup hooks regardless of foreground vs
-                // background — the worktree was created either way.
-                workspace.run_create_worktree_tasks(window, cx);
-
-                if activate && let Some(dock_position) = focused_dock {
-                    let dock = workspace.dock_at_position(dock_position);
-                    if let Some(panel) = dock.read(cx).active_panel() {
-                        panel.activation_focus_handle(cx).focus(window, cx);
-                    }
-                }
-            });
-        }
-    })?;
 
     Ok(new_workspace)
 }

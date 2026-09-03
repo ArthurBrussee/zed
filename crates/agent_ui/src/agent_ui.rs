@@ -11,6 +11,7 @@ mod context;
 mod context_server_configuration;
 pub(crate) mod conversation_view;
 mod diagnostics;
+mod diff_review;
 pub mod draft_prompt_store;
 mod entry_view_state;
 mod external_source_prompt;
@@ -31,7 +32,11 @@ pub mod terminal_thread_metadata_store;
 pub mod test_support;
 mod thread_import;
 pub mod thread_metadata_store;
+pub mod thread_read_state;
+pub mod thread_tab;
+pub mod thread_tab_registry;
 pub mod thread_worktree_archive;
+mod tool_call_diff;
 
 pub mod threads_archive_view;
 mod ui;
@@ -71,13 +76,13 @@ use workspace::{OpenOptions, Workspace};
 use crate::agent_configuration::ManageProfilesModal;
 pub use crate::agent_connection_store::{ActiveAcpConnection, AgentConnectionStore};
 pub use crate::agent_panel::{
-    AgentPanel, AgentPanelEvent, AgentPanelTerminalInfo, MaxIdleRetainedThreads, TerminalId,
-    ThreadTitleRegenerationResult,
+    AgentPanel, AgentPanelEvent, AgentPanelTerminalInfo, TerminalId, ThreadTitleRegenerationResult,
 };
 use crate::agent_registry_ui::AgentRegistryPage;
 pub use crate::inline_assistant::InlineAssistant;
 pub use crate::message_editor::MessageEditorEvent;
 pub use crate::thread_metadata_store::ThreadId;
+pub use crate::thread_read_state::ThreadReadState;
 pub use agent_diff::{AgentDiffPane, AgentDiffToolbar};
 pub use conversation_view::open_markdown_in_workspace;
 pub use conversation_view::{ConversationView, StateChange};
@@ -91,6 +96,25 @@ pub use thread_import::{
 };
 use zed_actions;
 pub use zed_actions::{CreateWorktree, NewWorktreeBranchTarget, SwitchWorktree};
+
+/// A subtle brand tint per agent, so Claude and Codex threads read apart at a
+/// glance. `None` for the native agent and unknown externals: they keep the
+/// theme's neutral icon color.
+pub fn agent_brand_color(agent_id: &project::AgentId) -> Option<gpui::Hsla> {
+    let id = agent_id.as_ref().to_ascii_lowercase();
+    // Low-saturation hints of each brand's hue: enough to tell agents apart,
+    // not so vivid that a row shouts. Works in either theme.
+    if id.contains("claude") {
+        Some(gpui::hsla(0.055, 0.42, 0.56, 0.85))
+    } else if id.contains("codex") || id.contains("openai") {
+        // A muted slate-teal rather than the vivid brand green.
+        Some(gpui::hsla(0.47, 0.22, 0.52, 0.85))
+    } else if id.contains("gemini") {
+        Some(gpui::hsla(0.58, 0.38, 0.60, 0.85))
+    } else {
+        None
+    }
+}
 
 pub(crate) fn resolve_agent_image(
     dest_url: &str,
@@ -119,9 +143,30 @@ pub(crate) fn resolve_agent_image(
     None
 }
 
+/// Whether a path is an HTML page, which the agent means for us to look at
+/// rendered, not to read as source.
+pub(crate) fn is_html_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm")
+        })
+}
+
+/// The `file://` URL for an absolute path, for handing a local file to the
+/// system browser.
+pub(crate) fn file_url(abs_path: &Path) -> Option<String> {
+    url::Url::from_file_path(abs_path)
+        .ok()
+        .map(|url| url.to_string())
+}
+
 /// Opens `abs_path` in the workspace, moving the cursor to `point` when one
 /// is given. Paths outside every worktree are only opened when a file exists
 /// there, so broken agent links don't create empty buffers.
+///
+/// HTML files are opened in the system browser: agents produce little HTML
+/// report pages to be looked at, not edited.
 pub(crate) fn open_abs_path_at_point(
     workspace: &mut Workspace,
     abs_path: PathBuf,
@@ -129,6 +174,13 @@ pub(crate) fn open_abs_path_at_point(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    if is_html_path(&abs_path)
+        && let Some(url) = file_url(&abs_path)
+    {
+        cx.open_url(&url);
+        return;
+    }
+
     let project_path = workspace
         .project()
         .update(cx, |project, cx| project.find_project_path(&abs_path, cx));
@@ -183,7 +235,7 @@ pub(crate) fn open_abs_path_at_point(
         .detach_and_log_err(cx);
 }
 
-pub const DEFAULT_THREAD_TITLE: &str = "New Agent Thread";
+pub const DEFAULT_THREAD_TITLE: &str = "New Thread";
 const PARALLEL_AGENT_LAYOUT_BACKFILL_KEY: &str = "parallel_agent_layout_backfilled";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -231,6 +283,8 @@ actions!(
         RemoveSelectedThread,
         /// Renames the currently selected thread.
         RenameSelectedThread,
+        /// Renames the thread shown in the focused thread tab.
+        RenameThread,
         /// Starts a chat conversation with follow-up enabled.
         ChatWithFollow,
         /// Cycles to the next inline assist suggestion.
@@ -273,6 +327,9 @@ actions!(
         RejectOnce,
         /// Follows the agent's suggestions.
         Follow,
+        /// Toggles between an agent-focused and a review-focused workspace
+        /// layout (git panel + agent diff vs thread tabs).
+        ToggleReviewLayout,
         /// Resets the trial upsell notification.
         ResetTrialUpsell,
         /// Resets the trial end upsell notification.
@@ -326,6 +383,9 @@ actions!(
         ImportThreadsFromOtherChannels,
         /// Starts a new terminal thread.
         NewTerminalThread,
+        /// Starts another agent in this worktree even when one is already
+        /// running; new-thread creation normally focuses the existing agent.
+        NewAdditionalThread,
     ]
 );
 
@@ -480,6 +540,17 @@ impl Agent {
         }
     }
 
+    /// The agent's brand logo: the same icon its `AgentServer` reports, so tabs,
+    /// sidebar rows, and menus all show one glyph per agent.
+    pub fn logo(&self) -> IconName {
+        match self {
+            Self::NativeAgent => IconName::ZedAgent,
+            Self::Custom { id } => agent_servers::agent_logo(id.as_ref()),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Stub => IconName::ZedAgent,
+        }
+    }
+
     pub fn server(
         &self,
         fs: Arc<dyn fs::Fs>,
@@ -494,6 +565,53 @@ impl Agent {
             Self::Stub => Rc::new(crate::test_support::StubAgentServer::default_response()),
         }
     }
+}
+
+/// Display metadata for an agent offered in a new-thread menu.
+pub struct AgentMenuEntry {
+    pub agent: Agent,
+    pub display_name: SharedString,
+    /// Path to the agent's custom SVG icon, when it provides one.
+    pub icon_path: Option<SharedString>,
+}
+
+/// Enumerates the external agents available for new threads in `project`,
+/// sorted by display name. The native Zed agent is not included.
+pub fn external_agent_menu_entries(
+    project: &Entity<project::Project>,
+    cx: &App,
+) -> Vec<AgentMenuEntry> {
+    let agent_server_store = project.read(cx).agent_server_store().clone();
+    let agent_server_store = agent_server_store.read(cx);
+    let registry_store = project::AgentRegistryStore::try_global(cx);
+    let registry_store_ref = registry_store.as_ref().map(|store| store.read(cx));
+
+    let mut entries = agent_server_store
+        .external_agents()
+        .map(|agent_id| {
+            let registry_agent = registry_store_ref
+                .as_ref()
+                .and_then(|store| store.agent(agent_id));
+            let display_name = agent_server_store
+                .agent_display_name(agent_id)
+                .or_else(|| registry_agent.as_ref().map(|agent| agent.name().clone()))
+                .unwrap_or_else(|| agent_id.0.clone());
+            let icon_path = agent_server_store.agent_icon(agent_id).or_else(|| {
+                registry_agent
+                    .as_ref()
+                    .and_then(|agent| agent.icon_path().cloned())
+            });
+            AgentMenuEntry {
+                agent: Agent::Custom {
+                    id: agent_id.clone(),
+                },
+                display_name,
+                icon_path,
+            }
+        })
+        .collect::<Vec<_>>();
+    entries.sort_unstable_by_key(|entry| entry.display_name.to_lowercase());
+    entries
 }
 
 /// Content to initialize new external agent with.

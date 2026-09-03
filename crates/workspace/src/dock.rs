@@ -36,6 +36,14 @@ pub use proto::PanelId;
 pub trait Panel: Focusable + EventEmitter<PanelEvent> + Render + Sized {
     fn persistent_name() -> &'static str;
     fn panel_key() -> &'static str;
+    /// Whether this panel's size is a preference about how the user works
+    /// rather than a property of the checkout they happen to have open. A panel
+    /// that says yes keeps one size across every workspace, so moving between
+    /// the worktrees of a project — each its own workspace, each with its own
+    /// id — does not resize it underneath you.
+    fn size_is_global() -> bool {
+        false
+    }
     /// The `Focusable::focus_handle` root identifies the panel's subtree for containment checks
     /// and must be tracked by the panel's root element. This method returns the handle that should
     /// receive focus when the panel is activated, such as a filter, commit, or message editor; it
@@ -107,6 +115,7 @@ pub trait PanelHandle: Send + Sync {
     fn panel_id(&self) -> EntityId;
     fn persistent_name(&self) -> &'static str;
     fn panel_key(&self) -> &'static str;
+    fn size_is_global(&self) -> bool;
     fn position(&self, window: &Window, cx: &App) -> DockPosition;
     fn position_is_valid(&self, position: DockPosition, cx: &App) -> bool;
     fn set_position(&self, position: DockPosition, window: &mut Window, cx: &mut App);
@@ -165,6 +174,10 @@ where
 
     fn panel_key(&self) -> &'static str {
         T::panel_key()
+    }
+
+    fn size_is_global(&self) -> bool {
+        T::size_is_global()
     }
 
     fn position(&self, window: &Window, cx: &App) -> DockPosition {
@@ -410,7 +423,7 @@ fn resize_panel_entry(
     flex: Option<f32>,
     window: &mut Window,
     cx: &mut App,
-) -> (&'static str, PanelSizeState) {
+) -> (&'static str, bool, PanelSizeState) {
     let size = size.map(|size| size.max(RESIZE_HANDLE_SIZE).round());
     let uses_flexible_width = panel_uses_flexible_width(position, entry.panel.as_ref(), window, cx);
     if uses_flexible_width {
@@ -419,7 +432,11 @@ fn resize_panel_entry(
         entry.size_state.size = size;
     }
     entry.panel.size_state_changed(window, cx);
-    (entry.panel.panel_key(), entry.size_state)
+    (
+        entry.panel.panel_key(),
+        entry.panel.size_is_global(),
+        entry.size_state,
+    )
 }
 
 impl Dock {
@@ -1053,6 +1070,29 @@ impl Dock {
         }
     }
 
+    /// Applies a size to whichever panel in this dock carries `panel_key`,
+    /// rather than to a panel handle we already have. A globally-sized panel is
+    /// resized in one workspace and has to land in all the others, where the
+    /// panel is a different entity with the same key.
+    pub fn set_size_state_for_panel_key(
+        &mut self,
+        panel_key: &str,
+        size_state: PanelSizeState,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if let Some(entry) = self
+            .panel_entries
+            .iter_mut()
+            .find(|entry| entry.panel.panel_key() == panel_key)
+        {
+            entry.size_state = size_state;
+            cx.notify();
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn toggle_panel_flexible_size(
         &mut self,
         panel: &dyn PanelHandle,
@@ -1075,6 +1115,7 @@ impl Dock {
             entry.size_state.flex = current_flex;
         }
         let panel_key = entry.panel.panel_key();
+        let size_is_global = entry.panel.size_is_global();
         let size_state = entry.size_state;
         let workspace = self.workspace.clone();
         entry
@@ -1084,7 +1125,8 @@ impl Dock {
         cx.defer(move |cx| {
             if let Some(workspace) = workspace.upgrade() {
                 workspace.update(cx, |workspace, cx| {
-                    workspace.persist_panel_size_state(panel_key, size_state, cx);
+                    workspace
+                        .persist_panel_size_state(panel_key, size_is_global, size_state, cx);
                 });
             }
         });
@@ -1100,14 +1142,15 @@ impl Dock {
     ) {
         let position = self.position;
         if let Some(entry) = self.active_panel_entry_mut() {
-            let (panel_key, size_state) =
+            let (panel_key, size_is_global, size_state) =
                 resize_panel_entry(position, entry, size, flex, window, cx);
 
             let workspace = self.workspace.clone();
             cx.defer(move |cx| {
                 if let Some(workspace) = workspace.upgrade() {
                     workspace.update(cx, |workspace, cx| {
-                        workspace.persist_panel_size_state(panel_key, size_state, cx);
+                        workspace
+                            .persist_panel_size_state(panel_key, size_is_global, size_state, cx);
                     });
                 }
             });
@@ -1199,8 +1242,9 @@ impl Dock {
         cx.defer(move |cx| {
             if let Some(workspace) = workspace.upgrade() {
                 workspace.update(cx, |workspace, cx| {
-                    for (panel_key, size_state) in size_states_to_persist {
-                        workspace.persist_panel_size_state(panel_key, size_state, cx);
+                    for (panel_key, size_is_global, size_state) in size_states_to_persist {
+                        workspace
+                            .persist_panel_size_state(panel_key, size_is_global, size_state, cx);
                     }
                 });
             }
@@ -1248,19 +1292,36 @@ impl Dock {
         }
     }
 
-    pub(crate) fn load_persisted_size_state(
+    /// Where a panel's size is stored. Per workspace by default; under one
+    /// shared key for a panel whose size is a preference rather than a property
+    /// of the checkout. `global` cannot collide with the alternative, which is
+    /// always either a workspace row id or a session id.
+    pub(crate) fn panel_size_scope_key(
         workspace: &Workspace,
-        panel_key: &'static str,
-        cx: &App,
-    ) -> Option<PanelSizeState> {
+        panel_key: &str,
+        is_global: bool,
+    ) -> Option<String> {
+        if is_global {
+            return Some(format!("global:{panel_key}"));
+        }
         let workspace_id = workspace
             .database_id()
             .map(|id| i64::from(id).to_string())
             .or(workspace.session_id())?;
+        Some(format!("{workspace_id}:{panel_key}"))
+    }
+
+    pub(crate) fn load_persisted_size_state(
+        workspace: &Workspace,
+        panel_key: &'static str,
+        is_global: bool,
+        cx: &App,
+    ) -> Option<PanelSizeState> {
+        let scope_key = Self::panel_size_scope_key(workspace, panel_key, is_global)?;
         let kvp = KeyValueStore::global(cx);
         let scope = kvp.scoped(PANEL_SIZE_STATE_KEY);
         scope
-            .read(&format!("{workspace_id}:{panel_key}"))
+            .read(&scope_key)
             .log_err()
             .flatten()
             .and_then(|json| serde_json::from_str::<PanelSizeState>(&json).log_err())
