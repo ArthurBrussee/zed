@@ -1712,6 +1712,17 @@ impl AgentConnection for AcpConnection {
         self.agent_capabilities.load_session
     }
 
+    fn loading_thread(
+        &self,
+        session_id: &acp::SessionId,
+        _cx: &App,
+    ) -> Option<Entity<AcpThread>> {
+        self.sessions
+            .borrow()
+            .get(session_id)
+            .and_then(|session| session.thread.upgrade())
+    }
+
     fn supports_resume_session(&self) -> bool {
         self.agent_capabilities
             .session_capabilities

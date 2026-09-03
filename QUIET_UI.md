@@ -860,55 +860,6 @@ does is removed as it lands.
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
-**Opening a long thread waits on the replay, and the replay is nearly all of it.**
-A thread left running since 2026-08-26 takes long enough to open that it reads as broken. It is not:
-it arrives, slowly. The measurements are in the log the fork already writes, and they say the
-obvious fix is the wrong one.
-
-    agent replayed the session in 12846ms
-    built views for 2074 thread entries in 418ms
-
-Building the views is three percent of the wait. Ninety-seven percent is the agent streaming the
-session back before Zed has anything to show, and that scales with the session: a 324-entry thread
-replays in about 2s, this one in 12.8s, and its file on disk is 86MB across 50,465 lines with sixty
-compactions behind those 2,074 entries. So do not reach for lazy or on-demand view building — that
-was tried, reverted on 2026-08-20, and the number it was aimed at is 418ms.
-
-What is worth doing is not making the reader wait for the whole replay before seeing anything.
-Entries arrive over the wire in order; the thread could show them as they land, or show the tail
-first, since the end of a conversation is what anyone opens it for. Either makes a long thread
-usable immediately instead of after thirteen seconds of nothing. Check first whether the replay
-actually streams or arrives in one piece: if the agent only answers whole, this becomes "say what is
-happening while it loads" instead, which is worth having anyway.
-
-Also worth a look while there: whether the replayed entries can be kept, so the second open of the
-same thread costs nothing. The cost is per-open today, and it is the same session every time.
-
-**What the 2026-09-03 run established, so the next one does not re-derive it.** It ran out of clock
-before building this and read the code instead; the question the entry opens with is answered.
-
-- **The replay does stream, and the entries are already landing in an `AcpThread` while the reader
-  waits.** `AcpConnection::open_or_create_session` (`agent_servers/src/acp.rs`) creates the
-  `Entity<AcpThread>` and registers the session *before* awaiting the `session/load` RPC, with a
-  comment saying exactly why: so the `session/update` notifications the agent sends during history
-  replay can find the thread. So the thread fills up entry by entry over those 12.8 seconds. What
-  waits is the caller: `ConversationView`'s load path awaits the whole `Task<Result<Entity<AcpThread>>>`
-  and only leaves `ServerState::Loading` when it resolves.
-- **So the fix is to get that entity to the view early, not to make the replay faster.** The seam is
-  the task's return value: nothing else hands the thread out mid-load. Either the connection exposes
-  the in-flight thread (its `sessions` map already holds a `WeakEntity` under the session id, so a
-  `loading_thread(&session_id)` on the `AgentConnection` trait is a few lines and defaultable), or
-  `open_or_create_session` publishes it through a channel the load path can select on.
-- **The risk is the state machine, not the plumbing.** `ServerState::Loading -> Connected` builds a
-  `Conversation`, registers the thread, and builds entry views; installing a half-loaded thread early
-  means that path must not run twice on the same entity. Worth writing as "enter Connected early with
-  the same entity, and make the completion path idempotent" rather than as a second code path.
-- **`loading_status` already exists** (`ConversationView::loading_status`, rendered by the Loading
-  arm) but is fed by the connection store's agent-startup status, not by the replay. If the streaming
-  version turns out to be too invasive, a live "replayed N entries" on that field is the fallback the
-  entry describes, and it needs the same early handle.
-
-
 **Make `+` fast enough to press without thinking.**
 Seven seconds on a good run and thirty on a bad one, measured in three phases the code still logs
 (`crates/git_ui_core/src/worktree_service.rs`, the `quiet-ui perf:` lines around the fetch, the
@@ -3059,8 +3010,8 @@ to infer overnight.
 **2026-09-03**: onto main 28e52a287 (47 upstream commits: a Zed v1.20.0 bump, LSP dynamic document
 selectors and per-project log scoping, a `which_key` pending-binding indicator, gpui touch-drag and
 hover-listener work, an `on_new_window` setting, unified language-model event-stream handling). A
-working night by three triggers at once: the Work queue held three items, the fork carried 11
-commits on top of the merge base, and the branch had last moved the day before. Squash-then-rebase
+working night by three triggers at once: the Work queue held three items — all three built — the
+fork carried 11 commits on top of the merge base, and the branch had last moved the day before. Squash-then-rebase
 folded those 11 into 1, reusing the squash's own message; tree-identical to the old tip before
 rebasing, backed up as `quiet-ui-pre-rebase39-2026-09-03`.
 
@@ -3111,19 +3062,51 @@ favour of.
    **No test:** `thread_item.rs` is a render component and this is four colour rules in it; there is
    nothing to assert that is not the code restated.
 
-**Not built: opening a long thread.** The tail of the queue, and the clock, not a judgement about
-the item. What the night did do is answer the question the entry opens with, and the findings are
-written into the entry so tomorrow starts from them rather than re-deriving them: the replay DOES
-stream (`open_or_create_session` creates the `AcpThread` and registers the session before awaiting
-the load RPC, precisely so replay notifications can find it), the thread is filling up for the whole
-13 seconds, and what waits is `ConversationView`'s load path awaiting the task's return value. So the
-work is handing that entity to the view early and making the completion path idempotent, not making
-the replay faster.
+3. *A replaying thread is shown while it replays.* The entry asked first whether the replay streams
+   or arrives whole, and it streams: `AcpConnection::open_or_create_session` creates the
+   `Entity<AcpThread>` and registers the session BEFORE awaiting the load RPC, with a comment saying
+   why — so the `session/update` notifications of the history replay have somewhere to land. The
+   entries were arriving for all 12.8 seconds; only the caller was waiting, because
+   `ConversationView`'s load path awaits the task, and the task does not resolve until the last entry
+   has landed. So the fix was never to make the replay faster. `AgentConnection` gained
+   `loading_thread(session_id)` (defaulted to `None`, answered by `AcpConnection` from the session map
+   it already keeps), the load path polls for it while it waits, and the moment there is anything in
+   it the view enters Connected on that thread. The completion path is the same call, and skips when
+   the thread is already the one on screen, so a thread is entered exactly once either way.
+   Two things had to be true and were not obvious. The load task lives inside the `Loading` state, so
+   entering Connected would have dropped it and cancelled the replay being watched; it is carried
+   into a `_replay_load` slot instead. And a view built mid-replay holds capabilities the load
+   response has not filled in yet — that turned out to be free, because `PromptCapabilitiesUpdated`
+   and `AvailableCommandsUpdated` already refresh them through the thread subscription the early
+   entry installs.
+   Tested with a connection whose `load_session` replays two chunks into the thread and then sits
+   there until released: the conversation is on screen with its replayed content before the load
+   resolves, and resolving leaves the same single thread in place. It fails against the old code at
+   the first assertion. **Not covered by any test:** the ordering question the entry also raised —
+   whether to show the tail first rather than the head — is untouched; entries appear in the order
+   they arrive, which is the order the agent sends them.
+
+**Left in the queue: the second open of a thread still costs a full replay.** The entry's aside
+about keeping replayed entries so reopening is free was not built and is not filed as a finding,
+because nothing was learned about it beyond what the entry says.
+
+**The two items left in the queue are waiting on Arthur, not on runway.** The night finished its
+three with time to spare, looked at both, and did not start either, for the reason each entry gives
+itself. *Make `+` fast* is measurement-gated on the running app for its good direction and needs
+three decisions (a missing-ref fallback, how to say "your base was behind", where an askpass prompt
+belongs) for its cheap one, with no way to exercise any of it here — unchanged since 2026-09-01, and
+re-reading it changed nothing. *Reclaim the abandoned worktree* lists its own blockers as three
+questions (what counts as abandoned, what makes removal safe, whether it should be silent), and they
+are product calls about deleting someone's worktree, not details to infer overnight. Guessing at
+either and shipping it into a build he cannot recompile is the wrong trade; both want an answer more
+than they want another night.
 
 **The gate, green, and one thing about how it is invoked.** Suites run: `acp_thread`, `agent_ui`,
-`sidebar` and `ui` — the fork's core crates plus the one other crate tonight touched. 210 + 445 (32
-intentionally `#[ignore]`d) + 170 + 82/41 passed, 0 failed; `sidebar` gained the new drag test and
-`acp_thread` is up 34 tests on last week's number from the rebase. The Verification queue was empty
+`sidebar` and `ui` — the fork's core crates plus the one other crate tonight touched
+plus `agent_servers`, which gained four lines answering `loading_thread`. 210 + 32 + 446 (32
+intentionally `#[ignore]`d) + 170 + 82/41 passed, 0 failed; `sidebar` gained the new drag test,
+`agent_ui` the new replay test, and `acp_thread` is up 34 tests on last week's number from the
+rebase. The Verification queue was empty
 going in and is empty going out. One real failure on the way, in the new test and not in the code it
 covers: it asserted where a newly opened tab lands, which the strip change had moved, and looking at
 what it actually did is what turned up the beside-the-active-tab behaviour recorded above.
@@ -3138,6 +3121,9 @@ must be too.
 
 Environment prerequisites needed reapplying in this fresh container
 (`CARGO_NET_GIT_FETCH_WITH_CLI=true`, `libasound2-dev`); both succeeded, `apt-get update` included.
-The disk sequence from 2026-09-01 held exactly: the debug test tree took the allowance down to 5.9G
-free, and `rm -rf target/debug` before the release clippy is what made room for it. Debug and
-release still do not coexist.
+The disk sequence from 2026-09-01 held exactly, twice: the debug test tree took the allowance down
+to 5.9G free on the first gate pass and to 1.1G on the second, and `rm -rf target/debug` before each
+release clippy is what made room for it. Debug and release still do not coexist. Worth knowing for
+the pacing: a full workspace `cargo check --all-targets` from cold took about ten minutes, the four
+suites about two, and the release clippy about six the first time and twenty seconds incrementally —
+the night had far more runway than the first pass through it assumed.

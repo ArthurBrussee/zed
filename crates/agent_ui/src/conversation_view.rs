@@ -618,6 +618,11 @@ pub struct ConversationView {
     notification_subscriptions: HashMap<WindowHandle<AgentNotification>, Vec<Subscription>>,
     auth_task: Option<Task<()>>,
     loading_status: Option<SharedString>,
+    /// Keeps a load task alive after its view has already entered `Connected`
+    /// on the thread the load is still filling. The task normally lives in the
+    /// `Loading` state, so showing the thread early would drop it and cancel
+    /// the replay it is in the middle of.
+    _replay_load: Option<Entity<LoadingView>>,
     /// When settings change, use this to see if the theme has changed (which
     /// causes mermaid diagrams to re-render).
     last_theme_id: Option<String>,
@@ -921,6 +926,11 @@ impl AuthState {
     }
 }
 
+/// How often a load looks to see whether the connection has a thread worth
+/// showing yet. Short enough that a fast session is not held back by it, long
+/// enough that a slow one is not asking every frame.
+const REPLAY_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 struct LoadingView {
     _load_task: Task<()>,
 }
@@ -1066,6 +1076,7 @@ impl ConversationView {
             notification_subscriptions: HashMap::default(),
             auth_task: None,
             loading_status: None,
+            _replay_load: None,
             last_theme_id: Some(cx.theme().id.clone()),
             draft_prompt_persist_task: None,
             pending_initial_content: None,
@@ -1373,6 +1384,9 @@ impl ConversationView {
             self.request_elicitation_form_states.clear();
         }
 
+        if matches!(&state, ServerState::Loading { .. }) {
+            self._replay_load = None;
+        }
         self.server_state = state;
         cx.emit(StateChange);
         cx.emit(AcpServerViewEvent::ActiveThreadChanged);
@@ -1626,7 +1640,52 @@ impl ConversationView {
                 return;
             };
 
-            let result = result.await;
+            // The load task only resolves once the last replayed entry has
+            // arrived, but the connection creates and registers the thread
+            // before it asks for the replay, so entries have been landing in it
+            // the whole time. Take that thread as soon as it has something in it
+            // and show the conversation filling up: on a long session the replay
+            // is nearly the whole wait, and the reader spent it looking at a
+            // "Loading…" label instead of at their own conversation.
+            let mut connection_entry_subscription = Some(connection_entry_subscription);
+            let mut initial_content = initial_content;
+            let mut entered: Option<Entity<AcpThread>> = None;
+            let mut pending_load = result;
+            let result = loop {
+                let poll = cx.background_executor().timer(REPLAY_POLL_INTERVAL);
+                match futures::future::select(pending_load, poll).await {
+                    futures::future::Either::Left((result, _)) => break result,
+                    futures::future::Either::Right((_, still_loading)) => {
+                        pending_load = still_loading;
+                    }
+                }
+                let (Some(session_id), None) = (resume_session_id.clone(), entered.as_ref()) else {
+                    continue;
+                };
+                entered = this
+                    .update_in(cx, |this, window, cx| {
+                        if !matches!(this.server_state, ServerState::Loading { .. }) {
+                            return None;
+                        }
+                        let thread = connection.loading_thread(&session_id, cx)?;
+                        if thread.read(cx).entries().is_empty() {
+                            return None;
+                        }
+                        let connection_entry_subscription = connection_entry_subscription.take()?;
+                        this.enter_connected(
+                            thread.clone(),
+                            connection.clone(),
+                            connection_entry_subscription,
+                            resumed_without_history,
+                            initial_content.take(),
+                            window,
+                            cx,
+                        );
+                        Some(thread)
+                    })
+                    .ok()
+                    .flatten();
+            };
             if resuming {
                 log::info!(
                     "quiet-ui perf: agent replayed the session in {:.0}ms",
@@ -1691,49 +1750,23 @@ impl ConversationView {
             this.update_in(cx, |this, window, cx| {
                 match result {
                     Ok(thread) => {
-                        this.clear_resolved_request_elicitations_for_connection(&connection, cx);
-                        let root_session_id = thread.read(cx).session_id().clone();
-
-                        let conversation = cx.new(|cx| {
-                            let mut conversation = Conversation::default();
-                            conversation.register_thread(thread.clone(), cx);
-                            conversation
-                        });
-
-                        let initial_content =
-                            initial_content.or_else(|| this.pending_initial_content.take());
-                        let current = this.new_thread_view(
-                            thread,
-                            conversation.clone(),
-                            resumed_without_history,
-                            initial_content,
-                            window,
-                            cx,
-                        );
-
-                        if this.focus_handle.contains_focused(window, cx) {
-                            current
-                                .read(cx)
-                                .message_editor
-                                .focus_handle(cx)
-                                .focus(window, cx);
-                        }
-
-                        this.root_session_id = Some(root_session_id.clone());
-                        let request_elicitation_subscription =
-                            Self::request_elicitation_subscription(&connection, cx);
-                        this.set_server_state(
-                            ServerState::Connected(ConnectedServerState {
+                        // Already entered on this thread mid-replay; the load
+                        // resolving only means the last entry has landed.
+                        if entered.as_ref() == Some(&thread) {
+                            cx.notify();
+                        } else if let Some(connection_entry_subscription) =
+                            connection_entry_subscription.take()
+                        {
+                            this.enter_connected(
+                                thread,
                                 connection,
-                                auth_state: AuthState::Ok,
-                                active_id: Some(root_session_id.clone()),
-                                threads: HashMap::from_iter([(root_session_id, current)]),
-                                conversation,
-                                _connection_entry_subscription: connection_entry_subscription,
-                                _request_elicitation_subscription: request_elicitation_subscription,
-                            }),
-                            cx,
-                        );
+                                connection_entry_subscription,
+                                resumed_without_history,
+                                initial_content.take(),
+                                window,
+                                cx,
+                            );
+                        }
                     }
                     Err(err) => {
                         this.handle_load_error(
@@ -1756,6 +1789,72 @@ impl ConversationView {
             connection: None,
             _request_elicitation_subscription: None,
         }
+    }
+
+    /// Enters `Connected` on `thread`: builds its view, installs the state and
+    /// focuses the composer if this view holds focus.
+    ///
+    /// A load calls this once, either as soon as the connection has a thread
+    /// worth showing (a session still replaying its history) or when the load
+    /// resolves, whichever came first. The load task lives in the `Loading`
+    /// state it replaces, so it is carried over rather than dropped: dropping it
+    /// would cancel the replay this is showing.
+    #[allow(clippy::too_many_arguments)]
+    fn enter_connected(
+        &mut self,
+        thread: Entity<AcpThread>,
+        connection: Rc<dyn AgentConnection>,
+        connection_entry_subscription: Subscription,
+        resumed_without_history: bool,
+        initial_content: Option<AgentInitialContent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let ServerState::Loading { _loading, .. } = &self.server_state {
+            self._replay_load = Some(_loading.clone());
+        }
+
+        self.clear_resolved_request_elicitations_for_connection(&connection, cx);
+        let root_session_id = thread.read(cx).session_id().clone();
+
+        let conversation = cx.new(|cx| {
+            let mut conversation = Conversation::default();
+            conversation.register_thread(thread.clone(), cx);
+            conversation
+        });
+
+        let initial_content = initial_content.or_else(|| self.pending_initial_content.take());
+        let current = self.new_thread_view(
+            thread,
+            conversation.clone(),
+            resumed_without_history,
+            initial_content,
+            window,
+            cx,
+        );
+
+        if self.focus_handle.contains_focused(window, cx) {
+            current
+                .read(cx)
+                .message_editor
+                .focus_handle(cx)
+                .focus(window, cx);
+        }
+
+        self.root_session_id = Some(root_session_id.clone());
+        let request_elicitation_subscription = Self::request_elicitation_subscription(&connection, cx);
+        self.set_server_state(
+            ServerState::Connected(ConnectedServerState {
+                connection,
+                auth_state: AuthState::Ok,
+                active_id: Some(root_session_id.clone()),
+                threads: HashMap::from_iter([(root_session_id, current)]),
+                conversation,
+                _connection_entry_subscription: connection_entry_subscription,
+                _request_elicitation_subscription: request_elicitation_subscription,
+            }),
+            cx,
+        );
     }
 
     fn new_thread_view(
@@ -4505,6 +4604,7 @@ pub(crate) mod tests {
     use project::Project;
     use serde_json::json;
     use settings::SettingsStore;
+    use futures::channel::oneshot;
     use std::any::Any;
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
@@ -5205,6 +5305,208 @@ pub(crate) mod tests {
             let state = view.active_thread().unwrap();
             assert!(state.read(cx).resumed_without_history);
             assert_eq!(state.read(cx).list_state.item_count(), 0);
+        });
+    }
+
+    /// A connection whose `load_session` replays entries into the thread and
+    /// then sits there, exactly like a long session coming back over the wire.
+    /// Releasing `finish` resolves the load.
+    #[derive(Clone)]
+    struct ReplayingConnection {
+        thread: Arc<Mutex<Option<Entity<AcpThread>>>>,
+        finish: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+    }
+
+    impl AgentConnection for ReplayingConnection {
+        fn agent_id(&self) -> AgentId {
+            AgentId::new("replaying")
+        }
+
+        fn telemetry_id(&self) -> SharedString {
+            "replaying".into()
+        }
+
+        fn new_session(
+            self: Rc<Self>,
+            project: Entity<Project>,
+            _work_dirs: PathList,
+            cx: &mut App,
+        ) -> Task<gpui::Result<Entity<AcpThread>>> {
+            let thread = build_test_thread(
+                self,
+                project,
+                "ReplayingConnection",
+                acp::SessionId::new("new-session"),
+                cx,
+            );
+            Task::ready(Ok(thread))
+        }
+
+        fn supports_load_session(&self) -> bool {
+            true
+        }
+
+        fn load_session(
+            self: Rc<Self>,
+            session_id: acp::SessionId,
+            project: Entity<Project>,
+            _work_dirs: PathList,
+            _title: Option<SharedString>,
+            cx: &mut App,
+        ) -> Task<gpui::Result<Entity<AcpThread>>> {
+            let thread = build_test_thread(
+                self.clone(),
+                project,
+                "ReplayingConnection",
+                session_id,
+                cx,
+            );
+            // Registered before the replay, which is what makes it findable
+            // while the load is still outstanding.
+            *self.thread.lock() = Some(thread.clone());
+
+            for text in ["first replayed", "second replayed"] {
+                thread
+                    .update(cx, |thread, cx| {
+                        thread.handle_session_update(
+                            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                                text.into(),
+                            )),
+                            cx,
+                        )
+                    })
+                    .expect("replayed chunk should apply");
+            }
+
+            let finish = self.finish.lock().take();
+            cx.foreground_executor().spawn(async move {
+                if let Some(finish) = finish {
+                    finish.await.ok();
+                }
+                Ok(thread)
+            })
+        }
+
+        fn loading_thread(
+            &self,
+            _session_id: &acp::SessionId,
+            _cx: &App,
+        ) -> Option<Entity<AcpThread>> {
+            self.thread.lock().clone()
+        }
+
+        fn auth_methods(&self) -> &[acp::AuthMethod] {
+            &[]
+        }
+
+        fn authenticate(
+            &self,
+            _method_id: acp::AuthMethodId,
+            _cx: &mut App,
+        ) -> Task<gpui::Result<()>> {
+            Task::ready(Ok(()))
+        }
+
+        fn prompt(
+            &self,
+            _params: acp::PromptRequest,
+            _cx: &mut App,
+        ) -> Task<gpui::Result<acp::PromptResponse>> {
+            Task::ready(Ok(acp::PromptResponse::new(acp::StopReason::EndTurn)))
+        }
+
+        fn cancel(&self, _session_id: &acp::SessionId, _cx: &mut App) {}
+
+        fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
+            self
+        }
+    }
+
+    #[gpui::test]
+    async fn test_a_replaying_session_is_shown_while_it_replays(cx: &mut TestAppContext) {
+        // Opening a long thread waits on the agent replaying it, and that is
+        // nearly the whole wait. The entries are landing in the thread the
+        // whole time, so the reader should be watching them arrive rather than
+        // a "Loading…" label.
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let thread_store = cx.update(|_window, cx| cx.new(|cx| ThreadStore::new(cx)));
+        let connection_store =
+            cx.update(|_window, cx| cx.new(|cx| AgentConnectionStore::new(project.clone(), cx)));
+
+        let (finish_tx, finish_rx) = oneshot::channel();
+        let connection = ReplayingConnection {
+            thread: Arc::new(Mutex::new(None)),
+            finish: Arc::new(Mutex::new(Some(finish_rx))),
+        };
+        let session_id = acp::SessionId::new("long-session");
+
+        let conversation_view = cx.update(|window, cx| {
+            cx.new(|cx| {
+                ConversationView::new(
+                    Rc::new(StubAgentServer::new(connection)),
+                    connection_store,
+                    Agent::Custom { id: "replaying".into() },
+                    Some(session_id.clone()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Vec::new(),
+                    workspace.downgrade(),
+                    project.clone(),
+                    Some(thread_store),
+                    AgentThreadSource::AgentPanel,
+                    ConnectionStart::Immediate,
+                    window,
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(REPLAY_POLL_INTERVAL * 2);
+        cx.run_until_parked();
+
+        // The load has not resolved, so under the old code this would still be
+        // Loading with nothing to look at.
+        conversation_view.read_with(cx, |view, cx| {
+            let thread_view = view
+                .active_thread()
+                .expect("the replaying thread should be showing already");
+            // Two chunks of one assistant message make one entry; what matters
+            // is that replayed content is on screen while the load runs.
+            assert_eq!(
+                thread_view.read(cx).thread.read(cx).entries().len(),
+                1,
+                "the entries replayed so far are the ones on screen"
+            );
+        });
+
+        finish_tx.send(()).ok();
+        cx.run_until_parked();
+
+        conversation_view.read_with(cx, |view, cx| {
+            assert!(
+                matches!(view.server_state, ServerState::Connected(_)),
+                "the load resolving leaves the same thread in place"
+            );
+            let connected = view.as_connected().unwrap();
+            assert_eq!(connected.threads.len(), 1, "one thread, entered once");
+            assert_eq!(
+                view.active_thread()
+                    .unwrap()
+                    .read(cx)
+                    .thread
+                    .read(cx)
+                    .entries()
+                    .len(),
+                1
+            );
         });
     }
 
