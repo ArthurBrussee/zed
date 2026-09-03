@@ -860,47 +860,6 @@ does is removed as it lands.
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
-**Reordering tabs does nothing to the sidebar, and the order differs per worktree.**
-Two separate bugs behind one complaint, and neither is the sort key, which was fixed on 2026-08-30.
-
-*Dragging a tab changes nothing.* The sidebar rebuilds on the agent panel's events —
-`ActiveViewChanged`, `ActiveViewFocused`, `EntryChanged` and the like
-(`crates/sidebar/src/sidebar.rs:1068`) — and reordering a pane's items emits none of them. Nothing
-became active, nothing was created or destroyed, so `update_entries` never runs and the rows keep
-the order they were built with until something unrelated triggers a rebuild. The pane's own reorder
-has to reach the sidebar: either the panel emits on it, or the sidebar observes the pane directly.
-
-*The order differs between worktrees.* `tab_positions` is one map keyed by thread id, filled with
-`or_insert` while iterating `workspaces`, so the first pane to claim a thread sets its position
-(`:1508`). Each window builds this for itself from its own workspace list, so the same thread can
-take a different number in different windows, and the sections order differently depending on which
-worktree you are looking from. The 2026-08-30 run judged this unreachable because
-`group_rows_by_workspace` puts a thread in exactly one group, which is true *within* one window and
-is what made it look harmless. Positions belong to a pane, so key them by workspace as well as by
-thread, and let each group read the positions of its own pane.
-
-The group-level ordering entry already queued is the third piece of this; do them together, and
-gate the lot with a test that reorders tabs in two workspaces and asserts both sidebars.
-
-**A working thread should be obvious in the sidebar.**
-Scanning the list for what is running takes looking. Today the whole signal is that the row's agent
-glyph is swapped for a small rotating accent spinner (`agent_running_indicator`,
-`crates/ui/src/components/ai/thread_item.rs:21`): one small icon, in the same place and at the same
-size as the icon it replaced, so a row that is working and a row that is not have the same shape.
-Make it read at a glance, from across the list, without hunting.
-
-This is deliberately open: choose what reads best with the sidebar in front of you. The row has more
-than an icon to work with — the title, the row's own background, the chips line underneath — and the
-strongest signals are usually the ones that change the row rather than one glyph inside it. Whatever
-it becomes, it has to survive a list where several threads run at once, and it must not make a
-running row jump or resize, because rows that change shape when work starts are worse than rows that
-are hard to scan.
-
-Two related entries are already queued and should be built together with this, not against it: the
-spinner should stop taking the model's place (so a working row still says which model), and the
-running command's last output line is the other half of "what is it doing". If a single change
-satisfies more than one of them, do that and say so.
-
 **Opening a long thread waits on the replay, and the replay is nearly all of it.**
 A thread left running since 2026-08-26 takes long enough to open that it reads as broken. It is not:
 it arrives, slowly. The measurements are in the log the fork already writes, and they say the
@@ -924,6 +883,30 @@ happening while it loads" instead, which is worth having anyway.
 
 Also worth a look while there: whether the replayed entries can be kept, so the second open of the
 same thread costs nothing. The cost is per-open today, and it is the same session every time.
+
+**What the 2026-09-03 run established, so the next one does not re-derive it.** It ran out of clock
+before building this and read the code instead; the question the entry opens with is answered.
+
+- **The replay does stream, and the entries are already landing in an `AcpThread` while the reader
+  waits.** `AcpConnection::open_or_create_session` (`agent_servers/src/acp.rs`) creates the
+  `Entity<AcpThread>` and registers the session *before* awaiting the `session/load` RPC, with a
+  comment saying exactly why: so the `session/update` notifications the agent sends during history
+  replay can find the thread. So the thread fills up entry by entry over those 12.8 seconds. What
+  waits is the caller: `ConversationView`'s load path awaits the whole `Task<Result<Entity<AcpThread>>>`
+  and only leaves `ServerState::Loading` when it resolves.
+- **So the fix is to get that entity to the view early, not to make the replay faster.** The seam is
+  the task's return value: nothing else hands the thread out mid-load. Either the connection exposes
+  the in-flight thread (its `sessions` map already holds a `WeakEntity` under the session id, so a
+  `loading_thread(&session_id)` on the `AgentConnection` trait is a few lines and defaultable), or
+  `open_or_create_session` publishes it through a channel the load path can select on.
+- **The risk is the state machine, not the plumbing.** `ServerState::Loading -> Connected` builds a
+  `Conversation`, registers the thread, and builds entry views; installing a half-loaded thread early
+  means that path must not run twice on the same entity. Worth writing as "enter Connected early with
+  the same entity, and make the completion path idempotent" rather than as a second code path.
+- **`loading_status` already exists** (`ConversationView::loading_status`, rendered by the Loading
+  arm) but is fed by the connection store's agent-startup status, not by the replay. If the streaming
+  version turns out to be too invasive, a live "replayed N entries" on that field is the fallback the
+  entry describes, and it needs the same early handle.
 
 
 **Make `+` fast enough to press without thinking.**
@@ -3072,3 +3055,89 @@ the three questions it turns on (what counts as abandoned when closing the last 
 the window; what makes removal safe; whether it should be silent) are calls to make, not details
 to infer overnight.
 
+
+**2026-09-03**: onto main 28e52a287 (47 upstream commits: a Zed v1.20.0 bump, LSP dynamic document
+selectors and per-project log scoping, a `which_key` pending-binding indicator, gpui touch-drag and
+hover-listener work, an `on_new_window` setting, unified language-model event-stream handling). A
+working night by three triggers at once: the Work queue held three items, the fork carried 11
+commits on top of the merge base, and the branch had last moved the day before. Squash-then-rebase
+folded those 11 into 1, reusing the squash's own message; tree-identical to the old tip before
+rebasing, backed up as `quiet-ui-pre-rebase39-2026-09-03`.
+
+**The rebase itself applied with zero conflicts, and no markerless drift.** `cargo check --workspace
+--all-targets` came back with 0 errors and 0 warnings against the replayed commit before a line of
+tonight's own work was written. None of the 47 commits touch a surface this fork patches; the two
+that come nearest (`agent_ui: Wrap long ask_user options`, and hiding the manage-skills command when
+AI is disabled) landed by plain auto-merge. Nothing upstream built here for the fork to delete in
+favour of.
+
+**Built, in queue order.**
+
+1. *Reordering tabs reaches the sidebar, and the order is the same from every worktree.* Two bugs,
+   as the entry said, and the second one's fix subsumed the first. The sidebar's rebuild fires on the
+   agent panel's events, and a reorder emits none of them — nothing is created, destroyed or
+   activated — so the rows kept the order they were built with. And they were built by looping the
+   window's panes with `or_insert`, first pane to claim a thread winning, so every window numbered
+   from its own workspace list and the worktree groups came out in a different order depending on
+   which one you read the list from.
+   The entry's fix was to key the positions by workspace as well as by thread. The code said
+   something better: the strip already has one source, `ThreadTabsRegistry`, which every pane mirrors
+   and which spans every workspace of every window. Sorting by the registry is one order by
+   construction, so the per-window divergence goes away without a compound key, and observing the
+   registry is how a drag reaches the sidebar at all.
+   That turned up a third thing the entry did not name, which the same change had to fix to be worth
+   having: panels published only their OWN real tabs, so a tab dragged past another worktree's tabs
+   was renumbered within its workspace's old slots and the next mirror snapped it back. Panels now
+   publish the WHOLE strip — real tabs and foreign proxies alike, each carrying the workspace that
+   owns the thread — and `set_workspace_threads` became `set_window_tabs`, which replaces the entries
+   of the workspaces that strip names (they are the window's) in the slots they already occupy and
+   leaves every other window's alone. **Behaviour change worth knowing:** a new thread's tab now
+   opens at the END of the strip rather than beside the active tab. The strip spans the window's
+   worktrees, so "beside the active tab" could drop a new thread into the middle of another
+   worktree's tabs; the old registry quietly moved it to the end afterwards, and once the strip is
+   the order, nothing does. Gated by the test the entry asked for: two workspaces, a drag in each
+   pane, both panes' strips and the sidebar's rows asserted after every one.
+2. *A working thread's row says so.* The entry was deliberately open, and its own hint was the
+   answer: the strongest signal is the one that changes the row rather than one glyph inside it. A
+   running row gets an accent wash across it and an accent edge down its leading side. Both are paint
+   over space the row already occupies, so nothing moves or resizes when a thread starts or stops —
+   the constraint the entry put hardest — and a wash marks every running row at once without any of
+   them shouting, which is what a list with several running threads needs. The spinner stays.
+   Two entries the item said to build with it: the first (the spinner should stop taking the model's
+   place) was already built on 2026-08-31 and is why the leading slot draws the logo. The second (the
+   running command's last output line) is not in the Work queue at all — it was named as queued and
+   is not there — so it was not built; it also wants a live label plumbed from the thread into
+   `ActiveThreadInfo`, which is a different change from this one.
+   **No test:** `thread_item.rs` is a render component and this is four colour rules in it; there is
+   nothing to assert that is not the code restated.
+
+**Not built: opening a long thread.** The tail of the queue, and the clock, not a judgement about
+the item. What the night did do is answer the question the entry opens with, and the findings are
+written into the entry so tomorrow starts from them rather than re-deriving them: the replay DOES
+stream (`open_or_create_session` creates the `AcpThread` and registers the session before awaiting
+the load RPC, precisely so replay notifications can find it), the thread is filling up for the whole
+13 seconds, and what waits is `ConversationView`'s load path awaiting the task's return value. So the
+work is handing that entity to the view early and making the completion path idempotent, not making
+the replay faster.
+
+**The gate, green, and one thing about how it is invoked.** Suites run: `acp_thread`, `agent_ui`,
+`sidebar` and `ui` — the fork's core crates plus the one other crate tonight touched. 210 + 445 (32
+intentionally `#[ignore]`d) + 170 + 82/41 passed, 0 failed; `sidebar` gained the new drag test and
+`acp_thread` is up 34 tests on last week's number from the rebase. The Verification queue was empty
+going in and is empty going out. One real failure on the way, in the new test and not in the code it
+covers: it asserted where a newly opened tab lands, which the strip change had moved, and looking at
+what it actually did is what turned up the beside-the-active-tab behaviour recorded above.
+`script/clippy` (release, all targets, all features) is clean across the same crates plus
+`gpui_macros`. **That last package is not optional, and this cost a run:** `-p ui` on its own in
+RELEASE fails to compile at all — `gpui_macros::derive_inspector_reflection` is gated on
+`any(feature = "inspector", debug_assertions)`, release turns `debug_assertions` off, and
+`--all-features` only reaches the packages named on the command line, so nothing enables
+`inspector`. Naming `gpui_macros` (as the 2026-09-01 run happened to) enables it and the build is
+fine. It is a selection artifact, not a code problem: if `ui` is in the clippy set, `gpui_macros`
+must be too.
+
+Environment prerequisites needed reapplying in this fresh container
+(`CARGO_NET_GIT_FETCH_WITH_CLI=true`, `libasound2-dev`); both succeeded, `apt-get update` included.
+The disk sequence from 2026-09-01 held exactly: the debug test tree took the allowance down to 5.9G
+free, and `rm -rf target/debug` before the release clippy is what made room for it. Debug and
+release still do not coexist.
