@@ -552,7 +552,20 @@ impl RenderOnce for ThreadItem {
             .blend(color.panel_background.opacity(0.25));
 
         let raw_bg = self.base_bg.unwrap_or(sidebar_base_bg);
+        // A working row has to be findable from across the list, so the signal
+        // is the ROW: an accent wash across it, and an accent edge down its
+        // leading side. Both are paint over space the row already occupies, so
+        // nothing moves or resizes when a thread starts or stops working, and a
+        // list with several running threads stays readable — a wash marks all
+        // of them without any one of them shouting.
+        let running = self.status == AgentThreadStatus::Running;
+        let accent = color.text_accent;
         let apparent_bg = color.background.blend(raw_bg);
+        let apparent_bg = if running {
+            apparent_bg.blend(accent.opacity(0.08))
+        } else {
+            apparent_bg
+        };
 
         let base_bg = if self.selected {
             apparent_bg.blend(color.element_active)
@@ -745,6 +758,7 @@ impl RenderOnce for ThreadItem {
             .w_full()
             .py_1()
             .px_1p5()
+            .when(running && !self.selected, |s| s.bg(accent.opacity(0.08)))
             .when(self.selected, |s| s.bg(color.element_active))
             .border_1()
             .border_color(gpui::transparent_black())
@@ -752,6 +766,17 @@ impl RenderOnce for ThreadItem {
             .when(self.rounded, |s| s.rounded_sm())
             .hover(|s| s.bg(hover_color))
             .on_hover(self.on_hover)
+            .when(running, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top_0()
+                        .bottom_0()
+                        .w(px(2.))
+                        .bg(accent.opacity(0.8)),
+                )
+            })
             .child(
                 h_flex()
                     .min_w_0()
