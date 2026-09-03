@@ -16794,3 +16794,137 @@ async fn test_active_worktree_groups_follow_the_tab_strip(cx: &mut TestAppContex
          even though the other worktree's thread is the newest"
     );
 }
+
+#[gpui::test]
+async fn test_dragging_a_tab_reorders_every_pane_and_the_sidebar(cx: &mut TestAppContext) {
+    // Dragging a tab creates nothing, destroys nothing and activates nothing,
+    // so the sidebar has to hear about it some other way; and the order it
+    // lands in has to be the same one whichever worktree the drag happened in.
+    let project_a = init_test_project_with_agent_panel("/project-a", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a.clone(), window, cx));
+    let (sidebar, panel_a) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    cx.run_until_parked();
+
+    let open_thread = |panel: &Entity<AgentPanel>, cx: &mut gpui::VisualTestContext| {
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("Done".into()),
+        )]);
+        open_thread_with_connection(panel, connection, cx);
+        send_message(panel, cx);
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, cx| panel.active_thread_id(cx).unwrap())
+    };
+
+    let thread_a1 = open_thread(&panel_a, cx);
+    let thread_a2 = open_thread(&panel_a, cx);
+
+    let fs = cx.update(|_, cx| <dyn fs::Fs>::global(cx));
+    fs.as_fake()
+        .insert_tree("/project-b", serde_json::json!({ "src": {} }))
+        .await;
+    let project_b = project::Project::test(fs, ["/project-b".as_ref()], cx).await;
+    let workspace_b = multi_workspace.update_in(cx, |mw, window, cx| {
+        mw.test_add_workspace(project_b.clone(), window, cx)
+    });
+    let panel_b = add_agent_panel(&workspace_b, cx);
+    cx.run_until_parked();
+
+    let thread_b = open_thread(&panel_b, cx);
+    sidebar.update_in(cx, |sidebar, _window, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+
+    let name = move |id: ThreadId| {
+        if id == thread_a1 {
+            "a1"
+        } else if id == thread_a2 {
+            "a2"
+        } else if id == thread_b {
+            "b"
+        } else {
+            "?"
+        }
+    };
+    let strip = |panel: &Entity<AgentPanel>, cx: &mut gpui::VisualTestContext| {
+        panel
+            .read_with(cx, |panel, cx| panel.thread_tab_ids_in_pane_order(cx))
+            .into_iter()
+            .map(name)
+            .collect::<Vec<_>>()
+    };
+    let active_rows = |cx: &mut gpui::VisualTestContext| {
+        sidebar
+            .read_with(cx, |sidebar, _cx| {
+                sidebar
+                    .contents
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(ix, _)| {
+                        sidebar.section_of_entry(*ix) == Some(SidebarSection::OpenInZed)
+                    })
+                    .filter_map(|(_, entry)| match entry {
+                        ListEntry::Thread(thread) => Some(thread.metadata.thread_id),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .into_iter()
+            .map(name)
+            .collect::<Vec<_>>()
+    };
+    // The drag itself: the tab at `from` lands at `to`, and nothing rebuilds
+    // the sidebar by hand afterwards.
+    let drag_tab = |panel: &Entity<AgentPanel>,
+                    from: usize,
+                    to: usize,
+                    cx: &mut gpui::VisualTestContext| {
+        let pane = panel.read_with(cx, |panel, _cx| panel.thread_pane().clone());
+        let item_id = pane.read_with(cx, |pane, _cx| pane.items().nth(from).unwrap().item_id());
+        cx.update(|window, cx| {
+            workspace::move_item(&pane, &pane, item_id, to, false, window, cx);
+        });
+        cx.run_until_parked();
+    };
+
+    assert_eq!(
+        strip(&panel_a, cx),
+        vec!["a1", "a2", "b"],
+        "both panes start on one strip spanning the window"
+    );
+    assert_eq!(strip(&panel_b, cx), vec!["a1", "a2", "b"]);
+    assert_eq!(active_rows(cx), vec!["a1", "a2", "b"]);
+
+    // A drag within one worktree's own tabs.
+    drag_tab(&panel_a, 1, 0, cx);
+    assert_eq!(
+        strip(&panel_a, cx),
+        vec!["a2", "a1", "b"],
+        "the dragged tab stays where it was dropped"
+    );
+    assert_eq!(
+        strip(&panel_b, cx),
+        vec!["a2", "a1", "b"],
+        "the other worktree's pane mirrors it, so both read the same order"
+    );
+    assert_eq!(
+        active_rows(cx),
+        vec!["a2", "a1", "b"],
+        "the rows follow the tabs without anything else rebuilding the list"
+    );
+
+    // A drag from the other worktree's pane, past that worktree's tabs.
+    drag_tab(&panel_b, 2, 0, cx);
+    assert_eq!(
+        strip(&panel_b, cx),
+        vec!["b", "a2", "a1"],
+        "a tab dragged past another worktree's tabs stays there too"
+    );
+    assert_eq!(strip(&panel_a, cx), vec!["b", "a2", "a1"]);
+    assert_eq!(
+        active_rows(cx),
+        vec!["b", "a2", "a1"],
+        "and the worktree groups reorder with them"
+    );
+}

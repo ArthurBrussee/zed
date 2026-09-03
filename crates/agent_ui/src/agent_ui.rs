@@ -83,6 +83,7 @@ pub use crate::inline_assistant::InlineAssistant;
 pub use crate::message_editor::MessageEditorEvent;
 pub use crate::thread_metadata_store::ThreadId;
 pub use crate::thread_read_state::ThreadReadState;
+pub use crate::thread_tab_registry::{ThreadTabsEntry, ThreadTabsRegistry};
 pub use agent_diff::{AgentDiffPane, AgentDiffToolbar};
 pub use conversation_view::open_markdown_in_workspace;
 pub use conversation_view::{ConversationView, StateChange};

@@ -1,11 +1,17 @@
 //! Window-spanning registry of open thread tabs.
 //!
-//! Every [`AgentPanel`](crate::AgentPanel) publishes its own pane's real
-//! [`ThreadTab`](crate::thread_tab::ThreadTab) set here and mirrors the other
-//! workspaces' entries as
-//! [`ForeignThreadTab`](crate::thread_tab::ForeignThreadTab) proxies, so each
-//! pane's tab strip spans all workspaces in the window. Entries keep global
-//! insertion order; a workspace's own entries follow its pane order.
+//! Every [`AgentPanel`](crate::AgentPanel) publishes its own pane's whole tab
+//! strip here — its real [`ThreadTab`](crate::thread_tab::ThreadTab)s plus the
+//! [`ForeignThreadTab`](crate::thread_tab::ForeignThreadTab) proxies mirroring
+//! the other workspaces of its window — and mirrors this registry back into
+//! that strip, so every pane in a window shows one order spanning all of its
+//! workspaces.
+//!
+//! That makes this list, not any one pane, the order the tabs are in: the
+//! sidebar reads it to sort its rows, and a drag lands the same way whichever
+//! pane it happened in and whichever kind of tab was dragged.
+
+use std::collections::HashSet;
 
 use gpui::{App, AppContext as _, Context, Entity, EntityId, Global, WeakEntity};
 use workspace::Workspace;
@@ -35,6 +41,11 @@ impl ThreadTabsRegistry {
             cx.set_global(GlobalThreadTabsRegistry(registry));
         }
         cx.global::<GlobalThreadTabsRegistry>().0.clone()
+    }
+
+    pub fn try_global(cx: &App) -> Option<Entity<Self>> {
+        cx.try_global::<GlobalThreadTabsRegistry>()
+            .map(|global| global.0.clone())
     }
 
     pub fn entries(&self) -> &[ThreadTabsEntry] {
@@ -78,42 +89,64 @@ impl ThreadTabsRegistry {
             .count()
     }
 
-    /// Replaces `workspace`'s entries with `thread_ids` (in pane order),
-    /// preserving global insertion order: surviving threads keep their
-    /// slots (reassigned in pane order) and new threads append at the end.
-    pub fn set_workspace_threads(
+    /// Records `owner`'s pane as `strip`: its whole tab sequence, real tabs
+    /// and foreign proxies alike, each carrying the workspace that owns the
+    /// thread.
+    ///
+    /// Only the workspaces the strip names (plus `owner`, whose last tab may
+    /// have just closed) are that pane's to speak for — those are the window's
+    /// — so their entries are replaced wholesale, in the slots they already
+    /// occupy. Every other window's entries keep theirs. Publishing the whole
+    /// strip rather than only the owner's own tabs is what lets a tab dragged
+    /// past another worktree's tabs stay where it was dropped: the drag is the
+    /// order, and the panes that mirror this list follow it.
+    pub fn set_window_tabs(
         &mut self,
-        workspace: WeakEntity<Workspace>,
-        thread_ids: Vec<ThreadId>,
+        owner: WeakEntity<Workspace>,
+        strip: Vec<ThreadTabsEntry>,
         cx: &mut Context<Self>,
     ) {
-        let workspace_id = workspace.entity_id();
-        let is_mine = |entry: &ThreadTabsEntry| entry.workspace.entity_id() == workspace_id;
+        let dropped_dead_entries = self.prune_dead_workspaces();
 
-        let old: Vec<ThreadId> = self
+        let mut window_workspaces: HashSet<EntityId> = strip
+            .iter()
+            .map(|entry| entry.workspace.entity_id())
+            .collect();
+        window_workspaces.insert(owner.entity_id());
+
+        let slots: Vec<usize> = self
             .entries
             .iter()
-            .filter(|entry| is_mine(entry))
-            .map(|entry| entry.thread_id)
+            .enumerate()
+            .filter(|(_, entry)| window_workspaces.contains(&entry.workspace.entity_id()))
+            .map(|(index, _)| index)
             .collect();
-        let dropped_dead_entries = self.prune_dead_workspaces();
-        if old == thread_ids && !dropped_dead_entries {
+
+        let unchanged = slots.len() == strip.len()
+            && slots.iter().zip(&strip).all(|(slot, wanted)| {
+                let entry = &self.entries[*slot];
+                entry.thread_id == wanted.thread_id
+                    && entry.workspace.entity_id() == wanted.workspace.entity_id()
+            });
+        if unchanged && !dropped_dead_entries {
             return;
         }
 
-        self.entries
-            .retain(|entry| !is_mine(entry) || thread_ids.contains(&entry.thread_id));
-        let mut ids = thread_ids.into_iter();
-        for entry in self.entries.iter_mut().filter(|entry| is_mine(entry)) {
-            if let Some(id) = ids.next() {
-                entry.thread_id = id;
-            }
+        let shared = slots.len().min(strip.len());
+        for (slot, entry) in slots.iter().zip(strip.iter()) {
+            self.entries[*slot] = entry.clone();
         }
-        for id in ids {
-            self.entries.push(ThreadTabsEntry {
-                thread_id: id,
-                workspace: workspace.clone(),
-            });
+        if strip.len() > shared {
+            // New tabs go in after the window's last one, so a window's tabs
+            // stay together rather than scattering to the end of the list.
+            let insert_at = slots.last().map_or(self.entries.len(), |slot| slot + 1);
+            for (offset, entry) in strip[shared..].iter().enumerate() {
+                self.entries.insert(insert_at + offset, entry.clone());
+            }
+        } else {
+            for slot in slots[shared..].iter().rev() {
+                self.entries.remove(*slot);
+            }
         }
         cx.notify();
     }

@@ -2070,16 +2070,37 @@ impl AgentPanel {
 
     /// Publishes the pane's real [`ThreadTab`](crate::thread_tab::ThreadTab)
     /// set, in pane order, to the window-global thread-tabs registry.
+    /// Publishes this pane's whole tab strip — its own tabs and the proxies
+    /// mirroring the window's other workspaces — so the registry records the
+    /// order the user arranged, whichever kind of tab they dragged.
     fn publish_thread_tabs(&mut self, cx: &mut Context<Self>) {
-        let thread_ids: Vec<ThreadId> = self
+        use crate::thread_tab::{ForeignThreadTab, ThreadTab};
+        use crate::thread_tab_registry::ThreadTabsEntry;
+
+        let strip: Vec<ThreadTabsEntry> = self
             .thread_pane
             .read(cx)
-            .items_of_type::<crate::thread_tab::ThreadTab>()
-            .map(|tab| tab.read(cx).thread_id(cx))
+            .items()
+            .filter_map(|item| {
+                if let Some(tab) = item.downcast::<ThreadTab>() {
+                    Some(ThreadTabsEntry {
+                        thread_id: tab.read(cx).thread_id(cx),
+                        workspace: self.workspace.clone(),
+                    })
+                } else {
+                    item.downcast::<ForeignThreadTab>().map(|proxy| {
+                        let proxy = proxy.read(cx);
+                        ThreadTabsEntry {
+                            thread_id: proxy.thread_id(),
+                            workspace: proxy.home_workspace().clone(),
+                        }
+                    })
+                }
+            })
             .collect();
         let workspace = self.workspace.clone();
         crate::thread_tab_registry::ThreadTabsRegistry::global(cx).update(cx, |registry, cx| {
-            registry.set_workspace_threads(workspace, thread_ids, cx);
+            registry.set_window_tabs(workspace, strip, cx);
         });
     }
 
@@ -5235,7 +5256,11 @@ impl AgentPanel {
             crate::thread_tab::ThreadTab::new(conversation_view, self.workspace.clone(), cx)
         });
         self.thread_pane.update(cx, |pane, cx| {
-            pane.add_item(Box::new(tab), true, focus, None, window, cx);
+            // The end of the strip, not next to whatever is active: the strip
+            // spans the window's worktrees, so "next to the active tab" can
+            // drop a new thread into the middle of another worktree's tabs.
+            let end = pane.items_len();
+            pane.add_item(Box::new(tab), true, focus, Some(end), window, cx);
         });
         cx.notify();
     }
@@ -5277,7 +5302,8 @@ impl AgentPanel {
             crate::thread_tab::ThreadTab::new(conversation_view, self.workspace.clone(), cx)
         });
         self.thread_pane.update(cx, |pane, cx| {
-            pane.add_item_inner(Box::new(tab), false, false, false, None, window, cx);
+            let end = pane.items_len();
+            pane.add_item_inner(Box::new(tab), false, false, false, Some(end), window, cx);
         });
         cx.emit(AgentPanelEvent::EntryChanged);
         cx.notify();
@@ -5339,8 +5365,8 @@ impl AgentPanel {
 
     /// Every thread this pane shows a tab for, in strip order: its own threads
     /// and the proxies standing in for the other workspaces'. Every pane
-    /// mirrors every workspace's threads in one insertion order, so this reads
-    /// as a global tab order, which is what the sidebar sorts Active by.
+    /// mirrors the registry, so this is one window's view of that global
+    /// order; the registry itself is what the sidebar sorts Active by.
     /// [`Self::open_thread_tab_ids`] is the narrower question — which threads
     /// are open *here* — and stays the answer for membership.
     pub fn thread_tab_ids_in_pane_order(&self, cx: &App) -> Vec<ThreadId> {

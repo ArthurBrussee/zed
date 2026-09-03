@@ -793,6 +793,17 @@ impl Sidebar {
         })
         .detach();
 
+        // Reordering a pane's tabs creates nothing, destroys nothing and
+        // activates nothing, so none of the agent panel's events fire and the
+        // rows would keep the order they were built with. The registry is
+        // where a reorder lands, so watch that instead — in any window, since
+        // this list shows every window's threads.
+        let thread_tabs_registry = agent_ui::ThreadTabsRegistry::global(cx);
+        cx.observe(&thread_tabs_registry, |this, _registry, cx| {
+            this.schedule_update_entries(false, cx);
+        })
+        .detach();
+
         cx.observe(
             &TerminalThreadMetadataStore::global(cx),
             |this, _store, cx| {
@@ -1495,19 +1506,6 @@ impl Sidebar {
         // alive. Otherwise closing a thread leaves it sitting in Active.
         let mut open_thread_ids: HashSet<agent_ui::ThreadId> = HashSet::new();
         let mut tabbed_threads: HashSet<agent_ui::ThreadId> = HashSet::new();
-        // Where each tabbed thread sits in the tab strip. The Active section is
-        // sorted by this so a row is where its tab is: the tabs are the order
-        // the user arranged, and reading the list to find the row for the tab
-        // in front of you is work the sidebar can do instead. A thread can be
-        // tabbed in more than one workspace, so the first pane that claims it
-        // wins rather than the last.
-        //
-        // Positions come from the WHOLE strip, foreign proxies included, which
-        // is one order spanning every workspace. Numbering only a pane's own
-        // real tabs gave every pane's first tab position 0, so each worktree's
-        // group tied on its first row and the groups fell back to the time
-        // sort — rows followed their tabs and the groups they sat in did not.
-        let mut tab_positions: HashMap<agent_ui::ThreadId, usize> = HashMap::default();
         for workspace in &workspaces {
             if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
                 let agent_panel = agent_panel.read(cx);
@@ -1516,18 +1514,37 @@ impl Sidebar {
                         .active_conversation_view()
                         .map(|conversation_view| conversation_view.read(cx).parent_id()),
                 );
-                for (position, thread_id) in agent_panel
-                    .thread_tab_ids_in_pane_order(cx)
-                    .into_iter()
-                    .enumerate()
-                {
-                    tab_positions.entry(thread_id).or_insert(position);
-                }
                 let tabs = agent_panel.open_thread_tab_ids(cx);
                 open_thread_ids.extend(tabs.iter().copied());
                 tabbed_threads.extend(tabs);
             }
         }
+
+        // Where each tabbed thread sits in the tab strip. The Active section is
+        // sorted by this so a row is where its tab is: the tabs are the order
+        // the user arranged, and reading the list to find the row for the tab
+        // in front of you is work the sidebar can do instead.
+        //
+        // The order is the registry's, not any one pane's. Every pane mirrors
+        // the registry, so it is the same strip the user is looking at, and it
+        // spans every workspace of every window — which is what stops a thread
+        // taking a different number depending on which worktree the list is
+        // read from. Reading the panes instead meant each window numbered from
+        // its own workspace list, first pane to claim a thread winning, so the
+        // groups ordered differently in each window. Numbering only a pane's
+        // own real tabs is the other wrong answer: every pane's first tab is
+        // position 0, so the worktree groups tie and fall back to the time
+        // sort.
+        let tab_positions: HashMap<agent_ui::ThreadId, usize> =
+            agent_ui::ThreadTabsRegistry::try_global(cx)
+                .map(|registry| {
+                    let mut positions = HashMap::default();
+                    for (position, entry) in registry.read(cx).entries().iter().enumerate() {
+                        positions.entry(entry.thread_id).or_insert(position);
+                    }
+                    positions
+                })
+                .unwrap_or_default();
 
         // Merge live info into threads and mask the unread marker on the
         // thread the user is actively viewing.
