@@ -860,6 +860,28 @@ does is removed as it lands.
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**A draft PR wears the same warning as one that needs a rebase.**
+Both draw `IconName::Warning` in `Color::Warning`, so a draft nobody has finished writing looks like
+a branch that cannot merge until it is rebased. Being a draft is not a problem to warn about: the
+chip already says "draft" and already draws it muted.
+
+The mapping was written expecting this and is defeated by what GitHub actually sends. `merge_state`
+deliberately lets `DRAFT` fall through to `Unknown`, with a comment saying the chip carries the draft
+state already (`crates/gh_status/src/gh_status.rs:688`). But GitHub reports `mergeStateStatus` as
+`BLOCKED` for a draft in a repository with branch protection, not `DRAFT`, so it becomes
+`MergeState::Blocked`, `blocked_reason` returns "blocked by branch protection", and the checks glyph
+is replaced by the warning (`:451`, `:461`).
+
+The narrow fix is at `:451`: mergeability has nothing to say about a draft either, so ask for
+`blocked_reason` on `PrState::Open` alone and leave `Draft` out with `Merged` and `Closed`. Take the
+draft case as a test, since the current tests cover `BEHIND` and `BLOCKED` but not a draft that
+reports `BLOCKED`.
+
+While there: `Behind` and `Blocked` are also indistinguishable from each other, both being the same
+warning glyph, and "needs a rebase" is something you can act on in a second where "blocked by branch
+protection" is somebody else's decision. If they can be told apart without adding a third glyph to a
+small chip, do it; if not, leave them and say so.
+
 **Archiving should happen at once, not after a load.**
 Archiving a thread visibly waits: something loads first, slowly, and only then does the row move.
 Archiving is a flag on metadata and should feel like one.
