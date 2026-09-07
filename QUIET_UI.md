@@ -860,6 +860,28 @@ does is removed as it lands.
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**Archiving should happen at once, not after a load.**
+Archiving a thread visibly waits: something loads first, slowly, and only then does the row move.
+Archiving is a flag on metadata and should feel like one.
+
+What the wait is: when the thread's workspace is closed, the sidebar opens that workspace before
+archiving anything (`should_load_closed_workspace_for_archive` into `open_workspace_for_archive`,
+`crates/sidebar/src/sidebar.rs:4038`, `:4331`, called from the thread path at `:4805`). It is not
+replaying the thread; it is building a whole workspace — worktree scan, repositories, language
+servers — because `build_root_plan` needs a project to decide which linked worktree roots can be
+deleted from disk. That is a real requirement for the deletion, and no requirement at all for the
+archive.
+
+Separate the two. Mark the thread archived immediately, so the row moves the moment it is asked for,
+and work out the disk plan afterwards. If the plan needs a workspace, open it in the background and
+delete when it answers; if that fails or is cancelled, nothing is deleted, which is the safe way for
+this to fail. Deleting a worktree is the part worth being careful and slow about, and archiving is
+not.
+
+Check whether the workspace has to be opened at all for the plan: what it is being asked is which
+worktree roots belong to this thread and whether anything else references them, and git can answer
+that about paths on disk without a project, LSP or file scan.
+
 **Two threads installing the same agent at once break the install.**
 Opening Codex threads on 2026-09-07 gave "Failed to Launch" with npm's `ENOTEMPTY`: it could not
 rename a freshly unpacked `@openai/codex-darwin-arm64` over the existing one because that directory
