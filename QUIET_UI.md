@@ -860,6 +860,24 @@ does is removed as it lands.
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**Two threads installing the same agent at once break the install.**
+Opening Codex threads on 2026-09-07 gave "Failed to Launch" with npm's `ENOTEMPTY`: it could not
+rename a freshly unpacked `@openai/codex-darwin-arm64` over the existing one because that directory
+was not empty. That is the signature of two `npm install` runs in the same directory at the same
+time, which is what happens when several threads each decide the agent needs installing, and it
+lands whenever a version bumps (this one was codex-acp 1.6.2 to 1.10.0, carrying codex 0.148.0 to
+0.153.4).
+
+The install ends up fine on a retry, which is the tell that nothing is wrong with the package: it is
+a race, and the user pays for it with a red card on every thread that lost. One install per agent at
+a time is the fix. Where the install is kicked off, a second request for the same agent should wait
+on the first and then use its result, rather than starting its own in the same directory.
+
+Worth checking while there whether the failure is even fatal: the directory was intact and usable
+immediately afterwards, so a launch that failed this way could plausibly re-check and continue
+rather than stopping at a card that says Retry.
+
+
 **Make `+` fast enough to press without thinking.**
 Seven seconds on a good run and thirty on a bad one, measured in three phases the code still logs
 (`crates/git_ui_core/src/worktree_service.rs`, the `quiet-ui perf:` lines around the fetch, the
