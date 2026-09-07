@@ -54,6 +54,19 @@ use ui::{
 use unicode_segmentation::UnicodeSegmentation as _;
 use util::ResultExt as _;
 use util::path_list::PathList;
+
+/// Repositories already swept for abandoned worktrees this launch, so the
+/// second window opened over the same project does not sweep it again.
+#[derive(Default)]
+struct SweptRepositories(HashSet<PathBuf>);
+
+impl gpui::Global for SweptRepositories {}
+
+fn claim_worktree_sweep(main_repo_path: &Path, cx: &mut App) -> bool {
+    cx.default_global::<SweptRepositories>()
+        .0
+        .insert(main_repo_path.to_path_buf())
+}
 use workspace::{
     CloseWindow, MultiWorkspace, MultiWorkspaceEvent, NextProject, NextThread, Open, OpenMode,
     PreviousProject, PreviousThread, ProjectGroupKey, RemovalIntent, SaveIntent,
@@ -860,6 +873,7 @@ impl Sidebar {
                 }
             }
             this.schedule_update_entries(false, cx);
+            this.reclaim_abandoned_worktrees(cx);
         });
 
         Self {
@@ -4252,6 +4266,186 @@ impl Sidebar {
                 .map(|path| (path.as_path(), remote_connection)),
             cx,
         );
+    }
+
+    /// Take the worktrees an abandoned `+` left behind off disk.
+    ///
+    /// Every worktree Zed creates is recorded, and archiving a thread takes
+    /// its worktree with it. Pressing `+` and walking away produces neither:
+    /// the draft has no typed text, so it is filtered out of the list, which
+    /// means there is no row to archive and nothing ever calls the pipeline.
+    /// One click, one worktree, forever.
+    ///
+    /// This runs once per repository per launch rather than when the window
+    /// closes. Closing is the moment a worktree becomes abandoned, but it is
+    /// also the moment its project and repositories are being torn down, and a
+    /// removal racing that teardown is one that can half happen. A worktree
+    /// still here from the last session is abandoned by definition, and
+    /// nothing is in flight to race.
+    ///
+    /// Nothing is persisted first, because by construction there is nothing to
+    /// persist: `git worktree remove` without `--force` refuses a worktree
+    /// carrying any uncommitted change, and a removed worktree's branch and
+    /// its commits stay in the repository. That is also why this says nothing:
+    /// it can only ever remove a directory that `git worktree add` would put
+    /// back from the branch it was on.
+    fn reclaim_abandoned_worktrees(&mut self, cx: &mut Context<Self>) {
+        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+            return;
+        };
+        let project = multi_workspace
+            .read(cx)
+            .workspace()
+            .read(cx)
+            .project()
+            .clone();
+        let Some(repo) = project.read(cx).active_repository(cx) else {
+            return;
+        };
+        let snapshot = repo.read(cx).snapshot();
+        if snapshot.is_linked_worktree() {
+            return;
+        }
+        let main_repo_path = snapshot.work_directory_abs_path.to_path_buf();
+        if !claim_worktree_sweep(&main_repo_path, cx) {
+            return;
+        }
+        let Some(managed_directory) = project::git_store::worktrees_directory_for_repo(
+            &main_repo_path,
+            &project::project_settings::ProjectSettings::get_global(cx)
+                .git
+                .worktree_directory,
+            snapshot.path_style,
+        )
+        .log_err() else {
+            return;
+        };
+        let remote_connection = project.read(cx).remote_connection_options(cx);
+        let worktrees = repo.update(cx, |repo, _cx| repo.worktrees());
+        let threads_loaded = ThreadMetadataStore::global(cx).read(cx).reload_task();
+
+        cx.spawn(async move |this, cx| {
+            // Reading the store before its rows are back from disk sees an
+            // empty store, which is the one state where every worktree looks
+            // abandoned.
+            threads_loaded.await;
+            let worktrees = worktrees.await??;
+            let abandoned = this.update(cx, |this, cx| {
+                this.abandoned_worktrees(
+                    &worktrees,
+                    &managed_directory,
+                    remote_connection.as_ref(),
+                    cx,
+                )
+            })?;
+
+            let mut reclaimed = Vec::new();
+            for path in abandoned {
+                let removed = repo
+                    .update(cx, |repo, _cx| repo.remove_worktree(path.clone(), false))
+                    .await;
+                match removed {
+                    Ok(Ok(())) => reclaimed.push(path),
+                    // A worktree that will not come off cleanly has something
+                    // in it, which means it was not abandoned after all.
+                    Ok(Err(error)) => {
+                        log::info!("leaving worktree {} in place: {error:#}", path.display());
+                    }
+                    Err(_) => {}
+                }
+            }
+            if reclaimed.is_empty() {
+                return anyhow::Ok(());
+            }
+
+            log::info!(
+                "reclaimed {} worktree(s) left behind by threads that were never started",
+                reclaimed.len()
+            );
+            for path in &reclaimed {
+                let forget = cx.update(|cx| {
+                    git_ui_core::created_worktrees::forget_created_worktree(
+                        path,
+                        remote_connection.as_ref(),
+                        cx,
+                    )
+                });
+                forget.await.log_err();
+            }
+            this.update(cx, |this, cx| {
+                this.delete_empty_drafts_for_archive_targets(
+                    reclaimed
+                        .iter()
+                        .map(|path| (path.as_path(), remote_connection.as_ref())),
+                    cx,
+                );
+                this.update_entries(cx);
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    /// The repository's linked worktrees that nothing is using: Zed made them,
+    /// they sit under the directory Zed manages, no window has them open, and
+    /// no thread that would block their archival refers to them.
+    fn abandoned_worktrees(
+        &self,
+        worktrees: &[git::repository::Worktree],
+        managed_directory: &Path,
+        remote_connection: Option<&RemoteConnectionOptions>,
+        cx: &App,
+    ) -> Vec<PathBuf> {
+        let open_paths = self
+            .archive_workspaces(cx)
+            .iter()
+            .flat_map(|workspace| workspace.read(cx).root_paths(cx))
+            .map(|path| path.to_path_buf())
+            .collect::<HashSet<_>>();
+        let archive_workspaces = self.archive_workspaces(cx);
+        let store = ThreadMetadataStore::global(cx);
+        let store = store.read(cx);
+
+        worktrees
+            .iter()
+            .filter(|worktree| !worktree.is_main && !worktree.is_bare)
+            .map(|worktree| worktree.path.clone())
+            .filter(|path| path.starts_with(managed_directory))
+            .filter(|path| !open_paths.contains(path))
+            .filter(|path| {
+                git_ui_core::created_worktrees::recorded_created_at(path, remote_connection, cx)
+                    .is_some()
+            })
+            .filter(|path| {
+                // What this reclaims is the empty draft's worktree, so there
+                // has to be an empty draft. A worktree with no row at all is
+                // not what this is about, and leaving it is the conservative
+                // reading of a store that may simply not know about it yet.
+                !store
+                    .unarchived_draft_ids_matching(|thread| {
+                        thread.matches_remote_connection(remote_connection)
+                            && thread.references_folder_path(path)
+                    })
+                    .is_empty()
+            })
+            .filter(|path| {
+                !Self::path_is_referenced_by_unarchived_threads_for_archive(
+                    &store,
+                    None,
+                    path,
+                    remote_connection,
+                    &archive_workspaces,
+                    cx,
+                )
+            })
+            .filter(|path| {
+                TerminalThreadMetadataStore::try_global(cx).is_none_or(|terminal_store| {
+                    !terminal_store
+                        .read(cx)
+                        .path_is_referenced_by_terminal(None, path, remote_connection)
+                })
+            })
+            .collect()
     }
 
     fn delete_empty_drafts_for_archive_targets<'a>(

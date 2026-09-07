@@ -3495,6 +3495,111 @@ async fn test_archive_selected_thread_archives_closed_linked_worktree(cx: &mut T
     );
 }
 
+/// Press `+`, get a worktree and an empty draft, walk away: the draft is
+/// filtered out of the list, so there was never a row to archive and nothing
+/// ever took the worktree off disk. One click, one worktree, forever.
+#[gpui::test]
+async fn test_a_worktree_left_by_an_abandoned_new_thread_is_reclaimed(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/reclaim",
+        serde_json::json!({
+            ".git": {
+                "worktrees": {
+                    "abandoned": { "commondir": "../../", "HEAD": "ref: refs/heads/abandoned" },
+                    "in-use": { "commondir": "../../", "HEAD": "ref: refs/heads/in-use" },
+                },
+            },
+            "src": {},
+        }),
+    )
+    .await;
+    for name in ["abandoned", "in-use"] {
+        fs.insert_tree(
+            format!("/worktrees/reclaim/{name}/reclaim"),
+            serde_json::json!({
+                ".git": format!("gitdir: /reclaim/.git/worktrees/{name}"),
+                "src": {},
+            }),
+        )
+        .await;
+        fs.add_linked_worktree_for_repo(
+            Path::new("/reclaim/.git"),
+            false,
+            git::repository::Worktree {
+                path: PathBuf::from(format!("/worktrees/reclaim/{name}/reclaim")),
+                ref_name: Some(format!("refs/heads/{name}").into()),
+                sha: "aaa".into(),
+                is_main: false,
+                is_bare: false,
+            },
+        )
+        .await;
+        agent_ui::test_support::record_zed_created_worktree(
+            fs.as_ref(),
+            Path::new(&format!("/worktrees/reclaim/{name}/reclaim")),
+            None,
+            cx,
+        )
+        .await;
+    }
+    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+
+    let main_project = project::Project::test(fs.clone(), ["/reclaim".as_ref()], cx).await;
+    main_project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+
+    // The abandoned worktree gets the empty draft `+` leaves behind; the other
+    // one carries a real thread, which is what keeps a worktree alive.
+    let abandoned_paths = PathList::new(&[PathBuf::from("/worktrees/reclaim/abandoned/reclaim")]);
+    let abandoned_draft_id = save_draft_metadata_with_main_paths(
+        None,
+        abandoned_paths.clone(),
+        PathList::new(&[PathBuf::from("/reclaim")]),
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 0).unwrap(),
+        cx,
+    );
+    save_thread_metadata_with_main_paths(
+        "in-use-thread",
+        "In Use Thread",
+        PathList::new(&[PathBuf::from("/worktrees/reclaim/in-use/reclaim")]),
+        PathList::new(&[PathBuf::from("/reclaim")]),
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 2, 0, 0, 0).unwrap(),
+        cx,
+    );
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(main_project.clone(), window, cx));
+    let _sidebar = setup_sidebar(&multi_workspace, cx);
+    for _ in 0..8 {
+        cx.run_until_parked();
+    }
+
+    assert!(
+        !fs.is_dir(Path::new("/worktrees/reclaim/abandoned/reclaim"))
+            .await,
+        "the worktree nothing ever used should be reclaimed"
+    );
+    assert!(
+        fs.is_dir(Path::new("/worktrees/reclaim/in-use/reclaim"))
+            .await,
+        "a worktree a thread is using must be left alone"
+    );
+    let draft_gone = cx.update(|_, cx| {
+        ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry(abandoned_draft_id)
+            .is_none()
+    });
+    assert!(
+        draft_gone,
+        "the empty draft that held the reclaimed worktree should go with it"
+    );
+}
+
 /// Archiving is a flag on metadata and has to feel like one. It used to build
 /// the thread's closed workspace first — worktree scan, repositories, language
 /// servers — because the disk plan needs a live project, and only moved the row
