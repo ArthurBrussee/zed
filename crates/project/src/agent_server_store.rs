@@ -8,7 +8,10 @@ use std::{
 use anyhow::{Context as _, Result, bail};
 use collections::HashMap;
 use fs::{Fs, RemoveOptions};
-use futures::StreamExt;
+use futures::{
+    FutureExt as _, StreamExt,
+    future::{BoxFuture, Shared},
+};
 use gpui::{
     AppContext as _, AsyncApp, Context, Entity, EventEmitter, SharedString, Subscription, Task,
     TaskExt,
@@ -1391,18 +1394,28 @@ impl ExternalAgentServer for LocalRegistryNpxAgent {
             fs.create_dir(&install_dir).await?;
 
             let (package_name, package_spec) = bounded_npm_package_spec(&package);
-            node_runtime
-                .run_npm_subcommand(
-                    Some(&install_dir),
-                    "install",
-                    &[package_spec.as_str(), "--save-exact"],
-                )
-                .await?;
-            let executable = node_runtime::read_package_executable(
-                install_dir.join("node_modules"),
-                package_name,
-            )
-            .await?;
+            let node_modules = install_dir.join("node_modules");
+            if let Err(error) =
+                install_npm_agent_package(&node_runtime, &install_dir, &package_spec).await
+            {
+                // An install that failed has not necessarily left nothing
+                // behind: the common failure is a version bump racing itself,
+                // and the package that is already unpacked runs. Launching the
+                // version on disk is worth more than a card that says Retry,
+                // and the version bound is a ceiling rather than a pin, so a
+                // launch that is behind is a launch, not a wrong answer.
+                let installed =
+                    node_runtime::read_package_executable(node_modules.clone(), package_name).await;
+                if installed.is_err() {
+                    return Err(error);
+                }
+                log::warn!(
+                    "installing {package_spec} failed ({error:#}); \
+                     launching the copy already in {install_dir:?}"
+                );
+            }
+            let executable =
+                node_runtime::read_package_executable(node_modules, package_name).await?;
 
             let node_binary = node_runtime.binary_path().await?;
             env.extend(node_runtime::npm_command_env(&node_binary));
@@ -1431,6 +1444,80 @@ impl ExternalAgentServer for LocalRegistryNpxAgent {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
+}
+
+/// The npm installs that are already running, keyed by the directory they are
+/// running in. See [`install_npm_agent_package`].
+static IN_FLIGHT_NPM_INSTALLS: LazyLock<
+    parking_lot::Mutex<HashMap<PathBuf, Shared<BoxFuture<'static, Result<(), Arc<anyhow::Error>>>>>>,
+> = LazyLock::new(Default::default);
+
+/// Installs an agent's npm package, joining the install already running in the
+/// same directory rather than starting a second one.
+async fn install_npm_agent_package(
+    node_runtime: &NodeRuntime,
+    install_dir: &Path,
+    package_spec: &str,
+) -> Result<()> {
+    let node_runtime = node_runtime.clone();
+    let dir = install_dir.to_path_buf();
+    let spec = package_spec.to_string();
+    install_once_per_directory(install_dir, move || {
+        async move {
+            node_runtime
+                .run_npm_subcommand(Some(&dir), "install", &[spec.as_str(), "--save-exact"])
+                .await
+                .map(drop)
+        }
+        .boxed()
+    })
+    .await
+}
+
+/// Runs `start` unless an install is already running in `install_dir`, in
+/// which case that one's result is awaited and returned instead.
+///
+/// `npm install` unpacks into a temporary directory and renames it over what
+/// is already there. Two runs in the same directory race, and the loser fails
+/// with `ENOTEMPTY` renaming over a tree the winner has not finished writing.
+/// That is what several threads launching the same agent at once looks like,
+/// and it lands on every version bump, when there is something to unpack. The
+/// directory is per agent and shared by every project in the process, so the
+/// gate has to be process-wide rather than per store.
+///
+/// Only concurrent installs are joined. Once one finishes its entry is
+/// dropped, so the next launch installs again and still picks up a new
+/// version.
+async fn install_once_per_directory(
+    install_dir: &Path,
+    start: impl FnOnce() -> BoxFuture<'static, Result<()>>,
+) -> Result<()> {
+    let install = {
+        let mut in_flight = IN_FLIGHT_NPM_INSTALLS.lock();
+        if let Some(install) = in_flight.get(install_dir) {
+            install.clone()
+        } else {
+            let install = start().map(|result| result.map_err(Arc::new)).boxed().shared();
+            in_flight.insert(install_dir.to_path_buf(), install.clone());
+            install
+        }
+    };
+
+    let result = install.clone().await;
+
+    // Whoever finishes waiting clears the entry, not whoever created it: the
+    // task that started an install can be dropped while another is still
+    // waiting on it, and an entry left behind would let a later launch join an
+    // install that has already finished and skip its own.
+    let mut in_flight = IN_FLIGHT_NPM_INSTALLS.lock();
+    if in_flight
+        .get(install_dir)
+        .is_some_and(|current| Shared::ptr_eq(current, &install))
+    {
+        in_flight.remove(install_dir);
+    }
+
+    result.map_err(|error| anyhow::anyhow!("{error:#}"))
 }
 
 /// People are using min-release-age more frequently. Which means a fresh registry will likely have
@@ -1855,6 +1942,66 @@ mod tests {
             bounded_npm_package_spec("agent-package@latest"),
             ("agent-package", "agent-package@latest".to_string())
         );
+    }
+
+    /// Opening several threads on the same agent at once ran several
+    /// `npm install`s in one directory, and the ones that lost the rename race
+    /// died with `ENOTEMPTY` and a "Failed to Launch" card. The ones that
+    /// arrive while an install is running wait on it instead.
+    #[test]
+    fn concurrent_launches_share_one_install_per_directory() {
+        use futures::channel::oneshot;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let codex = Path::new("/agents/test-codex");
+        let gemini = Path::new("/agents/test-gemini");
+        let installs = Arc::new(AtomicUsize::new(0));
+        let (finish, finished) = oneshot::channel::<()>();
+        let finished = finished.shared();
+
+        let install = || {
+            let installs = installs.clone();
+            let finished = finished.clone();
+            move || {
+                installs.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    finished.await.ok();
+                    Ok(())
+                }
+                .boxed()
+            }
+        };
+
+        // `join` polls in order, so all three have registered before the
+        // fourth future lets the installs finish.
+        let (first, second, other_agent, ()) =
+            futures::executor::block_on(futures::future::join4(
+                install_once_per_directory(codex, install()),
+                install_once_per_directory(codex, install()),
+                install_once_per_directory(gemini, install()),
+                async move {
+                    finish.send(()).ok();
+                },
+            ));
+        assert!(first.is_ok() && second.is_ok() && other_agent.is_ok());
+        assert_eq!(
+            installs.load(Ordering::SeqCst),
+            2,
+            "the second launch of the same agent started its own install"
+        );
+
+        // A launch that arrives after the install has finished still installs,
+        // which is how a version bump is picked up at all.
+        let installs = Arc::new(AtomicUsize::new(0));
+        let after = futures::executor::block_on(install_once_per_directory(codex, {
+            let installs = installs.clone();
+            move || {
+                installs.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(()) }.boxed()
+            }
+        }));
+        assert!(after.is_ok());
+        assert_eq!(installs.load(Ordering::SeqCst), 1);
     }
 
     #[test]
