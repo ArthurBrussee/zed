@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::anyhow;
 use askpass::AskPassDelegate;
@@ -23,12 +23,13 @@ use workspace::{
 };
 use zed_actions::NewWorktreeBranchTarget;
 
-use git::repository::{FetchOptions, Remote};
+use git::repository::{BranchesScanResult, FetchOptions, Remote};
 
 use util::ResultExt as _;
 
 use crate::askpass_modal::AskPassModal;
 use crate::notifications::{open_output, show_error_toast};
+use notifications::status_toast::StatusToast;
 use crate::worktree_names;
 
 /// A remote-tracking branch reference parsed into its remote and branch parts,
@@ -408,6 +409,161 @@ fn create_worktree_askpass_delegate(
                 .ok();
         },
     )
+}
+
+/// A base fetch that was moved off the creation's critical path, and what the
+/// base pointed at before it ran, so a base that moved can be reported.
+struct DeferredBaseFetch {
+    remote_name: String,
+    /// `remote/branch`, as the user would name the base.
+    base_display: String,
+    work_directories: Vec<PathBuf>,
+    base_before: Vec<Option<SharedString>>,
+}
+
+/// Repositories whose last fetch behind a creation failed.
+///
+/// A fetch that runs behind the new window is not allowed to ask for
+/// credentials, so on a remote that wants them it fails every time — and a
+/// base that is already in the clone would then never be refreshed by anything
+/// again. Recording the failure makes the next creation pay for a fetch in
+/// front of it, prompt and all, exactly as it did before; a fetch that
+/// succeeds clears the record.
+static REPOS_OWED_A_FETCH: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Default::default);
+
+fn repos_owed_a_fetch(work_directories: &[PathBuf]) -> bool {
+    let owed = REPOS_OWED_A_FETCH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    work_directories.iter().any(|path| owed.contains(path))
+}
+
+fn set_repos_owed_a_fetch(work_directories: &[PathBuf], owed: bool) {
+    let mut repos = REPOS_OWED_A_FETCH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for path in work_directories {
+        if owed {
+            repos.insert(path.clone());
+        } else {
+            repos.remove(path);
+        }
+    }
+}
+
+fn repo_work_directories(git_repos: &[Entity<Repository>], cx: &App) -> Vec<PathBuf> {
+    git_repos
+        .iter()
+        .map(|repo| {
+            repo.read(cx)
+                .snapshot()
+                .work_directory_abs_path
+                .to_path_buf()
+        })
+        .collect()
+}
+
+type BranchScan = futures::channel::oneshot::Receiver<anyhow::Result<BranchesScanResult>>;
+
+fn start_base_ref_scan(git_repos: &[Entity<Repository>], cx: &mut App) -> Vec<BranchScan> {
+    git_repos
+        .iter()
+        .map(|repo| repo.update(cx, |repo, _cx| repo.branches()))
+        .collect()
+}
+
+/// What `base_ref` points at in each repository, in `git_repos` order, or
+/// `None` when any of them does not have that ref at all.
+///
+/// `None` is the answer that forces a fetch before anything is created: `git
+/// worktree add` is handed this ref as its starting point, so a repository
+/// that has never fetched it cannot make a worktree from it. A repository that
+/// has it but reports no commit for it is still a repository that can be
+/// created from, so it answers `Some(None)` rather than failing the lot.
+async fn base_ref_commits(
+    scans: Vec<BranchScan>,
+    base_ref: &str,
+) -> Option<Vec<Option<SharedString>>> {
+    let mut commits = Vec::with_capacity(scans.len());
+    for scan in futures::future::join_all(scans).await {
+        let branch = scan
+            .ok()?
+            .ok()?
+            .branches
+            .into_iter()
+            .find(|branch| branch.ref_name == base_ref)?;
+        commits.push(branch.most_recent_commit.map(|commit| commit.sha));
+    }
+    Some(commits)
+}
+
+/// Runs the base fetch that creation skipped, behind the new worktree's
+/// window, and says so once if the base moved while the worktree was being
+/// made from where it used to be.
+///
+/// Nothing here can fail the creation: the worktree exists and its window is
+/// open before this starts. The fetch is not allowed to ask for credentials —
+/// a password prompt for an operation the user did not ask for, on a window
+/// that has just appeared, is worse than a base that stays where it is — so a
+/// remote that wants one leaves the answer unknown and the next creation
+/// fetches in front of itself again.
+fn fetch_base_behind_creation(
+    git_repos: Vec<Entity<Repository>>,
+    base_ref: String,
+    deferred: DeferredBaseFetch,
+    workspace: &Entity<Workspace>,
+    cx: &mut AsyncWindowContext,
+) {
+    let DeferredBaseFetch {
+        remote_name,
+        base_display,
+        work_directories,
+        base_before,
+    } = deferred;
+    let workspace = workspace.downgrade();
+    cx.spawn(async move |cx| {
+        let askpass_delegates = cx.update(|_, cx| {
+            let mut cx = cx.to_async();
+            git_repos
+                .iter()
+                .map(|_| {
+                    // Dropping the sender is how this says "no password", which
+                    // fails the fetch rather than prompting for one.
+                    AskPassDelegate::new(&mut cx, |_prompt, _password, _cx| {})
+                })
+                .collect::<Vec<_>>()
+        })?;
+
+        let fetched =
+            fetch_remote_for_worktree_base(&git_repos, remote_name.clone(), askpass_delegates, cx)
+                .await;
+        set_repos_owed_a_fetch(&work_directories, fetched.is_err());
+        if let Err(error) = fetched {
+            log::info!("fetching {remote_name} behind a worktree creation failed: {error:#}");
+            return anyhow::Ok(());
+        }
+
+        let scans = cx.update(|_, cx| start_base_ref_scan(&git_repos, cx))?;
+        let moved = match base_ref_commits(scans, &base_ref).await {
+            Some(base_after) => base_after != base_before,
+            None => false,
+        };
+        if !moved {
+            return anyhow::Ok(());
+        }
+
+        log::info!("{base_display} moved while the worktree was being created from it");
+        workspace.update(cx, |workspace, cx| {
+            let toast = StatusToast::new(
+                format!("{base_display} moved; this worktree is behind it"),
+                cx,
+                |this, _cx| this.icon(Icon::new(IconName::ArrowDown).size(IconSize::Small)),
+            );
+            workspace.toggle_status_toast(toast, cx);
+        })?;
+        anyhow::Ok(())
+    })
+    .detach();
 }
 
 async fn fetch_remote_for_worktree_base(
@@ -1024,6 +1180,25 @@ async fn do_create_worktree(
             .clone()
     })?;
 
+    // Both of these are local git calls whose answers are wanted a few lines
+    // apart, so they run at once rather than one behind the other: whether the
+    // base ref is already in this clone decides whether the fetch below has to
+    // happen before the worktree can be made at all.
+    let base_ref = resolve_worktree_branch_target(&branch_target);
+    let (work_directories, base_ref_scans) = if remote_branch_fetch_mode.should_fetch()
+        && remote_branch_to_fetch(&branch_target).is_some()
+        && base_ref.is_some()
+    {
+        let work_directories = cx.update(|_, cx| repo_work_directories(&git_repos, cx))?;
+        let scans = match repos_owed_a_fetch(&work_directories) {
+            true => None,
+            false => Some(cx.update(|_, cx| start_base_ref_scan(&git_repos, cx))?),
+        };
+        (work_directories, scans)
+    } else {
+        (Vec::new(), None)
+    };
+
     let mut existing_worktree_names = Vec::new();
     let mut existing_worktree_paths = HashSet::default();
     for result in futures::future::join_all(worktree_receivers).await {
@@ -1051,37 +1226,66 @@ async fn do_create_worktree(
     // The three phases of making a worktree, each of which the user waits
     // through before the window appears: fetching the base branch, checking the
     // tree out, and opening the workspace over it.
+    //
+    // The fetch is the only one that talks to the network, and it used to be
+    // paid on every creation whether or not the base had moved. It is only
+    // *required* when the base ref is not in this clone at all: a branch that
+    // has never been fetched here cannot be created from. When it is already
+    // here the worktree is made from it straight away and the fetch happens
+    // behind the new window, which says so if the base turns out to have
+    // moved.
     let fetch_started = std::time::Instant::now();
+    let mut fetch_behind_creation = None;
     if remote_branch_fetch_mode.should_fetch()
         && let Some((remote_name, branch_name)) = remote_branch_to_fetch(&branch_target)
     {
         let remote_name = remote_name.to_string();
         let branch_name = branch_name.to_string();
-        if let Err(error) = fetch_remote_for_worktree_base(
-            &git_repos,
-            remote_name.clone(),
-            fetch_askpass_delegates,
-            cx,
-        )
-        .await
-        {
-            return Err(WorktreeFetchError {
-                remote_name,
-                branch_name,
-                source: error,
+        let base_before = match (base_ref.as_deref(), base_ref_scans) {
+            (Some(base_ref), Some(scans)) => base_ref_commits(scans, base_ref).await,
+            _ => None,
+        };
+        match base_before {
+            Some(base_before) => {
+                fetch_behind_creation = Some(DeferredBaseFetch {
+                    base_display: format!("{remote_name}/{branch_name}"),
+                    remote_name,
+                    work_directories,
+                    base_before,
+                });
             }
-            .into());
+            None => {
+                if let Err(error) = fetch_remote_for_worktree_base(
+                    &git_repos,
+                    remote_name.clone(),
+                    fetch_askpass_delegates,
+                    cx,
+                )
+                .await
+                {
+                    return Err(WorktreeFetchError {
+                        remote_name,
+                        branch_name,
+                        source: error,
+                    }
+                    .into());
+                }
+                set_repos_owed_a_fetch(&work_directories, false);
+            }
         }
     }
 
     log::info!(
-        "quiet-ui perf: worktree base fetched in {:.0}ms",
+        "quiet-ui perf: worktree base {} in {:.0}ms",
+        if fetch_behind_creation.is_some() {
+            "already present"
+        } else {
+            "fetched"
+        },
         fetch_started.elapsed().as_secs_f64() * 1000.
     );
 
     let mut rng = rand::rng();
-
-    let base_ref = resolve_worktree_branch_target(&branch_target);
 
     let (creation_infos, path_remapping) = cx.update(|_, cx| {
         start_worktree_creations(
@@ -1089,7 +1293,7 @@ async fn do_create_worktree(
             worktree_name,
             &existing_worktree_names,
             &existing_worktree_paths,
-            base_ref,
+            base_ref.clone(),
             &worktree_directory_setting,
             &mut rng,
             cx,
@@ -1152,6 +1356,12 @@ async fn do_create_worktree(
         "quiet-ui perf: worktree workspace opened in {:.0}ms",
         open_started.elapsed().as_secs_f64() * 1000.
     );
+
+    if let Some(deferred) = fetch_behind_creation
+        && let Some(base_ref) = base_ref
+    {
+        fetch_base_behind_creation(git_repos, base_ref, deferred, &workspace, cx);
+    }
 
     Ok(CreatedWorktreeWorkspace {
         workspace,
@@ -1726,6 +1936,162 @@ mod tests {
         assert!(
             !has_modal,
             "security modal should not show for a linked worktree created from a trusted main worktree"
+        );
+    }
+
+    /// Every creation used to fetch its base branch first, 1.5 to 3 seconds of
+    /// the wait on `+`, whether or not the base had moved. A base that is
+    /// already in the clone can be created from as it stands, so the fetch
+    /// happens behind the new window instead — and the creation stops
+    /// depending on the network at all.
+    #[gpui::test]
+    async fn test_a_base_already_in_the_clone_is_not_fetched_before_creating(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+        fs.insert_tree(
+            path!("/offline"),
+            json!({
+                "project": {
+                    ".git": {},
+                    "src": { "main.rs": "fn main() {}" },
+                },
+            }),
+        )
+        .await;
+        let dot_git = PathBuf::from(path!("/offline/project/.git"));
+        fs.insert_branches(&dot_git, &["main", "origin/main"]);
+        fs.set_fetch_error(&dot_git, Some("could not resolve host"));
+
+        let project =
+            Project::test(fs.clone(), [Path::new(path!("/offline/project"))], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        multi_workspace.update(cx, |multi_workspace, cx| {
+            multi_workspace.retain_active_workspace(cx);
+        });
+        let main_workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        let created = main_workspace
+            .update_in(cx, |workspace, window, cx| {
+                create_worktree_workspace(
+                    workspace,
+                    &zed_actions::CreateWorktree {
+                        worktree_name: Some("feature".to_string()),
+                        branch_target: NewWorktreeBranchTarget::RemoteBranch {
+                            remote_name: "origin".to_string(),
+                            branch_name: "main".to_string(),
+                        },
+                    },
+                    window,
+                    None,
+                    cx,
+                )
+            })
+            .await;
+        assert!(
+            created.is_ok(),
+            "a base already in the clone should not make creation wait on a fetch: {:?}",
+            created.err()
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            fs.fetched_remotes(&dot_git),
+            vec!["origin".to_string()],
+            "the fetch should still have happened, behind the creation"
+        );
+
+        // That fetch failed, so the base is no longer being refreshed by
+        // anything. The next creation pays for a fetch in front of itself
+        // again rather than building on a base nothing is updating.
+        let second = main_workspace
+            .update_in(cx, |workspace, window, cx| {
+                create_worktree_workspace(
+                    workspace,
+                    &zed_actions::CreateWorktree {
+                        worktree_name: Some("feature-2".to_string()),
+                        branch_target: NewWorktreeBranchTarget::RemoteBranch {
+                            remote_name: "origin".to_string(),
+                            branch_name: "main".to_string(),
+                        },
+                    },
+                    window,
+                    None,
+                    cx,
+                )
+            })
+            .await;
+        assert!(
+            second.is_err(),
+            "a repository whose background fetch failed should fetch in front of the next creation"
+        );
+    }
+
+    /// The other half: a base that has never been fetched into this clone
+    /// cannot be created from, so that creation still waits for the fetch and
+    /// fails with it.
+    #[gpui::test]
+    async fn test_a_base_missing_from_the_clone_is_fetched_first(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+        fs.insert_tree(
+            path!("/never-fetched"),
+            json!({
+                "project": {
+                    ".git": {},
+                    "src": { "main.rs": "fn main() {}" },
+                },
+            }),
+        )
+        .await;
+        let dot_git = PathBuf::from(path!("/never-fetched/project/.git"));
+        fs.insert_branches(&dot_git, &["main"]);
+        fs.set_fetch_error(&dot_git, Some("could not resolve host"));
+
+        let project = Project::test(
+            fs.clone(),
+            [Path::new(path!("/never-fetched/project"))],
+            cx,
+        )
+        .await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        multi_workspace.update(cx, |multi_workspace, cx| {
+            multi_workspace.retain_active_workspace(cx);
+        });
+        let main_workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        let created = main_workspace
+            .update_in(cx, |workspace, window, cx| {
+                create_worktree_workspace(
+                    workspace,
+                    &zed_actions::CreateWorktree {
+                        worktree_name: Some("feature".to_string()),
+                        branch_target: NewWorktreeBranchTarget::RemoteBranch {
+                            remote_name: "origin".to_string(),
+                            branch_name: "main".to_string(),
+                        },
+                    },
+                    window,
+                    None,
+                    cx,
+                )
+            })
+            .await;
+        assert!(
+            created.is_err(),
+            "a base that is not in the clone has to be fetched before anything can be made from it"
         );
     }
 
