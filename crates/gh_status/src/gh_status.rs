@@ -920,7 +920,7 @@ mod tests {
 
         // What a draft can still be told: a conflict is reported by
         // `mergeable`, which does not answer for draftness.
-        let mut conflicting = pr.clone();
+        let mut conflicting = pr;
         conflicting.merge = MergeState::Conflicting;
         let chip = pr_chip(&conflicting);
         assert_eq!(chip.checks, Some((IconName::Warning, Color::Warning)));
