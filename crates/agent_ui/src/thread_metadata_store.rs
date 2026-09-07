@@ -325,6 +325,25 @@ pub struct ThreadMetadata {
     pub archived: bool,
 }
 
+/// The last PR state observed for a thread's branches.
+///
+/// Archiving a thread removes its git worktree from disk, so its branch can no
+/// longer be resolved and `gh_status` has nothing to query. Persisting the last
+/// observed branches and PRs keeps an archived thread's PR badge (merged,
+/// closed, ...) instead of degrading it to the inert "no PR" pill.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ThreadPrSnapshot {
+    /// The branches the PRs were observed on, in the order they were seen.
+    pub branches: Vec<SharedString>,
+    pub prs: Vec<gh_status::PrStatus>,
+}
+
+impl ThreadPrSnapshot {
+    pub fn is_empty(&self) -> bool {
+        self.branches.is_empty() && self.prs.is_empty()
+    }
+}
+
 impl ThreadMetadata {
     /// A thread is a draft until its first message is sent, at which point
     /// it gets an ACP `session_id`.
@@ -503,6 +522,7 @@ pub struct ThreadMetadataStore {
     threads_by_paths: HashMap<PathList, HashSet<ThreadId>>,
     threads_by_main_paths: HashMap<PathList, HashSet<ThreadId>>,
     threads_by_session: HashMap<acp::SessionId, ThreadId>,
+    pr_snapshots: HashMap<ThreadId, ThreadPrSnapshot>,
     reload_task: Option<Shared<Task<()>>>,
     conversation_subscriptions: HashMap<gpui::EntityId, Subscription>,
     pending_thread_ops_tx: async_channel::Sender<DbOperation>,
@@ -654,16 +674,48 @@ impl ThreadMetadataStore {
             .filter(move |s| s.matches_remote_connection(remote_connection))
     }
 
+    /// The last known branches and PR state for a thread, persisted so an
+    /// archived thread (whose worktree, and therefore branch, is gone) keeps
+    /// showing the PR it produced.
+    pub fn pr_snapshot(&self, thread_id: ThreadId) -> Option<&ThreadPrSnapshot> {
+        self.pr_snapshots.get(&thread_id)
+    }
+
+    /// Record the PR state currently observed for a thread's branches. A no-op
+    /// when it matches what is already stored, so callers can refresh on every
+    /// poll without churning the database.
+    pub fn set_pr_snapshot(
+        &mut self,
+        thread_id: ThreadId,
+        snapshot: ThreadPrSnapshot,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pr_snapshots.get(&thread_id) == Some(&snapshot) {
+            return;
+        }
+        self.pr_snapshots.insert(thread_id, snapshot.clone());
+
+        let db = self.db.clone();
+        cx.background_spawn(async move { db.save_pr_snapshot(thread_id, snapshot).await })
+            .detach_and_log_err(cx);
+        cx.notify();
+    }
+
     fn reload(&mut self, cx: &mut Context<Self>) -> Shared<Task<()>> {
         let db = self.db.clone();
         self.reload_task.take();
 
-        let list_task = cx
-            .background_spawn(async move { db.list().context("Failed to fetch sidebar metadata") });
+        let list_task = cx.background_spawn(async move {
+            let rows = db.list().context("Failed to fetch sidebar metadata")?;
+            let pr_snapshots = db
+                .list_pr_snapshots()
+                .context("Failed to fetch thread PR snapshots")?;
+            anyhow::Ok((rows, pr_snapshots))
+        });
 
         let reload_task = cx
             .spawn(async move |this, cx| {
-                let Some(rows) = list_task.await.log_err() else {
+                let Some((rows, pr_snapshots)) = list_task.await.log_err() else {
                     return;
                 };
 
@@ -672,6 +724,7 @@ impl ThreadMetadataStore {
                     this.threads_by_paths.clear();
                     this.threads_by_main_paths.clear();
                     this.threads_by_session.clear();
+                    this.pr_snapshots = pr_snapshots;
 
                     for row in rows {
                         this.cache_thread_metadata(row);
@@ -713,6 +766,25 @@ impl ThreadMetadataStore {
         }
         let metadata = ThreadMetadata {
             title_override: Some(title_override),
+            ..existing.clone()
+        };
+        self.save(metadata, cx);
+    }
+
+    pub fn set_agent_id(
+        &mut self,
+        thread_id: ThreadId,
+        agent_id: project::AgentId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(existing) = self.entry(thread_id) else {
+            return;
+        };
+        if existing.agent_id == agent_id {
+            return;
+        }
+        let metadata = ThreadMetadata {
+            agent_id,
             ..existing.clone()
         };
         self.save(metadata, cx);
@@ -1155,6 +1227,7 @@ impl ThreadMetadataStore {
             }
         }
         self.threads.remove(&thread_id);
+        self.pr_snapshots.remove(&thread_id);
         self.pending_thread_ops_tx
             .try_send(DbOperation::Delete(thread_id))
             .log_err();
@@ -1241,6 +1314,7 @@ impl ThreadMetadataStore {
             threads_by_paths: HashMap::default(),
             threads_by_main_paths: HashMap::default(),
             threads_by_session: HashMap::default(),
+            pr_snapshots: HashMap::default(),
             reload_task: None,
             conversation_subscriptions: HashMap::default(),
             pending_thread_ops_tx: tx,
@@ -1260,6 +1334,47 @@ impl ThreadMetadataStore {
             ops.insert(operation.id(), operation);
         }
         ops.into_values().collect()
+    }
+
+    /// Seeds the metadata row for an unstarted draft at creation time. The
+    /// event-driven path below only writes rows once a session connects, and
+    /// an unstarted draft deliberately has no session: without this row the
+    /// draft would not survive a reload and would not show in the sidebar.
+    pub fn save_unstarted_draft(
+        &mut self,
+        thread_id: ThreadId,
+        agent_id: project::AgentId,
+        title: Option<SharedString>,
+        project: &Entity<project::Project>,
+        cx: &mut Context<Self>,
+    ) {
+        if project.read(cx).is_via_collab() {
+            return;
+        }
+        if self.entry(thread_id).is_some() {
+            return;
+        }
+        let updated_at = Utc::now();
+        let project = project.read(cx);
+        let worktree_paths = project.worktree_paths(cx);
+        let remote_connection = project.remote_connection_options(cx);
+        let archived = worktree_paths.is_empty();
+        self.save(
+            ThreadMetadata {
+                thread_id,
+                session_id: None,
+                agent_id,
+                title,
+                title_override: None,
+                created_at: Some(updated_at),
+                interacted_at: Some(updated_at),
+                updated_at,
+                worktree_paths,
+                remote_connection,
+                archived,
+            },
+            cx,
+        );
     }
 
     fn handle_conversation_event(
@@ -1462,6 +1577,15 @@ impl Domain for ThreadMetadataDb {
         sql!(
             ALTER TABLE sidebar_threads ADD COLUMN title_override TEXT;
         ),
+        sql!(
+            ALTER TABLE sidebar_threads ADD COLUMN done INTEGER DEFAULT 0;
+        ),
+        sql!(
+            CREATE TABLE IF NOT EXISTS thread_pr_snapshots(
+                thread_id BLOB PRIMARY KEY,
+                snapshot TEXT NOT NULL
+            ) STRICT;
+        ),
     ];
 }
 
@@ -1575,9 +1699,51 @@ impl ThreadMetadataDb {
             let mut stmt =
                 Statement::prepare(conn, "DELETE FROM sidebar_threads WHERE thread_id = ?")?;
             stmt.bind(&thread_id, 1)?;
+            stmt.exec()?;
+
+            let mut stmt =
+                Statement::prepare(conn, "DELETE FROM thread_pr_snapshots WHERE thread_id = ?")?;
+            stmt.bind(&thread_id, 1)?;
             stmt.exec()
         })
         .await
+    }
+
+    pub async fn save_pr_snapshot(
+        &self,
+        thread_id: ThreadId,
+        snapshot: ThreadPrSnapshot,
+    ) -> anyhow::Result<()> {
+        let snapshot = serde_json::to_string(&snapshot).context("serialize thread PR snapshot")?;
+        self.write(move |conn| {
+            let mut stmt = Statement::prepare(
+                conn,
+                "INSERT INTO thread_pr_snapshots(thread_id, snapshot) VALUES (?1, ?2) \
+                 ON CONFLICT(thread_id) DO UPDATE SET snapshot = excluded.snapshot",
+            )?;
+            let i = stmt.bind(&thread_id, 1)?;
+            stmt.bind(&snapshot, i)?;
+            stmt.exec()
+        })
+        .await
+    }
+
+    pub fn list_pr_snapshots(&self) -> anyhow::Result<HashMap<ThreadId, ThreadPrSnapshot>> {
+        let rows = self
+            .select::<(ThreadId, String)>("SELECT thread_id, snapshot FROM thread_pr_snapshots")?(
+        )?;
+        let mut snapshots = HashMap::default();
+        for (thread_id, json) in rows {
+            match serde_json::from_str::<ThreadPrSnapshot>(&json) {
+                Ok(snapshot) => {
+                    snapshots.insert(thread_id, snapshot);
+                }
+                Err(error) => {
+                    log::warn!("failed to parse PR snapshot for thread {thread_id:?}: {error:#}")
+                }
+            }
+        }
+        Ok(snapshots)
     }
 
     pub async fn create_archived_worktree(
@@ -1971,6 +2137,44 @@ mod tests {
         assert_eq!(rows[0].title.as_deref(), Some("Agent Generated Title"));
         assert_eq!(rows[0].title_override.as_deref(), Some("User Title"));
         assert_eq!(rows[0].title().as_deref(), Some("User Title"));
+    }
+
+    #[gpui::test]
+    async fn test_pr_snapshot_round_trips_and_is_deleted_with_the_thread() {
+        let thread = std::thread::current();
+        let test_name = thread.name().unwrap_or("unknown_test");
+        let db_name = format!("THREAD_METADATA_DB_{}", test_name);
+        let db = ThreadMetadataDb(gpui::block_on(db::open_test_db::<ThreadMetadataDb>(
+            &db_name,
+        )));
+
+        let metadata = make_metadata("session-1", "Thread", Utc::now(), PathList::default());
+        let thread_id = metadata.thread_id;
+        db.save(metadata).await.unwrap();
+
+        let snapshot = ThreadPrSnapshot {
+            branches: vec!["feature".into()],
+            prs: vec![gh_status::PrStatus {
+                number: 42,
+                url: "https://github.com/org/repo/pull/42".into(),
+                title: "Ship it".into(),
+                state: gh_status::PrState::Merged,
+                checks: gh_status::ChecksState::Passing,
+                review: gh_status::ReviewState::Approved,
+                failing_checks: Vec::new(),
+                extra_failing_checks: 0,
+                merge: gh_status::MergeState::Unknown,
+            }],
+        };
+        db.save_pr_snapshot(thread_id, snapshot.clone())
+            .await
+            .unwrap();
+
+        let snapshots = db.list_pr_snapshots().unwrap();
+        assert_eq!(snapshots.get(&thread_id), Some(&snapshot));
+
+        db.delete(thread_id).await.unwrap();
+        assert!(db.list_pr_snapshots().unwrap().is_empty());
     }
 
     #[gpui::test]
