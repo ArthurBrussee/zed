@@ -860,148 +860,30 @@ does is removed as it lands.
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
-**A draft PR wears the same warning as one that needs a rebase.**
-Both draw `IconName::Warning` in `Color::Warning`, so a draft nobody has finished writing looks like
-a branch that cannot merge until it is rebased. Being a draft is not a problem to warn about: the
-chip already says "draft" and already draws it muted.
+**Make `+` free, not merely quicker: keep a worktree ready before it is asked for.**
+One spare, created in the background off the default branch, handed over the instant `+` is
+pressed, with the next one started immediately after. This is the only approach that moves the
+whole cost out of the moment the user is waiting; the checkout itself is git writing files and is
+not going to get much faster. The naming is the part to work out: a spare has to be created without
+knowing its branch name, so create it detached (or on a scratch name) and set the branch when it is
+claimed. The costs are one worktree of disk standing idle, and the machinery to make sure a spare
+is never handed out twice, never claimed while half-built, and cleaned up on quit.
 
-The mapping was written expecting this and is defeated by what GitHub actually sends. `merge_state`
-deliberately lets `DRAFT` fall through to `Unknown`, with a comment saying the chip carries the draft
-state already (`crates/gh_status/src/gh_status.rs:688`). But GitHub reports `mergeStateStatus` as
-`BLOCKED` for a draft in a repository with branch protection, not `DRAFT`, so it becomes
-`MergeState::Blocked`, `blocked_reason` returns "blocked by branch protection", and the checks glyph
-is replaced by the warning (`:451`, `:461`).
+**What the 2026-09-07 run established, so the next one does not re-derive it.**
 
-The narrow fix is at `:451`: mergeability has nothing to say about a draft either, so ask for
-`blocked_reason` on `PrState::Open` alone and leave `Draft` out with `Merged` and `Closed`. Take the
-draft case as a test, since the current tests cover `BEHIND` and `BLOCKED` but not a draft that
-reports `BLOCKED`.
-
-While there: `Behind` and `Blocked` are also indistinguishable from each other, both being the same
-warning glyph, and "needs a rebase" is something you can act on in a second where "blocked by branch
-protection" is somebody else's decision. If they can be told apart without adding a third glyph to a
-small chip, do it; if not, leave them and say so.
-
-**Archiving should happen at once, not after a load.**
-Archiving a thread visibly waits: something loads first, slowly, and only then does the row move.
-Archiving is a flag on metadata and should feel like one.
-
-What the wait is: when the thread's workspace is closed, the sidebar opens that workspace before
-archiving anything (`should_load_closed_workspace_for_archive` into `open_workspace_for_archive`,
-`crates/sidebar/src/sidebar.rs:4038`, `:4331`, called from the thread path at `:4805`). It is not
-replaying the thread; it is building a whole workspace — worktree scan, repositories, language
-servers — because `build_root_plan` needs a project to decide which linked worktree roots can be
-deleted from disk. That is a real requirement for the deletion, and no requirement at all for the
-archive.
-
-Separate the two. Mark the thread archived immediately, so the row moves the moment it is asked for,
-and work out the disk plan afterwards. If the plan needs a workspace, open it in the background and
-delete when it answers; if that fails or is cancelled, nothing is deleted, which is the safe way for
-this to fail. Deleting a worktree is the part worth being careful and slow about, and archiving is
-not.
-
-Check whether the workspace has to be opened at all for the plan: what it is being asked is which
-worktree roots belong to this thread and whether anything else references them, and git can answer
-that about paths on disk without a project, LSP or file scan.
-
-**Two threads installing the same agent at once break the install.**
-Opening Codex threads on 2026-09-07 gave "Failed to Launch" with npm's `ENOTEMPTY`: it could not
-rename a freshly unpacked `@openai/codex-darwin-arm64` over the existing one because that directory
-was not empty. That is the signature of two `npm install` runs in the same directory at the same
-time, which is what happens when several threads each decide the agent needs installing, and it
-lands whenever a version bumps (this one was codex-acp 1.6.2 to 1.10.0, carrying codex 0.148.0 to
-0.153.4).
-
-The install ends up fine on a retry, which is the tell that nothing is wrong with the package: it is
-a race, and the user pays for it with a red card on every thread that lost. One install per agent at
-a time is the fix. Where the install is kicked off, a second request for the same agent should wait
-on the first and then use its result, rather than starting its own in the same directory.
-
-Worth checking while there whether the failure is even fatal: the directory was intact and usable
-immediately afterwards, so a launch that failed this way could plausibly re-check and continue
-rather than stopping at a card that says Retry.
-
-
-**Make `+` fast enough to press without thinking.**
-Seven seconds on a good run and thirty on a bad one, measured in three phases the code still logs
-(`crates/git_ui_core/src/worktree_service.rs`, the `quiet-ui perf:` lines around the fetch, the
-checkout and the workspace open). Take fresh numbers before optimising: the window-shown line was
-added since those, and the picture may have moved.
-
-Two directions, in the order they are worth trying:
-
-- **Keep a worktree ready before it is asked for.** One spare, created in the background off the
-  default branch, handed over the instant `+` is pressed, with the next one started immediately
-  after. This is the only approach that makes `+` feel free rather than merely quicker, because it
-  moves the whole cost out of the moment the user is waiting. The naming is the part to work out: a
-  spare has to be created without knowing its branch name, so create it detached (or on a scratch
-  name) and set the branch when it is claimed. The costs are one worktree of disk standing idle, and
-  the machinery to make sure a spare is never handed out twice, never claimed while half-built, and
-  cleaned up on quit.
-- **Take the fetch off the critical path.** Every creation currently fetches the base branch before
-  anything else happens, 1.5 to 3 seconds, whether or not the base has moved. Create from the local
-  ref and fetch behind it: a worktree made from a base that is minutes stale is almost always fine,
-  and the thread can say so if the fetch later shows it was behind.
-
-**What the 2026-09-01 run established, so the next one does not re-derive it.** It did not build
-this, and said why in that night's report; these are the findings.
-
-- **The premise is already true.** The entry was written expecting the cost to move onto `+` only
-  once the draft-worktree entry below landed. It has already moved: the sidebar's `+` calls
-  `AgentPanel::create_new_worktree_thread`, which creates the worktree and switches to it there and
-  then. The wait is on `+` today. (The draft-worktree deletion landed that night and changed nothing
-  about this, since `+` was already immediate.)
-- **The fetch half is not cheap, and this is the part that needs deciding before it is built.**
-  `RemoteBranchFetchMode` already has a `UseLocal` arm, so the lever exists — but it is currently
-  only reachable from the "Use local {branch}" button on the fetch-failure toast, i.e. as a user's
-  explicit retry. Making it the default needs three things the entry does not cover:
-  1. A missing-ref fallback. The unconditional fetch is what guarantees the base ref exists at all;
-     a base that has never been fetched into this clone cannot be created from. So the flow has to
-     become try-local, and on failure fetch and retry, rather than simply not fetching.
-  2. A way to say "your base was behind", which means resolving the base ref a second time after the
-     background fetch and comparing, not just running the fetch.
-  3. A decision about credentials. Today a fetch that needs an askpass prompt blocks creation and
-     the prompt belongs to the source window. Moved behind creation, that prompt would appear on its
-     own, after the new window has already opened, for an operation the user did not ask for.
-- **None of it can be exercised here.** `worktree_service.rs` has no test module, and the sandbox
-  has no git remote to fetch from, so every path above is unverifiable in the nightly. `+` is the
-  fork's most load-bearing action in a build that cannot be recompiled on the laptop, which is why
-  that night declined to ship it blind rather than guessing. The way through is either a test
-  harness for `worktree_service` built on a local bare repo (RealFs, `git clone` a path, push to it)
-  so fetch and behind-ness are real, or Arthur taking the three decisions above so the change is
-  specification rather than guesswork.
-- **The spare stays measurement-gated**, as this entry already says. The measurements need the
-  running app, which the nightly does not have.
-
-The checkout itself is git writing files and is not going to get much faster, which is why the spare
-is the interesting idea and the fetch is the cheap one.
-
-**Reclaim the worktree an abandoned `+` leaves behind.**
-Found while deleting the draft-worktree concept on 2026-09-01, and left unbuilt because the trigger
-is a product decision rather than an implementation detail.
-
-Every worktree Zed creates is recorded (`do_create_worktree` calls
-`created_worktrees::record_created_worktree_for_repo`), and the archival pipeline
-(`thread_worktree_archive`: `build_root_plan` -> `persist_worktree_state` -> `remove_root`) will
-only remove a worktree that carries such a record and sits under the managed worktrees directory. So
-the *recording* half of "make sure an abandoned thread is covered" is already in place.
-
-What is missing is anything that fires it. Press `+`, get a worktree and an empty draft, then walk
-away: the draft has no typed text, so `rebuild_contents` filters it out of the sidebar list
-(`threads.retain(|thread| thread.draft.is_none() || thread.metadata.title.is_some())`), which means
-there is no row to archive and nothing ever calls the pipeline. The worktree stays on disk. One
-click, one worktree, forever.
-
-The decisions needed before this can be written:
-
-- **What counts as abandoned.** Closing the tab is not it: closing the last thread tab leaves the
-  pane on a placeholder rather than closing the workspace. Quitting Zed, or closing the window, are
-  the honest events.
-- **What makes it safe to remove.** Never typed a message is not enough on its own — the user may
-  have opened files, edited them, or committed. A check for an untouched working tree (and no
-  commits beyond the base) is the minimum, and archival persists state before removing anyway.
-- **Whether it should be silent.** Reclaiming disk without saying so is the kind of thing that is
-  alarming the first time it is noticed.
+- **The fetch half of this entry is built and is no longer here.** The base branch is no longer
+  fetched before creation when the base ref is already in the clone; the fetch runs behind the new
+  window instead, and a base that moved says so. See that night's rebase log entry for how the
+  three questions the 2026-09-01 run raised (missing-ref fallback, saying "your base was behind",
+  where an askpass prompt belongs) were answered from the code rather than by asking.
+- **`worktree_service.rs` does have a test module**, contrary to the 2026-09-01 finding, and
+  `FakeFs` can now fetch, record what it was asked to fetch, and fail like an offline machine. A
+  spare-worktree change is testable here; that blocker is gone.
+- **What is left is genuinely measurement-gated.** The remaining cost is the checkout and the
+  workspace open, and how much of the seven seconds each accounts for now needs the running app —
+  the `quiet-ui perf:` lines log fetch, checkout, workspace-open and window-shown. Take those
+  numbers before building the spare: they decide whether one spare is enough, and whether the
+  window-open half wants its own answer.
 
 ## Verification queue
 
@@ -3189,3 +3071,143 @@ release clippy is what made room for it. Debug and release still do not coexist.
 the pacing: a full workspace `cargo check --all-targets` from cold took about ten minutes, the four
 suites about two, and the release clippy about six the first time and twenty seconds incrementally —
 the night had far more runway than the first pass through it assumed.
+
+**2026-09-07**: onto main ad51f6825 (39 upstream commits: a `TestWindow` scale-factor simulation,
+fewer file descriptors for macOS worktree-root watching, LLVM IR bloat reduction, project-panel
+preview and Wayland IME fixes, macOS modifier-key hints, an `agent_skills` description-length fix, a
+redundant `RealFs` stat removed). A working night by two triggers: the Work queue held five items and
+the fork carried 8 commits on top of the merge base. Squash-then-rebase folded those 8 into 1,
+reusing the squash's own message; tree-identical to the old tip before rebasing, backed up as
+`quiet-ui-pre-rebase40-2026-09-07`.
+
+**The rebase applied with zero conflicts, and no markerless drift.** `cargo check --workspace
+--all-targets` came back with 0 errors and 0 warnings on the replayed commit. None of the 39 commits
+touch a surface this fork patches. Nothing upstream built here for the fork to delete in favour of.
+
+**Built, in queue order. The queue is empty except for one direction of one entry.**
+
+1. *A draft PR no longer wears the unmergeable warning.* The entry had the diagnosis exactly right:
+   GitHub answers `mergeStateStatus: BLOCKED` for a draft in a protected repository, so `merge_state`'s
+   deliberate `DRAFT` fall-through never fires and the draft picks up "blocked by branch protection"
+   and the warning glyph. The entry's fix was to ask for `blocked_reason` on `PrState::Open` alone.
+   The code said something slightly narrower and strictly better: only `Blocked` is the draft state
+   restated. A conflict is reported by the separate `mergeable` field, which does not answer for
+   draftness, so a draft that really does conflict still says so — dropping every blocker for drafts
+   would have thrown that away. Tested with the exact `gh` payload from the complaint, plus the
+   conflicting-draft case that survives.
+   The aside was also buildable: `Behind` and `Blocked` no longer draw the same glyph. Telling them
+   apart does not need a third glyph, only a different one in the slot the checks glyph already
+   occupies — a branch that is behind gets an arrow in `Color::Warning` because it is a rebase away,
+   branch protection gets a muted lock because it is somebody else's decision and only has to stop
+   the chip reading as ready. `Conflicting` keeps the warning it had.
+
+2. *Archiving a thread is immediate.* The wait was exactly where the entry said. The entry also asked
+   whether the workspace has to be opened at all for the plan: it does. `build_root_plan` needs a live
+   `Entity<Project>` for every project holding the worktree and a live `Entity<Repository>` to run the
+   git that persists the worktree's state before deleting it; answering "which roots belong to this
+   thread" from paths alone would mean rewriting the destructive half, which is the half worth being
+   slow and careful about. So the two were separated rather than the plan being made cheaper: the
+   thread is marked archived at once and the workspace is opened behind it, with the existing pipeline
+   running when it answers. Every failure leaves the worktree on disk — the load fails, the plan comes
+   back empty, or the user unarchives while it is in flight, which is checked before anything is
+   removed (`ThreadMetadataStore::attach_archive_job` refuses a thread that is live again).
+   One thing the first cut got wrong, caught by an existing test rather than by review: an empty plan
+   is not nothing to do. An external linked worktree produces no root plan, but the workspace opened
+   to discover that still has to be removed, along with the empty drafts that were only holding it
+   open. Scope: `archive_thread` only. `close_terminal` and `remove_draft` take the same load-first
+   path and were left, because they destroy rather than flag and waiting for the thing being destroyed
+   is defensible; that is a separate call.
+
+3. *One npm install per agent at a time.* The race is in `LocalRegistryNpxAgent::get_command`
+   (`crates/project/src/agent_server_store.rs`), which runs `npm install` in a per-agent directory on
+   every launch. The directory is shared by every project in the process, so the gate is process-wide:
+   a launch that arrives while an install is running joins it and uses its result. Only concurrent
+   installs are joined — once one finishes its entry is dropped, so the next launch still picks up a
+   version bump. The entry's aside was right too: the failure is not fatal. An install that fails now
+   falls back to the package already unpacked rather than stopping at a Retry card, which is worth
+   more than a red card given the version is a ceiling rather than a pin. The dedup is a small generic
+   function so it can be tested without a `NodeRuntime`; the test drives three concurrent calls across
+   two directories and asserts two installs.
+
+4. *The base fetch is off the critical path of `+`.* The fetch half of "Make `+` fast enough to press
+   without thinking", which the 2026-09-01 and 2026-09-03 runs both left for Arthur to decide. The
+   code answered all three questions those runs raised, so they were not decisions after all:
+   - **Missing-ref fallback**: the fetch is only *required* when the base ref is not in this clone,
+     because that ref is what `git worktree add` is handed. So the gate is "does the base ref already
+     resolve here", answered by the branch scan, and a missing ref keeps today's behaviour exactly —
+     fetch in front, prompt and all.
+   - **Saying "your base was behind"**: the base ref's commit is read before creation and again after
+     the fetch behind it; a base that moved gets one auto-dismissing status toast on the new window,
+     which is the surface this file already uses for the fetch-failure case.
+   - **Where an askpass prompt belongs**: nowhere, for the fetch behind the window. A password prompt
+     for an operation the user did not ask for, on a window that has just appeared, is worse than a
+     base that stays where it is, so that fetch cannot prompt. The tail that leaves — a remote that
+     always wants credentials would stop being refreshed by anything — is closed by recording the
+     repository as owed a fetch, which makes the next creation fetch in front of itself again.
+   The branch scan runs alongside the worktree listing that was already there, so nothing is added to
+   the wait. The 2026-09-01 finding that none of this could be exercised here is out of date twice
+   over: `worktree_service.rs` has a test module, and `FakeFs::fetch` was `unimplemented!()` and now
+   records what it was asked to fetch and can be made to fail like an offline machine. The two tests
+   turn on that: with the base present, creation succeeds *while every fetch fails*, which is the
+   whole claim; with the base absent it fails, which is the fallback.
+
+5. *The worktree an abandoned `+` leaves behind is reclaimed.* The entry's three questions again
+   turned out to be answerable from the code:
+   - **What makes it safe** is `git worktree remove` without `--force`, which refuses a worktree
+     carrying any uncommitted change; and a removed worktree's branch and commits stay in the
+     repository. So nothing can be lost, and there is nothing to persist first — which is what makes
+     this cheap enough to do at all.
+   - **Whether it should be silent** follows from that: it can only ever remove a directory
+     `git worktree add` would put back from the branch it was on. It logs and says nothing.
+   - **What counts as abandoned** is not the window closing. Closing is also when the project and its
+     repositories are torn down, and a removal racing that teardown can half happen. A worktree still
+     here from the last session is abandoned by definition, so this runs once per repository per
+     launch instead.
+   The predicate is: Zed made it (the creation record), it is under the managed worktrees directory,
+   no window has it open, no thread or terminal that would block archival refers to it, and the empty
+   draft `+` left behind does. That last clause is what makes it *this* worktree rather than any
+   orphan, and it is also the safety property that matters most: a thread store whose rows have not
+   come back from disk yet has no rows, so it reclaims nothing. The store's `reload_task()` is awaited
+   as well, following the precedent `migrate_thread_metadata` already sets for the same race.
+
+**Left in the queue: one direction of one entry, and it is measurement-gated, not deferred.** The
+spare worktree — one made in the background and handed over the instant `+` is pressed — is the only
+approach that makes `+` free rather than quicker, and what remains of the seven seconds is the
+checkout and the workspace open. Which of those to attack, and whether one spare is enough, wants the
+`quiet-ui perf:` numbers from the running app, which the nightly does not have. The entry has been
+rewritten to that direction alone, carrying tonight's findings so the next run does not re-derive
+them.
+
+**The gate.** Suites run: the fork's core crates plus every crate touched tonight — `acp_thread`
+(210), `agent_ui` (446, 32 intentionally `#[ignore]`d), `sidebar` (173), `gh_status` (28),
+`git_ui_core` (29), `project` (62 lib + 391 integration, 4 ignored) and `fs` (17 lib + 22
+integration, 1 ignored); 0 failed anywhere. `sidebar` is up 3 tests, `gh_status` 1, `git_ui_core` 2,
+`project` 1. The Verification queue was empty going in and is empty going out. One real failure on
+the way, in existing code rather than new: the first cut of the deferred archive returned early on an
+empty root plan, which broke
+`test_archive_selected_thread_deletes_empty_draft_when_linked_worktree_has_no_archive_root` — an
+external linked worktree produces no plan, but the workspace opened to discover that still has to be
+removed. Five more failed while the abandoned-worktree sweep was too eager, which is what turned up
+the empty-store race and led to the empty-draft clause that fixes it properly. `script/clippy` (release, all targets, all
+features) is clean across the same seven crates, after one fix: a `redundant_clone` in tonight's new
+`gh_status` test, which the test suites do not catch because it is not a failure.
+
+**Two things about how the gate is invoked, both of which cost time here.**
+
+- **`cargo test` with several `-p` flags does not run the lib test targets.** `cargo test -p project
+  -p fs` ran only `tests/integration/*` and reported nothing else, so the 62 unit tests in
+  `project`'s lib — including tonight's — were silently not run. `cargo test -p project --lib` runs
+  them. Run each crate on its own, or add `--lib`, or the gate can come back green having skipped the
+  code it was there to check.
+- **The debug test tree and the release clippy tree do not both fit, and neither does the whole gate
+  at once.** Building the test trees for seven crates in one `cargo test` filled the allowance and
+  failed with `No space left on device` partway through `project`. Two passes with `rm -rf
+  target/debug` between them fit comfortably: 22G free after the first clean, 618M at the end of the
+  second pass. Same again before the release clippy.
+
+Environment prerequisites needed reapplying in this fresh container (`CARGO_NET_GIT_FETCH_WITH_CLI=true`,
+`libasound2-dev`). New this time: `apt-get update` failed outright on the third-party PPAs baked into
+the image (`deadsnakes` and `ondrej`, 403 Forbidden, "no longer signed") and, unlike 2026-08-05, the
+cached package lists were too cold for `apt-get install libasound2-dev` to succeed on its own.
+Deleting those two files from `/etc/apt/sources.list.d/` and re-running `apt-get update` fixed it.
+Worth doing first in future containers rather than discovering it.
