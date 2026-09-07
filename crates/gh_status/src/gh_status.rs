@@ -119,6 +119,25 @@ impl MergeState {
             MergeState::Unknown | MergeState::Mergeable => None,
         }
     }
+
+    /// The glyph that stands in for the checks glyph when the PR cannot merge,
+    /// and `None` when nothing is in the way. It stays in the checks slot
+    /// rather than adding one, because the chip is small and already carries a
+    /// state glyph.
+    ///
+    /// The blockers are not the same kind of thing and do not read the same. A
+    /// branch that is behind is a rebase away, so it is drawn as work to do; a
+    /// conflict is the same work gone wrong, and keeps the warning it has had.
+    /// Branch protection is somebody else's decision, and all it has to do is
+    /// stop the chip reading as ready.
+    pub fn blocked_glyph(self) -> Option<(IconName, Color)> {
+        match self {
+            MergeState::Behind => Some((IconName::ArrowDown, Color::Warning)),
+            MergeState::Conflicting => Some((IconName::Warning, Color::Warning)),
+            MergeState::Blocked => Some((IconName::Lock, Color::Muted)),
+            MergeState::Unknown | MergeState::Mergeable => None,
+        }
+    }
 }
 
 /// A hover card cannot grow without bound; a workflow with forty checks would
@@ -445,22 +464,27 @@ fn pr_chip(pr: &PrStatus) -> ThreadItemPrChip {
         ReviewState::ReviewRequired => "review required",
         ReviewState::None => "no review",
     };
-    // A merged or closed PR is not waiting to merge, so mergeability has
-    // nothing to say about it.
-    let blocked_reason = match pr.state {
-        PrState::Open | PrState::Draft => pr.merge.blocked_reason(),
-        PrState::Merged | PrState::Closed => None,
+    let merge = match (pr.state, pr.merge) {
+        // A merged or closed PR is not waiting to merge, so mergeability has
+        // nothing to say about it.
+        (PrState::Merged | PrState::Closed, _) => MergeState::Unknown,
+        // GitHub answers `BLOCKED` for a draft in a repository with branch
+        // protection, so on a draft that blocker is the draft state restated —
+        // and the chip already says "draft", muted, without warning about it.
+        // A conflict or a stale base is a real thing a draft can be, and
+        // `mergeable` reports a conflict whatever the draft state, so those
+        // still count.
+        (PrState::Draft, MergeState::Blocked) => MergeState::Unknown,
+        (_, merge) => merge,
     };
-    // Mergeability does not get a glyph of its own — the chip is small and
-    // already carries a state colour and a checks glyph. It changes what the
+    let blocked_reason = merge.blocked_reason();
+    // Mergeability does not get a glyph slot of its own. It changes what the
     // checks glyph says instead: passing checks on a PR that cannot merge are
     // not green, because reading them as ready is the exact mistake this is
     // here to stop. The reason goes in the hover card, where there is room for
     // a sentence.
-    let checks = match blocked_reason {
-        Some(_) if pr.checks == ChecksState::Passing => {
-            Some((IconName::Warning, Color::Warning))
-        }
+    let checks = match merge.blocked_glyph() {
+        Some(glyph) if pr.checks == ChecksState::Passing => Some(glyph),
         _ => checks,
     };
     let summary = [
@@ -824,20 +848,39 @@ mod tests {
     }
 
     /// The complaint itself: green checks and an unmergeable PR looked
-    /// identical, and the only way to find out was to open it.
+    /// identical, and the only way to find out was to open it. Each blocker
+    /// draws its own glyph, so a branch that is a rebase away is not read as
+    /// one waiting on somebody else's approval.
     #[test]
     fn passing_checks_on_a_pr_that_cannot_merge_are_not_green() {
-        for (state, reason) in [
-            (MergeState::Behind, "behind base branch"),
-            (MergeState::Conflicting, "conflicts with base branch"),
-            (MergeState::Blocked, "blocked by branch protection"),
+        for (state, glyph, reason) in [
+            (
+                MergeState::Behind,
+                (IconName::ArrowDown, Color::Warning),
+                "behind base branch",
+            ),
+            (
+                MergeState::Conflicting,
+                (IconName::Warning, Color::Warning),
+                "conflicts with base branch",
+            ),
+            (
+                MergeState::Blocked,
+                (IconName::Lock, Color::Muted),
+                "blocked by branch protection",
+            ),
         ] {
             let mut pr = green_pr();
             pr.merge = state;
             let chip = pr_chip(&pr);
             assert_eq!(
                 chip.checks,
-                Some((IconName::Warning, Color::Warning)),
+                Some(glyph),
+                "{state:?} did not draw its own glyph"
+            );
+            assert_ne!(
+                chip.checks,
+                Some((IconName::Check, Color::Success)),
                 "{state:?} still rendered as green"
             );
             assert!(chip.tooltip.contains(reason), "{state:?}: {}", chip.tooltip);
@@ -847,6 +890,44 @@ mod tests {
                 "{state:?} did not carry its reason into the hover card"
             );
         }
+    }
+
+    /// A draft in a repository with branch protection reports `BLOCKED`, which
+    /// said "blocked by branch protection" and replaced the checks glyph with
+    /// a warning — so an unfinished PR looked exactly like one that cannot
+    /// merge. Being a draft is not a problem to warn about; the chip already
+    /// says so, muted.
+    #[test]
+    fn a_draft_is_not_warned_about_for_being_a_draft() {
+        let json = r#"[{
+            "number": 1,
+            "url": "https://example.com/1",
+            "title": "Half written",
+            "state": "OPEN",
+            "isDraft": true,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "BLOCKED",
+            "statusCheckRollup": [{"conclusion": "SUCCESS"}]
+        }]"#;
+        let pr = parse_pr_list(json).unwrap().remove(0);
+        assert_eq!(pr.state, PrState::Draft);
+        assert_eq!(pr.merge, MergeState::Blocked);
+
+        let chip = pr_chip(&pr);
+        assert_eq!(chip.checks, Some((IconName::Check, Color::Success)));
+        assert!(!chip.tooltip.contains("blocked"), "{}", chip.tooltip);
+        assert_eq!(chip.detail.unwrap().merge_blocker, None);
+
+        // What a draft can still be told: a conflict is reported by
+        // `mergeable`, which does not answer for draftness.
+        let mut conflicting = pr.clone();
+        conflicting.merge = MergeState::Conflicting;
+        let chip = pr_chip(&conflicting);
+        assert_eq!(chip.checks, Some((IconName::Warning, Color::Warning)));
+        assert_eq!(
+            chip.detail.unwrap().merge_blocker.as_deref(),
+            Some("conflicts with base branch")
+        );
     }
 
     /// A merged PR merged, and a closed one is not waiting to; neither has a
