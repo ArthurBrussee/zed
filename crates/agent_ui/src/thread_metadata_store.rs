@@ -942,6 +942,20 @@ impl ThreadMetadataStore {
         cx.emit(ThreadMetadataStoreEvent::ThreadArchived(thread_id));
     }
 
+    /// Attach a worktree teardown to a thread that was archived earlier, so an
+    /// unarchive can still cancel it. The job is dropped — and so cancelled —
+    /// when the thread is no longer archived, which is the case where it must
+    /// never have been started: the worktree belongs to a live thread again.
+    pub fn attach_archive_job(
+        &mut self,
+        thread_id: ThreadId,
+        archive_job: (Task<()>, async_channel::Sender<()>),
+    ) {
+        if self.entry(thread_id).is_some_and(|thread| thread.archived) {
+            self.in_flight_archives.insert(thread_id, archive_job);
+        }
+    }
+
     pub fn unarchive(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
         self.update_archived(thread_id, false, cx);
         // Dropping the Sender triggers cancellation in the background task.

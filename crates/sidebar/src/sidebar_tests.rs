@@ -3495,6 +3495,240 @@ async fn test_archive_selected_thread_archives_closed_linked_worktree(cx: &mut T
     );
 }
 
+/// Archiving is a flag on metadata and has to feel like one. It used to build
+/// the thread's closed workspace first — worktree scan, repositories, language
+/// servers — because the disk plan needs a live project, and only moved the row
+/// once that finished. The row moves first now, and the worktree still comes
+/// off disk behind it.
+#[gpui::test]
+async fn test_archiving_a_closed_worktree_thread_does_not_wait_for_its_workspace(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/project",
+        serde_json::json!({
+            ".git": {
+                "worktrees": {
+                    "feature-a": {
+                        "commondir": "../../",
+                        "HEAD": "ref: refs/heads/feature-a",
+                    },
+                },
+            },
+            "src": {},
+        }),
+    )
+    .await;
+    fs.insert_tree(
+        "/worktrees/project/feature-a/project",
+        serde_json::json!({
+            ".git": "gitdir: /project/.git/worktrees/feature-a",
+            "src": {},
+        }),
+    )
+    .await;
+    fs.add_linked_worktree_for_repo(
+        Path::new("/project/.git"),
+        false,
+        git::repository::Worktree {
+            path: PathBuf::from("/worktrees/project/feature-a/project"),
+            ref_name: Some("refs/heads/feature-a".into()),
+            sha: "aaa".into(),
+            is_main: false,
+            is_bare: false,
+        },
+    )
+    .await;
+    agent_ui::test_support::record_zed_created_worktree(
+        fs.as_ref(),
+        Path::new("/worktrees/project/feature-a/project"),
+        None,
+        cx,
+    )
+    .await;
+    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+
+    let main_project = project::Project::test(fs.clone(), ["/project".as_ref()], cx).await;
+    main_project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(main_project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    let worktree_session_id = acp::SessionId::new(Arc::from("worktree-thread"));
+    let worktree_folder_paths =
+        PathList::new(&[PathBuf::from("/worktrees/project/feature-a/project")]);
+    save_thread_metadata_with_main_paths(
+        "worktree-thread",
+        "Worktree Thread",
+        worktree_folder_paths.clone(),
+        PathList::new(&[PathBuf::from("/project")]),
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 0).unwrap(),
+        cx,
+    );
+    save_thread_metadata(
+        acp::SessionId::new(Arc::from("main-thread")),
+        Some("Main Thread".into()),
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 2, 0, 0, 0).unwrap(),
+        None,
+        None,
+        &main_project,
+        cx,
+    );
+    sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+
+    // Archive without letting anything run afterwards, which is the whole
+    // point: the workspace has not been opened at this instant and the row has
+    // already moved.
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.archive_thread(&worktree_session_id, window, cx);
+    });
+    let archived = cx.update(|_, cx| {
+        ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry_by_session(&worktree_session_id)
+            .map(|thread| thread.archived)
+    });
+    assert_eq!(
+        archived,
+        Some(true),
+        "the thread should be archived before its workspace is built"
+    );
+    assert!(
+        multi_workspace
+            .read_with(cx, |multi_workspace, cx| {
+                multi_workspace.workspace_for_paths(&worktree_folder_paths, None, cx)
+            })
+            .is_none(),
+        "the worktree's workspace should not be open yet"
+    );
+
+    // And the slow half still happens, behind the flag.
+    for _ in 0..8 {
+        cx.run_until_parked();
+    }
+    assert!(
+        !fs.is_dir(Path::new("/worktrees/project/feature-a/project"))
+            .await,
+        "linked worktree directory should be removed from disk once the plan is built"
+    );
+    assert_eq!(
+        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace
+            .workspaces()
+            .count()),
+        1,
+        "the workspace opened to plan the removal should not be left behind"
+    );
+}
+
+/// The worktree belongs to a live thread again, so it must stay on disk: the
+/// user can unarchive while the workspace that plans the removal is still
+/// being built.
+#[gpui::test]
+async fn test_unarchiving_during_the_deferred_plan_leaves_the_worktree_alone(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/project",
+        serde_json::json!({
+            ".git": {
+                "worktrees": {
+                    "feature-a": {
+                        "commondir": "../../",
+                        "HEAD": "ref: refs/heads/feature-a",
+                    },
+                },
+            },
+            "src": {},
+        }),
+    )
+    .await;
+    fs.insert_tree(
+        "/worktrees/project/feature-a/project",
+        serde_json::json!({
+            ".git": "gitdir: /project/.git/worktrees/feature-a",
+            "src": {},
+        }),
+    )
+    .await;
+    fs.add_linked_worktree_for_repo(
+        Path::new("/project/.git"),
+        false,
+        git::repository::Worktree {
+            path: PathBuf::from("/worktrees/project/feature-a/project"),
+            ref_name: Some("refs/heads/feature-a".into()),
+            sha: "aaa".into(),
+            is_main: false,
+            is_bare: false,
+        },
+    )
+    .await;
+    agent_ui::test_support::record_zed_created_worktree(
+        fs.as_ref(),
+        Path::new("/worktrees/project/feature-a/project"),
+        None,
+        cx,
+    )
+    .await;
+    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+
+    let main_project = project::Project::test(fs.clone(), ["/project".as_ref()], cx).await;
+    main_project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(main_project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    let worktree_session_id = acp::SessionId::new(Arc::from("worktree-thread"));
+    let worktree_folder_paths =
+        PathList::new(&[PathBuf::from("/worktrees/project/feature-a/project")]);
+    save_thread_metadata_with_main_paths(
+        "worktree-thread",
+        "Worktree Thread",
+        worktree_folder_paths.clone(),
+        PathList::new(&[PathBuf::from("/project")]),
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 0).unwrap(),
+        cx,
+    );
+    sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+
+    let thread_id = cx.update(|_, cx| {
+        ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry_by_session(&worktree_session_id)
+            .expect("thread metadata should exist")
+            .thread_id
+    });
+
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.archive_thread(&worktree_session_id, window, cx);
+    });
+    cx.update(|_, cx| {
+        ThreadMetadataStore::global(cx).update(cx, |store, cx| store.unarchive(thread_id, cx));
+    });
+    for _ in 0..8 {
+        cx.run_until_parked();
+    }
+
+    assert!(
+        fs.is_dir(Path::new("/worktrees/project/feature-a/project"))
+            .await,
+        "a thread that is live again must keep its worktree"
+    );
+}
+
 #[gpui::test]
 async fn test_archive_selected_thread_deletes_empty_draft_when_linked_worktree_has_no_archive_root(
     cx: &mut TestAppContext,

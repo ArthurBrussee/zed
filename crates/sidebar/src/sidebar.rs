@@ -4795,35 +4795,40 @@ impl Sidebar {
             });
         let thread_entry_workspace = thread_entry.map(|thread| thread.workspace.clone());
 
-        if let (
-            Some(metadata),
-            Some(ThreadEntryWorkspace::Closed {
+        // Archiving is a flag on the thread's metadata, and the row can move
+        // the moment it is set. Working out whether the thread's linked
+        // worktree can come off disk is the slow half — `build_root_plan`
+        // needs live project and repository entities, so a closed workspace
+        // has to be built first, worktree scan and language servers and all —
+        // and it has nothing to say about the flag. The two are separated
+        // here: archive now, settle the disk behind it. A load that fails, or
+        // an unarchive that beats it, leaves the worktree where it is, which
+        // is the safe way for this to fail.
+        let deferred_worktree_archive = match (metadata.as_ref(), &thread_entry_workspace) {
+            (
+                Some(metadata),
+                Some(ThreadEntryWorkspace::Closed {
+                    folder_paths,
+                    project_group_key,
+                }),
+            ) if self.should_load_closed_workspace_for_archive(
                 folder_paths,
                 project_group_key,
-            }),
-        ) = (metadata.as_ref(), thread_entry_workspace)
-            && self.should_load_closed_workspace_for_archive(
-                &folder_paths,
-                &project_group_key,
                 metadata.remote_connection.as_ref(),
                 Some(metadata.thread_id),
                 None,
                 cx,
-            )
-        {
-            let session_id = session_id.clone();
-            self.open_workspace_for_archive(
-                folder_paths,
-                project_group_key,
-                window,
-                cx,
-                move |this, _workspace, window, cx| {
-                    this.update_entries(cx);
-                    this.archive_thread(&session_id, window, cx);
-                },
-            );
-            return;
-        }
+            ) =>
+            {
+                Some((
+                    metadata.thread_id,
+                    metadata.folder_paths().clone(),
+                    folder_paths.clone(),
+                    project_group_key.clone(),
+                ))
+            }
+            _ => None,
+        };
 
         // Compute which linked worktree roots should be archived from disk if
         // this thread is archived. This must happen before we remove any
@@ -4922,6 +4927,116 @@ impl Sidebar {
                     in_flight,
                     window,
                     cx,
+                );
+                if let Some((thread_id, plan_paths, folder_paths, project_group_key)) =
+                    deferred_worktree_archive
+                {
+                    this.archive_worktree_after_workspace_loads(
+                        thread_id,
+                        plan_paths,
+                        folder_paths,
+                        project_group_key,
+                        thread_remote_connection,
+                        window,
+                        cx,
+                    );
+                }
+            },
+        );
+    }
+
+    /// Take the thread's linked worktree off disk once the workspace that
+    /// holds it has loaded. The thread is already archived by the time this
+    /// runs; nothing here is needed for it to read that way.
+    ///
+    /// Opening the workspace is in service of `build_root_plan` alone, which
+    /// needs a live project and a live repository entity to persist the
+    /// worktree's git state before anything is deleted. That is the part worth
+    /// being slow and careful about, so it keeps the whole existing pipeline —
+    /// it has just stopped standing in front of the archive.
+    ///
+    /// Every way this can go wrong ends with the worktree still on disk: the
+    /// load fails, the plan comes back empty, or the user unarchives the
+    /// thread while the workspace is still building, in which case the
+    /// worktree belongs to a live thread again and must not be touched. The
+    /// workspace opened along the way is left open in that last case, since
+    /// the thread that is live again is the thing that would be using it.
+    fn archive_worktree_after_workspace_loads(
+        &mut self,
+        thread_id: ThreadId,
+        thread_folder_paths: PathList,
+        folder_paths: PathList,
+        project_group_key: ProjectGroupKey,
+        remote_connection: Option<RemoteConnectionOptions>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_workspace_for_archive(
+            folder_paths,
+            project_group_key,
+            window,
+            cx,
+            move |this, _workspace, window, cx| {
+                if !ThreadMetadataStore::global(cx)
+                    .read(cx)
+                    .entry(thread_id)
+                    .is_some_and(|thread| thread.archived)
+                {
+                    return;
+                }
+                this.update_entries(cx);
+
+                let roots_to_archive = this.roots_to_archive_for_paths(
+                    &thread_folder_paths,
+                    remote_connection.as_ref(),
+                    Some(thread_id),
+                    None,
+                    cx,
+                );
+
+                // An empty plan is not nothing to do: the workspace opened to
+                // build it still has to go, and with it the empty drafts that
+                // were only ever holding it open.
+                let mut workspaces_to_remove = this
+                    .linked_worktree_workspace_to_remove(
+                        &thread_folder_paths,
+                        remote_connection.as_ref(),
+                        Some(thread_id),
+                        None,
+                        &roots_to_archive,
+                        cx,
+                    )
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                let close_item_tasks = this.close_items_for_archived_worktrees(
+                    &roots_to_archive,
+                    &mut workspaces_to_remove,
+                    window,
+                    cx,
+                );
+                let removed_workspace = !workspaces_to_remove.is_empty();
+
+                this.remove_workspaces_then(
+                    workspaces_to_remove,
+                    close_item_tasks,
+                    window,
+                    cx,
+                    move |this, _window, cx| {
+                        if removed_workspace {
+                            this.delete_empty_drafts_for_archive_paths(
+                                &thread_folder_paths,
+                                remote_connection.as_ref(),
+                                cx,
+                            );
+                        }
+                        if let Some(job) =
+                            this.start_archive_worktree_task(thread_id, roots_to_archive, cx)
+                        {
+                            ThreadMetadataStore::global(cx).update(cx, |store, _cx| {
+                                store.attach_archive_job(thread_id, job);
+                            });
+                        }
+                    },
                 );
             },
         );
