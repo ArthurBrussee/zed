@@ -4978,6 +4978,152 @@ async fn test_close_tab_from_active_row(cx: &mut TestAppContext) {
     });
 }
 
+// Dragging one Active row onto another arranges the list by moving the thread's
+// tab. There is one order, held by the tabs, and the row moves because the tab
+// did — never alongside it.
+#[gpui::test]
+async fn test_drag_active_row_reorders_its_tab(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    cx.run_until_parked();
+
+    let mut thread_ids = Vec::new();
+    for _ in 0..2 {
+        open_thread_with_connection(&panel, StubAgentConnection::new(), cx);
+        send_message(&panel, cx);
+        let session_id = active_session_id(&panel, cx);
+        save_test_thread_metadata(&session_id, &project, cx).await;
+        thread_ids.push(cx.update(|_window, cx| {
+            ThreadMetadataStore::global(cx)
+                .read(cx)
+                .entry_by_session(&session_id)
+                .expect("thread metadata should exist")
+                .thread_id
+        }));
+    }
+    cx.run_until_parked();
+    sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+
+    let (first, second) = (thread_ids[0], thread_ids[1]);
+    #[track_caller]
+    fn position_of(ids: &[ThreadId], target: ThreadId, what: &str) -> usize {
+        ids.iter()
+            .position(|id| *id == target)
+            .unwrap_or_else(|| panic!("{what} should be present"))
+    }
+    let tabs = |cx: &mut gpui::VisualTestContext| {
+        panel.read_with(cx, |panel, cx| panel.open_thread_tab_ids(cx))
+    };
+    let rows = |cx: &mut gpui::VisualTestContext| {
+        sidebar.read_with(cx, |sidebar, _cx| {
+            sidebar
+                .contents
+                .entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    ListEntry::Thread(thread) => Some(thread.metadata.thread_id),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+
+    let tabs_before = tabs(cx);
+    assert!(
+        position_of(&tabs_before, first, "the first thread's tab")
+            < position_of(&tabs_before, second, "the second thread's tab"),
+        "the thread opened first starts in front"
+    );
+
+    // Pick up the second row and drop it on the first.
+    let target_ix = sidebar.read_with(cx, |sidebar, _cx| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .position(|entry| {
+                matches!(entry, ListEntry::Thread(thread) if thread.metadata.thread_id == first)
+            })
+            .expect("the first thread's row should be present")
+    });
+    let dragged = sidebar.read_with(cx, |sidebar, _cx| {
+        let ix = sidebar
+            .contents
+            .entries
+            .iter()
+            .position(|entry| {
+                matches!(entry, ListEntry::Thread(thread) if thread.metadata.thread_id == second)
+            })
+            .expect("the second thread's row should be present");
+        let ListEntry::Thread(thread) = &sidebar.contents.entries[ix] else {
+            unreachable!()
+        };
+        sidebar
+            .draggable_thread_row(ix, thread)
+            .expect("an Active row hosting a tab can be picked up")
+    });
+
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.handle_thread_row_drop(&dragged, target_ix, window, cx);
+    });
+    cx.run_until_parked();
+
+    let tabs_after = tabs(cx);
+    assert!(
+        position_of(&tabs_after, second, "the second thread's tab")
+            < position_of(&tabs_after, first, "the first thread's tab"),
+        "dropping a row on the one above it moves its tab in front of that one"
+    );
+
+    let rows_after = rows(cx);
+    assert!(
+        position_of(&rows_after, second, "the second thread's row")
+            < position_of(&rows_after, first, "the first thread's row"),
+        "the row follows its tab without the sidebar keeping an order of its own"
+    );
+}
+
+// A row with no tab is not draggable: the drag moves a tab, and All Threads and
+// Archived rows have none. A manual order for rows that are only history would
+// be the second, disagreeing order this feature exists to avoid.
+#[gpui::test]
+async fn test_rows_without_a_tab_are_not_draggable(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, _panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let session_id = acp::SessionId::new(Arc::from("historical-thread"));
+    save_test_thread_metadata(&session_id, &project, cx).await;
+    cx.run_until_parked();
+    sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+
+    sidebar.read_with(cx, |sidebar, _cx| {
+        let ix = sidebar
+            .contents
+            .entries
+            .iter()
+            .position(|entry| entry.session_id() == Some(&session_id))
+            .expect("the historical thread's row should be present");
+        assert_ne!(
+            sidebar.section_of_entry(ix),
+            Some(SidebarSection::OpenInZed),
+            "a thread that was never opened is history, not Active"
+        );
+        let ListEntry::Thread(thread) = &sidebar.contents.entries[ix] else {
+            unreachable!()
+        };
+        assert!(
+            sidebar.draggable_thread_row(ix, thread).is_none(),
+            "a row with no tab has nothing to move"
+        );
+    });
+}
+
 #[gpui::test]
 async fn test_confirm_on_historical_thread_preserves_historical_timestamp_and_order(
     cx: &mut TestAppContext,

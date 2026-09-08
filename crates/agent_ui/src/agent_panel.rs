@@ -5374,6 +5374,52 @@ impl AgentPanel {
             .collect()
     }
 
+    /// Moves `thread_id`'s tab to where `target_thread_id`'s tab sits, which is
+    /// what dropping one sidebar row on another means. Both have to be this
+    /// pane's own tabs: the sidebar only offers the drag inside one worktree
+    /// group, and a group is one workspace, so both rows are real tabs here.
+    /// Returns whether the pair was found and the move made.
+    ///
+    /// Nothing is activated. Reordering is arranging the list, not asking to
+    /// read the thread, and the drag never touched the panel's focus.
+    pub fn move_thread_tab_to(
+        &mut self,
+        thread_id: ThreadId,
+        target_thread_id: ThreadId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let pane = self.thread_pane.clone();
+        let mut source = None;
+        let mut destination_index = None;
+        for (index, item) in pane.read(cx).items().enumerate() {
+            let Some(tab) = item.downcast::<crate::thread_tab::ThreadTab>() else {
+                continue;
+            };
+            let id = tab.read(cx).thread_id(cx);
+            if id == thread_id && source.is_none() {
+                source = Some((index, item.item_id()));
+            }
+            if id == target_thread_id && destination_index.is_none() {
+                destination_index = Some(index);
+            }
+        }
+
+        let (Some((source_index, item_id)), Some(destination_index)) = (source, destination_index)
+        else {
+            return false;
+        };
+        if source_index == destination_index {
+            return true;
+        }
+
+        // The target's index in the strip as it stands, which is the same thing
+        // a tab drag hands `move_item`: dropping on a row above lands before it,
+        // dropping on one below lands after it.
+        workspace::move_item(&pane, &pane, item_id, destination_index, false, window, cx);
+        true
+    }
+
     /// Whether any tab-hosted conversation view is still alive.
     fn has_live_tab_thread(&self) -> bool {
         self.active_tab_thread.is_some()

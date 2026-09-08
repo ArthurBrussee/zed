@@ -356,6 +356,38 @@ struct SoloWorktree {
     path: Option<PathBuf>,
 }
 
+/// An Active row picked up to be reordered.
+///
+/// The sidebar keeps no order of its own: the drag ends in the thread's tab
+/// moving, and the row follows because Active is sorted by the tab strip. So
+/// the payload carries what it takes to find that tab — the thread, and the
+/// workspace whose pane holds it. The workspace doubles as the group a drag is
+/// confined to: dropping a thread among another worktree's rows would read as
+/// moving it to that worktree, which is not what this does.
+#[derive(Clone)]
+struct DraggedThreadRow {
+    thread_id: agent_ui::ThreadId,
+    workspace: Entity<Workspace>,
+    title: SharedString,
+    /// Where the row was picked up from, so a row being hovered can say which
+    /// of its edges the dragged row would land on.
+    ix: usize,
+}
+
+impl Render for DraggedThreadRow {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let color = cx.theme().colors();
+        h_flex()
+            .px_1p5()
+            .py_0p5()
+            .rounded_sm()
+            .bg(color.elevated_surface_background)
+            .border_1()
+            .border_color(color.border)
+            .child(Label::new(self.title.clone()).size(LabelSize::Small))
+    }
+}
+
 /// What a selection points at, stable across list rebuilds.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EntryIdentity {
@@ -1715,6 +1747,65 @@ impl Sidebar {
             }
         }
         visible
+    }
+
+    /// Whether the row at `ix` can be picked up, and what to carry if it can.
+    ///
+    /// Only Active rows with a tab in an open workspace: the drag moves the
+    /// tab, so a row without one has nothing to move, and All Threads and
+    /// Archived have no tabs at all. A manual order for rows that are only
+    /// history would be a second order with its own storage, which is the one
+    /// thing this feature is built to avoid.
+    fn draggable_thread_row(&self, ix: usize, thread: &ThreadEntry) -> Option<DraggedThreadRow> {
+        if self.section_of_entry(ix) != Some(SidebarSection::OpenInZed) {
+            return None;
+        }
+        let thread_id = thread.metadata.thread_id;
+        if !self.contents.tabbed_threads.contains(&thread_id) {
+            return None;
+        }
+        let ThreadEntryWorkspace::Open(workspace) = &thread.workspace else {
+            return None;
+        };
+        Some(DraggedThreadRow {
+            thread_id,
+            workspace: workspace.clone(),
+            title: thread.metadata.display_title(),
+            ix,
+        })
+    }
+
+    /// Lands a dragged row on the row at `target_ix` by moving its tab to where
+    /// the target's tab sits. The row moves because the tab moved: the panel
+    /// republishes its strip, the registry notifies, and the Active section —
+    /// which is sorted by that strip — rebuilds around the new order.
+    fn handle_thread_row_drop(
+        &mut self,
+        dragged: &DraggedThreadRow,
+        target_ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = match self.contents.entries.get(target_ix) {
+            Some(ListEntry::Thread(thread)) => self.draggable_thread_row(target_ix, thread),
+            _ => None,
+        };
+        let Some(target) = target else {
+            return;
+        };
+        if target.thread_id == dragged.thread_id
+            || target.workspace.entity_id() != dragged.workspace.entity_id()
+        {
+            return;
+        }
+
+        let Some(panel) = target.workspace.read(cx).panel::<AgentPanel>(cx) else {
+            return;
+        };
+        let thread_id = dragged.thread_id;
+        panel.update(cx, |panel, cx| {
+            panel.move_thread_tab_to(thread_id, target.thread_id, window, cx);
+        });
     }
 
     /// Which workspace a thread belongs to, for grouping. A draft is an
@@ -6460,6 +6551,44 @@ impl Sidebar {
                 }
             })
             .into_any_element();
+
+        // Active rows are draggable: the drag moves the thread's tab, and the
+        // row moves because the tab did. The wrapper is what carries it, so the
+        // row's own click, hover and context menu are untouched.
+        let row = match self.draggable_thread_row(ix, thread) {
+            Some(dragged) => {
+                let group = dragged.workspace.entity_id();
+                div()
+                    .id(("thread-row-drag", ix))
+                    .on_drag(dragged, |row, _, _, cx| cx.new(|_| row.clone()))
+                    .drag_over::<DraggedThreadRow>(move |style, dragged, _, cx| {
+                        // Only rows of the dragged row's own worktree accept it,
+                        // so a group that would refuse the drop does not offer
+                        // to take it.
+                        if dragged.workspace.entity_id() != group {
+                            return style;
+                        }
+                        let color = cx.theme().colors();
+                        let style = style.bg(color.drop_target_background);
+                        // The edge the row would land on: a row dragged from
+                        // below lands above this one, and the reverse.
+                        match ix.cmp(&dragged.ix) {
+                            Ordering::Less => style.border_t_2(),
+                            Ordering::Greater => style.border_b_2(),
+                            Ordering::Equal => style,
+                        }
+                        .border_color(color.drop_target_border)
+                    })
+                    .on_drop(cx.listener(
+                        move |this, dragged: &DraggedThreadRow, window, cx| {
+                            this.handle_thread_row_drop(dragged, ix, window, cx);
+                        },
+                    ))
+                    .child(row)
+                    .into_any_element()
+            }
+            None => row,
+        };
 
         // A header used to set one worktree apart from the next. A row that
         // stands in for its worktree keeps that gap itself, so a list of solo
