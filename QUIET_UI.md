@@ -908,10 +908,10 @@ is never handed out twice, never claimed while half-built, and cleaned up on qui
   will never pick up. Extending that predicate (a spare marker in the creation record) is part of
   this item, not a detail to discover afterwards.
 
-**Three more places doing work per frame or per rebuild, found by reading rather than by using.**
-The 2026-09-08 run's slow pass fixed the two it could prove outright and left these, each with the
-mechanism named so the next run can confirm it with the timing lines that run added rather than
-re-derive it:
+**Two more places doing work per rebuild, found by reading rather than by using.**
+The 2026-09-08 run's slow pass fixed everything it could prove outright and left these two, each
+with the mechanism named so the next run can confirm it with the timing lines that run added rather
+than re-derive it:
 
 - `Sidebar::rebuild_contents` deep-clones every stored thread's `ThreadMetadata` and every stored
   terminal's, once per rebuild, to build rows it then throws away on the next one. Hundreds of
@@ -921,11 +921,9 @@ re-derive it:
 - `resolve_workspace`, in the same rebuild, scans every open workspace for every stored thread and
   compares `PathList`s. Small today because the number of open workspaces is small; quadratic in
   the thing that grows.
-- `Sidebar::render_thread_row` clones a row's whole `ThreadMetadata` twice — plus its worktree list
-  and its folder paths — on every frame it draws, to hand them to closures that only run when
-  someone clicks. The row is already an `Arc<ThreadEntry>`, so the closures could hold the `Arc` and
-  take what they need at click time. (A fourth candidate was checked and is not one: a running
-  command's output is *not* rescanned per frame, because `Terminal::output` is only filled on exit.)
+(A third candidate was checked and is not one: a running command's output is *not* rescanned per
+frame, because `Terminal::output` is only filled on exit. A fourth was real and is already fixed —
+see the row-rendering entry in that night's rebase log.)
 
 ## Verification queue
 
@@ -3313,8 +3311,17 @@ Kept, with reasons, so the next pass does not re-open them:
   frame — on exactly the frames the cache was about to answer from. It borrows now. The two
   suspicions the entry named are instrumented rather than guessed at: a sidebar rebuild costing
   more than a frame logs its row count, its duration and how many quiet rebuilds it stands for, and
-  a chip whose command is parsed far past the once it should be says so as the count doubles. Three
-  further findings went to the Work queue with their mechanisms named.
+  a chip whose command is parsed far past the once it should be says so as the count doubles.
+
+  A fourth cost, found while checking the queue notes and fixed rather than queued:
+  `render_thread_row` handed a row's whole `ThreadMetadata` to two closures by value and derived its
+  folder paths, on every frame, for handlers that only fire on a click — the row is an
+  `Arc<ThreadEntry>`, so the closures share that now and take what they need when they run. The
+  blanked worktree list built beside them went too: the row passes `Vec::new()` to the item and has
+  since rows stopped naming their worktree, so the clone and the loop that emptied it were work
+  whose result was discarded. Two further findings went to the Work queue with their mechanisms
+  named; a third suspected one was checked and is not real (a running command's output is not
+  rescanned per frame, because `Terminal::output` is only filled on exit).
 - *Drag a thread in the sidebar to reorder it.* Active rows can be picked up and dropped on each
   other. The drop ends in `workspace::move_item` on the thread's own tab, so there is still one
   order — the tab strip's — and the row moves because the tab moved. The prerequisite the entry
