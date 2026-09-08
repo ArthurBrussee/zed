@@ -860,6 +860,48 @@ does is removed as it lands.
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**A pass over the diff: delete what upstream already does.**
+The fork is 80 files, +33,604 / -10,111 against upstream. About 3,300 of those insertions are tests
+and 3,238 are this document; the remaining 27,000 lines of code are the thing to look at. Some of it
+is the fork's whole reason to exist and stays. Some of it is a hand-rolled version of something Zed
+grew later, or something that started small and outlived its need, and every line of that costs a
+conflict at every rebase.
+
+This is the pass, not a look. Read the fork's own additions against what upstream now has, decide
+about each one, and delete what you can. Where the biggest lumps are, by insertions:
+
+    thread_view.rs           +4132   chips.rs     +2954   sidebar.rs   +2581 (-2946)
+    command_parse.rs         +3146   agent_panel.rs +2823  gh_status.rs +1415
+    conversation_view.rs     +1259   acp_thread.rs +1094   terminal.rs   +658
+
+The rebase log already names this as the most valuable thing a run can find, and has found it
+before: `branch_diff.rs` folded into upstream's `project_diff` once upstream grew `DiffBase`, and
+`command_chip_summary` plus nine helpers went when the parser could label chips from its own
+segments. Look for the same shape again: a helper that duplicates an upstream API with a different
+name, a wrapper that exists only to pass one extra argument, an abstraction with one caller,
+a fallback for a case upstream now handles.
+
+Report what you deleted with its line count, and what you decided to keep and why. Keeping something
+with a reason is a good outcome; the bad outcome is reading it all and changing nothing.
+
+**A pass over what has got slow.**
+Several waits are long enough to change behaviour, and they are measured, not felt. From the logs
+this fork already writes:
+
+    opening a long thread    12,846ms replay, then 418ms of views
+    creating a worktree       1,985 + 4,938 + 2,564ms across its three phases, 30s on a bad run
+    archiving a thread        a whole workspace built before the flag is set
+
+Each of those has its own queue entry and they should be built. This one is for what those three
+have in common: work done on the foreground that nobody asked to wait for, and work done once per
+open that could be done once. Go looking rather than waiting for the next complaint — the timing
+lines are already in the code, so add them where they are missing, run the app's own suites, and
+find the next three.
+
+Two places worth suspecting before measuring, both the fork's own: `update_entries` rebuilds the
+whole sidebar and is called from 38 places, and the chip layer reparses commands on every frame it
+draws (there is a cache, so check it is actually hit). Confirm with numbers before changing either.
+
 **An image read from a file still overflows its box.**
 The 2026-09-02 fix sized a picture's box from its real dimensions and it works — for the images the
 agent sends as bytes. An image on disk still takes the fixed 20rem default and paints over
