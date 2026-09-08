@@ -52,43 +52,6 @@ impl ThreadTabsRegistry {
         &self.entries
     }
 
-    /// Number of open threads whose turn is currently running, across all
-    /// workspaces. Conversation views poke this registry on thread status
-    /// changes, so observers (the title bar) re-read this on time.
-    pub fn running_turn_count(&self, cx: &App) -> usize {
-        self.running_turn_count_impl(None, cx)
-    }
-
-    /// Like [`running_turn_count`](Self::running_turn_count) but skips the
-    /// entry for `exclude`. A thread view calls this while it renders (it holds
-    /// its own lease, so re-reading itself would panic) and adds its own status
-    /// back separately.
-    pub fn running_turn_count_excluding(&self, exclude: ThreadId, cx: &App) -> usize {
-        self.running_turn_count_impl(Some(exclude), cx)
-    }
-
-    fn running_turn_count_impl(&self, exclude: Option<ThreadId>, cx: &App) -> usize {
-        self.entries
-            .iter()
-            .filter(|entry| Some(entry.thread_id) != exclude)
-            .filter(|entry| {
-                entry
-                    .workspace
-                    .upgrade()
-                    .and_then(|workspace| workspace.read(cx).panel::<crate::AgentPanel>(cx))
-                    .and_then(|panel| {
-                        panel
-                            .read(cx)
-                            .conversation_view_for_id(&entry.thread_id, cx)
-                    })
-                    .and_then(|view| view.read(cx).root_thread(cx))
-                    .is_some_and(|thread| {
-                        thread.read(cx).status() != acp_thread::ThreadStatus::Idle
-                    })
-            })
-            .count()
-    }
-
     /// Records `owner`'s pane as `strip`: its whole tab sequence, real tabs
     /// and foreign proxies alike, each carrying the workspace that owns the
     /// thread.

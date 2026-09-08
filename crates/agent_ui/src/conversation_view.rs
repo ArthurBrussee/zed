@@ -709,12 +709,6 @@ impl ConversationView {
             .and_then(|id| self.thread_view(id))
     }
 
-    /// Whether the agent connection has settled, i.e. the view renders a
-    /// conversation (or an error) rather than the connecting placeholder.
-    pub fn connection_settled(&self) -> bool {
-        !matches!(self.server_state, ServerState::Loading { .. })
-    }
-
     /// Installs content in the view's message editor after construction. When
     /// the connection is still loading the content is held and applied to the
     /// thread view the moment it is created, so a caller never has to wait for

@@ -2781,16 +2781,6 @@ impl AgentPanel {
         self.activate_additional_new_thread(true, AgentThreadSource::AgentPanel, window, cx);
     }
 
-    /// Sets the agent used for new threads and persists it as the default,
-    /// without creating or focusing anything. Non-native agents are ignored
-    /// in collab projects.
-    pub fn set_default_agent(&mut self, agent: Agent, cx: &mut Context<Self>) {
-        if self.project.read(cx).is_via_collab() && !agent.is_native() {
-            return;
-        }
-        self.set_selected_agent_and_persist(agent, cx);
-    }
-
     fn set_selected_agent_and_persist(&mut self, agent: Agent, cx: &mut Context<Self>) {
         if self.selected_agent != agent {
             self.selected_agent = agent.clone();
