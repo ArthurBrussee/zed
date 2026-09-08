@@ -69,6 +69,26 @@ fn copy_chip_image(image: ChipImage, cx: &mut App) {
 }
 
 /// The format a file's name claims, for the formats an image chip can show.
+/// A picture's shape, taken from the header of the file it lives in.
+///
+/// The whole file is read, because that is the read `Fs` offers, but only the
+/// few bytes at the front of it are parsed. A name that is not a raster format
+/// answers without touching the disk at all.
+pub(super) async fn image_shape_of_file(fs: &Arc<dyn fs::Fs>, path: &std::path::Path) -> ImageShape {
+    let Some(format) = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .and_then(image_format_from_extension)
+    else {
+        return ImageShape::Unknown;
+    };
+    fs.load_bytes(path)
+        .await
+        .ok()
+        .and_then(|bytes| acp_thread::ContentBlock::image_dimensions(&bytes, format))
+        .map_or(ImageShape::Unknown, ImageShape::Known)
+}
+
 fn image_format_from_extension(extension: &str) -> Option<gpui::ImageFormat> {
     match extension.to_ascii_lowercase().as_str() {
         "png" => Some(gpui::ImageFormat::Png),
@@ -937,7 +957,11 @@ impl ThreadView {
         cx: &Context<Self>,
     ) -> Option<impl Fn(&mut Window, &mut App) -> gpui::AnyView + use<>> {
         let image = self.tool_call_image(tool_call, cx)?;
-        let dimensions = image.dimensions();
+        // Whatever the inline chip's read already learned about the file. The
+        // card does not start one of its own: a popover that has not opened yet
+        // is not a reason to touch the disk, and a card is not measured once
+        // and kept the way a list entry is.
+        let dimensions = self.chip_image_dimensions(&image);
         Some(chip_hover_card(move |_window, _cx| {
             let picture = match image.clone() {
                 ChipImage::File(path) => img(path),
@@ -2710,6 +2734,76 @@ impl ThreadView {
     /// The picture an expanded image chip shows. Clicking opens it where images
     /// open; right-clicking offers the picture itself, since a screenshot in a
     /// thread is usually wanted somewhere else.
+    /// A picture's shape as far as this view knows it: carried alongside data
+    /// the agent sent, read from the header for one that lives in a file, and
+    /// unknown until that read lands.
+    fn chip_image_dimensions(&self, image: &ChipImage) -> Option<gpui::Size<u32>> {
+        match image {
+            ChipImage::File(path) => match self.chip_cache.image_shapes.borrow().get(path.as_path())
+            {
+                Some(ImageShape::Known(dimensions)) => Some(*dimensions),
+                _ => None,
+            },
+            ChipImage::Data { dimensions, .. } => *dimensions,
+        }
+    }
+
+    /// The box to draw a picture that lives in a file, starting the read of its
+    /// header the first time it is asked for.
+    ///
+    /// A picture the agent sent inline arrives with its dimensions and gets a
+    /// box shaped like itself; one it only named the path of used to take the
+    /// fixed box whatever shape it was, which is how a tall screenshot ended up
+    /// painting over the chips below it.
+    fn image_file_box_height(
+        &self,
+        path: &std::path::Path,
+        entry_ix: usize,
+        cx: &Context<Self>,
+    ) -> Rems {
+        let known = self.chip_cache.image_shapes.borrow().get(path).copied();
+        match known {
+            Some(ImageShape::Known(dimensions)) => {
+                image_box_height(Some(dimensions), IMAGE_CHIP_WIDTH)
+            }
+            Some(ImageShape::Unknown) => IMAGE_CHIP_HEIGHT,
+            Some(ImageShape::Reading) => IMAGE_CHIP_MAX_HEIGHT,
+            None => {
+                self.read_image_shape(path.to_path_buf(), entry_ix, cx);
+                IMAGE_CHIP_MAX_HEIGHT
+            }
+        }
+    }
+
+    /// Reads a picture's header off the foreground and remeasures the entry it
+    /// is in once the shape is known. The entry was measured at a placeholder
+    /// height, and a `ListState` keeps the height it measured, so the remeasure
+    /// is what makes the answer count for anything.
+    fn read_image_shape(&self, path: std::path::PathBuf, entry_ix: usize, cx: &Context<Self>) {
+        let Some(fs) = self
+            .project
+            .upgrade()
+            .map(|project| project.read(cx).fs().clone())
+        else {
+            return;
+        };
+        self.chip_cache
+            .image_shapes
+            .borrow_mut()
+            .insert(path.clone(), ImageShape::Reading);
+
+        cx.spawn(async move |this, cx| {
+            let shape = image_shape_of_file(&fs, &path).await;
+            this.update(cx, |this, cx| {
+                this.chip_cache.image_shapes.borrow_mut().insert(path, shape);
+                this.list_state.remeasure_items(entry_ix..entry_ix + 1);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn render_inline_image(
         &self,
         entry_ix: usize,
@@ -2724,7 +2818,10 @@ impl ThreadView {
             ChipImage::Data { .. } => None,
         };
         let copyable = image.clone();
-        let dimensions = image.dimensions();
+        let box_height = match &image {
+            ChipImage::File(path) => self.image_file_box_height(path, entry_ix, cx),
+            ChipImage::Data { dimensions, .. } => image_box_height(*dimensions, IMAGE_CHIP_WIDTH),
+        };
         let picture = match image {
             ChipImage::File(path) => img(path),
             ChipImage::Data { image, .. } => img(image),
@@ -2742,7 +2839,7 @@ impl ThreadView {
             // where the picture's shape is known, so fitting it inside costs
             // it nothing.
             .w(IMAGE_CHIP_WIDTH)
-            .h(image_box_height(dimensions, IMAGE_CHIP_WIDTH))
+            .h(box_height)
             .child(
                 picture
                     .size_full()

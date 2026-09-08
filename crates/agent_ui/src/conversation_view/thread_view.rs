@@ -89,9 +89,10 @@ const IMAGE_CHIP_MIN_HEIGHT: Rems = Rems(4.);
 /// a box that does not already fit the picture is a box the picture spills out
 /// of, over the chips below.
 ///
-/// The dimensions arrive with the image (`ContentBlock::Image`), so this is
-/// arithmetic and not a measurement that has to wait for a decode. Without them
-/// there is nothing to compute from and the fixed box stands.
+/// The dimensions arrive with the image (`ContentBlock::Image`) or are read
+/// from a file's header, so this is arithmetic and not a measurement that has
+/// to wait for a decode. Without them there is nothing to compute from and the
+/// fixed box stands.
 pub(super) fn image_box_height(dimensions: Option<gpui::Size<u32>>, width: Rems) -> Rems {
     let Some(dimensions) = dimensions.filter(|size| size.width > 0 && size.height > 0) else {
         return IMAGE_CHIP_HEIGHT;
@@ -852,6 +853,11 @@ struct ChipCache {
     /// which also makes it readable, since a stream of output redrawn at frame
     /// rate is a blur.
     tails: RefCell<HashMap<acp::ToolCallId, CommandTail>>,
+    /// The shape of each picture that lives in a file, so its box is sized to
+    /// the picture like an inline one's is. A file says its shape in the header
+    /// it opens with, but getting at that header is IO, so it is read once per
+    /// path in the background and the answer kept for as long as the view is.
+    image_shapes: RefCell<HashMap<std::path::PathBuf, ImageShape>>,
     /// Answers that hold for the length of one frame, thrown away at the start
     /// of the next: the style chips are drawn in, and which entries are chips.
     /// Both are asked for once per visible entry, and the run each entry
@@ -859,6 +865,21 @@ struct ChipCache {
     /// come back many times over within a single frame.
     frame_style: RefCell<Option<MarkdownStyle>>,
     frame_chip_entries: RefCell<Vec<Option<bool>>>,
+}
+
+/// What is known about the shape of a picture on disk.
+#[derive(Clone, Copy)]
+pub(super) enum ImageShape {
+    /// The header is being read. Until it answers the box is as tall as a
+    /// picture is ever allowed to be: too tall only letterboxes, while too
+    /// short is the box a tall screenshot paints out of and over the chips
+    /// under it.
+    Reading,
+    Known(gpui::Size<u32>),
+    /// Read and not understood: an SVG, a format `image` does not decode, a
+    /// file that was gone by the time it was opened. Nothing better than the
+    /// fixed box is available for it.
+    Unknown,
 }
 
 /// Highlight runs, kept for as long as the style they were built in holds.
@@ -1076,9 +1097,9 @@ enum CommandFileDiff {
 /// A picture a chip stands for, however the agent delivered it.
 #[derive(Clone)]
 enum ChipImage {
-    /// An image on disk, which may live outside the project. Its shape is not
-    /// known without reading it, which is why only the variant below can size
-    /// its own box.
+    /// An image on disk, which may live outside the project. Its shape is only
+    /// known once its header has been read, which the view does once per path
+    /// and keeps in `ChipCache::image_shapes`.
     File(std::path::PathBuf),
     /// Image data the call carried, with no file behind it, and the dimensions
     /// decoded alongside it.
@@ -1086,16 +1107,6 @@ enum ChipImage {
         image: Arc<gpui::Image>,
         dimensions: Option<gpui::Size<u32>>,
     },
-}
-
-impl ChipImage {
-    /// The shape of the picture, when it is known.
-    fn dimensions(&self) -> Option<gpui::Size<u32>> {
-        match self {
-            ChipImage::File(_) => None,
-            ChipImage::Data { dimensions, .. } => *dimensions,
-        }
-    }
 }
 
 /// What a chip click expands. Tool-call expansion is keyed by id (it drives the
@@ -14428,6 +14439,89 @@ mod tests {
             image_box_height(Some(gpui::size(0, 100)), IMAGE_CHIP_WIDTH).0,
             IMAGE_CHIP_HEIGHT.0
         );
+    }
+
+    /// A real file of the given shape, so the header parsed off it is the one a
+    /// picture of that shape actually carries.
+    fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(width, height))
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .expect("a blank image encodes as a png");
+        bytes.into_inner()
+    }
+
+    #[gpui::test]
+    async fn a_picture_on_disk_is_measured_from_its_own_header(cx: &mut gpui::TestAppContext) {
+        use super::chips::image_shape_of_file;
+
+        let fs = FakeFs::new(cx.executor());
+        // The capture from the 2026-09-07 report: 1024 wide and taller than the
+        // fixed box, which is how it came to paint over the chips under it.
+        fs.insert_tree(path!("/project"), json!({ "src": {} })).await;
+        fs.insert_file(
+            path!("/project/platform-1024-light.png"),
+            png_bytes(1024, 1536),
+        )
+        .await;
+        // A landscape capture, for the other direction.
+        fs.insert_file(path!("/project/wide.png"), png_bytes(1600, 400))
+            .await;
+
+        let fs: Arc<dyn fs::Fs> = fs;
+        let shape =
+            image_shape_of_file(&fs, path!("/project/platform-1024-light.png").as_ref()).await;
+        let ImageShape::Known(dimensions) = shape else {
+            panic!("a png on disk says its shape in its header");
+        };
+        assert_eq!(dimensions, gpui::size(1024, 1536));
+
+        // Its box is the picture's shape, capped, rather than the fixed one it
+        // used to take. The fixed box was 12rem short of holding it.
+        assert_eq!(
+            image_box_height(Some(dimensions), IMAGE_CHIP_WIDTH).0,
+            IMAGE_CHIP_MAX_HEIGHT.0
+        );
+        assert!(IMAGE_CHIP_HEIGHT.0 < IMAGE_CHIP_MAX_HEIGHT.0);
+
+        // A landscape capture gets a box shorter than the fixed one, so the
+        // shape is read for its own sake and not just to grow the box.
+        let ImageShape::Known(dimensions) =
+            image_shape_of_file(&fs, path!("/project/wide.png").as_ref()).await
+        else {
+            panic!("a png on disk says its shape in its header");
+        };
+        assert_eq!(image_box_height(Some(dimensions), IMAGE_CHIP_WIDTH).0, 6.);
+    }
+
+    #[gpui::test]
+    async fn a_picture_with_no_readable_header_keeps_the_fixed_box(cx: &mut gpui::TestAppContext) {
+        use super::chips::image_shape_of_file;
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({ "src": {} })).await;
+        // A vector image has no pixel dimensions to read, and `image` does not
+        // decode it at all.
+        fs.insert_file(path!("/project/logo.svg"), b"<svg/>".to_vec())
+            .await;
+        // A name that promises a png over bytes that are not one.
+        fs.insert_file(path!("/project/truncated.png"), b"not a png".to_vec())
+            .await;
+        let fs: Arc<dyn fs::Fs> = fs;
+
+        for path in [
+            path!("/project/logo.svg"),
+            path!("/project/truncated.png"),
+            path!("/project/gone.png"),
+        ] {
+            assert!(
+                matches!(
+                    image_shape_of_file(&fs, path.as_ref()).await,
+                    ImageShape::Unknown
+                ),
+                "{path} has no shape to read, so the fixed box stands"
+            );
+        }
     }
 
     #[track_caller]

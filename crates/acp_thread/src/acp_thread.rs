@@ -1591,7 +1591,10 @@ impl ContentBlock {
         Some((Arc::new(gpui::Image::from_bytes(format, bytes)), dimensions))
     }
 
-    fn image_dimensions(bytes: &[u8], format: gpui::ImageFormat) -> Option<gpui::Size<u32>> {
+    /// A picture's shape, read from the header the format opens with rather
+    /// than by decoding it. Public because a picture the agent only named the
+    /// path of has to be measured the same way, from bytes read off disk.
+    pub fn image_dimensions(bytes: &[u8], format: gpui::ImageFormat) -> Option<gpui::Size<u32>> {
         let format = match format {
             gpui::ImageFormat::Png => image::ImageFormat::Png,
             gpui::ImageFormat::Jpeg => image::ImageFormat::Jpeg,
