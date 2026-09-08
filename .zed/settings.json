@@ -31,6 +31,11 @@
       "formatter": "prettier",
     },
     "Rust": {
+      // No rust-analyzer on this repository. Indexing a workspace this size
+      // costs more CPU and disk than the editor is worth on the machine this
+      // fork is developed on; `cargo check` and `script/clippy` are what the
+      // work is gated by anyway. Remove the `!` line to get it back.
+      "language_servers": ["!rust-analyzer"],
       "tasks": {
         "variables": {
           "RUST_DEFAULT_PACKAGE_RUN": "zed",

@@ -28,6 +28,7 @@ feature_flags.workspace = true
 multi_buffer.workspace = true
 file_icons.workspace = true
 futures.workspace = true
+git.workspace = true
 gpui.workspace = true
 http_proxy.workspace = true
 itertools.workspace = true
@@ -58,6 +59,7 @@ urlencoding.workspace = true
 [dev-dependencies]
 env_logger.workspace = true
 gpui = { workspace = true, "features" = ["test-support"] }
+markdown = { workspace = true, "features" = ["test-support"] }
 indoc.workspace = true
 parking_lot.workspace = true
 project = { workspace = true, "features" = ["test-support"] }

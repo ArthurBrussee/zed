@@ -184,10 +184,18 @@ fn remove_cxs(parsed: &mut ParsedArgs, args: &mut Vec<FnArg>, test_name: &Ident)
                 Some(stringify!(#test_name)),
             );
         ));
+        // Quitting has to happen inside an `update`, exactly as the
+        // `#[gpui::test]` harness does it. `quit` shuts the app down directly,
+        // and entities released by that shutdown are retained until the end of
+        // the effect cycle; `update` is what flushes it. Called bare, nothing
+        // ever flushes, and whatever the shutdown released is still holding a
+        // handle when the leak detector runs on drop.
         parsed.cx_teardowns.extend(quote!(
             dispatcher.run_until_parked();
-            #cx_varname.executor().forbid_parking();
-            #cx_varname.quit();
+            #cx_varname.update(|cx| {
+                cx.background_executor().forbid_parking();
+                cx.quit();
+            });
             dispatcher.run_until_parked();
         ));
 

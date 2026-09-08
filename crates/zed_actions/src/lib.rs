@@ -602,6 +602,8 @@ pub mod agent {
             ResetAgentZoom,
             /// Pastes clipboard content without any formatting.
             PasteRaw,
+            /// Adds a review comment on the selected lines of a diff.
+            AddReviewComment,
         ]
     );
 

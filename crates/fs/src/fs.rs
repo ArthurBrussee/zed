@@ -2245,6 +2245,20 @@ impl FakeFs {
         .unwrap();
     }
 
+    /// Makes every fetch on this repository fail, as an offline machine does.
+    pub fn set_fetch_error(&self, dot_git: &Path, message: Option<&str>) {
+        self.with_git_state(dot_git, true, |state| {
+            state.simulated_fetch_error = message.map(ToString::to_string);
+        })
+        .unwrap();
+    }
+
+    /// Every remote this repository has been asked to fetch, in order.
+    pub fn fetched_remotes(&self, dot_git: &Path) -> Vec<String> {
+        self.with_git_state(dot_git, false, |state| state.fetched_remotes.clone())
+            .unwrap()
+    }
+
     pub fn insert_branches(&self, dot_git: &Path, branches: &[&str]) {
         self.with_git_state(dot_git, true, |state| {
             if let Some(first) = branches.first()
