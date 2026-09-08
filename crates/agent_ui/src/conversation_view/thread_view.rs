@@ -1060,12 +1060,14 @@ impl ChipCache {
     }
 
     fn output(&self, tool_call: &ToolCall, cx: &App) -> Rc<OutputFacts> {
-        let content = tool_call
+        // Borrowed, never copied. Taking the output by value to measure its
+        // length meant a `cargo test`'s worth of text was memcpy'd once per
+        // chip per frame, on the frames the cache was about to answer anyway.
+        let output = tool_call
             .terminals()
             .next()
-            .and_then(|terminal| terminal.read(cx).output())
-            .map(|output| output.content.clone());
-        let scanned_len = content.as_ref().map_or(0, |content| content.len());
+            .and_then(|terminal| terminal.read(cx).output());
+        let scanned_len = output.map_or(0, |output| output.content.len());
         if let Some(facts) = self.outputs.borrow().get(&tool_call.id)
             && facts.scanned_len == scanned_len
         {
@@ -1074,9 +1076,8 @@ impl ChipCache {
 
         let facts = Rc::new(OutputFacts {
             scanned_len,
-            summary: content
-                .as_deref()
-                .map(acp_thread::summarize_output)
+            summary: output
+                .map(|output| acp_thread::summarize_output(&output.content))
                 .filter(|summary| !summary.is_empty()),
         });
         self.outputs
