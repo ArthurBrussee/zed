@@ -6054,7 +6054,7 @@ impl Sidebar {
     fn render_thread(
         &self,
         ix: usize,
-        thread: &ThreadEntry,
+        thread: &Arc<ThreadEntry>,
         is_active: bool,
         is_focused: bool,
         cx: &mut Context<Self>,
@@ -6073,7 +6073,7 @@ impl Sidebar {
     fn render_thread_row(
         &self,
         ix: usize,
-        thread: &ThreadEntry,
+        thread: &Arc<ThreadEntry>,
         is_active: bool,
         is_focused: bool,
         cx: &mut Context<Self>,
@@ -6081,7 +6081,12 @@ impl Sidebar {
         let has_notification = self.contents.is_thread_notified(&thread.metadata.thread_id);
 
         let title: SharedString = thread.metadata.display_title();
-        let metadata = thread.metadata.clone();
+        // The row's own entry, shared with the closures below rather than
+        // copied into each of them. Handing them the metadata by value meant a
+        // `ThreadMetadata` — strings, path list, PR snapshot — was cloned twice
+        // per row on every frame the sidebar drew, for handlers that only run
+        // when someone clicks.
+        let entry = thread.clone();
         let thread_workspace = thread.workspace.clone();
 
         let is_hovered = self.hovered_thread_index == Some(ix);
@@ -6117,13 +6122,6 @@ impl Sidebar {
             .blend(color.panel_background.opacity(0.25));
 
         let is_remote = thread.workspace.is_remote(cx);
-
-        // Rows never show the workspace name; the branch chip and title
-        // identify the worktree.
-        let mut worktrees = thread.worktrees.clone();
-        for worktree in &mut worktrees {
-            worktree.worktree_name = None;
-        }
 
         let (icon, icon_svg) = if is_draft {
             (IconName::Circle, None)
@@ -6230,9 +6228,9 @@ impl Sidebar {
                             // up any worktree archived away with it.
                             .tooltip(Tooltip::text("Delete Thread"))
                             .on_click({
-                                let metadata = metadata.clone();
+                                let entry = entry.clone();
                                 cx.listener(move |this, _, _window, cx| {
-                                    this.delete_thread(&metadata, cx);
+                                    this.delete_thread(&entry.metadata, cx);
                                 })
                             })
                             .into_any_element(),
@@ -6353,6 +6351,7 @@ impl Sidebar {
             })
             .on_click({
                 let thread_workspace = thread_workspace.clone();
+                let entry = entry.clone();
                 cx.listener(move |this, _, window, cx| {
                     this.selection = None;
                     if is_restoring {
@@ -6361,19 +6360,25 @@ impl Sidebar {
                     // Opening an archived thread unarchives it (restoring its
                     // worktrees if they were snapshotted away).
                     if is_archived {
-                        this.open_thread_from_archive(metadata.clone(), window, cx);
+                        this.open_thread_from_archive(entry.metadata.clone(), window, cx);
                         return;
                     }
                     match &thread_workspace {
                         ThreadEntryWorkspace::Open(workspace) => {
-                            this.activate_thread(metadata.clone(), workspace, false, window, cx);
+                            this.activate_thread(
+                                entry.metadata.clone(),
+                                workspace,
+                                false,
+                                window,
+                                cx,
+                            );
                         }
                         ThreadEntryWorkspace::Closed {
                             folder_paths,
                             project_group_key,
                         } => {
                             this.open_workspace_and_activate_thread(
-                                metadata.clone(),
+                                entry.metadata.clone(),
                                 folder_paths.clone(),
                                 project_group_key,
                                 window,
@@ -6403,7 +6408,6 @@ impl Sidebar {
 
         let is_zed_thread = thread.metadata.agent_id.as_ref() == ZED_AGENT_ID.as_ref();
         let can_open_as_markdown = thread.is_live || is_zed_thread;
-        let folder_paths = thread.metadata.folder_paths().clone();
 
         // Hovering a row says where the thread lives: worktree and branch,
         // with the full path underneath.
@@ -6451,7 +6455,7 @@ impl Sidebar {
                 let thread_id = thread.metadata.thread_id;
                 let markdown_title = Some(thread.metadata.display_title());
                 let rename_title = title;
-                let menu_metadata = thread.metadata.clone();
+                let menu_entry = entry;
                 move |_window, cx| {
                     let session_id = session_id.clone();
                     let sidebar = sidebar.clone();
@@ -6459,8 +6463,8 @@ impl Sidebar {
                     let thread_workspace = thread_workspace.clone();
                     let markdown_title = markdown_title.clone();
                     let rename_title = rename_title.clone();
-                    let folder_paths = folder_paths.clone();
-                    let menu_metadata = menu_metadata.clone();
+                    let folder_paths = menu_entry.metadata.folder_paths().clone();
+                    let menu_metadata = menu_entry.metadata.clone();
                     ContextMenu::build(_window, cx, move |mut menu, _window, _cx| {
                         menu = menu.entry("Rename Title", None, {
                             let sidebar = sidebar.clone();
