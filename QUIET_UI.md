@@ -860,6 +860,31 @@ does is removed as it lands.
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**An image read from a file still overflows its box.**
+The 2026-09-02 fix sized a picture's box from its real dimensions and it works — for the images the
+agent sends as bytes. An image on disk still takes the fixed 20rem default and paints over
+everything under it, which is what a screenshot from 2026-09-07 shows: `platform-1024-light.png`,
+written by a `python3` command and drawn by the produced-image feature, running over a dozen chips
+and two paragraphs below it.
+
+The gap is stated in the type's own comment: `ChipImage::File`'s "shape is not known without reading
+it, which is why only the variant below can size its own box"
+(`crates/agent_ui/src/conversation_view/thread_view.rs:1079`), so `image_box_height` (`:95`) gets
+`None` and returns `IMAGE_CHIP_HEIGHT`. Everything a 1024-wide capture needs is therefore
+letterboxed into a 4:3 box it does not fit.
+
+A file's shape is cheap to learn: the dimensions live in the first bytes of the header for every
+format that matters here, and `image_dimensions` (`crates/acp_thread/src/acp_thread.rs:1594`)
+already parses them from bytes. Read the header off the foreground, cache it by path, and hand
+`image_box_height` the same `Some(dimensions)` the `Data` variant hands it. Until the read answers,
+the entry has to be measured as *something*: pick the value that is wrong in the safe direction, and
+remeasure when the real shape arrives.
+
+Take the produced-image path as the test case, since that is the one that only ever has files:
+`command_output_images` into `render_inline_image`
+(`crates/agent_ui/src/conversation_view/thread_view/chips.rs:1321`).
+
+
 **Make `+` free, not merely quicker: keep a worktree ready before it is asked for.**
 One spare, created in the background off the default branch, handed over the instant `+` is
 pressed, with the next one started immediately after. This is the only approach that moves the
