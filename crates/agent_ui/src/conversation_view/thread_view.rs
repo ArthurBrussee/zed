@@ -853,6 +853,11 @@ struct ChipCache {
     /// which also makes it readable, since a stream of output redrawn at frame
     /// rate is a blur.
     tails: RefCell<HashMap<acp::ToolCallId, CommandTail>>,
+    /// How many times each call's command has been parsed. The cache exists so
+    /// that happens once, and a chip that reparses as it draws is what made a
+    /// long thread crawl. Kept so the next report of a slow thread is a number
+    /// rather than a suspicion.
+    command_parses: RefCell<HashMap<acp::ToolCallId, usize>>,
     /// The shape of each picture that lives in a file, so its box is sized to
     /// the picture like an inline one's is. A file says its shape in the header
     /// it opens with, but getting at that header is IO, so it is read once per
@@ -1030,7 +1035,28 @@ impl ChipCache {
         self.commands
             .borrow_mut()
             .insert(tool_call.id.clone(), facts.clone());
+        self.note_command_parse(&tool_call.id);
         facts
+    }
+
+    /// Counts a command line being parsed, and says so once the count has run
+    /// far past the one parse a call is supposed to need. Logged as it doubles,
+    /// so a chip reparsing at frame rate says so in a handful of lines rather
+    /// than one per frame.
+    fn note_command_parse(&self, id: &acp::ToolCallId) {
+        /// One parse per call is the design. A few more mean the label moved,
+        /// which a streaming label does; this many mean it is being redone.
+        const WORTH_REPORTING: usize = 8;
+
+        let mut parses = self.command_parses.borrow_mut();
+        let count = parses.entry(id.clone()).or_default();
+        *count += 1;
+        if *count >= WORTH_REPORTING && count.is_power_of_two() {
+            log::info!(
+                "quiet-ui perf: chip cache parsed {id:?} {count} times; \
+                 its label is moving under the cache"
+            );
+        }
     }
 
     fn output(&self, tool_call: &ToolCall, cx: &App) -> Rc<OutputFacts> {

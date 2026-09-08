@@ -55,6 +55,10 @@ use unicode_segmentation::UnicodeSegmentation as _;
 use util::ResultExt as _;
 use util::path_list::PathList;
 
+/// A sidebar rebuild costing more than a frame at 60Hz is one the user can feel
+/// between two keystrokes. Rebuilds under it are counted, not logged.
+const SLOW_REBUILD: std::time::Duration = std::time::Duration::from_millis(16);
+
 /// Repositories already swept for abandoned worktrees this launch, so the
 /// second window opened over the same project does not sweep it again.
 #[derive(Default)]
@@ -761,6 +765,9 @@ pub struct Sidebar {
     worktree_sizes: HashMap<PathBuf, u64>,
     worktree_size_task: Option<Task<()>>,
     worktree_sizes_pending: Vec<PathBuf>,
+    /// Rebuilds since the last one slow enough to log, so a logged one says how
+    /// many it stands for.
+    quiet_rebuilds: usize,
     _subscriptions: Vec<gpui::Subscription>,
     _draft_editor_observations: Vec<gpui::Subscription>,
     update_task: Option<Task<()>>,
@@ -938,6 +945,7 @@ impl Sidebar {
             worktree_sizes: HashMap::new(),
             worktree_size_task: None,
             worktree_sizes_pending: Vec::new(),
+            quiet_rebuilds: 0,
             _subscriptions: Vec::new(),
             _draft_editor_observations: Vec::new(),
             update_task: None,
@@ -1832,29 +1840,36 @@ impl Sidebar {
     /// keeping a worktree's threads together is worth more than reproducing an
     /// interleaving exactly.
     fn group_rows_by_workspace(rows: Vec<ListEntry>) -> Vec<ListEntry> {
-        fn workspace_key(entry: &ListEntry) -> Option<String> {
-            let ListEntry::Thread(thread) = entry else {
-                return None;
-            };
-            Sidebar::thread_workspace_key(thread)
-        }
         // (Terminal rows keep their flat placement: they are transient and
         // carry their own worktree chip.)
 
+        // One key per row, derived once. Deriving it inside the member scan
+        // meant formatting an entity id for every row of every group — a list
+        // of twenty worktrees paid two thousand allocations to be grouped, and
+        // it is grouped again on every rebuild.
+        let keys: Vec<Option<String>> = rows
+            .iter()
+            .map(|entry| match entry {
+                ListEntry::Thread(thread) => Sidebar::thread_workspace_key(thread),
+                _ => None,
+            })
+            .collect();
+
         let mut out: Vec<ListEntry> = Vec::with_capacity(rows.len() + 4);
-        let mut emitted: HashSet<String> = HashSet::new();
-        for row in &rows {
-            let Some(key) = workspace_key(row) else {
+        let mut emitted: HashSet<&str> = HashSet::new();
+        for (row, key) in rows.iter().zip(&keys) {
+            let Some(key) = key else {
                 out.push(row.clone());
                 continue;
             };
-            if !emitted.insert(key.clone()) {
+            if !emitted.insert(key.as_str()) {
                 continue;
             }
             let members: Vec<ListEntry> = rows
                 .iter()
-                .filter(|candidate| workspace_key(candidate).as_ref() == Some(&key))
-                .cloned()
+                .zip(&keys)
+                .filter(|(_, candidate)| candidate.as_ref() == Some(key))
+                .map(|(candidate, _)| candidate.clone())
                 .collect();
             let lead_thread = members.iter().find_map(|member| match member {
                 ListEntry::Thread(thread) => Some(thread.clone()),
@@ -2178,6 +2193,11 @@ impl Sidebar {
             return;
         }
 
+        // A rebuild walks every stored thread and every open workspace, and it
+        // is asked for from forty places. Neither the cost of one nor how many
+        // of them there are has ever been a number, so the slow ones say so and
+        // carry the count of the quiet ones they follow.
+        let rebuild_started = std::time::Instant::now();
         let had_notifications = self.has_notifications(cx);
         let previous_shapes: Vec<EntryShape> = self.entry_shapes().collect();
         // Selection is index-based, and a rebuild reshuffles indices (a
@@ -2233,6 +2253,18 @@ impl Sidebar {
             multi_workspace.update(cx, |_, cx| {
                 cx.notify();
             });
+        }
+
+        self.quiet_rebuilds += 1;
+        let elapsed = rebuild_started.elapsed();
+        if elapsed >= SLOW_REBUILD {
+            log::info!(
+                "quiet-ui perf: sidebar rebuilt {} rows in {:.0}ms, after {} rebuilds nobody felt",
+                self.contents.all_entries.len(),
+                elapsed.as_secs_f64() * 1000.,
+                self.quiet_rebuilds - 1,
+            );
+            self.quiet_rebuilds = 0;
         }
 
         cx.notify();
