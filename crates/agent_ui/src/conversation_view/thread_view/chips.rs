@@ -68,7 +68,6 @@ fn copy_chip_image(image: ChipImage, cx: &mut App) {
     }
 }
 
-/// The format a file's name claims, for the formats an image chip can show.
 /// A picture's shape, taken from the header of the file it lives in.
 ///
 /// The whole file is read, because that is the read `Fs` offers, but only the
@@ -89,6 +88,7 @@ pub(super) async fn image_shape_of_file(fs: &Arc<dyn fs::Fs>, path: &std::path::
         .map_or(ImageShape::Unknown, ImageShape::Known)
 }
 
+/// The format a file's name claims, for the formats an image chip can show.
 fn image_format_from_extension(extension: &str) -> Option<gpui::ImageFormat> {
     match extension.to_ascii_lowercase().as_str() {
         "png" => Some(gpui::ImageFormat::Png),
@@ -2731,9 +2731,6 @@ impl ThreadView {
         )
     }
 
-    /// The picture an expanded image chip shows. Clicking opens it where images
-    /// open; right-clicking offers the picture itself, since a screenshot in a
-    /// thread is usually wanted somewhere else.
     /// A picture's shape as far as this view knows it: carried alongside data
     /// the agent sent, read from the header for one that lives in a file, and
     /// unknown until that read lands.
@@ -2804,6 +2801,9 @@ impl ThreadView {
         .detach();
     }
 
+    /// The picture an expanded image chip shows. Clicking opens it where images
+    /// open; right-clicking offers the picture itself, since a screenshot in a
+    /// thread is usually wanted somewhere else.
     fn render_inline_image(
         &self,
         entry_ix: usize,
