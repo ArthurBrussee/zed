@@ -902,6 +902,32 @@ Two places worth suspecting before measuring, both the fork's own: `update_entri
 whole sidebar and is called from 38 places, and the chip layer reparses commands on every frame it
 draws (there is a cache, so check it is actually hit). Confirm with numbers before changing either.
 
+**Drag a thread in the sidebar to reorder it.**
+Rows should be draggable, the way tabs are. The sidebar is where the threads are read, so it should
+be where they can be arranged.
+
+Make the drag move the tab, not introduce a second order. Active rows already follow tab order, and
+that was insisted on: one order, held by the tabs, with the sidebar reflecting it. A drag in the
+sidebar should therefore end in the same place a drag on the tab strip ends —
+`workspace::move_item(source, destination, item_id, destination_index, ..)`
+(`crates/workspace/src/workspace.rs:12181`) — and the row moves because the tab moved, not
+alongside it. Anything else gives two orders that disagree, which is the bug three entries above
+this one.
+
+Scope it to what has a tab. Active rows do; All threads and Archived do not, and a manual order for
+rows that are only history is a different feature with its own storage. Constrain a drag to its own
+worktree group as well: dragging a row into another group would read as moving a thread between
+worktrees, which is not what it does.
+
+The sidebar has no drag support at all today — no `on_drag`, no drop targets — so this is the first
+one. `Pane`'s tab drag is the model to read (`crates/workspace/src/pane.rs:2953`), including the
+part usually forgotten: what the row looks like while it is being dragged, where the insertion point
+shows, and what happens when a drag is abandoned outside the list.
+
+One consequence to handle rather than discover: reordering a pane's items currently emits nothing
+the sidebar listens for, which is its own queued entry. This feature cannot work until that does, so
+build them together.
+
 **An image read from a file still overflows its box.**
 The 2026-09-02 fix sized a picture's box from its real dimensions and it works — for the images the
 agent sends as bytes. An image on disk still takes the fixed 20rem default and paints over
