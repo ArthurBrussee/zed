@@ -860,99 +860,6 @@ does is removed as it lands.
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
-**A pass over the diff: delete what upstream already does.**
-The fork is 80 files, +33,604 / -10,111 against upstream. About 3,300 of those insertions are tests
-and 3,238 are this document; the remaining 27,000 lines of code are the thing to look at. Some of it
-is the fork's whole reason to exist and stays. Some of it is a hand-rolled version of something Zed
-grew later, or something that started small and outlived its need, and every line of that costs a
-conflict at every rebase.
-
-This is the pass, not a look. Read the fork's own additions against what upstream now has, decide
-about each one, and delete what you can. Where the biggest lumps are, by insertions:
-
-    thread_view.rs           +4132   chips.rs     +2954   sidebar.rs   +2581 (-2946)
-    command_parse.rs         +3146   agent_panel.rs +2823  gh_status.rs +1415
-    conversation_view.rs     +1259   acp_thread.rs +1094   terminal.rs   +658
-
-The rebase log already names this as the most valuable thing a run can find, and has found it
-before: `branch_diff.rs` folded into upstream's `project_diff` once upstream grew `DiffBase`, and
-`command_chip_summary` plus nine helpers went when the parser could label chips from its own
-segments. Look for the same shape again: a helper that duplicates an upstream API with a different
-name, a wrapper that exists only to pass one extra argument, an abstraction with one caller,
-a fallback for a case upstream now handles.
-
-Report what you deleted with its line count, and what you decided to keep and why. Keeping something
-with a reason is a good outcome; the bad outcome is reading it all and changing nothing.
-
-**A pass over what has got slow.**
-Several waits are long enough to change behaviour, and they are measured, not felt. From the logs
-this fork already writes:
-
-    opening a long thread    12,846ms replay, then 418ms of views
-    creating a worktree       1,985 + 4,938 + 2,564ms across its three phases, 30s on a bad run
-    archiving a thread        a whole workspace built before the flag is set
-
-Each of those has its own queue entry and they should be built. This one is for what those three
-have in common: work done on the foreground that nobody asked to wait for, and work done once per
-open that could be done once. Go looking rather than waiting for the next complaint — the timing
-lines are already in the code, so add them where they are missing, run the app's own suites, and
-find the next three.
-
-Two places worth suspecting before measuring, both the fork's own: `update_entries` rebuilds the
-whole sidebar and is called from 38 places, and the chip layer reparses commands on every frame it
-draws (there is a cache, so check it is actually hit). Confirm with numbers before changing either.
-
-**Drag a thread in the sidebar to reorder it.**
-Rows should be draggable, the way tabs are. The sidebar is where the threads are read, so it should
-be where they can be arranged.
-
-Make the drag move the tab, not introduce a second order. Active rows already follow tab order, and
-that was insisted on: one order, held by the tabs, with the sidebar reflecting it. A drag in the
-sidebar should therefore end in the same place a drag on the tab strip ends —
-`workspace::move_item(source, destination, item_id, destination_index, ..)`
-(`crates/workspace/src/workspace.rs:12181`) — and the row moves because the tab moved, not
-alongside it. Anything else gives two orders that disagree, which is the bug three entries above
-this one.
-
-Scope it to what has a tab. Active rows do; All threads and Archived do not, and a manual order for
-rows that are only history is a different feature with its own storage. Constrain a drag to its own
-worktree group as well: dragging a row into another group would read as moving a thread between
-worktrees, which is not what it does.
-
-The sidebar has no drag support at all today — no `on_drag`, no drop targets — so this is the first
-one. `Pane`'s tab drag is the model to read (`crates/workspace/src/pane.rs:2953`), including the
-part usually forgotten: what the row looks like while it is being dragged, where the insertion point
-shows, and what happens when a drag is abandoned outside the list.
-
-One consequence to handle rather than discover: reordering a pane's items currently emits nothing
-the sidebar listens for, which is its own queued entry. This feature cannot work until that does, so
-build them together.
-
-**An image read from a file still overflows its box.**
-The 2026-09-02 fix sized a picture's box from its real dimensions and it works — for the images the
-agent sends as bytes. An image on disk still takes the fixed 20rem default and paints over
-everything under it, which is what a screenshot from 2026-09-07 shows: `platform-1024-light.png`,
-written by a `python3` command and drawn by the produced-image feature, running over a dozen chips
-and two paragraphs below it.
-
-The gap is stated in the type's own comment: `ChipImage::File`'s "shape is not known without reading
-it, which is why only the variant below can size its own box"
-(`crates/agent_ui/src/conversation_view/thread_view.rs:1079`), so `image_box_height` (`:95`) gets
-`None` and returns `IMAGE_CHIP_HEIGHT`. Everything a 1024-wide capture needs is therefore
-letterboxed into a 4:3 box it does not fit.
-
-A file's shape is cheap to learn: the dimensions live in the first bytes of the header for every
-format that matters here, and `image_dimensions` (`crates/acp_thread/src/acp_thread.rs:1594`)
-already parses them from bytes. Read the header off the foreground, cache it by path, and hand
-`image_box_height` the same `Some(dimensions)` the `Data` variant hands it. Until the read answers,
-the entry has to be measured as *something*: pick the value that is wrong in the safe direction, and
-remeasure when the real shape arrives.
-
-Take the produced-image path as the test case, since that is the one that only ever has files:
-`command_output_images` into `render_inline_image`
-(`crates/agent_ui/src/conversation_view/thread_view/chips.rs:1321`).
-
-
 **Make `+` free, not merely quicker: keep a worktree ready before it is asked for.**
 One spare, created in the background off the default branch, handed over the instant `+` is
 pressed, with the next one started immediately after. This is the only approach that moves the
@@ -977,6 +884,48 @@ is never handed out twice, never claimed while half-built, and cleaned up on qui
   the `quiet-ui perf:` lines log fetch, checkout, workspace-open and window-shown. Take those
   numbers before building the spare: they decide whether one spare is enough, and whether the
   window-open half wants its own answer.
+
+**What the 2026-09-08 run established, reading the creation path rather than re-deriving the above.**
+
+- **There is no branch to name.** `start_worktree_creations` already creates every worktree as
+  `CreateWorktreeTarget::Detached { base_sha }`, and the *directory* name is generated by
+  `worktree_names::generate_worktree_name` when the caller passes none — which `+` does. So the
+  entry's "create it detached and set the branch when it is claimed" is already how creation works,
+  and a spare needs no rename on claim. That worry can go.
+- **Staleness is not the objection it looks like.** A spare is checked out at the local base ref as
+  it stood when the spare was made. That is exactly what a fresh creation does too, since the
+  2026-09-07 change stopped fetching before creation; the deferred fetch behind the new window is
+  already the thing that says "your base was behind". A spare is therefore no more stale than a
+  creation, and it can reuse that same reporting rather than needing a policy of its own.
+- **"One spare" is one per repo-set, not one per app.** A worktree is created for the whole set of
+  `git_repos` in the workspace `+` was pressed in, and the paths are consolidated per underlying
+  repository. Two projects open means two sets, so the disk cost and the refill policy both scale
+  with what is open — which is the part the numbers are wanted for, and the reason "one worktree of
+  disk standing idle" understates it.
+- **A spare has no draft, so nothing reclaims it.** The 2026-09-07 abandoned-worktree sweep
+  identifies a Zed-made worktree partly by the empty draft `+` left beside it. A spare has no
+  thread and no draft, so a crash between creating one and claiming it leaks a worktree that sweep
+  will never pick up. Extending that predicate (a spare marker in the creation record) is part of
+  this item, not a detail to discover afterwards.
+
+**Three more places doing work per frame or per rebuild, found by reading rather than by using.**
+The 2026-09-08 run's slow pass fixed the two it could prove outright and left these, each with the
+mechanism named so the next run can confirm it with the timing lines that run added rather than
+re-derive it:
+
+- `Sidebar::rebuild_contents` deep-clones every stored thread's `ThreadMetadata` and every stored
+  terminal's, once per rebuild, to build rows it then throws away on the next one. Hundreds of
+  stored threads means hundreds of metadata clones per rebuild, and a rebuild is asked for from
+  forty places. Handing rows out as `Arc`s from the store is the fix; it is a store change, so it
+  wants the new `quiet-ui perf: sidebar rebuilt` line to say how much of a rebuild this is first.
+- `resolve_workspace`, in the same rebuild, scans every open workspace for every stored thread and
+  compares `PathList`s. Small today because the number of open workspaces is small; quadratic in
+  the thing that grows.
+- `Sidebar::render_thread_row` clones a row's whole `ThreadMetadata` twice — plus its worktree list
+  and its folder paths — on every frame it draws, to hand them to closures that only run when
+  someone clicks. The row is already an `Arc<ThreadEntry>`, so the closures could hold the `Arc` and
+  take what they need at click time. (A fourth candidate was checked and is not one: a running
+  command's output is *not* rescanned per frame, because `Terminal::output` is only filled on exit.)
 
 ## Verification queue
 
@@ -3304,3 +3253,105 @@ the image (`deadsnakes` and `ondrej`, 403 Forbidden, "no longer signed") and, un
 cached package lists were too cold for `apt-get install libasound2-dev` to succeed on its own.
 Deleting those two files from `/etc/apt/sources.list.d/` and re-running `apt-get update` fixed it.
 Worth doing first in future containers rather than discovering it.
+
+**2026-09-08**: onto main 20d3cd1d79 (7 upstream commits). Squash-then-rebase folded the standing
+squash and ten follow-up commits into one, reusing the squash's own message; tree-identical to the
+old tip (`a6d7d09346`) before rebasing. The rebase itself applied with zero conflicts: the branch
+was rebased the night before and three of the ten follow-ups were queue edits made today, so
+upstream had barely gone anywhere.
+
+**One markerless drift, and it is the reason the replay check exists.** `RealFs::new` now returns
+`Arc<Self>` rather than `Self`, so the fork's own `Project::test(Arc::new(RealFs::new(..)))` in
+`branch_diff_stats.rs` became `Arc<Arc<RealFs>>` and stopped coercing to `Arc<dyn Fs>`. No conflict
+marker, two call sites, both in test code the fork added. Dropping the `Arc::new` fixes it. Nothing
+else in the seven upstream commits touches a surface this fork patches.
+
+**Nothing upstream grew this round that the fork can now delete.** Checked specifically: upstream
+still has no generated-file or lockfile notion of its own (`generated_file.rs` stays), no
+branch-diff stat aggregation beyond `git::status::DiffStat`, which `branch_diff_stats.rs` already
+consumes rather than duplicates, and no multi-thread tab strip for the agent panel.
+
+**The deletion pass, run in full rather than looked at.** Every function defined in the fork's own
+files and in its largest edits to upstream files (`thread_view.rs`, `agent_panel.rs`,
+`conversation_view.rs`, `acp_thread.rs`, `terminal.rs`, `thread_metadata_store.rs`,
+`agent_diff.rs`, `model_selector_popover.rs`, `config_options.rs`, `thread_item.rs`,
+`diff_multibuffer.rs`, `worktree_service.rs`, `dock.rs`, `status_bar.rs`) was swept for callers,
+then filtered to what the fork itself added — deleting upstream's own dead code widens the diff
+rather than shrinking it, which is the opposite of the point.
+
+Four functions came back with no callers at all, 53 lines, now gone:
+`ThreadTabsRegistry::running_turn_count`, its `_excluding` sibling and their shared `_impl` (the
+title bar counts running turns itself now), `AgentPanel::set_default_agent`, and
+`ConversationView::connection_settled`. All four are `pub` in a library crate, which is why nothing
+ever warned about them — a `pub` item with no callers is invisible to `dead_code`, so this sweep is
+worth repeating rather than waiting for the compiler to raise it. `ChipImage::dimensions` went too,
+as part of the image work below.
+
+Kept, with reasons, so the next pass does not re-open them:
+
+- The fork's own modules (`command_parse`, `command_output`, `chips`, `gh_status`, `thread_tab`,
+  `thread_tab_registry`, `branch_diff_stats`, `diff_review`, `tool_call_diff`, `generated_file`,
+  `thread_read_state`, `quiet_ui_update`, the `sidebar` crate) are the fork's reason to exist and
+  have no upstream counterpart to defer to.
+- The small hooks into upstream files are each a few lines with nothing upstream to adopt instead:
+  `MarkdownStyle::inline_image_height` and `web_link_globe`, `Diff::buffer_and_diff`,
+  `AgentConnection::loading_thread`, `FakeFs::set_fetch_error`/`fetched_remotes`, the branch-diff
+  generated-file header control, `picker::set_popover`'s visibility, and the `property_test`
+  teardown fix.
+- `crates/agent_ui/src/ui/terminal_tool_header.rs` is now twelve lines holding one struct with one
+  caller, which reads like something to fold into `thread_view.rs`. It is not: the file is
+  upstream's, so folding it trades a 384-line deletion for a 396-line one plus a 12-line addition
+  elsewhere, and moves a shared type out of `ui`. No smaller, and worse placed.
+
+**Built tonight, in queue order.**
+
+- *The slow pass.* Two costs proved by reading and fixed. `group_rows_by_workspace` derived a
+  workspace key — a `format!` of an entity id — for every row of every group, so twenty worktrees
+  paid two thousand allocations to be grouped, on every one of the forty places a rebuild is asked
+  for; the keys are derived once up front now. And `ChipCache::output` took the terminal's output
+  *by value* to read its length, so a `cargo test`'s worth of text was memcpy'd once per chip per
+  frame — on exactly the frames the cache was about to answer from. It borrows now. The two
+  suspicions the entry named are instrumented rather than guessed at: a sidebar rebuild costing
+  more than a frame logs its row count, its duration and how many quiet rebuilds it stands for, and
+  a chip whose command is parsed far past the once it should be says so as the count doubles. Three
+  further findings went to the Work queue with their mechanisms named.
+- *Drag a thread in the sidebar to reorder it.* Active rows can be picked up and dropped on each
+  other. The drop ends in `workspace::move_item` on the thread's own tab, so there is still one
+  order — the tab strip's — and the row moves because the tab moved. The prerequisite the entry
+  warned about turned out to be already built: the sidebar observes `ThreadTabsRegistry` and sorts
+  Active by it, so a reorder already reaches the rows. Scoped as asked: only rows with a tab, only
+  inside one worktree group.
+- *An image read from a file still overflows its box.* A file's shape is read from its header once
+  per path in the background and handed to `image_box_height`, so a picture on disk gets the box an
+  inline one already got. Until the read lands the box is `IMAGE_CHIP_MAX_HEIGHT` — wrong in the
+  direction that letterboxes rather than the one that paints over the chips below — and the entry
+  is remeasured when the real shape arrives, since a `ListState` keeps the height it first measured.
+  `ContentBlock::image_dimensions` is now `pub` for it.
+
+**Not built, and why.** The spare worktree is the only Work queue item left, and it stays for the
+reason the 2026-09-07 run recorded rather than for its size: what is left of the seven seconds is
+the checkout and the workspace open, and deciding between them — and whether one spare is enough —
+wants the `quiet-ui perf:` numbers from the running app. This sandbox has no macOS and no display,
+so it cannot produce them. The instrumentation is already in place; the run is what is missing.
+
+**The gate.** `cargo test -p acp_thread -p agent_ui -p sidebar`: 210 + 448 (32 intentionally
+`#[ignore]`d) + 175 passed, 0 failed. `agent_ui` is up 2 and `sidebar` up 2, all four tonight's.
+`script/clippy -p acp_thread -p agent_ui -p sidebar` (`--release --all-targets --all-features --
+--deny warnings`) clean. The Verification queue was empty going in and is empty going out. The only
+failure on the way was the `RealFs` drift above.
+
+**A gate-invocation trap, new to this log.** `cargo check --workspace --all-targets 2>&1 | tail -N`
+reports the exit code of `tail`, not of cargo, so the first replay check came back "exit 0" with an
+empty log while cargo had in fact failed. It cost a wrong "no drift" reading that had to be
+retracted. Pipe to a file, or check `PIPESTATUS`, or do not pipe at all.
+
+**The disk allowance decides the gate's order.** The debug test tree and the release clippy tree do
+not fit together: the test build left 6.9G free, which is not enough to start a release build. Tests
+first, then `rm -rf target/debug` (27G free after), then clippy. Same as 2026-09-07 found.
+
+Environment prerequisites needed reapplying in this fresh container
+(`CARGO_NET_GIT_FETCH_WITH_CLI=true`, `libasound2-dev`). `apt-get update` again failed on the
+third-party PPAs baked into the image (`deadsnakes` and `ondrej`, 403 and "no longer signed"), but
+unlike 2026-09-07 the cached lists were warm enough that `apt-get install -y libasound2-dev`
+succeeded anyway — so deleting those two files from `/etc/apt/sources.list.d/` is worth trying only
+if the install itself fails.
