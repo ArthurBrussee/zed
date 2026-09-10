@@ -860,6 +860,34 @@ does is removed as it lands.
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**A thread can sit in "loading" forever, saying nothing.**
+On 2026-09-10 threads stopped opening: the row showed loading and stayed there. What the machine
+said about it, all of which was gathered from outside the app because the app said none of it:
+
+- No agent process existed at all. Nothing under `external_agents` was running, so no launch had
+  reached a spawn.
+- Nothing was logged. The last line at the time of the attempts was minutes old, and no launch,
+  error or timeout appeared while threads were being clicked.
+- Zed was healthy: 15% CPU, main thread idle in its event loop, only ordinary render frames for
+  `ThreadView` and `MessageEditor` in a sample. Not a deadlock.
+- Every external dependency was fine: `codex-acp` 1.11.0 ran from its install directory, the npm
+  registry answered in 0.25s, `npm install --dry-run` took 1s, a login shell 0.4s, direnv completed,
+  and `gh auth status` was good. There had been a network outage twenty minutes earlier, during
+  which every PR fetch failed, which is the only candidate for what wedged it.
+
+The fix worth making is the one that does not depend on finding the trigger: a launch that cannot
+finish has to say so. Give the path from "user opens a thread" to "agent process spawned" a timeout
+and a log line at each step it passes, so the next occurrence names itself instead of needing a
+process sample to rule out a deadlock. A spinner that can spin forever is not a state, it is an
+absence of one.
+
+Then look for what can wedge that path with no output. The shape to suspect is the one already
+found in `gh_status`: a task guarded by "one of these is already running" whose guard is cleared
+only on completion, so a task that never completes locks its slot for the life of the process. Check
+whether the launch, the registry refresh, or the environment capture can do the same, and whether a
+failure during a network outage leaves any of them permanently held.
+
+
 **Make `+` free, not merely quicker: keep a worktree ready before it is asked for.**
 One spare, created in the background off the default branch, handed over the instant `+` is
 pressed, with the next one started immediately after. This is the only approach that moves the
