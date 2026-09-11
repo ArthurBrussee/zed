@@ -860,6 +860,34 @@ does is removed as it lands.
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**Raise the file-descriptor limit at startup, and say when a spawn fails for it.**
+This is the cause of the "threads stuck loading" entry below, and of rust-analyzer failing to start,
+and of an agent that would not launch: all three are one thing. On 2026-09-11 the app was at ~298
+open descriptors against a soft limit of **256**, inherited from launchd
+(`launchctl limit maxfiles` reports `256 unlimited`), so every `spawn` returned `EMFILE`:
+
+    ERROR [project::lsp_store] Failed to start language server "rust-analyzer": failed to spawn command ...
+    Caused by:
+        Too many open files (os error 24)
+
+Nothing in this workspace calls `setrlimit` or mentions `RLIMIT_NOFILE`, so the app runs its whole
+life on whatever launchd handed it. With several worktrees open, tens of thousands of watched
+entries, a language server per project and an agent per thread, 256 is not a limit that will hold.
+Raise the soft limit to the hard limit at startup, before anything opens a file, and log the value
+it settled on.
+
+The other half is that this took a process sample, a dozen shell probes and a day to find, because
+the error the user saw was `failed to spawn command <the whole command line>` with no reason
+attached. `spawn` wraps the OS error as context (`crates/util/src/process.rs:49`), so the cause is
+there and only prints under `{:#}`. Whatever surfaces a launch failure in the UI must show the
+cause, not just the command: "Too many open files" would have ended this in a minute. Check the
+other side too, since the agent launch failure reached the UI without reaching the log at all.
+
+While there: an `EMFILE` is worth naming for what it is. If a spawn fails with it, the app can say
+that it is out of file handles rather than reporting it as the agent or the language server being
+broken, which is what it looks like from the outside.
+
+
 **A thread can sit in "loading" forever, saying nothing.**
 On 2026-09-10 threads stopped opening: the row showed loading and stayed there. What the machine
 said about it, all of which was gathered from outside the app because the app said none of it:
