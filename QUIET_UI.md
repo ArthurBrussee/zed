@@ -860,6 +860,55 @@ does is removed as it lands.
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**The command-changed card: hover shows that command's diff, clicking opens the whole file.**
+Hovering a command's changed-file chip still shows the file's entire uncommitted diff rather than
+what that command did. It is still `open_uncommitted_diff`
+(`crates/agent_ui/src/conversation_view/thread_view/chips.rs:2457`), which answers "how does this
+file differ from HEAD", a different question from the one the card claims to answer.
+
+The simplification that makes this tractable: stop trying to open a per-command diff as a *file*.
+Clicking the chip should open the file in the ordinary diff view, showing the total diff, exactly as
+any other file does: no special editor, no reconstructed buffer, nothing to keep in sync. All the
+per-command work then lives in the hover card alone, which is small, read-only, and thrown away when
+the pointer leaves. That removes the reason the earlier attempt was judged too expensive: nothing
+has to persist.
+
+So the hover needs before-and-after text for the files a command touched, and only for as long as
+the card is up. The shape is in the entry the 2026-08-22 run declined, and it still holds: a file
+clean at command start has HEAD as its before-text and costs nothing; a file already dirty needs its
+text captured at start, and `RepositoryWatch` already walks exactly that set for its baseline. Feed
+both into `Diff::finalized(path, old_text, new_text, ..)`
+(`crates/acp_thread/src/diff.rs:18`), which is what the declared-edit chips already use and draws
+without a file header.
+
+**Refresh the diff stats on more than the events they watch now.**
+The stats at the bottom go stale and wrong. `BranchDiffStats` subscribes to `HeadChanged`,
+`StatusesChanged`, `GitWorktreeListChanged` and repositories being added or removed
+(`crates/agent_ui/src/conversation_view/branch_diff_stats.rs:54`), then recomputes after a 250ms
+debounce. Two gaps, and the second is the likelier one in use:
+
+- A branch switched *outside* Zed, in a terminal, only reaches the app when its own git watching
+  notices. The fork knows something the editor does not: when an agent's command finished, and many
+  of those commands are git operations. A finished command in a repository is a reason to recompute.
+- The 250ms debounce can fire while a checkout is still settling, and nothing recomputes afterwards
+  because no further event arrives, so a wrong number stands until the next unrelated change.
+  Recompute once more after a checkout has quieted, or verify the value it computed against HEAD
+  before keeping it.
+
+Worth adding a trigger when the window regains focus, too: a branch switched in a terminal while
+Zed was in the background is exactly when the number is looked at next.
+
+**A running command's output line belongs under the chip, not beside it.**
+It renders to the side today (`in_progress_tail_is_left_to_the_active_area`,
+`crates/agent_ui/src/conversation_view/thread_view.rs:15075`), which leaves it competing with the
+chip for width and truncating early. Put it on its own line beneath: a double-height chip while a
+command runs, with the line free to use the full width and elide at the end.
+
+The constraint from when this was first built still applies: the chip must not change the entry's
+height after the list has measured it, so the taller shape has to be there from the moment the
+command starts running, not added when the first line of output arrives.
+
+
 **Raise the file-descriptor limit at startup, and say when a spawn fails for it.**
 This is the cause of the "threads stuck loading" entry below, and of rust-analyzer failing to start,
 and of an agent that would not launch: all three are one thing. On 2026-09-11 the app was at ~298
