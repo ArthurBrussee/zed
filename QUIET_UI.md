@@ -860,6 +860,31 @@ does is removed as it lands.
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**A command's work can hide inside `$(...)`, and the chip throws it away.**
+This line finds a symbol and reads the lines around it, and the chip describes almost none of that:
+
+    f=$(grep -rln "export function withWristLnsCalibrationCollisionTarget" portico/src --include='*.ts' | head -1)
+    n=$(grep -n "export function withWristLnsCalibrationCollisionTarget" "$f" | cut -d: -f1)
+    echo "$f"
+    sed -n "$((n-6)),$((n+25))p" "$f"
+
+`classify_stage` returns `Noop` for any assignment whose value starts with `$(`
+(`crates/acp_thread/src/command_parse.rs:1687`), on the reasoning that the substitution "runs through
+the rest of the line, so there is no program left to read here". For a bare `x=$(date)` that is
+right. Here it discards both greps, which are the only statements that say what the line was looking
+for, and leaves the chip describing the leftovers: a read, a `cut`, and a path of `$f`.
+
+Two things to fix, and the first is most of it. A substitution's contents are a command and should be
+parsed as one, contributing its segments to the line rather than being dropped. Then a variable that
+was never expanded is not a filename: `$f` should not be rendered as a path, and a `sed -n` whose
+range is `$((n-6)),$((n+25))` has no line numbers worth showing either, so neither should be
+presented as if it were known.
+
+What the line deserves to say is what it did: searched for that symbol, then read the file it found.
+The parser already has both ideas, and the search is currently the part being thrown away. Take this
+exact line as the test case.
+
+
 **The command-changed card: hover shows that command's diff, clicking opens the whole file.**
 Hovering a command's changed-file chip still shows the file's entire uncommitted diff rather than
 what that command did. It is still `open_uncommitted_diff`
