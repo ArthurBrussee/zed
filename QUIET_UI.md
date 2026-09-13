@@ -860,6 +860,29 @@ does is removed as it lands.
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**Say what a running thread is running, not just that it is.**
+The spinner says an agent is working and nothing else. A thread with four terminals going and two
+subagents out is doing something quite different from one thinking about a reply, and the sidebar is
+where that difference should be visible. Alongside the spinner, show how many terminals are running
+and how many subagents are out, each only when there is at least one.
+
+Both are reachable where the row's live state is already assembled. `ActiveThreadInfo`
+(`crates/sidebar/src/sidebar.rs:184`) is built from the thread itself (`:7864`), which is the same
+place the title, status and diff stats come from. A thread's tool calls expose their terminals
+(`ToolCall::terminals`, `crates/acp_thread/src/acp_thread.rs:839`) and a subagent call carries
+`subagent_session_info` (`:877`), so both counts are a walk over the entries the thread already
+holds. Count what is *running*, not what has ever run: a finished terminal is not a thing in flight.
+
+Keep it to numbers. A row is a row, and a glyph with a count beside it says everything wanted here;
+the place for names or detail is the thread itself. Do this together with the queued entry on making
+a working thread obvious at a glance, since both change the same part of the row and each one done
+alone will be redone by the other.
+
+Do not let the counts make the row change size. A thread that starts a terminal must not reflow the
+list, which means the space is either always there or the counts sit where something else already
+does.
+
+
 **A command's work can hide inside `$(...)`, and the chip throws it away.**
 This line finds a symbol and reads the lines around it, and the chip describes almost none of that:
 
