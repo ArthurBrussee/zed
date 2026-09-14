@@ -81,6 +81,12 @@ pub struct FakeGitRepositoryState {
     pub commit_data: HashMap<Oid, FakeCommitDataEntry>,
     pub stash_entries: GitStash,
     pub commit_template: Option<GitCommitTemplate>,
+    /// Every remote this repository has been asked to fetch, in order, so a
+    /// test can tell a flow that fetched from one that did not.
+    pub fetched_remotes: Vec<String>,
+    /// When set, every fetch records its attempt and then fails with this
+    /// message, standing in for a machine that is offline.
+    pub simulated_fetch_error: Option<String>,
 }
 
 impl FakeGitRepositoryState {
@@ -108,6 +114,8 @@ impl FakeGitRepositoryState {
             commit_history: Vec::new(),
             stash_entries: Default::default(),
             commit_template: None,
+            fetched_remotes: Vec::new(),
+            simulated_fetch_error: None,
         }
     }
 }
@@ -1174,12 +1182,24 @@ impl GitRepository for FakeGitRepository {
 
     fn fetch(
         &self,
-        _fetch_options: FetchOptions,
+        fetch_options: FetchOptions,
         _askpass: AskPassDelegate,
         _env: Arc<HashMap<String, String>>,
         _cx: AsyncApp,
     ) -> BoxFuture<'_, Result<git::repository::RemoteCommandOutput>> {
-        unimplemented!()
+        let remote = fetch_options
+            .to_proto()
+            .unwrap_or_else(|| "<all>".to_string());
+        self.with_state_async(true, move |state| {
+            state.fetched_remotes.push(remote);
+            if let Some(message) = state.simulated_fetch_error.clone() {
+                bail!("{message}");
+            }
+            Ok(git::repository::RemoteCommandOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        })
     }
 
     fn get_all_remotes(&self) -> BoxFuture<'_, Result<Vec<Remote>>> {

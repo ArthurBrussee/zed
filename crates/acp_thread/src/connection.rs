@@ -121,6 +121,24 @@ pub trait AgentConnection {
         Task::ready(Err(anyhow::Error::msg("Loading sessions is not supported")))
     }
 
+    /// The thread an in-flight [`Self::load_session`] or
+    /// [`Self::resume_session`] is filling, if the connection has created it
+    /// already.
+    ///
+    /// A long session's history replays over the wire entry by entry, and the
+    /// connection registers the thread before it asks for the replay so those
+    /// updates have somewhere to land. The task the load returns only resolves
+    /// once the last entry has arrived, so without this the reader waits out
+    /// the whole replay looking at nothing; with it they can watch the
+    /// conversation fill up.
+    fn loading_thread(
+        &self,
+        _session_id: &acp::SessionId,
+        _cx: &App,
+    ) -> Option<Entity<AcpThread>> {
+        None
+    }
+
     /// Whether this agent supports closing existing sessions.
     fn supports_close_session(&self) -> bool {
         false
