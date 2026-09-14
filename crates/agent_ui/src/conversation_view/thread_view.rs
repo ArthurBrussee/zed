@@ -6057,6 +6057,7 @@ impl ThreadView {
                             ))
                     })
                     .children(self.render_pending_review_comments(cx))
+                    .children(self.render_input_activity_pill(cx))
                     .child(self.render_input_run_indicator(cx))
                     .when(is_generating, |this| {
                         this.child(self.render_stop_button(cx))
@@ -6122,6 +6123,25 @@ impl ThreadView {
                 ))
                 .into_any_element(),
         )
+    }
+
+    /// What this thread has in flight, in the row above the message box: the
+    /// same pill the sidebar's rows draw, so the thread being looked at says
+    /// what it is doing without a glance sideways. Nothing while it is idle,
+    /// and the counts inside it are silent at zero.
+    fn render_input_activity_pill(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let thread = self.thread.read(cx);
+        if thread.status() == ThreadStatus::Idle {
+            return None;
+        }
+        let work = thread.running_work(cx);
+        Some(ui::agent_activity_pill(
+            "input-activity",
+            ui::RunningWorkCounts {
+                terminals: work.terminals,
+                subagents: work.subagents,
+            },
+        ))
     }
 
     /// The right end of the input status bar: the loading spinner while added

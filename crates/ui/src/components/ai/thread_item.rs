@@ -309,9 +309,11 @@ impl RenderOnce for PrChip {
 
 /// A glyph and a number for work a thread has in flight: the commands still
 /// running, the subagents still out. The number carries it; the glyph says
-/// which kind of work it counts.
+/// which kind of work it counts. The number sits in a slot wide enough for the
+/// counts it could hold rather than the one it shows, so a thread going from
+/// one command to two does not shuffle what it sits in.
 fn running_work_count(
-    id: &'static str,
+    id: impl Into<ElementId>,
     icon: IconName,
     count: usize,
     tooltip: String,
@@ -321,11 +323,63 @@ fn running_work_count(
         .gap_0p5()
         .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Accent))
         .child(
-            Label::new(count.to_string())
-                .size(LabelSize::Small)
-                .color(Color::Muted),
+            h_flex()
+                .min_w(rems_from_px(10_f32))
+                .justify_center()
+                .child(
+                Label::new(count.to_string())
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            ),
         )
         .tooltip(Tooltip::text(tooltip))
+}
+
+/// What a working thread is doing, as one thing: it is spinning, and with it
+/// the commands still running and the subagents still out. Zero is silent — a
+/// thread with neither shows the spinner alone — so the pill only ever says
+/// something it knows.
+pub fn agent_activity_pill(id: impl Into<SharedString>, work: RunningWorkCounts) -> AnyElement {
+    let id = id.into();
+    let RunningWorkCounts {
+        terminals,
+        subagents,
+    } = work;
+    h_flex()
+        .gap_1()
+        .child(agent_running_indicator())
+        .when(terminals > 0, |this| {
+            this.child(running_work_count(
+                SharedString::from(format!("{id}-terminals")),
+                IconName::ToolTerminal,
+                terminals,
+                if terminals == 1 {
+                    "1 command running".into()
+                } else {
+                    format!("{terminals} commands running")
+                },
+            ))
+        })
+        .when(subagents > 0, |this| {
+            this.child(running_work_count(
+                SharedString::from(format!("{id}-subagents")),
+                IconName::ZedAgent,
+                subagents,
+                if subagents == 1 {
+                    "1 subagent working".into()
+                } else {
+                    format!("{subagents} subagents working")
+                },
+            ))
+        })
+        .into_any_element()
+}
+
+/// The work a thread has in flight, as the pill draws it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RunningWorkCounts {
+    pub terminals: usize,
+    pub subagents: usize,
 }
 
 #[derive(IntoElement, RegisterComponent)]
@@ -692,15 +746,23 @@ impl RenderOnce for ThreadItem {
 
         // ...so the status goes to the right end of the title row instead. The
         // slot is always drawn, empty or not, so the row does not change shape
-        // when a thread starts or stops.
+        // when a thread starts or stops. A running thread draws the pill there:
+        // spinning, and with it what it is spinning on.
         let status_indicator = if self.status == AgentThreadStatus::Running {
-            Some(agent_running_indicator().into_any_element())
+            Some(agent_activity_pill(
+                format!("status-{}", self.id),
+                RunningWorkCounts {
+                    terminals: self.running_terminals,
+                    subagents: self.running_subagents,
+                },
+            ))
         } else {
             status_icon.map(|icon| icon.into_any_element())
         };
         let status_slot = h_flex()
             .id(SharedString::from(format!("status-{}", self.id)))
-            .size_4()
+            .h_4()
+            .min_w_4()
             .flex_none()
             .justify_center()
             .children(status_indicator);
@@ -733,15 +795,6 @@ impl RenderOnce for ThreadItem {
                 .when(!opaque_window, |label| label.truncate())
                 .into_any_element()
         };
-
-        // What a working thread is working on, next to how much it has
-        // changed. Only counts: the row has room for a glyph and a number, and
-        // the names of the commands are in the thread itself. Both live on the
-        // metadata line, which every row already draws, so a thread starting a
-        // terminal does not resize its row.
-        let running_terminals = self.running_terminals;
-        let running_subagents = self.running_subagents;
-        let has_running_work = running_terminals > 0 || running_subagents > 0;
 
         let has_diff_stats = self.added.is_some() || self.removed.is_some();
         let diff_stat_id = self.id.clone();
@@ -790,7 +843,6 @@ impl RenderOnce for ThreadItem {
             || has_project_paths
             || has_worktree
             || has_pr_chips
-            || has_running_work
             || has_diff_stats
             || has_size
             || has_timestamp;
@@ -945,38 +997,7 @@ impl RenderOnce for ThreadItem {
                         })
                         .when(
                             (has_project_name || has_project_paths || has_worktree || has_pr_chips)
-                                && (has_running_work
-                                    || has_diff_stats
-                                    || has_size
-                                    || has_timestamp),
-                            |this| this.child(dot_separator()),
-                        )
-                        .when(running_terminals > 0, |this| {
-                            this.child(running_work_count(
-                                "running-terminals",
-                                IconName::ToolTerminal,
-                                running_terminals,
-                                if running_terminals == 1 {
-                                    "1 command running".into()
-                                } else {
-                                    format!("{running_terminals} commands running")
-                                },
-                            ))
-                        })
-                        .when(running_subagents > 0, |this| {
-                            this.child(running_work_count(
-                                "running-subagents",
-                                IconName::ZedAgent,
-                                running_subagents,
-                                if running_subagents == 1 {
-                                    "1 subagent working".into()
-                                } else {
-                                    format!("{running_subagents} subagents working")
-                                },
-                            ))
-                        })
-                        .when(
-                            has_running_work && (has_diff_stats || has_size || has_timestamp),
+                                && (has_diff_stats || has_size || has_timestamp),
                             |this| this.child(dot_separator()),
                         )
                         .when(has_diff_stats, |this| {
