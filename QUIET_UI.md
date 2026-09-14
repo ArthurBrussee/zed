@@ -860,130 +860,6 @@ does is removed as it lands.
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
-**The running chip only needs its output band when there is output.**
-The band beneath a running command's label is reserved for as long as the command runs, so a command
-that prints nothing, or has not printed yet, takes double height and shows empty space. Reserve it
-only while there is a line to put in it.
-
-That reverses a constraint the earlier entry set, and the reason it set it is worth re-checking
-rather than assuming: the fear was an entry changing height after `ListState` had measured it, which
-is how the image overlaps happened. Two things have been learned since. The image overlaps turned
-out to be a box that was the wrong size from the start, not a box that grew. And gpui's list
-re-renders and re-measures every *visible* item each frame
-(`crates/gpui/src/elements/list.rs:1073`), so a visible entry that changes height is relayed out
-rather than painted over. The existing implementation also already performs exactly this height
-change once, when the command ends and the band is given back, telling `ListState` to remeasure.
-
-So take the band when the first line arrives and give it back when the last one goes, using the same
-remeasure the end-of-command path already does. The case to check before trusting it is an entry
-that is *scrolled out of view* when its output starts: an off-screen item keeps its cached height,
-so confirm what happens when it scrolls back, and if that is where it breaks, reserving the band
-from the start for off-screen entries only is a smaller compromise than reserving it always.
-
-
-**Move the row's hover buttons into the right-click menu, and drop the close button.**
-Three buttons appear over a row when the pointer crosses it: close tab
-(`crates/sidebar/src/sidebar.rs:6276`), archive (`:6294`) and new thread in this worktree (`:6338`).
-They cover the row's own content, they appear on a row you were only passing over, and two of the
-three already have a better home: the row has a right-click menu with Rename Title, Regenerate
-Title, Open Conversation as Markdown and the worktree actions (`:6440`).
-
-Archive and new-thread move into that menu. The close button goes entirely: a tab is closed from the
-tab, which is where closing already lives, and a row that is not open as a tab has nothing to close.
-With all three gone the row stops changing under the pointer.
-
-Put the new entries where they read: archive belongs near the worktree actions it sits above,
-new-thread near the top where it is an action on the worktree rather than on this thread. Keep the
-menu's existing order otherwise.
-
-The worktree header keeps its own `+` (`:2717`, `:2820`): that one is not a hover surprise, it is the
-header's job, and it is how a worktree gets its first thread.
-
-
-**The activity pill belongs above the message box too.**
-Once the sidebar's spinner carries the running terminals and subagents, the thread you are actually
-looking at should say the same thing without a glance sideways. The input status bar already carries
-this kind of state: the context window indicator, the branch's diff stats, the PR chips, pending
-review comments and a run indicator all sit there
-(`render_input_status_bar`, `crates/agent_ui/src/conversation_view/thread_view.rs:5933`).
-
-Put the pill beside `render_input_run_indicator`, which is the thing in that row it is closest to in
-meaning. The numbers come from the same `AcpThread::running_work` the sidebar uses, so this is one
-more caller and no new counting. Same rules as the sidebar's: silent at zero, and a stable footprint
-so a terminal starting does not shuffle the row.
-
-Build it with the sidebar pill rather than after it. They are the same component in two places, and
-the second one done separately is how two spellings of the same idea get created.
-
-**Make the spinner an activity pill, with the counts inside it.**
-`running_work` landed on the metadata line beside the diff stats, and the 2026-09-13 run chose that
-slot on purpose: the metadata line is drawn on every row, so counts appearing there cannot resize a
-row. Move them anyway. The counts belong with the spinner, in the title row, as one pill that says
-what the thread is doing: spinning, and with it the number of terminals running and subagents out.
-Read as one thing, they are activity; read apart, they are two facts in different places that happen
-to be about the same thread.
-
-The resize objection is answerable rather than fatal. That slot already changes when work starts,
-because the agent glyph is swapped for the spinner, so the question is only whether the pill may
-change width as terminals come and go. Give it a stable footprint: size it for the counts it can
-hold rather than for the ones it currently shows, so a thread going from one terminal to two does
-not shuffle the title. If the counts genuinely cannot fit there without reflowing, say so with what
-you tried, and leave them where they are.
-
-Nothing new needs computing: `AcpThread::running_work` already counts terminals whose process has
-not exited and subagent calls still `InProgress`, and the sidebar's live-info walk already carries
-both numbers into the row. This is where they are drawn, not how they are found. Zero stays silent:
-a thread with no terminals and no subagents shows the spinner alone.
-
-
-**Make `+` free, not merely quicker: keep a worktree ready before it is asked for.**
-One spare, created in the background off the default branch, handed over the instant `+` is
-pressed, with the next one started immediately after. This is the only approach that moves the
-whole cost out of the moment the user is waiting; the checkout itself is git writing files and is
-not going to get much faster. The naming is the part to work out: a spare has to be created without
-knowing its branch name, so create it detached (or on a scratch name) and set the branch when it is
-claimed. The costs are one worktree of disk standing idle, and the machinery to make sure a spare
-is never handed out twice, never claimed while half-built, and cleaned up on quit.
-
-**What the 2026-09-07 run established, so the next one does not re-derive it.**
-
-- **The fetch half of this entry is built and is no longer here.** The base branch is no longer
-  fetched before creation when the base ref is already in the clone; the fetch runs behind the new
-  window instead, and a base that moved says so. See that night's rebase log entry for how the
-  three questions the 2026-09-01 run raised (missing-ref fallback, saying "your base was behind",
-  where an askpass prompt belongs) were answered from the code rather than by asking.
-- **`worktree_service.rs` does have a test module**, contrary to the 2026-09-01 finding, and
-  `FakeFs` can now fetch, record what it was asked to fetch, and fail like an offline machine. A
-  spare-worktree change is testable here; that blocker is gone.
-- **What is left is genuinely measurement-gated.** The remaining cost is the checkout and the
-  workspace open, and how much of the seven seconds each accounts for now needs the running app —
-  the `quiet-ui perf:` lines log fetch, checkout, workspace-open and window-shown. Take those
-  numbers before building the spare: they decide whether one spare is enough, and whether the
-  window-open half wants its own answer.
-
-**What the 2026-09-08 run established, reading the creation path rather than re-deriving the above.**
-
-- **There is no branch to name.** `start_worktree_creations` already creates every worktree as
-  `CreateWorktreeTarget::Detached { base_sha }`, and the *directory* name is generated by
-  `worktree_names::generate_worktree_name` when the caller passes none — which `+` does. So the
-  entry's "create it detached and set the branch when it is claimed" is already how creation works,
-  and a spare needs no rename on claim. That worry can go.
-- **Staleness is not the objection it looks like.** A spare is checked out at the local base ref as
-  it stood when the spare was made. That is exactly what a fresh creation does too, since the
-  2026-09-07 change stopped fetching before creation; the deferred fetch behind the new window is
-  already the thing that says "your base was behind". A spare is therefore no more stale than a
-  creation, and it can reuse that same reporting rather than needing a policy of its own.
-- **"One spare" is one per repo-set, not one per app.** A worktree is created for the whole set of
-  `git_repos` in the workspace `+` was pressed in, and the paths are consolidated per underlying
-  repository. Two projects open means two sets, so the disk cost and the refill policy both scale
-  with what is open — which is the part the numbers are wanted for, and the reason "one worktree of
-  disk standing idle" understates it.
-- **A spare has no draft, so nothing reclaims it.** The 2026-09-07 abandoned-worktree sweep
-  identifies a Zed-made worktree partly by the empty draft `+` left beside it. A spare has no
-  thread and no draft, so a crash between creating one and claiming it leaks a worktree that sweep
-  will never pick up. Extending that predicate (a spare marker in the creation record) is part of
-  this item, not a detail to discover afterwards.
-
 **Two more places doing work per rebuild, found by reading rather than by using.**
 The 2026-09-08 run's slow pass fixed everything it could prove outright and left these two, each
 with the mechanism named so the next run can confirm it with the timing lines that run added rather
@@ -3591,3 +3467,128 @@ Environment prerequisites needed reapplying in this fresh container
 third-party PPAs baked into the image (`ondrej`, 403 and "no longer signed"), and again the cached
 lists were warm enough that `apt-get install -y libasound2-dev` succeeded anyway — so deleting
 those files from `/etc/apt/sources.list.d/` stays a thing to try only if the install itself fails.
+
+**2026-09-14**: onto main d62802d45 (11 upstream commits). Squash-then-rebase folded the standing
+squash and five follow-ups (last night's rebase-log commit and the four queue entries added during
+the day) into one commit, reusing the squash's own message; tree-identical to the old tip before
+rebasing.
+
+Two files conflicted, both of them the recurring seam, and both because upstream rebuilt something
+this fork had built by hand. `acp_thread.rs`: #64080 and #64177 gave `ToolCall` a private
+`title: Option<SharedString>` with `label_text`/`new_label` beside it, a tool-name fallback ("Tool
+call" when a call has neither title nor name), and an `update_fields` that only rebuilds the label
+when the title, kind or name actually changed. That is the shape this fork's inline
+title-and-label code was standing in for, so the fork's *behaviour* moved into upstream's
+functions: a command's label is still a bash-tagged fenced block (highlighted, not
+`Markdown::new_text`), an edit's label is still `edit_label_source` off the call's locations — which
+is why `label_text`/`new_label` take the locations here and why `label_changed` also fires on a
+locations update — and an update for an unknown tool call is still dropped with a log line rather
+than pushed as a "Tool call not found" chip. `thread_view.rs`: upstream's #64081 replaced the
+compaction summary (`Option`) with `Vec<ContentBlock>` plus an `error`, and gave the marker a
+`Button`; the fork keeps its own accent marker, takes upstream's data shape, and `expandable` is now
+`has_details && !is_compacting`. Upstream's new `render_output_content_block` also **replaces**
+the fork's embedded-resource special case outright: it checks `content.markdown()` first, which
+covers an embedded resource carrying markdown, which is exactly what the fork's own
+`render_embedded_resource_output` existed to do. Deleted in favour of upstream's; the one thing
+carried into it is the fork's inline image sizing, which upstream's image branch drops
+(`content.image()`'s dimensions).
+
+Three markerless drifts, all of them found by `cargo check --workspace --all-targets` rather than
+by a marker. A duplicate `markdown` dev-dependency in `crates/acp_thread/Cargo.toml` (the fork's
+line and upstream's own, spelled differently) failed the manifest before any crate built.
+`ContextCompaction` gained `error` and turned `summary` into a `Vec`, which the fork's
+provider-native compaction notice constructs. And `ToolCall`'s now-private `title` means the
+struct can no longer be built literally outside `acp_thread`, which is what `agent_ui`'s
+`test_tool_call` helper did: it goes through a new `ToolCall::for_test` (test-support only, built
+on `from_acp`), so a test's call now carries the same title and label a real one would.
+
+**Built tonight, the Work queue's first four entries.**
+
+- *A running command takes the output band only when it prints.* The band beneath a running
+  command's label was reserved for the whole run, so a command that printed nothing (or had not
+  printed yet) paid a second row for an empty band. It is taken when the first line arrives and
+  given back when the last one goes. The earlier entry's fear — a chip that grows after
+  `ListState` measured it — was checked rather than assumed: `list.rs`'s `layout_items` re-renders
+  and re-measures every item inside the visible area each frame and writes the new size back, and
+  an item that is off-screen when its output starts is re-measured on the frame it scrolls back
+  into, before it is painted. The end-of-command `remeasure_chip` stays as it was.
+- *A row's own actions live in its context menu.* The three hover buttons are gone. Archive and
+  new-thread-in-this-worktree are menu entries now (new-thread first, since it is an action on the
+  worktree; archive beside the worktree actions it sat above), and the archive entry says which it
+  is — "Archive Worktree" for the only thread of a linked worktree, "Archive Thread" otherwise —
+  the way the button's tooltip did. The close button is gone entirely along with
+  `Sidebar::close_thread_tab` and the test that drove it: a tab is closed from the tab. The
+  worktree header's own `+` is untouched.
+- *The spinner and what it is spinning on, as one pill.* `agent_activity_pill` in
+  `ui::thread_item` is the one component: the spinner, then the running-terminal and
+  running-subagent counts, each in a slot wide enough for two digits so a thread going from one
+  command to two does not shuffle what the pill sits in. It replaces the sidebar row's bare
+  spinner in the title row's status slot (which now sizes to it rather than being fixed at 4), and
+  the counts are off the metadata line. The same pill, from the same `AcpThread::running_work`,
+  went into the input status bar beside `render_input_run_indicator`, so the thread being looked at
+  says what it is doing without a glance sideways. Both were built together, as the entry asked.
+
+- *`+` is free now: the worktree is already there.* One spare per repository set is created in the
+  background, at the base `+` itself resolves, and handed over whole the moment `+` is pressed —
+  the checkout the user used to wait through is behind them before they ask. The pool
+  (`git_ui_core/src/worktree_spares.rs`) holds one entry per set, keyed on the paths
+  `path_for_new_linked_worktree` generates under a fixed probe name, which resolve through each
+  repository's main checkout: a project opened on a linked worktree therefore keys to the same
+  spare as the checkout it came from. A claim removes the entry, so no spare is handed out twice,
+  and a set that is mid-build is left alone rather than queued behind (a half-built spare is the
+  same checkout with a wait in front of it). The claim itself is the middle phase of
+  `do_create_worktree` and nothing else: the base-fetch phase in front of it is untouched, so a
+  claimed window still gets the deferred fetch that says the base moved.
+
+  Four things the entry asked about, answered in the code rather than deferred. *Naming*: nothing
+  to do — creation is already detached with a generated directory name, so a spare needs no rename
+  when claimed. *Never handed out twice, never claimed while half-built*: the pool is a global
+  keyed map with `Building`/`Ready` states, and a claim is a removal. *Never a fetch nobody asked
+  for*: a base that is not in the clone is a base a spare is not made from at all (checked with
+  the same local scan the creation path uses, and skipped outright for a repository that owes a
+  fetch), so the creation that wants it still fetches visibly, in front of its own window.
+  *Cleaned up on quit*: the sweep's existing answer stands — quit is when the project is being
+  torn down and a removal racing that teardown half-happens — so a spare is recorded as one
+  (`CreatedWorktreeRecord.spare`, cleared on claim) and the launch sweep, which until now
+  recognized an abandoned worktree by the empty draft beside it, now also collects a worktree
+  marked as a spare nobody claimed. This launch's own ready spares are excluded from that sweep by
+  path, and a claimed spare that has gone from disk since is dropped rather than opened, so the
+  creation checks one out as it always did.
+
+  `+` and the spare now resolve their base through one function
+  (`default_worktree_branch_target`), because a spare made from a base `+` does not ask for is a
+  spare that is never claimed. Two tests cover the handover: one asserts the workspace opens over
+  the directory that was already on disk and that the next spare is started once it does, the
+  other that a spare made at another base is left standing while the creation makes its own.
+
+  What is still open is what the entry said was measurement-gated, and it still cannot be answered
+  from this sandbox: whether one spare per set is enough, and how much of the remaining wait is the
+  window open rather than the checkout. The `quiet-ui perf:` lines now include
+  `a spare worktree is ready at …` and a claim that says it did not check anything out, so a
+  morning's log answers it.
+
+**The gate.** Suites: the fork's core crates plus the two crates tonight added to — `acp_thread`,
+`agent_ui` (32 intentionally `#[ignore]`d), `sidebar` (one fewer than last night: the close-tab row
+test went with the button), `ui`, `git_ui_core` (two new spare-worktree tests). All passing, 0
+failed. The Verification queue was empty going in and is empty going out.
+
+`script/clippy -p acp_thread -p agent_ui -p sidebar -p ui -p gpui_macros -p git_ui_core` (release,
+all targets, all features) is clean, and so is `cargo check --workspace --all-targets` — the check
+that actually catches this rebase's kind of drift, since three of tonight's four breakages carried
+no conflict marker. (`-p gpui_macros` is still there for the reason the 2026-09-13 entry gives: in
+release, `ui` alone cannot be linted.)
+
+One upstream test failed and was adapted, not fixed: #64177's
+`test_tool_call_label_updates_preserve_titles` asserts that a call whose kind becomes `Execute`
+keeps its plain title as the label. In this fork a command's label is a bash-tagged fenced code
+block, which is the whole reason commands highlight as shell; the expectation now spells the
+fence, and the "no strong text" half of the assertion still holds because a fenced block has no
+markdown inside it.
+
+Two environment notes, both old friends. The prerequisites needed reapplying in this fresh
+container (`CARGO_NET_GIT_FETCH_WITH_CLI=true`, `libasound2-dev`), and `apt-get update` failed
+again on the third-party PPAs baked into the image (`deadsnakes` and `ondrej`, 403 and "no longer
+signed") while `apt-get install -y libasound2-dev` still succeeded off the cached lists. And the
+disk allowance behaved as recorded: the release lint ran out of room with the debug test tree
+still on disk, `rm -rf target/debug` between the two passes fit comfortably, and the rebuild cost
+about ten minutes when the suites were re-run afterwards.
