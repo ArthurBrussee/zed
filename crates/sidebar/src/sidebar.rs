@@ -2343,30 +2343,6 @@ impl Sidebar {
             })
     }
 
-    /// Closes a thread's open tab in its workspace's panel, the same effect as
-    /// closing the tab in the thread pane, without archiving or deleting it.
-    fn close_thread_tab(
-        &mut self,
-        thread_id: agent_ui::ThreadId,
-        workspace: &Entity<Workspace>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) else {
-            return;
-        };
-        let pane = panel.read(cx).thread_pane().clone();
-        let item_id = pane.read(cx).items().find_map(|item| {
-            let tab = item.downcast::<agent_ui::thread_tab::ThreadTab>()?;
-            (tab.read(cx).thread_id(cx) == thread_id).then(|| item.item_id())
-        });
-        if let Some(item_id) = item_id {
-            pane.update(cx, |pane, cx| {
-                pane.remove_item(item_id, false, false, window, cx);
-            });
-        }
-    }
-
     /// The branches of a thread's worktrees, as `(repo path, branch)`.
     fn thread_branches(thread: &ThreadEntry) -> Vec<(&Path, &str)> {
         // A draft has no worktree of its own yet; its paths still resolve to the
@@ -6106,9 +6082,6 @@ impl Sidebar {
         // it is collapsed and the rows are not visible.
         let row_pr_chips = Self::thread_pr_chips(thread, cx);
         let is_archived = thread.metadata.archived;
-        // Only Active-section rows are open as tabs, so only they get a
-        // close-the-tab affordance.
-        let is_active_section = self.section_of_entry(ix) == Some(SidebarSection::OpenInZed);
         let is_restoring = self
             .restoring_tasks
             .contains_key(&thread.metadata.thread_id);
@@ -6116,8 +6089,6 @@ impl Sidebar {
             self.rename_target == Some(RenameTarget::Thread(thread.metadata.thread_id));
 
         let thread_id_for_actions = thread.metadata.thread_id;
-        let session_id_for_delete = thread.metadata.session_id.clone();
-        let focus_handle = self.focus_handle.clone();
         let rename_title_editor = is_renaming.then(|| self.render_rename_title_editor(cx));
 
         let id = SharedString::from(format!("thread-entry-{}", ix));
@@ -6265,95 +6236,12 @@ impl Sidebar {
                                 })
                                 .into_any_element(),
                         ),
-                        None => {
-                            // An open (Active-section) row can close its tab; the
-                            // X sits to the left of the archive button.
-                            let close_tab_button = if is_active_section
-                                && let ThreadEntryWorkspace::Open(workspace) = &thread_workspace
-                            {
-                                let workspace = workspace.clone();
-                                Some(
-                                    IconButton::new("close-thread-tab", IconName::Close)
-                                        .icon_size(IconSize::Small)
-                                        .icon_color(Color::Muted)
-                                        .tooltip(Tooltip::text("Close Tab"))
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.close_thread_tab(
-                                                thread_id_for_actions,
-                                                &workspace,
-                                                window,
-                                                cx,
-                                            );
-                                        }))
-                                        .into_any_element(),
-                                )
-                            } else {
-                                None
-                            };
-                            let archive_button =
-                                IconButton::new("archive-thread", IconName::Archive)
-                                    .icon_size(IconSize::Small)
-                                    .tooltip({
-                                        let focus_handle = focus_handle.clone();
-                                        // The only thread in a linked worktree
-                                        // takes the worktree with it, so the
-                                        // button says what it will do.
-                                        let takes_worktree = thread
-                                            .solo_worktree
-                                            .as_ref()
-                                            .is_some_and(|solo| solo.is_linked_worktree);
-                                        move |_window, cx| {
-                                            Tooltip::for_action_in(
-                                                if takes_worktree {
-                                                    "Archive Worktree"
-                                                } else {
-                                                    "Archive Thread"
-                                                },
-                                                &ArchiveSelectedThread,
-                                                &focus_handle,
-                                                cx,
-                                            )
-                                        }
-                                    })
-                                    .on_click({
-                                        let session_id = session_id_for_delete.clone();
-                                        cx.listener(move |this, _, window, cx| {
-                                            if let Some(ref session_id) = session_id {
-                                                this.archive_thread(session_id, window, cx);
-                                            }
-                                        })
-                                    });
-                            // A row archives its own thread wherever it sits.
-                            // The worktree's own archive lives on its header,
-                            // one row up, and takes the whole group — except
-                            // for a row that is its own worktree, which has no
-                            // header and so carries the worktree's + itself.
-                            // Its archive is already the worktree's: archiving
-                            // the only thread takes the worktree with it.
-                            let solo = thread.solo_worktree.clone();
-                            let new_thread_button = solo
-                                .as_ref()
-                                .and_then(|solo| solo.workspace.clone())
-                                .map(|workspace| {
-                                    IconButton::new("new-thread-in-worktree", IconName::Plus)
-                                        .icon_size(IconSize::Small)
-                                        .icon_color(Color::Muted)
-                                        .tooltip(Tooltip::text("New Thread in This Worktree"))
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            cx.stop_propagation();
-                                            this.new_thread_in_worktree(&workspace, window, cx);
-                                        }))
-                                        .into_any_element()
-                                });
-                            Some(
-                                h_flex()
-                                    .gap_0p5()
-                                    .when_some(new_thread_button, |this, button| this.child(button))
-                                    .when_some(close_tab_button, |this, button| this.child(button))
-                                    .child(archive_button)
-                                    .into_any_element(),
-                            )
-                        }
+                        // Archiving and starting a thread in this worktree live
+                        // on the row's context menu: a button that appears
+                        // under the pointer covers the row it is about, on a
+                        // row the pointer was only passing over. Closing lives
+                        // on the tab, which is the thing being closed.
+                        None => None,
                     }
                 };
 
@@ -6419,6 +6307,18 @@ impl Sidebar {
         let is_zed_thread = thread.metadata.agent_id.as_ref() == ZED_AGENT_ID.as_ref();
         let can_open_as_markdown = thread.is_live || is_zed_thread;
 
+        // A row that stands in for its own worktree carries the worktree's own
+        // actions: starting another thread in it, and an archive that takes the
+        // worktree with the thread.
+        let solo_workspace = thread
+            .solo_worktree
+            .as_ref()
+            .and_then(|solo| solo.workspace.clone());
+        let takes_worktree = thread
+            .solo_worktree
+            .as_ref()
+            .is_some_and(|solo| solo.is_linked_worktree);
+
         // Hovering a row says where the thread lives: worktree and branch,
         // with the full path underneath.
         let hover_worktrees: Vec<(SharedString, SharedString)> = thread
@@ -6475,7 +6375,24 @@ impl Sidebar {
                     let rename_title = rename_title.clone();
                     let folder_paths = menu_entry.metadata.folder_paths().clone();
                     let menu_metadata = menu_entry.metadata.clone();
+                    let solo_workspace = solo_workspace.clone();
                     ContextMenu::build(_window, cx, move |mut menu, _window, _cx| {
+                        // A thread of its own worktree has no header to carry
+                        // the worktree's +, so the row carries it: this is an
+                        // action on the worktree, which is why it reads first.
+                        if let Some(workspace) = solo_workspace.clone() {
+                            menu = menu.entry("New Thread in This Worktree", None, {
+                                let sidebar = sidebar.clone();
+                                move |window, cx| {
+                                    sidebar
+                                        .update(cx, |sidebar, cx| {
+                                            sidebar.new_thread_in_worktree(&workspace, window, cx);
+                                        })
+                                        .ok();
+                                }
+                            });
+                        }
+
                         menu = menu.entry("Rename Title", None, {
                             let sidebar = sidebar.clone();
                             let rename_title = rename_title.clone();
@@ -6582,16 +6499,27 @@ impl Sidebar {
                                     }
                                 })
                         } else {
-                            menu.separator().entry("Archive Worktree", None, {
-                                let session_id = session_id.clone();
-                                move |window, cx| {
-                                    sidebar
-                                        .update(cx, |sidebar, cx| {
-                                            sidebar.archive_thread(&session_id, window, cx);
-                                        })
-                                        .ok();
-                                }
-                            })
+                            // The only thread in a linked worktree takes the
+                            // worktree with it, so the entry says what it will
+                            // do.
+                            menu.separator().entry(
+                                if takes_worktree {
+                                    "Archive Worktree"
+                                } else {
+                                    "Archive Thread"
+                                },
+                                Some(Box::new(ArchiveSelectedThread)),
+                                {
+                                    let session_id = session_id.clone();
+                                    move |window, cx| {
+                                        sidebar
+                                            .update(cx, |sidebar, cx| {
+                                                sidebar.archive_thread(&session_id, window, cx);
+                                            })
+                                            .ok();
+                                    }
+                                },
+                            )
                         }
                     })
                 }
