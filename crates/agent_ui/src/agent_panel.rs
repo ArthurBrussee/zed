@@ -3838,31 +3838,16 @@ impl AgentPanel {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
-        let default_branch = workspace
-            .read(cx)
-            .project()
-            .read(cx)
-            .active_repository(cx)
-            .map(|repo| repo.update(cx, |repo, _| repo.default_branch(true)));
+        // The same base the spare worktrees are made from: they are only ever
+        // this `+`'s if the two agree on what it asks for.
+        let branch_target = git_ui_core::worktree_service::default_worktree_branch_target(
+            &workspace.read(cx).project().clone(),
+            cx,
+        );
 
         let workspace = workspace.downgrade();
         cx.spawn_in(window, async move |_this, cx| {
-            let branch_target = match default_branch {
-                Some(rx) => match rx.await {
-                    Ok(Ok(Some(name))) => {
-                        git_ui_core::worktree_service::RemoteBranchName::parse(&name)
-                            .map(|remote| {
-                                git_ui_core::worktree_service::WorktreeCreateTarget::DefaultBranch(
-                                    remote,
-                                )
-                                .branch_target()
-                            })
-                            .unwrap_or(zed_actions::NewWorktreeBranchTarget::CurrentBranch)
-                    }
-                    _ => zed_actions::NewWorktreeBranchTarget::CurrentBranch,
-                },
-                None => zed_actions::NewWorktreeBranchTarget::CurrentBranch,
-            };
+            let branch_target = branch_target.await;
             let action = zed_actions::CreateWorktree {
                 worktree_name: None,
                 branch_target,

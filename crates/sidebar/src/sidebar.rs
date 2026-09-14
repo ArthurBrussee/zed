@@ -918,6 +918,7 @@ impl Sidebar {
             }
             this.schedule_update_entries(false, cx);
             this.reclaim_abandoned_worktrees(cx);
+            this.ensure_spare_worktree(window, cx);
         });
 
         Self {
@@ -998,7 +999,7 @@ impl Sidebar {
         cx.subscribe_in(
             &git_store,
             window,
-            |this, _, event: &project::git_store::GitStoreEvent, _window, cx| {
+            |this, _, event: &project::git_store::GitStoreEvent, window, cx| {
                 if matches!(
                     event,
                     project::git_store::GitStoreEvent::RepositoryUpdated(
@@ -1009,6 +1010,11 @@ impl Sidebar {
                     )
                 ) {
                     this.schedule_update_entries(false, cx);
+                    // The repositories a spare would be made from are only
+                    // known once they have been scanned, which is after the
+                    // window opens. Asking again here costs a map lookup once
+                    // there is one.
+                    this.ensure_spare_worktree(window, cx);
                 }
                 // A branch's upstream tracking lives in the branch list, so a
                 // push (or a fetch that moves the base) changes it. That means
@@ -4491,6 +4497,18 @@ impl Sidebar {
         .detach_and_log_err(cx);
     }
 
+    /// Keep a worktree ready for the next `+`. The checkout `+` pays for is git
+    /// writing files, and the only way to stop waiting for it is to have it
+    /// already done; one spare per repository set is made in the background and
+    /// handed over whole when `+` is pressed.
+    fn ensure_spare_worktree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+            return;
+        };
+        let workspace = multi_workspace.read(cx).workspace().clone();
+        git_ui_core::worktree_service::ensure_spare_worktree(&workspace, window, cx);
+    }
+
     /// The repository's linked worktrees that nothing is using: Zed made them,
     /// they sit under the directory Zed manages, no window has them open, and
     /// no thread that would block their archival refers to them.
@@ -4510,6 +4528,12 @@ impl Sidebar {
         let archive_workspaces = self.archive_workspaces(cx);
         let store = ThreadMetadataStore::global(cx);
         let store = store.read(cx);
+        // A spare this launch is still holding is not abandoned, it is waiting
+        // to be handed over.
+        let ready_spares: HashSet<PathBuf> =
+            git_ui_core::worktree_spares::SpareWorktrees::ready_paths(cx)
+                .into_iter()
+                .collect();
 
         worktrees
             .iter()
@@ -4521,17 +4545,24 @@ impl Sidebar {
                 git_ui_core::created_worktrees::recorded_created_at(path, remote_connection, cx)
                     .is_some()
             })
+            .filter(|path| !ready_spares.contains(path.as_path()))
             .filter(|path| {
                 // What this reclaims is the empty draft's worktree, so there
                 // has to be an empty draft. A worktree with no row at all is
                 // not what this is about, and leaving it is the conservative
                 // reading of a store that may simply not know about it yet.
-                !store
-                    .unarchived_draft_ids_matching(|thread| {
-                        thread.matches_remote_connection(remote_connection)
-                            && thread.references_folder_path(path)
-                    })
-                    .is_empty()
+                //
+                // A spare is the exception, and the reason it is recorded as
+                // one: it is a worktree Zed made with no thread and no draft
+                // beside it, so one still marked here is one a previous
+                // session made and never handed over.
+                git_ui_core::created_worktrees::recorded_as_spare(path, remote_connection, cx)
+                    || !store
+                        .unarchived_draft_ids_matching(|thread| {
+                            thread.matches_remote_connection(remote_connection)
+                                && thread.references_folder_path(path)
+                        })
+                        .is_empty()
             })
             .filter(|path| {
                 !Self::path_is_referenced_by_unarchived_threads_for_archive(
@@ -4545,9 +4576,11 @@ impl Sidebar {
             })
             .filter(|path| {
                 TerminalThreadMetadataStore::try_global(cx).is_none_or(|terminal_store| {
-                    !terminal_store
-                        .read(cx)
-                        .path_is_referenced_by_terminal(None, path, remote_connection)
+                    !terminal_store.read(cx).path_is_referenced_by_terminal(
+                        None,
+                        path,
+                        remote_connection,
+                    )
                 })
             })
             .collect()
@@ -6553,11 +6586,11 @@ impl Sidebar {
                         }
                         .border_color(color.drop_target_border)
                     })
-                    .on_drop(cx.listener(
-                        move |this, dragged: &DraggedThreadRow, window, cx| {
+                    .on_drop(
+                        cx.listener(move |this, dragged: &DraggedThreadRow, window, cx| {
                             this.handle_thread_row_drop(dragged, ix, window, cx);
-                        },
-                    ))
+                        }),
+                    )
                     .child(row)
                     .into_any_element()
             }

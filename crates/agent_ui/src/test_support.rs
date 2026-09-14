@@ -150,6 +150,7 @@ pub async fn record_zed_created_worktree(
             worktree_path,
             remote,
             created_at,
+            false,
             cx,
         )
     })
