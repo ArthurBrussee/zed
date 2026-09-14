@@ -8358,8 +8358,10 @@ mod tests {
                 true,
             ),
             (
+                // A command's label is a bash-tagged fenced code block, so it
+                // highlights as shell rather than rendering as prose.
                 acp::ToolCallUpdateFields::new().kind(acp::ToolKind::Execute),
-                "**Readable title**",
+                "```bash\n**Readable title**\n```",
                 false,
             ),
             (
