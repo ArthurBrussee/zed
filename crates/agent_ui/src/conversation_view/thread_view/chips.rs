@@ -2057,13 +2057,16 @@ impl ThreadView {
             has_terminals.then(|| self.chip_cache.command(tool_call, cx).command.clone());
         // A collapsed chip that is still running says what it is up to; the
         // expanded one shows the output itself, so it needs no excerpt. The
-        // taller shape is there for as long as the command runs, not from when
-        // its first line of output arrives: the list has already measured this
-        // entry, and a chip that grew under it would tear the grid.
-        let two_line = running && has_terminals && !is_expanded;
-        let running_tail = two_line
+        // band that holds the line is the chip's second row, so a command that
+        // has printed nothing, or has not printed yet, would pay an empty row
+        // for it: take the band when the first line arrives and give it back
+        // when the last one goes. The list re-renders and re-measures every
+        // visible entry each frame, and one that is off-screen when its output
+        // starts is re-measured when it scrolls back, before it is painted.
+        let running_tail = (running && has_terminals && !is_expanded)
             .then(|| self.chip_cache.tail(tool_call, cx))
             .flatten();
+        let two_line = running_tail.is_some();
 
         let chip_group = SharedString::from(format!("action-chip-{entry_ix}"));
         let chip = self

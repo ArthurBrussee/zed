@@ -14937,6 +14937,66 @@ mod tests {
         });
     }
 
+    #[gpui::test]
+    fn a_command_that_has_printed_nothing_has_no_line_for_the_band(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        crate::test_support::init_test(cx);
+
+        cx.update(|cx| {
+            let AgentThreadEntry::ToolCall(mut tool_call) = test_tool_call(
+                "1",
+                "```bash\ncargo test\n```",
+                acp::ToolKind::Execute,
+                None,
+                cx,
+            ) else {
+                unreachable!()
+            };
+            let inner = cx.new(|cx| {
+                ::terminal::TerminalBuilder::new_display_only(
+                    ::terminal::terminal_settings::CursorShape::default(),
+                    ::terminal::terminal_settings::AlternateScroll::On,
+                    None,
+                    0,
+                    cx.background_executor(),
+                    util::paths::PathStyle::local(),
+                )
+                .subscribe(cx)
+            });
+            let language_registry = Arc::new(language::LanguageRegistry::test(
+                cx.background_executor().clone(),
+            ));
+            let terminal = cx.new(|cx| {
+                acp_thread::Terminal::new(
+                    acp::TerminalId::new("terminal-1"),
+                    "cargo test",
+                    None,
+                    None,
+                    inner.clone(),
+                    language_registry,
+                    None,
+                    cx,
+                )
+            });
+            tool_call.content = vec![acp_thread::ToolCallContent::Terminal(terminal)];
+
+            // A command that has started but printed nothing has no line, so
+            // the chip stays one line rather than reserving an empty band.
+            assert_eq!(ChipCache::default().tail(&tool_call, cx), None);
+
+            // The first line it prints is the one the band is taken for. The
+            // cache samples at most once a second, so this asks a fresh one.
+            inner.update(cx, |inner, cx| {
+                inner.write_output(b"Compiling acp_thread v0.1.0\n", cx)
+            });
+            assert_eq!(
+                ChipCache::default().tail(&tool_call, cx).as_deref(),
+                Some("Compiling acp_thread v0.1.0")
+            );
+        });
+    }
+
     /// An edit tool call whose locations name the given files (no diffs, so the
     /// chip split is exercised from locations alone).
     /// An edit call the way a patch-sending agent (Codex) reports it: diffs
