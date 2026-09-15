@@ -518,7 +518,10 @@ pub struct ArchivedGitWorktree {
 /// Listens to ConversationView events and updates metadata when the root thread changes.
 pub struct ThreadMetadataStore {
     db: ThreadMetadataDb,
-    threads: HashMap<ThreadId, ThreadMetadata>,
+    /// Rows are handed out as `Arc`s: the sidebar rebuilds its contents from
+    /// every stored thread, from forty call sites, and a rebuild that deep-cloned
+    /// each row paid for hundreds of copies it threw away on the next one.
+    threads: HashMap<ThreadId, Arc<ThreadMetadata>>,
     threads_by_paths: HashMap<PathList, HashSet<ThreadId>>,
     threads_by_main_paths: HashMap<PathList, HashSet<ThreadId>>,
     threads_by_session: HashMap<acp::SessionId, ThreadId>,
@@ -607,17 +610,22 @@ impl ThreadMetadataStore {
 
     /// Returns the metadata for a specific thread, if it exists.
     pub fn entry(&self, thread_id: ThreadId) -> Option<&ThreadMetadata> {
+        self.threads.get(&thread_id).map(Arc::as_ref)
+    }
+
+    /// The shared row for a thread, for callers that keep it rather than read it.
+    pub fn entry_arc(&self, thread_id: ThreadId) -> Option<&Arc<ThreadMetadata>> {
         self.threads.get(&thread_id)
     }
 
     /// Returns the metadata for a thread identified by its ACP session ID.
     pub fn entry_by_session(&self, session_id: &acp::SessionId) -> Option<&ThreadMetadata> {
         let thread_id = self.threads_by_session.get(session_id)?;
-        self.threads.get(thread_id)
+        self.threads.get(thread_id).map(Arc::as_ref)
     }
 
-    /// Returns all threads.
-    pub fn entries(&self) -> impl Iterator<Item = &ThreadMetadata> + '_ {
+    /// Returns all threads, as the shared rows the store holds.
+    pub fn entries(&self) -> impl Iterator<Item = &Arc<ThreadMetadata>> + '_ {
         self.threads.values()
     }
 
@@ -629,7 +637,7 @@ impl ThreadMetadataStore {
 
     /// Returns all archived threads.
     pub fn archived_entries(&self) -> impl Iterator<Item = &ThreadMetadata> + '_ {
-        self.entries().filter(|t| t.archived)
+        self.entries().map(Arc::as_ref).filter(|t| t.archived)
     }
 
     /// Returns all threads for the given path list and remote connection,
@@ -647,7 +655,7 @@ impl ThreadMetadataStore {
             .get(path_list)
             .into_iter()
             .flatten()
-            .filter_map(|s| self.threads.get(s))
+            .filter_map(|s| self.threads.get(s).map(Arc::as_ref))
             .filter(|s| !s.archived)
             .filter(move |s| s.matches_remote_connection(remote_connection))
     }
@@ -669,7 +677,7 @@ impl ThreadMetadataStore {
             .get(path_list)
             .into_iter()
             .flatten()
-            .filter_map(|s| self.threads.get(s))
+            .filter_map(|s| self.threads.get(s).map(Arc::as_ref))
             .filter(|s| !s.archived)
             .filter(move |s| s.matches_remote_connection(remote_connection))
     }
@@ -843,7 +851,8 @@ impl ThreadMetadataStore {
                 .insert(session_id.clone(), metadata.thread_id);
         }
 
-        self.threads.insert(metadata.thread_id, metadata.clone());
+        self.threads
+            .insert(metadata.thread_id, Arc::new(metadata.clone()));
 
         self.threads_by_paths
             .entry(metadata.folder_paths().clone())
@@ -875,7 +884,7 @@ impl ThreadMetadataStore {
                     work_dirs.clone(),
                 )
                 .unwrap_or_else(|_| WorktreePaths::from_folder_paths(&work_dirs)),
-                ..thread.clone()
+                ..ThreadMetadata::clone(thread)
             });
             cx.notify();
         }
@@ -903,7 +912,7 @@ impl ThreadMetadataStore {
             }
             self.save_internal(ThreadMetadata {
                 worktree_paths: worktree_paths.clone(),
-                ..thread.clone()
+                ..ThreadMetadata::clone(thread)
             });
             changed = true;
         }
@@ -921,7 +930,7 @@ impl ThreadMetadataStore {
         if let Some(thread) = self.threads.get(thread_id) {
             self.save_internal(ThreadMetadata {
                 interacted_at: Some(time),
-                ..thread.clone()
+                ..ThreadMetadata::clone(thread)
             });
             cx.notify();
         };
@@ -1023,7 +1032,7 @@ impl ThreadMetadataStore {
                     new_folder_paths.clone(),
                 )
                 .unwrap_or_else(|_| WorktreePaths::from_folder_paths(&new_folder_paths)),
-                ..thread
+                ..Arc::unwrap_or_clone(thread)
             });
             cx.notify();
         }
@@ -1051,7 +1060,7 @@ impl ThreadMetadataStore {
                     new_folder_paths.clone(),
                 )
                 .unwrap_or_else(|_| WorktreePaths::from_folder_paths(&new_folder_paths)),
-                ..thread
+                ..Arc::unwrap_or_clone(thread)
             });
             cx.notify();
         }
@@ -1099,7 +1108,7 @@ impl ThreadMetadataStore {
         }
 
         for thread_id in thread_ids {
-            if let Some(thread) = self.threads.get_mut(thread_id) {
+            if let Some(thread) = self.threads.get_mut(thread_id).map(Arc::make_mut) {
                 if let Some(ids) = self
                     .threads_by_main_paths
                     .get_mut(thread.main_worktree_paths())
@@ -1217,7 +1226,7 @@ impl ThreadMetadataStore {
         if let Some(thread) = self.threads.get(&thread_id) {
             self.save_internal(ThreadMetadata {
                 archived,
-                ..thread.clone()
+                ..ThreadMetadata::clone(thread)
             });
             cx.notify();
         }
@@ -2571,7 +2580,7 @@ mod tests {
             .iter()
             .filter_map(|metadata| {
                 let session_id = metadata.session_id.as_ref()?.0.to_string();
-                (session_id != "a-session-0").then_some((session_id, metadata))
+                (session_id != "a-session-0").then_some((session_id, metadata.as_ref()))
             })
             .collect();
         assert!(!migrated_by_session["a-session-1"].archived);
@@ -3575,7 +3584,7 @@ mod tests {
             let store = ThreadMetadataStore::global(cx);
             let store = store.read(cx);
 
-            let entries: Vec<ThreadMetadata> = store.entries().cloned().collect();
+            let entries: Vec<ThreadMetadata> = store.entries().map(|t| t.as_ref().clone()).collect();
             pretty_assertions::assert_eq!(
                 entries,
                 vec![ThreadMetadata {

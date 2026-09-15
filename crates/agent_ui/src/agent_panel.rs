@@ -4827,6 +4827,7 @@ impl AgentPanel {
         let entries: Vec<serde_json::Value> = store
             .read(cx)
             .entries()
+            .map(Arc::as_ref)
             .filter(|t| !t.archived)
             .map(thread_metadata_to_debug_json)
             .collect();

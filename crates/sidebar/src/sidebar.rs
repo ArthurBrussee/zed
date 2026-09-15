@@ -328,7 +328,9 @@ enum DraftKind {
 
 #[derive(Clone)]
 struct ThreadEntry {
-    metadata: ThreadMetadata,
+    /// Shared with the store rather than copied out of it: a rebuild reads
+    /// every stored thread, and only live rows and drafts rewrite what they read.
+    metadata: Arc<ThreadMetadata>,
     icon: IconName,
     icon_from_external_svg: Option<SharedString>,
     status: AgentThreadStatus,
@@ -418,7 +420,7 @@ fn entry_identity(entry: &ListEntry) -> Option<EntryIdentity> {
 
 #[derive(Clone)]
 struct TerminalEntry {
-    metadata: TerminalThreadMetadata,
+    metadata: Arc<TerminalThreadMetadata>,
     workspace: ThreadEntryWorkspace,
     worktrees: Vec<ThreadItemWorktreeInfo>,
     has_notification: bool,
@@ -432,7 +434,7 @@ impl ThreadEntry {
     /// but if we have a correspond thread already loaded we want to apply the
     /// live information.
     fn apply_active_info(&mut self, info: &ActiveThreadInfo) {
-        self.metadata.title = Some(info.title.clone());
+        Arc::make_mut(&mut self.metadata).title = Some(info.title.clone());
         self.status = info.status;
         self.icon = info.icon;
         self.icon_from_external_svg = info.icon_from_external_svg.clone();
@@ -528,10 +530,10 @@ struct WorkspaceHeaderEntry {
 #[derive(Clone)]
 enum ActivatableEntry {
     Thread {
-        metadata: ThreadMetadata,
+        metadata: Arc<ThreadMetadata>,
     },
     Terminal {
-        metadata: TerminalThreadMetadata,
+        metadata: Arc<TerminalThreadMetadata>,
         workspace: ThreadEntryWorkspace,
     },
 }
@@ -1435,32 +1437,32 @@ impl Sidebar {
         }
 
         // Workspace resolution across all open workspaces, matching both the
-        // stored path list and the remote identity.
-        let open_workspace_locations: Vec<(
+        // stored path list and the remote identity. Keyed by path list rather
+        // than scanned: every stored thread and terminal resolves through here,
+        // so a scan is quadratic in the thing that grows.
+        let mut open_workspace_locations: HashMap<
             PathList,
-            Option<RemoteConnectionOptions>,
-            Entity<Workspace>,
-        )> = workspaces
-            .iter()
-            .map(|ws| {
-                (
-                    workspace_path_list(ws, cx),
-                    ws.read(cx).project().read(cx).remote_connection_options(cx),
-                    ws.clone(),
-                )
-            })
-            .collect();
+            Vec<(Option<RemoteConnectionOptions>, Entity<Workspace>)>,
+        > = HashMap::default();
+        for ws in &workspaces {
+            let remote = ws.read(cx).project().read(cx).remote_connection_options(cx);
+            open_workspace_locations
+                .entry(workspace_path_list(ws, cx))
+                .or_default()
+                .push((remote, ws.clone()));
+        }
         let resolve_workspace = |worktree_paths: &WorktreePaths,
                                  remote_connection: Option<&RemoteConnectionOptions>|
          -> ThreadEntryWorkspace {
             let folder_paths = worktree_paths.folder_path_list();
             open_workspace_locations
-                .iter()
-                .find(|(paths, ws_remote, _)| {
-                    paths == folder_paths
-                        && same_remote_connection_identity(ws_remote.as_ref(), remote_connection)
+                .get(folder_paths)
+                .and_then(|candidates| {
+                    candidates.iter().find(|(ws_remote, _)| {
+                        same_remote_connection_identity(ws_remote.as_ref(), remote_connection)
+                    })
                 })
-                .map(|(_, _, ws)| ThreadEntryWorkspace::Open(ws.clone()))
+                .map(|(_, ws)| ThreadEntryWorkspace::Open(ws.clone()))
                 .unwrap_or_else(|| ThreadEntryWorkspace::Closed {
                     folder_paths: folder_paths.clone(),
                     project_group_key: ProjectGroupKey::from_worktree_paths(
@@ -1548,7 +1550,7 @@ impl Sidebar {
                 draft_display_label_for_thread_metadata(&thread.metadata, &thread.workspace, cx)
             {
                 let thread = Arc::make_mut(thread);
-                thread.metadata.title = Some(label);
+                Arc::make_mut(&mut thread.metadata).title = Some(label);
                 thread.draft = Some(kind);
             }
         }
@@ -3579,7 +3581,7 @@ impl Sidebar {
 
     fn activate_thread_in_other_window(
         &self,
-        metadata: ThreadMetadata,
+        metadata: Arc<ThreadMetadata>,
         workspace: Entity<Workspace>,
         target_window: WindowHandle<MultiWorkspace>,
         cx: &mut Context<Self>,
@@ -3622,7 +3624,7 @@ impl Sidebar {
 
     fn activate_thread(
         &mut self,
-        metadata: ThreadMetadata,
+        metadata: Arc<ThreadMetadata>,
         workspace: &Entity<Workspace>,
         retain: bool,
         window: &mut Window,
@@ -3647,7 +3649,7 @@ impl Sidebar {
 
     fn open_workspace_and_activate_thread(
         &mut self,
-        metadata: ThreadMetadata,
+        metadata: Arc<ThreadMetadata>,
         folder_paths: PathList,
         project_group_key: &ProjectGroupKey,
         window: &mut Window,
@@ -3748,7 +3750,7 @@ impl Sidebar {
 
     fn open_thread_from_archive(
         &mut self,
-        metadata: ThreadMetadata,
+        metadata: Arc<ThreadMetadata>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -3890,7 +3892,7 @@ impl Sidebar {
                     })?;
 
                     let updated_metadata =
-                        cx.update(|_window, cx| store.read(cx).entry(thread_id).cloned())?;
+                        cx.update(|_window, cx| store.read(cx).entry_arc(thread_id).cloned())?;
 
                     if let Some(updated_metadata) = updated_metadata {
                         let new_paths = updated_metadata.folder_paths().clone();
@@ -4011,7 +4013,7 @@ impl Sidebar {
 
     fn activate_terminal_entry(
         &mut self,
-        metadata: TerminalThreadMetadata,
+        metadata: Arc<TerminalThreadMetadata>,
         workspace: ThreadEntryWorkspace,
         retain: bool,
         window: &mut Window,
@@ -4107,7 +4109,7 @@ impl Sidebar {
     fn activate_terminal_in_workspace(
         &mut self,
         workspace: &Entity<Workspace>,
-        metadata: TerminalThreadMetadata,
+        metadata: Arc<TerminalThreadMetadata>,
         retain: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -4137,7 +4139,7 @@ impl Sidebar {
 
     fn open_workspace_and_activate_terminal(
         &mut self,
-        metadata: TerminalThreadMetadata,
+        metadata: Arc<TerminalThreadMetadata>,
         folder_paths: PathList,
         project_group_key: &ProjectGroupKey,
         window: &mut Window,

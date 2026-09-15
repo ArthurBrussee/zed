@@ -1124,6 +1124,71 @@ async fn test_single_workspace_with_saved_threads(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_stored_rows_share_the_store_allocation(cx: &mut TestAppContext) {
+    let project = init_test_project("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    let session_id = acp::SessionId::new(Arc::from("thread-1"));
+    save_thread_metadata(
+        session_id.clone(),
+        Some("Fix crash in project panel".into()),
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 3, 0, 0, 0).unwrap(),
+        None,
+        None,
+        &project,
+        cx,
+    );
+    cx.run_until_parked();
+
+    multi_workspace.update_in(cx, |_, _window, cx| cx.notify());
+    cx.run_until_parked();
+
+    let stored = cx.update(|_window, cx| {
+        let store = ThreadMetadataStore::global(cx);
+        let store = store.read(cx);
+        let thread_id = store
+            .entry_by_session(&session_id)
+            .expect("the seeded thread should be stored")
+            .thread_id;
+        store
+            .entry_arc(thread_id)
+            .cloned()
+            .expect("the seeded thread should be stored")
+    });
+
+    let row_metadata = |cx: &mut gpui::VisualTestContext| {
+        sidebar.read_with(cx, |sidebar, _| {
+            sidebar
+                .contents
+                .entries
+                .iter()
+                .find_map(|entry| match entry {
+                    ListEntry::Thread(thread) => Some(thread.metadata.clone()),
+                    _ => None,
+                })
+                .expect("the stored thread should have a row")
+        })
+    };
+
+    assert!(
+        Arc::ptr_eq(&stored, &row_metadata(cx)),
+        "a row should share the store's metadata rather than copy it"
+    );
+
+    // The cost this guards is per-rebuild, so the second one matters more
+    // than the first: rebuilding must not deep-copy every stored row again.
+    multi_workspace.update_in(cx, |_, _window, cx| cx.notify());
+    cx.run_until_parked();
+
+    assert!(
+        Arc::ptr_eq(&stored, &row_metadata(cx)),
+        "a rebuild should keep sharing the store's metadata"
+    );
+}
+
+#[gpui::test]
 async fn test_workspace_lifecycle(cx: &mut TestAppContext) {
     let project = init_test_project("/project-a", cx).await;
     let (multi_workspace, cx) =
@@ -1269,7 +1334,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
             // Section headers are skipped by visible_entries_as_strings.
             ListEntry::SectionHeader(SidebarSection::OpenInZed),
             ListEntry::Thread(Arc::new(ThreadEntry {
-                metadata: ThreadMetadata {
+                metadata: Arc::new(ThreadMetadata {
                     thread_id: ThreadId::new(),
                     session_id: Some(acp::SessionId::new(Arc::from("t-1"))),
                     agent_id: AgentId::new("zed-agent"),
@@ -1281,7 +1346,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                     interacted_at: None,
                     archived: false,
                     remote_connection: None,
-                },
+                }),
                 icon: IconName::ZedAgent,
                 icon_from_external_svg: None,
                 status: AgentThreadStatus::Completed,
@@ -1298,7 +1363,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
             })),
             // Active thread with Running status
             ListEntry::Thread(Arc::new(ThreadEntry {
-                metadata: ThreadMetadata {
+                metadata: Arc::new(ThreadMetadata {
                     thread_id: ThreadId::new(),
                     session_id: Some(acp::SessionId::new(Arc::from("t-2"))),
                     agent_id: AgentId::new("zed-agent"),
@@ -1310,7 +1375,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                     interacted_at: None,
                     archived: false,
                     remote_connection: None,
-                },
+                }),
                 icon: IconName::ZedAgent,
                 icon_from_external_svg: None,
                 status: AgentThreadStatus::Running,
@@ -1327,7 +1392,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
             })),
             // Active thread with Error status
             ListEntry::Thread(Arc::new(ThreadEntry {
-                metadata: ThreadMetadata {
+                metadata: Arc::new(ThreadMetadata {
                     thread_id: ThreadId::new(),
                     session_id: Some(acp::SessionId::new(Arc::from("t-3"))),
                     agent_id: AgentId::new("zed-agent"),
@@ -1339,7 +1404,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                     interacted_at: None,
                     archived: false,
                     remote_connection: None,
-                },
+                }),
                 icon: IconName::ZedAgent,
                 icon_from_external_svg: None,
                 status: AgentThreadStatus::Error,
@@ -1357,7 +1422,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
             // Thread with WaitingForConfirmation status, not active
             // remote_connection: None,
             ListEntry::Thread(Arc::new(ThreadEntry {
-                metadata: ThreadMetadata {
+                metadata: Arc::new(ThreadMetadata {
                     thread_id: ThreadId::new(),
                     session_id: Some(acp::SessionId::new(Arc::from("t-4"))),
                     agent_id: AgentId::new("zed-agent"),
@@ -1369,7 +1434,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                     interacted_at: None,
                     archived: false,
                     remote_connection: None,
-                },
+                }),
                 icon: IconName::ZedAgent,
                 icon_from_external_svg: None,
                 status: AgentThreadStatus::WaitingForConfirmation,
@@ -1387,7 +1452,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
             // Background thread that completed (should show notification)
             // remote_connection: None,
             ListEntry::Thread(Arc::new(ThreadEntry {
-                metadata: ThreadMetadata {
+                metadata: Arc::new(ThreadMetadata {
                     thread_id: notified_thread_id,
                     session_id: Some(acp::SessionId::new(Arc::from("t-5"))),
                     agent_id: AgentId::new("zed-agent"),
@@ -1399,7 +1464,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                     interacted_at: None,
                     archived: false,
                     remote_connection: None,
-                },
+                }),
                 icon: IconName::ZedAgent,
                 icon_from_external_svg: None,
                 status: AgentThreadStatus::Completed,
@@ -5114,7 +5179,7 @@ async fn test_reopen_closed_thread_from_history(cx: &mut TestAppContext) {
 
     // Click the now-closed thread in the sidebar: it must reopen as a tab.
     sidebar.update_in(cx, |sidebar, window, cx| {
-        sidebar.activate_thread(metadata.clone(), &workspace, false, window, cx);
+        sidebar.activate_thread(Arc::new(metadata.clone()), &workspace, false, window, cx);
     });
     cx.run_until_parked();
 
@@ -6021,7 +6086,7 @@ async fn test_focused_thread_tracks_user_intent(cx: &mut TestAppContext) {
             .expect("session_id_a should exist in metadata store")
     });
     sidebar.update_in(cx, |sidebar, window, cx| {
-        sidebar.activate_thread(thread_metadata_a, &workspace_a, false, window, cx);
+        sidebar.activate_thread(Arc::new(thread_metadata_a), &workspace_a, false, window, cx);
     });
     cx.run_until_parked();
 
@@ -6084,7 +6149,7 @@ async fn test_focused_thread_tracks_user_intent(cx: &mut TestAppContext) {
             .expect("session_id_b should exist in metadata store")
     });
     sidebar.update_in(cx, |sidebar, window, cx| {
-        sidebar.activate_thread(thread_metadata_b, &workspace_b, false, window, cx);
+        sidebar.activate_thread(Arc::new(thread_metadata_b), &workspace_b, false, window, cx);
     });
     cx.run_until_parked();
 
@@ -8389,7 +8454,7 @@ async fn test_activate_archived_thread_with_saved_paths_activates_matching_works
     // switch to the workspace for project-b.
     sidebar.update_in(cx, |sidebar, window, cx| {
         sidebar.open_thread_from_archive(
-            ThreadMetadata {
+            Arc::new(ThreadMetadata {
                 thread_id: ThreadId::new(),
                 session_id: Some(session_id.clone()),
                 agent_id: agent::ZED_AGENT_ID.clone(),
@@ -8403,7 +8468,7 @@ async fn test_activate_archived_thread_with_saved_paths_activates_matching_works
                 )])),
                 archived: false,
                 remote_connection: None,
-            },
+            }),
             window,
             cx,
         );
@@ -8459,7 +8524,7 @@ async fn test_activate_archived_thread_cwd_fallback_with_matching_workspace(
     // No thread saved to the store – cwd is the only path hint.
     sidebar.update_in(cx, |sidebar, window, cx| {
         sidebar.open_thread_from_archive(
-            ThreadMetadata {
+            Arc::new(ThreadMetadata {
                 thread_id: ThreadId::new(),
                 session_id: Some(acp::SessionId::new(Arc::from("unknown-session"))),
                 agent_id: agent::ZED_AGENT_ID.clone(),
@@ -8473,7 +8538,7 @@ async fn test_activate_archived_thread_cwd_fallback_with_matching_workspace(
                 ])),
                 archived: false,
                 remote_connection: None,
-            },
+            }),
             window,
             cx,
         );
@@ -8527,7 +8592,7 @@ async fn test_activate_archived_thread_no_paths_no_cwd_uses_active_workspace(
     // No saved thread, no cwd – should fall back to the active workspace.
     sidebar.update_in(cx, |sidebar, window, cx| {
         sidebar.open_thread_from_archive(
-            ThreadMetadata {
+            Arc::new(ThreadMetadata {
                 thread_id: ThreadId::new(),
                 session_id: Some(acp::SessionId::new(Arc::from("no-context-session"))),
                 agent_id: agent::ZED_AGENT_ID.clone(),
@@ -8539,7 +8604,7 @@ async fn test_activate_archived_thread_no_paths_no_cwd_uses_active_workspace(
                 worktree_paths: WorktreePaths::default(),
                 archived: false,
                 remote_connection: None,
-            },
+            }),
             window,
             cx,
         );
@@ -8585,7 +8650,7 @@ async fn test_activate_archived_thread_saved_paths_opens_new_workspace(cx: &mut 
 
     sidebar.update_in(cx, |sidebar, window, cx| {
         sidebar.open_thread_from_archive(
-            ThreadMetadata {
+            Arc::new(ThreadMetadata {
                 thread_id: ThreadId::new(),
                 session_id: Some(session_id.clone()),
                 agent_id: agent::ZED_AGENT_ID.clone(),
@@ -8597,7 +8662,7 @@ async fn test_activate_archived_thread_saved_paths_opens_new_workspace(cx: &mut 
                 worktree_paths: WorktreePaths::from_folder_paths(&path_list_b),
                 archived: false,
                 remote_connection: None,
-            },
+            }),
             window,
             cx,
         );
@@ -8642,7 +8707,7 @@ async fn test_activate_archived_thread_reuses_workspace_in_another_window(cx: &m
 
     sidebar.update_in(cx_a, |sidebar, window, cx| {
         sidebar.open_thread_from_archive(
-            ThreadMetadata {
+            Arc::new(ThreadMetadata {
                 thread_id: ThreadId::new(),
                 session_id: Some(session_id.clone()),
                 agent_id: agent::ZED_AGENT_ID.clone(),
@@ -8656,7 +8721,7 @@ async fn test_activate_archived_thread_reuses_workspace_in_another_window(cx: &m
                 )])),
                 archived: false,
                 remote_connection: None,
-            },
+            }),
             window,
             cx,
         );
@@ -8739,7 +8804,7 @@ async fn test_activate_archived_thread_reuses_workspace_in_another_window_with_t
     seed_thread_metadata(metadata.clone(), cx_a);
 
     sidebar_a.update_in(cx_a, |sidebar, window, cx| {
-        sidebar.open_thread_from_archive(metadata, window, cx);
+        sidebar.open_thread_from_archive(Arc::new(metadata), window, cx);
     });
     cx_a.run_until_parked();
 
@@ -8822,7 +8887,7 @@ async fn test_activate_archived_thread_prefers_current_window_for_matching_paths
     seed_thread_metadata(metadata.clone(), cx_a);
 
     sidebar_a.update_in(cx_a, |sidebar, window, cx| {
-        sidebar.open_thread_from_archive(metadata, window, cx);
+        sidebar.open_thread_from_archive(Arc::new(metadata), window, cx);
     });
     cx_a.run_until_parked();
 
@@ -9688,7 +9753,7 @@ async fn test_restore_worktree_thread_uses_main_repo_project_group_key(cx: &mut 
     // provisional ProjectGroupKey to find a matching workspace.
     let metadata = cx.update(|_window, cx| store.read(cx).entry(thread_id).unwrap().clone());
     sidebar.update_in(cx, |sidebar, window, cx| {
-        sidebar.open_thread_from_archive(metadata, window, cx);
+        sidebar.open_thread_from_archive(Arc::new(metadata), window, cx);
     });
     cx.run_until_parked();
 
@@ -10567,7 +10632,7 @@ async fn test_unarchive_only_shows_restored_thread(cx: &mut TestAppContext) {
     // Unarchive it — the draft should be replaced by the restored thread.
     let restored_title = metadata.display_title();
     sidebar.update_in(cx, |sidebar, window, cx| {
-        sidebar.open_thread_from_archive(metadata, window, cx);
+        sidebar.open_thread_from_archive(Arc::new(metadata), window, cx);
     });
     cx.run_until_parked();
 
@@ -10662,7 +10727,7 @@ async fn test_unarchive_first_thread_in_group_does_not_create_spurious_draft(
     });
 
     sidebar.update_in(cx, |sidebar, window, cx| {
-        sidebar.open_thread_from_archive(metadata, window, cx);
+        sidebar.open_thread_from_archive(Arc::new(metadata), window, cx);
     });
     cx.run_until_parked();
 
@@ -10748,7 +10813,7 @@ async fn test_unarchive_into_new_workspace_does_not_create_duplicate_real_thread
     });
 
     sidebar.update_in(cx, |sidebar, window, cx| {
-        sidebar.open_thread_from_archive(metadata, window, cx);
+        sidebar.open_thread_from_archive(Arc::new(metadata), window, cx);
     });
 
     cx.run_until_parked();
@@ -10892,7 +10957,7 @@ async fn test_unarchive_into_existing_workspace_replaces_draft(cx: &mut TestAppC
     });
 
     sidebar.update_in(cx, |sidebar, window, cx| {
-        sidebar.open_thread_from_archive(metadata, window, cx);
+        sidebar.open_thread_from_archive(Arc::new(metadata), window, cx);
     });
     cx.run_until_parked();
 
@@ -10978,7 +11043,7 @@ async fn test_unarchive_into_inactive_existing_workspace_does_not_leave_active_d
     });
 
     sidebar.update_in(cx, |sidebar, window, cx| {
-        sidebar.open_thread_from_archive(metadata, window, cx);
+        sidebar.open_thread_from_archive(Arc::new(metadata), window, cx);
     });
 
     let panel_b_before_settle = workspace_b.read_with(cx, |workspace, cx| {
@@ -11122,7 +11187,7 @@ async fn test_unarchive_after_removing_parent_project_group_restores_real_thread
     );
 
     sidebar.update_in(cx, |sidebar, window, cx| {
-        sidebar.open_thread_from_archive(archived_metadata.clone(), window, cx);
+        sidebar.open_thread_from_archive(Arc::new(archived_metadata.clone()), window, cx);
     });
     cx.run_until_parked();
 
@@ -11236,7 +11301,7 @@ async fn test_unarchive_does_not_create_duplicate_real_thread_metadata(cx: &mut 
     });
 
     sidebar.update_in(cx, |sidebar, window, cx| {
-        sidebar.open_thread_from_archive(metadata, window, cx);
+        sidebar.open_thread_from_archive(Arc::new(metadata), window, cx);
     });
     cx.run_until_parked();
 
@@ -11848,7 +11913,7 @@ async fn test_unarchive_linked_worktree_thread_into_project_group_shows_only_res
     });
 
     sidebar.update_in(cx, |sidebar, window, cx| {
-        sidebar.open_thread_from_archive(metadata, window, cx);
+        sidebar.open_thread_from_archive(Arc::new(metadata), window, cx);
     });
     cx.run_until_parked();
 
@@ -16325,7 +16390,7 @@ async fn test_thread_pr_chips_always_show_pr_state_for_branches(cx: &mut TestApp
     init_test(cx);
 
     let make_entry = |worktrees: Vec<ui::ThreadItemWorktreeInfo>| ThreadEntry {
-        metadata: ThreadMetadata {
+        metadata: Arc::new(ThreadMetadata {
             thread_id: ThreadId::new(),
             session_id: Some(acp::SessionId::new("session")),
             agent_id: agent::ZED_AGENT_ID.clone(),
@@ -16337,7 +16402,7 @@ async fn test_thread_pr_chips_always_show_pr_state_for_branches(cx: &mut TestApp
             worktree_paths: WorktreePaths::default(),
             remote_connection: None,
             archived: false,
-        },
+        }),
         icon: ui::IconName::ZedAgent,
         icon_from_external_svg: None,
         status: ui::AgentThreadStatus::Completed,
@@ -16405,7 +16470,7 @@ async fn test_draft_row_suppresses_project_branch_prs(cx: &mut TestAppContext) {
     init_test(cx);
 
     let make_entry = |draft: Option<DraftKind>| ThreadEntry {
-        metadata: ThreadMetadata {
+        metadata: Arc::new(ThreadMetadata {
             thread_id: ThreadId::new(),
             session_id: Some(acp::SessionId::new("session")),
             agent_id: agent::ZED_AGENT_ID.clone(),
@@ -16417,7 +16482,7 @@ async fn test_draft_row_suppresses_project_branch_prs(cx: &mut TestAppContext) {
             worktree_paths: WorktreePaths::default(),
             remote_connection: None,
             archived: false,
-        },
+        }),
         icon: ui::IconName::ZedAgent,
         icon_from_external_svg: None,
         status: ui::AgentThreadStatus::Completed,
@@ -16514,7 +16579,7 @@ async fn test_archived_thread_keeps_its_persisted_pr_badge(cx: &mut TestAppConte
     // to resolve and gh_status has nothing to query.
     let thread_id = ThreadId::new();
     let entry = ThreadEntry {
-        metadata: ThreadMetadata {
+        metadata: Arc::new(ThreadMetadata {
             thread_id,
             session_id: Some(acp::SessionId::new("archived")),
             agent_id: agent::ZED_AGENT_ID.clone(),
@@ -16526,7 +16591,7 @@ async fn test_archived_thread_keeps_its_persisted_pr_badge(cx: &mut TestAppConte
             worktree_paths: WorktreePaths::default(),
             remote_connection: None,
             archived: true,
-        },
+        }),
         icon: ui::IconName::ZedAgent,
         icon_from_external_svg: None,
         status: ui::AgentThreadStatus::Completed,
@@ -16603,7 +16668,7 @@ async fn test_archived_thread_keeps_its_persisted_pr_badge(cx: &mut TestAppConte
 fn test_a_worktree_archive_stops_once_nothing_is_left_to_archive(_cx: &mut TestAppContext) {
     let make_entry = |title: &str, archived: bool| {
         Arc::new(ThreadEntry {
-            metadata: ThreadMetadata {
+            metadata: Arc::new(ThreadMetadata {
                 thread_id: ThreadId::new(),
                 session_id: Some(acp::SessionId::new(title.to_string())),
                 agent_id: agent::ZED_AGENT_ID.clone(),
@@ -16615,7 +16680,7 @@ fn test_a_worktree_archive_stops_once_nothing_is_left_to_archive(_cx: &mut TestA
                 worktree_paths: WorktreePaths::default(),
                 remote_connection: None,
                 archived,
-            },
+            }),
             icon: ui::IconName::ZedAgent,
             icon_from_external_svg: None,
             status: ui::AgentThreadStatus::Completed,
@@ -16670,7 +16735,7 @@ fn test_a_worktree_archive_stops_once_nothing_is_left_to_archive(_cx: &mut TestA
 fn test_a_live_thread_does_not_pull_its_worktree_siblings_into_active(_cx: &mut TestAppContext) {
     let make_entry = |title: &str, folder: &str, is_live: bool| {
         Arc::new(ThreadEntry {
-            metadata: ThreadMetadata {
+            metadata: Arc::new(ThreadMetadata {
                 thread_id: ThreadId::new(),
                 session_id: Some(acp::SessionId::new(title.to_string())),
                 agent_id: agent::ZED_AGENT_ID.clone(),
@@ -16682,7 +16747,7 @@ fn test_a_live_thread_does_not_pull_its_worktree_siblings_into_active(_cx: &mut 
                 worktree_paths: WorktreePaths::default(),
                 remote_connection: None,
                 archived: false,
-            },
+            }),
             icon: ui::IconName::ZedAgent,
             icon_from_external_svg: None,
             status: ui::AgentThreadStatus::Completed,
@@ -16745,7 +16810,7 @@ fn test_a_live_thread_does_not_pull_its_worktree_siblings_into_active(_cx: &mut 
 fn test_archived_threads_go_to_their_own_bottom_section(_cx: &mut TestAppContext) {
     let make_entry = |title: &str, archived: bool, updated_at: DateTime<Utc>| {
         Arc::new(ThreadEntry {
-            metadata: ThreadMetadata {
+            metadata: Arc::new(ThreadMetadata {
                 thread_id: ThreadId::new(),
                 session_id: Some(acp::SessionId::new(title.to_string())),
                 agent_id: agent::ZED_AGENT_ID.clone(),
@@ -16757,7 +16822,7 @@ fn test_archived_threads_go_to_their_own_bottom_section(_cx: &mut TestAppContext
                 worktree_paths: WorktreePaths::default(),
                 remote_connection: None,
                 archived,
-            },
+            }),
             icon: ui::IconName::ZedAgent,
             icon_from_external_svg: None,
             status: ui::AgentThreadStatus::Completed,
@@ -16817,7 +16882,7 @@ fn test_archived_threads_go_to_their_own_bottom_section(_cx: &mut TestAppContext
 fn test_active_rows_follow_the_tab_order(_cx: &mut TestAppContext) {
     let make_entry = |title: &str, folder: &str, minutes_old: i64| {
         Arc::new(ThreadEntry {
-            metadata: ThreadMetadata {
+            metadata: Arc::new(ThreadMetadata {
                 thread_id: ThreadId::new(),
                 session_id: Some(acp::SessionId::new(title.to_string())),
                 agent_id: agent::ZED_AGENT_ID.clone(),
@@ -16829,7 +16894,7 @@ fn test_active_rows_follow_the_tab_order(_cx: &mut TestAppContext) {
                 worktree_paths: WorktreePaths::default(),
                 remote_connection: None,
                 archived: false,
-            },
+            }),
             icon: ui::IconName::ZedAgent,
             icon_from_external_svg: None,
             status: ui::AgentThreadStatus::Completed,
@@ -16925,7 +16990,7 @@ fn test_active_rows_follow_the_tab_order(_cx: &mut TestAppContext) {
 fn test_a_thread_is_in_active_or_in_all_threads_but_not_both(_cx: &mut TestAppContext) {
     let make_entry = |title: &str, minutes_old: i64| {
         Arc::new(ThreadEntry {
-            metadata: ThreadMetadata {
+            metadata: Arc::new(ThreadMetadata {
                 thread_id: ThreadId::new(),
                 session_id: Some(acp::SessionId::new(title.to_string())),
                 agent_id: agent::ZED_AGENT_ID.clone(),
@@ -16937,7 +17002,7 @@ fn test_a_thread_is_in_active_or_in_all_threads_but_not_both(_cx: &mut TestAppCo
                 worktree_paths: WorktreePaths::default(),
                 remote_connection: None,
                 archived: false,
-            },
+            }),
             icon: ui::IconName::ZedAgent,
             icon_from_external_svg: None,
             status: ui::AgentThreadStatus::Completed,
@@ -17303,7 +17368,7 @@ fn test_age_label_formats(_cx: &mut TestAppContext) {
 fn test_collapsing_a_worktree_leaves_the_rows_after_it_alone(cx: &mut TestAppContext) {
     let entry = |title: &str, solo: bool| {
         let mut thread = ThreadEntry {
-            metadata: ThreadMetadata {
+            metadata: Arc::new(ThreadMetadata {
                 thread_id: ThreadId::new(),
                 session_id: Some(acp::SessionId::new(Arc::from(title))),
                 agent_id: AgentId::new("zed-agent"),
@@ -17315,7 +17380,7 @@ fn test_collapsing_a_worktree_leaves_the_rows_after_it_alone(cx: &mut TestAppCon
                 interacted_at: None,
                 archived: false,
                 remote_connection: None,
-            },
+            }),
             icon: IconName::ZedAgent,
             icon_from_external_svg: None,
             status: AgentThreadStatus::Completed,
