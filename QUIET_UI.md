@@ -860,22 +860,7 @@ does is removed as it lands.
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
-**Two more places doing work per rebuild, found by reading rather than by using.**
-The 2026-09-08 run's slow pass fixed everything it could prove outright and left these two, each
-with the mechanism named so the next run can confirm it with the timing lines that run added rather
-than re-derive it:
-
-- `Sidebar::rebuild_contents` deep-clones every stored thread's `ThreadMetadata` and every stored
-  terminal's, once per rebuild, to build rows it then throws away on the next one. Hundreds of
-  stored threads means hundreds of metadata clones per rebuild, and a rebuild is asked for from
-  forty places. Handing rows out as `Arc`s from the store is the fix; it is a store change, so it
-  wants the new `quiet-ui perf: sidebar rebuilt` line to say how much of a rebuild this is first.
-- `resolve_workspace`, in the same rebuild, scans every open workspace for every stored thread and
-  compares `PathList`s. Small today because the number of open workspaces is small; quadratic in
-  the thing that grows.
-(A third candidate was checked and is not one: a running command's output is *not* rescanned per
-frame, because `Terminal::output` is only filled on exit. A fourth was real and is already fixed —
-see the row-rendering entry in that night's rebase log.)
+**Empty.** Nothing is waiting to be built.
 
 ## Verification queue
 
@@ -3592,3 +3577,89 @@ signed") while `apt-get install -y libasound2-dev` still succeeded off the cache
 disk allowance behaved as recorded: the release lint ran out of room with the debug test tree
 still on disk, `rm -rf target/debug` between the two passes fit comfortably, and the rebuild cost
 about ten minutes when the suites were re-run afterwards.
+
+**2026-09-15**: onto main 01c555b43 (22 upstream commits). Squash-then-rebase folded the standing
+squash and six follow-ups (last night's rebase-log commit and the five code commits from the 09-14
+run) into one, reusing the squash's own message; tree-identical to the old tip (`3a9d20954`)
+before rebasing.
+
+**Three files conflicted, from two upstream PRs, and no markerless drift at all.**
+`cargo check --workspace --all-targets` right after the replay came back clean on the first try,
+which has not happened before — worth recording, because it means the conflict count was the whole
+story this once rather than the usual half of it.
+
+`sidebar.rs` and `sidebar_tests.rs` both conflicted on #62883, which turns the threads-sidebar
+width into a setting. **This is the night's deletion: the fork's own `DEFAULT_WIDTH`, `MIN_WIDTH`
+and `MAX_WIDTH` constants are gone**, and the sidebar takes its width from
+`agent.threads_sidebar_default_width`, clamped by `agent_settings`' `THREADS_LIST_MIN_WIDTH` and
+`THREADS_LIST_MAX_WIDTH`. Upstream's shape is strictly better than the constants it replaces: only
+a user-dragged width is persisted, a legacy width other than the old 300-pixel default is still
+read as a manual resize, and the observer re-reads the setting live. The fork's own serialized
+state rides along unchanged — `collapsed_sections` stays, and the fork's removal of upstream's
+`active_view`/`SerializedSidebarView` and `NewEntryTarget` stands, since the merged history model
+has no separate archive view and no new-entry submenu. Upstream's five new width tests came with
+it and are kept.
+
+A note for the next run, because this one nearly got it wrong: `crates/sidebar` is an **upstream**
+crate that the fork edits heavily, not a fork-owned one. The rebase log's "a conflict inside a file
+only this branch edits is a same-branch replay artifact" does not apply to it, and treating a
+`sidebar.rs` conflict as a replay artifact would have thrown upstream's change away wholesale.
+
+`thread_view.rs` conflicted on #64163, which is one line: the terminal tool-call output box
+switches from `editor_background` to `terminal_background`, because an editor-coloured margin above
+a terminal that paints its own background shows as a light band over a dark terminal. The conflict
+itself resolves to ours — the fork deleted that whole card container in favour of its one-line row
+and left rail, so there was nothing there to recolour. But **the bug upstream fixed is the fork's
+too**: the fork wraps the terminal view in its own `div()` with `editor_background`, with the same
+mismatch. That box is `terminal_background` now. The fork already had the `overflow_hidden()` half
+of upstream's fix, so only the colour moved.
+
+Nothing else upstream grew this round that the fork duplicates. Checked specifically: #64083's
+version-control colours for diff stats land in `ui`'s `DiffStat`, which the fork's `thread_item`
+already consumes rather than reimplements, so that improvement arrives for free.
+
+**Built tonight: the Work queue's only entry, both halves.**
+
+- *A rebuild shares the store's rows instead of copying them.* `Sidebar::rebuild_contents`
+  deep-cloned every stored thread's `ThreadMetadata` and every stored terminal's, once per rebuild,
+  to build rows it threw away on the next one — and a rebuild is asked for from forty places. Both
+  metadata stores hold their rows as `Arc`s now and hand those out, so a rebuild costs a refcount
+  bump per row instead of a deep clone. The rows that genuinely rewrite what they read go through
+  `Arc::make_mut` — a live thread taking its title from the running session
+  (`apply_active_info`), a draft taking its derived label — so the copy is paid by the few rows
+  that need it rather than by all of them. The `Arc` runs the whole way through the row's life:
+  `ThreadEntry`, `TerminalEntry`, `ActivatableEntry`, the thread switcher's entries and the
+  activation paths all carry the shared row, so nothing copies it back out at the other end.
+  `ThreadMetadataStore::entry_arc` is the one new accessor; the terminal store did not need its
+  twin, so it does not have one.
+- *`resolve_workspace` is keyed rather than scanned.* It scanned every open workspace for every
+  stored thread and compared `PathList`s; it is a `HashMap<PathList, Vec<…>>` lookup now. Small
+  today, as the entry said, but it was the quadratic one. Order is preserved: a key collision can
+  only be two workspaces with identical path lists, and the `Vec` under the key keeps the order
+  `workspaces` had, so the remote-identity tiebreak still picks what the scan picked.
+
+  The entry asked for the `quiet-ui perf: sidebar rebuilt` numbers before the store change, and
+  those still cannot come from this sandbox (no macOS, no display). It was built anyway rather than
+  deferred a third night: the entry named the fix outright, the fix is behaviour-preserving, and
+  the measurement would only have sized a win, not chosen between designs. What the numbers were
+  wanted for is still worth reading in a morning's log.
+
+  Tested by the thing the change is actually about: `test_stored_rows_share_the_store_allocation`
+  asserts `Arc::ptr_eq` between the store's row and the sidebar row built from it, then rebuilds
+  and asserts it again — the second rebuild being the one that matters, since the cost this removes
+  was per-rebuild. A regression that reintroduces a copy fails it.
+
+**The gate.** `cargo test -p acp_thread -p agent_ui -p sidebar`: 241 + 460 (32 intentionally
+`#[ignore]`d) + 180 passed, 0 failed. `sidebar` is up one, tonight's. `script/clippy -p acp_thread
+-p agent_ui -p sidebar` (release, all targets, all features) clean, and so is
+`cargo check --workspace --all-targets`. The Verification queue was empty going in and is empty
+going out. Nothing failed on the way — no upstream expectation needed adapting this round, which
+follows from there being no markerless drift.
+
+Environment: the prerequisites needed reapplying in this fresh container as always
+(`CARGO_NET_GIT_FETCH_WITH_CLI=true`, `libasound2-dev`). `apt-get update` failed again on the two
+third-party PPAs baked into the image (`deadsnakes` and `ondrej`, 403 and "no longer signed") and
+`apt-get install -y libasound2-dev` again succeeded off the cached lists, so the standing advice
+holds: the update's failure is noise, only an install failure is worth acting on. The disk
+allowance behaved exactly as recorded — the debug test tree left 6.0G free, which will not start a
+release build; `rm -rf target/debug` freed 27G and the lint then fit.
