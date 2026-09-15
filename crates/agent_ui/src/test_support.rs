@@ -315,21 +315,6 @@ pub fn draft_prompt_text(panel: &Entity<AgentPanel>, cx: &VisualTestContext) -> 
     editor.read_with(cx, |editor, cx| editor.text(cx))
 }
 
-/// Sends whatever is in the active draft's composer, the way Enter does. For
-/// an unstarted draft this is the moment the agent (and worktree) is created.
-pub fn send_draft(panel: &Entity<AgentPanel>, cx: &mut VisualTestContext) {
-    let message_editor = draft_message_editor(panel, cx);
-    let thread_view = panel.read_with(cx, |panel, cx| panel.active_thread_view(cx));
-    if let Some(thread_view) = thread_view {
-        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
-    } else {
-        message_editor.update(cx, |_editor, cx| {
-            cx.emit(crate::message_editor::MessageEditorEvent::Send)
-        });
-    }
-    cx.run_until_parked();
-}
-
 pub fn type_draft_prompt(panel: &Entity<AgentPanel>, text: &str, cx: &mut VisualTestContext) {
     // An unstarted draft owns its composer directly; a started thread's
     // composer lives on the thread view.

@@ -3649,8 +3649,20 @@ already consumes rather than reimplements, so that improvement arrives for free.
   and asserts it again — the second rebuild being the one that matters, since the cost this removes
   was per-rebuild. A regression that reintroduces a copy fails it.
 
+**The deletion pass, run again because a week of fork code had landed since the last one.** The
+queue emptied with most of the night left, so the 09-08 sweep was repeated on what the 09-13 and
+09-14 runs added: every `pub fn` the fork defines, in its thirteen own modules and in its additions
+to upstream's files (152 of them), swept for callers. One came back with none — `send_draft` in
+`agent_ui`'s `test_support`, a fork-added helper for sending an unstarted draft the way Enter does,
+fourteen lines, now gone. `draft_message_editor` and `draft_prompt_text` sit beside it and both
+still have callers, so they stay. Tonight's own work was caught by the same reflex before it
+landed: the terminal store got an `entry_arc` twin of the thread store's new one, nothing needed
+it, and it went in the same commit rather than waiting for the next sweep. The 09-08 entry's point
+stands — a `pub` item with no callers raises no warning, so this only ever gets found by looking.
+
 **The gate.** `cargo test -p acp_thread -p agent_ui -p sidebar`: 241 + 460 (32 intentionally
-`#[ignore]`d) + 180 passed, 0 failed. `sidebar` is up one, tonight's. `script/clippy -p acp_thread
+`#[ignore]`d) + 180 passed, 0 failed. Run twice, once for the rebuild work and again after the
+deletion, with identical counts both times. `sidebar` is up one, tonight's. `script/clippy -p acp_thread
 -p agent_ui -p sidebar` (release, all targets, all features) clean, and so is
 `cargo check --workspace --all-targets`. The Verification queue was empty going in and is empty
 going out. Nothing failed on the way — no upstream expectation needed adapting this round, which
