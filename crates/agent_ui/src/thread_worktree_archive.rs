@@ -796,6 +796,7 @@ pub async fn restore_worktree_via_git(
             &wt_repo,
             worktree_path,
             remote_connection,
+            false,
             cx,
         )
         .await;
@@ -1577,6 +1578,7 @@ mod tests {
                 worktree_path,
                 None,
                 actual_created_at + Duration::from_secs(1),
+                false,
                 cx,
             )
         })

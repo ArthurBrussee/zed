@@ -855,8 +855,10 @@ impl AcpConnection {
         let stdout = child.stdout.take().context("Failed to take stdout")?;
         let stdin = child.stdin.take().context("Failed to take stdin")?;
         let stderr = child.stderr.take().context("Failed to take stderr")?;
-        log::debug!("Spawning external agent server: {:?}, {:?}", path, args);
-        log::trace!("Spawned (pid: {})", child.id());
+        // The steps of a launch are logged as they are passed, so a launch
+        // that stops says where rather than needing a process sample to rule
+        // out a deadlock. This is the last one before the agent answers.
+        log::info!("quiet-ui launch: spawned {path} (pid {}) {args:?}", child.id());
 
         let sessions = Rc::new(RefCell::new(HashMap::default()));
         let debug_log = AcpDebugLog::default();
@@ -1725,6 +1727,17 @@ impl AgentConnection for AcpConnection {
 
     fn supports_load_session(&self) -> bool {
         self.agent_capabilities.load_session
+    }
+
+    fn loading_thread(
+        &self,
+        session_id: &acp::SessionId,
+        _cx: &App,
+    ) -> Option<Entity<AcpThread>> {
+        self.sessions
+            .borrow()
+            .get(session_id)
+            .and_then(|session| session.thread.upgrade())
     }
 
     fn supports_resume_session(&self) -> bool {

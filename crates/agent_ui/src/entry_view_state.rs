@@ -48,6 +48,7 @@ pub struct EntryViewState {
     user_toggled_thinking_blocks: HashSet<(usize, usize)>,
     expanded_compactions: HashSet<usize>,
     expanded_tool_calls: HashSet<acp::ToolCallId>,
+    user_collapsed_tool_calls: HashSet<acp::ToolCallId>,
 }
 
 impl EntryViewState {
@@ -70,6 +71,7 @@ impl EntryViewState {
             user_toggled_thinking_blocks: HashSet::default(),
             expanded_compactions: HashSet::default(),
             expanded_tool_calls: HashSet::default(),
+            user_collapsed_tool_calls: HashSet::default(),
         }
     }
 
@@ -91,6 +93,26 @@ impl EntryViewState {
         }
     }
 
+    /// Whether the user explicitly collapsed this tool call, overriding any
+    /// auto-expansion (e.g. a failed terminal command opening its output).
+    pub(crate) fn is_tool_call_user_collapsed(&self, tool_call_id: &acp::ToolCallId) -> bool {
+        self.user_collapsed_tool_calls.contains(tool_call_id)
+    }
+
+    pub(crate) fn set_tool_call_expanded(
+        &mut self,
+        tool_call_id: &acp::ToolCallId,
+        expanded: bool,
+    ) {
+        if expanded {
+            self.expanded_tool_calls.insert(tool_call_id.clone());
+            self.user_collapsed_tool_calls.remove(tool_call_id);
+        } else {
+            self.expanded_tool_calls.remove(tool_call_id);
+            self.user_collapsed_tool_calls.insert(tool_call_id.clone());
+        }
+    }
+
     pub(crate) fn is_compaction_expanded(&self, entry_ix: usize) -> bool {
         self.expanded_compactions.contains(&entry_ix)
     }
@@ -107,10 +129,6 @@ impl EntryViewState {
 
     pub(crate) fn clear_auto_expand_tracking(&mut self) {
         self.auto_expanded_thinking_block = None;
-    }
-
-    pub(crate) fn is_auto_expanded_thinking_block(&self, key: (usize, usize)) -> bool {
-        self.auto_expanded_thinking_block == Some(key)
     }
 
     pub(crate) fn auto_expand_streaming_thought(&mut self, thread: &AcpThread, cx: &App) -> bool {
@@ -154,6 +172,10 @@ impl EntryViewState {
         false
     }
 
+    // Thoughts no longer expand in the transcript (their full text is a hover
+    // card), so nothing in production toggles them; the thread-search test still
+    // drives this to assert expanded thinking content is searchable.
+    #[cfg(test)]
     pub(crate) fn toggle_thinking_block_expansion(&mut self, key: (usize, usize), cx: &App) {
         match AgentSettings::get_global(cx).thinking_display {
             ThinkingBlockDisplay::Auto => {
@@ -240,7 +262,9 @@ impl EntryViewState {
                 let can_rewind = thread.read(cx).supports_truncate(cx);
                 let has_client_id = message.client_id.is_some();
                 let is_subagent = thread.read(cx).parent_session_id().is_some();
-                let chunks = message.chunks.clone();
+                // Attached review comments render as a chip next to the
+                // message, not as the wall of quoted diff they compose into.
+                let chunks = crate::diff_review::without_review_blocks(message.chunks.clone());
                 if let Some(Entry::UserMessage(editor)) = self.entries.get_mut(index) {
                     if !editor.focus_handle(cx).is_focused(window) {
                         // Only update if we are not editing.
@@ -268,6 +292,10 @@ impl EntryViewState {
                         if !can_rewind || !has_client_id || is_subagent {
                             editor.set_read_only(true, cx);
                         }
+                        // The editor sits inside the accent-tinted message
+                        // bubble; its own background would paint over the
+                        // tint.
+                        editor.set_transparent_background(true, cx);
                         editor.set_message(chunks, window, cx);
                         editor
                     });
@@ -691,7 +719,7 @@ fn create_editor_diff(
     })
 }
 
-fn diff_editor_text_style_refinement(cx: &mut App) -> TextStyleRefinement {
+pub(crate) fn diff_editor_text_style_refinement(cx: &mut App) -> TextStyleRefinement {
     TextStyleRefinement {
         font_size: Some(
             TextSize::Small
