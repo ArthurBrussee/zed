@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+#
+# Installs the latest quiet-ui build into /Applications.
+#
+# The nightly build publishes to a release at a fixed tag, so this needs no
+# arguments and never needs updating: it always fetches whatever that tag holds.
+# Run it again whenever you want the newer one.
+
+set -euo pipefail
+
+URL=https://github.com/ArthurBrussee/zed/releases/download/quiet-ui-latest/Zed-quiet-ui.dmg
+
+work=$(mktemp -d)
+mount="$work/mnt"
+mkdir "$mount"
+cleanup() {
+    hdiutil detach -quiet "$mount" >/dev/null 2>&1 || true
+    rm -rf "$work"
+}
+trap cleanup EXIT
+
+echo "Downloading the latest quiet-ui build"
+curl -fL --progress-bar -o "$work/Zed-quiet-ui.dmg" "$URL"
+
+hdiutil attach -quiet -nobrowse -readonly -mountpoint "$mount" "$work/Zed-quiet-ui.dmg"
+app=$(find "$mount" -maxdepth 1 -name "*.app" | head -1)
+if [ -z "$app" ]; then
+    echo "No application in the disk image" >&2
+    exit 1
+fi
+name=$(basename "$app")
+
+# Replaced rather than merged: copying over a previous install leaves whatever
+# files this build no longer ships.
+echo "Installing $name"
+rm -rf "/Applications/$name"
+cp -R "$app" "/Applications/$name"
+
+# The build is signed ad-hoc rather than with an Apple identity, so macOS
+# refuses it if it arrives carrying a quarantine flag. curl does not set one
+# (only the applications that download on your behalf do, browsers among them),
+# so this matters when the dmg came from clicking the release link.
+xattr -dr com.apple.quarantine "/Applications/$name" 2>/dev/null || true
+
+echo "Installed /Applications/$name"

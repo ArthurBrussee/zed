@@ -99,6 +99,7 @@ dependencies = [
  "feature_flags",
  "file_icons",
  "futures 0.3.34",
+ "git",
  "gpui",
  "http_proxy",
  "image",
@@ -490,7 +491,9 @@ dependencies = [
  "fs",
  "futures 0.3.34",
  "fuzzy",
+ "gh_status",
  "git",
+ "git_ui",
  "git_ui_core",
  "gpui",
  "gpui_tokio",
@@ -7084,6 +7087,21 @@ dependencies = [
  "heck 0.5.0",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "gh_status"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "futures 0.3.34",
+ "gpui",
+ "log",
+ "serde",
+ "serde_json",
+ "ui",
+ "util",
 ]
 
 [[package]]
@@ -16959,8 +16977,8 @@ dependencies = [
  "db",
  "editor",
  "extension",
- "feature_flags",
  "fs",
+ "gh_status",
  "git",
  "git_ui_core",
  "gpui",
@@ -22975,6 +22993,7 @@ dependencies = [
  "file_finder",
  "fs",
  "futures 0.3.34",
+ "gh_status",
  "git",
  "git_hosting_providers",
  "git_ui",

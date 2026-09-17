@@ -17,6 +17,13 @@ use crate::{
     worktree_store::WorktreeStore,
 };
 
+/// How long a directory's shell may take to print its environment before the
+/// capture gives up on it. The answer is cached for the life of the process,
+/// so a login shell that never returns is not one slow launch: it is every
+/// later one joining a task that will never finish, with nothing in the log to
+/// say so.
+const SHELL_ENVIRONMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
 pub struct ProjectEnvironment {
     cli_environment: Option<HashMap<String, String>>,
     local_environments: HashMap<(Shell, Arc<Path>), Shared<Task<Option<HashMap<String, String>>>>>,
@@ -210,19 +217,35 @@ impl ProjectEnvironment {
                 let shell = shell.clone();
                 let tx = self.environment_error_messages_tx.clone();
                 cx.spawn(async move |cx| {
-                    let mut shell_env = match cx
+                    let mut capture = cx
                         .background_spawn(load_directory_shell_environment(
                             shell,
                             abs_path.clone(),
                             load_direnv,
                             tx,
                         ))
-                        .await
-                    {
-                        Ok(shell_env) => Some(shell_env),
-                        Err(e) => {
+                        .fuse();
+                    let mut timeout = cx
+                        .background_executor()
+                        .timer(SHELL_ENVIRONMENT_TIMEOUT)
+                        .fuse();
+                    let captured = futures::select_biased! {
+                        captured = capture => Some(captured),
+                        _ = timeout => None,
+                    };
+                    let mut shell_env = match captured {
+                        Some(Ok(shell_env)) => Some(shell_env),
+                        Some(Err(e)) => {
                             log::error!(
                                 "Failed to load shell environment for directory {abs_path:?}: {e:#}"
+                            );
+                            None
+                        }
+                        None => {
+                            log::error!(
+                                "Gave up loading the shell environment for {abs_path:?} after {}s; \
+                                 continuing without it",
+                                SHELL_ENVIRONMENT_TIMEOUT.as_secs()
                             );
                             None
                         }
