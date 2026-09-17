@@ -860,6 +860,28 @@ does is removed as it lands.
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**Tighter tabs, and no separate spinner in the tab bar.**
+Thread tabs are bigger than they need to be and a running one wears a spinner as a third element
+beside its agent icon and title. Make the titles smaller, cut the spacing, and let the tab itself
+show that it is running instead of adding a glyph to say so.
+
+What the tab draws today (`ThreadTab::tab_content`, `crates/agent_ui/src/thread_tab.rs:362`): an
+`h_flex` with `gap_1p5`, the agent icon at `IconSize::Small`, then an indicator, then the title at
+`Label`'s default size. `render_tab_indicator` (`:67`) returns the shared
+`agent_running_indicator` for a running thread and a 6px dot for attention or unread.
+
+Two changes. Take a size down on the title and tighten the gap, so a tab is the width of its name
+rather than of its decorations. Then replace the running case in `render_tab_indicator` with
+something that belongs to the tab rather than sitting inside it: the highlight is yours to choose,
+and the thing to avoid is a second animated glyph in a row of tabs, which is what makes a busy tab
+bar hard to read. The attention and unread dots stay as they are: they are small and they mean
+different things.
+
+Leave the sidebar's spinner alone. That one is becoming an activity pill with counts in it, which is
+a different job: the sidebar is where you look to find work, the tab bar is where you are already
+looking.
+
+
 **Empty.** Nothing is waiting to be built.
 
 ## Verification queue
