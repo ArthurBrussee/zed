@@ -1272,6 +1272,11 @@ impl ThreadView {
         let mut segments: Vec<AnyElement> = Vec::new();
         let mut row: Vec<AnyElement> = Vec::new();
         let mut any_chip = false;
+        // A multi-file edit draws a chip per file, and working out which files
+        // a call touched reads every diff it carries and builds a path from
+        // each. Asked once per chip that is once per file per file, on every
+        // frame the run is on screen; a call's files cannot change within one.
+        let mut edited_files: HashMap<usize, Vec<EditedFile>> = HashMap::default();
         let flush_row = |segments: &mut Vec<AnyElement>, row: &mut Vec<AnyElement>| {
             if !row.is_empty() {
                 segments.push(
@@ -1356,7 +1361,10 @@ impl ThreadView {
                     let Some(AgentThreadEntry::ToolCall(tool_call)) = entries.get(entry_ix) else {
                         continue;
                     };
-                    let Some(file) = Self::edited_files(tool_call, cx).get(file_ix).cloned() else {
+                    let files = edited_files
+                        .entry(entry_ix)
+                        .or_insert_with(|| Self::edited_files(tool_call, cx));
+                    let Some(file) = files.get(file_ix).cloned() else {
                         continue;
                     };
                     // Edit chips do not expand inline: hover shows the diff, a
