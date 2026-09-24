@@ -877,12 +877,64 @@ struct ChipCache {
     /// path in the background and the answer kept for as long as the view is.
     image_shapes: RefCell<HashMap<std::path::PathBuf, ImageShape>>,
     /// Answers that hold for the length of one frame, thrown away at the start
-    /// of the next: the style chips are drawn in, and which entries are chips.
-    /// Both are asked for once per visible entry, and the run each entry
-    /// belongs to is found by scanning its neighbours, so the same questions
-    /// come back many times over within a single frame.
+    /// of the next: the style chips are drawn in, which entries are chips, and
+    /// the run each one belongs to. All three are asked for once per visible
+    /// entry, so the same questions come back many times over within a single
+    /// frame.
     frame_style: RefCell<Option<MarkdownStyle>>,
     frame_chip_entries: RefCell<Vec<Option<bool>>>,
+    frame_runs: RefCell<Vec<RunMemo>>,
+}
+
+/// The maximal run of chip entries containing `entry_ix`, inclusive, or `None`
+/// when that entry is not a chip.
+///
+/// Records what it learns for every entry in the run, not just the one asked
+/// about: each entry the list draws asks for its own run, and without this a
+/// run of N entries is walked N times for one frame's worth of answers.
+fn find_run(
+    entry_ix: usize,
+    len: usize,
+    is_chip: impl Fn(usize) -> bool,
+    memo: &mut [RunMemo],
+) -> Option<(usize, usize)> {
+    if !is_chip(entry_ix) {
+        memo[entry_ix] = RunMemo::NotAChip;
+        return None;
+    }
+    let mut start = entry_ix;
+    while start > 0 && is_chip(start - 1) {
+        start -= 1;
+    }
+    let mut end = entry_ix;
+    while end + 1 < len && is_chip(end + 1) {
+        end += 1;
+    }
+    // The entries that stopped the walk are not chips, and saying so here
+    // saves the two entries flanking every run a walk of their own.
+    if start > 0 {
+        memo[start - 1] = RunMemo::NotAChip;
+    }
+    if end + 1 < len {
+        memo[end + 1] = RunMemo::NotAChip;
+    }
+    for ix in start..=end {
+        memo[ix] = RunMemo::Run { start, end };
+    }
+    Some((start, end))
+}
+
+/// What is known about the run an entry belongs to, within one frame.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+enum RunMemo {
+    #[default]
+    Unknown,
+    NotAChip,
+    /// The maximal run of chip entries this one sits in, inclusive.
+    Run {
+        start: usize,
+        end: usize,
+    },
 }
 
 /// What is known about the shape of a picture on disk.
@@ -970,6 +1022,7 @@ impl ChipCache {
     fn begin_frame(&self) {
         self.frame_style.borrow_mut().take();
         self.frame_chip_entries.borrow_mut().clear();
+        self.frame_runs.borrow_mut().clear();
     }
 
     /// The style chip labels are drawn in, built once for the frame.
@@ -9477,9 +9530,20 @@ impl ThreadView {
             return None;
         }
         let entries = &entries[..visible];
-        // Every entry the list draws asks this, and answering means walking to
-        // both ends of its run, so a long run tests the same entries once per
-        // entry it contains. Within a frame the answers cannot change.
+
+        // Every entry the list draws asks this, so within a frame the whole
+        // run is answered the first time any of it is, rather than walked
+        // again for each entry it contains.
+        let mut runs = self.chip_cache.frame_runs.borrow_mut();
+        if runs.len() < entries.len() {
+            runs.resize(entries.len(), RunMemo::Unknown);
+        }
+        match runs[entry_ix] {
+            RunMemo::NotAChip => return None,
+            RunMemo::Run { start, end } => return Some(Self::chunk_of_run(start, end, entry_ix)),
+            RunMemo::Unknown => {}
+        }
+
         let is_chip = |ix: usize| -> bool {
             let mut flags = self.chip_cache.frame_chip_entries.borrow_mut();
             if flags.len() < entries.len() {
@@ -9495,17 +9559,7 @@ impl ThreadView {
             }
         };
 
-        if !is_chip(entry_ix) {
-            return None;
-        }
-        let mut start = entry_ix;
-        while start > 0 && is_chip(start - 1) {
-            start -= 1;
-        }
-        let mut end = entry_ix;
-        while end + 1 < entries.len() && is_chip(end + 1) {
-            end += 1;
-        }
+        let (start, end) = find_run(entry_ix, entries.len(), is_chip, &mut runs)?;
         Some(Self::chunk_of_run(start, end, entry_ix))
     }
 
@@ -15918,6 +15972,47 @@ mod tests {
             indented: false,
             is_subagent_output: false,
         })
+    }
+
+    #[test]
+    fn a_run_is_walked_once_a_frame_however_many_of_it_is_drawn() {
+        //          0     1     2     3     4     5     6     7
+        let chips = [false, true, true, true, false, true, false, false];
+        let asked = std::cell::RefCell::new(Vec::new());
+        let is_chip = |ix: usize| {
+            asked.borrow_mut().push(ix);
+            chips[ix]
+        };
+
+        let mut memo = vec![RunMemo::Unknown; chips.len()];
+        assert_eq!(find_run(2, chips.len(), &is_chip, &mut memo), Some((1, 3)));
+
+        // The walk answered its whole run, and the entries that stopped it.
+        assert_eq!(memo[0], RunMemo::NotAChip);
+        assert_eq!(memo[4], RunMemo::NotAChip);
+        for ix in 1..=3 {
+            assert_eq!(memo[ix], RunMemo::Run { start: 1, end: 3 });
+        }
+        // Nothing beyond what it had to touch.
+        assert_eq!(memo[5], RunMemo::Unknown);
+
+        // Every entry of the run agrees with a walk of its own, which is what
+        // the memo stands in for.
+        asked.borrow_mut().clear();
+        for ix in 1..=3 {
+            let mut fresh = vec![RunMemo::Unknown; chips.len()];
+            assert_eq!(find_run(ix, chips.len(), &is_chip, &mut fresh), Some((1, 3)));
+        }
+
+        // A run of one, and a run that ends at the last entry.
+        let mut memo = vec![RunMemo::Unknown; chips.len()];
+        assert_eq!(find_run(5, chips.len(), &is_chip, &mut memo), Some((5, 5)));
+        assert_eq!(find_run(0, chips.len(), &is_chip, &mut memo), None);
+        assert_eq!(memo[0], RunMemo::NotAChip);
+
+        let all = [true, true, true];
+        let mut memo = vec![RunMemo::Unknown; all.len()];
+        assert_eq!(find_run(1, all.len(), |ix| all[ix], &mut memo), Some((0, 2)));
     }
 
     #[gpui::test]

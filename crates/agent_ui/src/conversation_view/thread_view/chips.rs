@@ -687,8 +687,10 @@ impl ThreadView {
     /// below it.
     pub(crate) fn drawn_item_for_entry(&self, entry_ix: usize, cx: &App) -> usize {
         // Called between frames, when an entry has just changed: the frame's
-        // memo of which entries are chips was built before that change.
+        // memos of which entries are chips, and of the runs they form, were
+        // both built before that change.
         self.chip_cache.frame_chip_entries.borrow_mut().clear();
+        self.chip_cache.frame_runs.borrow_mut().clear();
         self.action_run_bounds(entry_ix, cx)
             .map_or(entry_ix, |(run_start, _)| run_start)
     }
