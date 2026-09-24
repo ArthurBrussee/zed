@@ -31,6 +31,9 @@ const LIST_THRESHOLD: usize = 3;
 
 /// The pull requests named in a message or a command's output, in the order
 /// they appear and without repeats.
+///
+/// The text must be finished. For text that is still arriving, see
+/// [`pr_mentions_so_far`].
 pub fn pr_mentions(text: &str) -> Vec<PrMention> {
     let mut found: Vec<PrMention> = Vec::new();
     let mut searched = 0;
@@ -75,7 +78,42 @@ pub fn creates_pull_request(command: &str) -> bool {
         })
 }
 
+/// The pull requests named so far in text that is still being written.
+///
+/// A URL that runs to the very end of what has arrived is not a mention yet:
+/// the next chunk may extend it, and every number a URL passes through on its
+/// way is itself a valid pull request. A chunk boundary inside
+/// `.../pull/15700` mines `157`, the pass after it mines `15700`, and both
+/// land in the set — which is how `#157` appeared beside `#15700`.
+pub fn pr_mentions_so_far(text: &str) -> Vec<PrMention> {
+    pr_mentions(&text[..unfinished_url_start(text).unwrap_or(text.len())])
+}
+
+/// Where the URL the text ends inside begins, if it ends inside one. A span
+/// that nothing has closed — no whitespace, no delimiter — is one the writer
+/// has not finished.
+fn unfinished_url_start(text: &str) -> Option<usize> {
+    let mut searched = 0;
+    let mut last_host = None;
+    while let Some(offset) = text[searched..].find(HOST) {
+        let host_at = searched + offset;
+        searched = host_at + HOST.len();
+        if host_is_its_own_word(&text[..host_at]) {
+            last_host = Some(host_at);
+        }
+    }
+    let host_at = last_host?;
+    let closed = text[host_at + HOST.len()..].contains(is_url_end);
+    (!closed).then_some(host_at)
+}
+
 const HOST: &str = "github.com/";
+
+/// What ends a URL: the first character that cannot be in one.
+fn is_url_end(c: char) -> bool {
+    const DELIMITERS: &str = "\"'<>()[]{}`,;|";
+    c.is_whitespace() || DELIMITERS.contains(c)
+}
 
 /// Whether the text before `github.com/` leaves it a host rather than the
 /// tail of some other word: a scheme's `//`, `www.`, or nothing at all.
@@ -92,10 +130,7 @@ fn host_is_its_own_word(before: &str) -> bool {
 /// to the first character that cannot be in one, which is what finds it inside
 /// a markdown link or before a sentence's full stop.
 fn pr_mention_after_host(after: &str) -> Option<PrMention> {
-    const DELIMITERS: &str = "\"'<>()[]{}`,;|";
-    let span_end = after
-        .find(|c: char| c.is_whitespace() || DELIMITERS.contains(c))
-        .unwrap_or(after.len());
+    let span_end = after.find(is_url_end).unwrap_or(after.len());
     let mut parts = after[..span_end].split('/');
 
     let owner = parts.next()?;
@@ -134,6 +169,59 @@ mod tests {
             repo: repo.into(),
             number,
         }
+    }
+
+    /// The case from the report: adding #15700 also added #157.
+    ///
+    /// A message arriving in chunks is read on every pass, and the numbers a
+    /// URL passes through on its way are all valid pull requests, so a chunk
+    /// boundary inside one mines a shorter PR that nobody ever named.
+    #[test]
+    fn test_a_url_still_arriving_is_not_a_mention_yet() {
+        let whole = "Opened https://github.com/zed-industries/zed/pull/15700";
+        // Every prefix of the message, as the chunks would deliver it.
+        for split in 0..whole.len() {
+            let so_far = &whole[..split];
+            assert_eq!(
+                pr_mentions_so_far(so_far),
+                Vec::new(),
+                "{so_far:?} names no finished pull request"
+            );
+        }
+        // Including the whole message: nothing has closed the URL, so as far
+        // as this can tell the next chunk may still extend it. It is the
+        // entry finishing that settles it, and a finished entry is read with
+        // `pr_mentions`, which names the one it actually says.
+        assert_eq!(pr_mentions_so_far(whole), Vec::new());
+        assert_eq!(pr_mentions(whole), vec![mention("zed-industries/zed", 15700)]);
+
+        // A URL something has closed is finished even with more to come: the
+        // chips should not wait for the end of a paragraph.
+        assert_eq!(
+            pr_mentions_so_far("Opened https://github.com/zed-industries/zed/pull/15700 and now"),
+            vec![mention("zed-industries/zed", 15700)]
+        );
+        assert_eq!(
+            pr_mentions_so_far("See (https://github.com/zed-industries/zed/pull/15700)"),
+            vec![mention("zed-industries/zed", 15700)],
+            "a closing bracket ends the span the same way whitespace does"
+        );
+
+        // Only the last URL can be the unfinished one; the ones before it
+        // were closed by whatever came after them.
+        assert_eq!(
+            pr_mentions_so_far(
+                "First https://github.com/o/n/pull/12, then https://github.com/o/n/pull/34"
+            ),
+            vec![mention("o/n", 12)]
+        );
+
+        // Text that ends in something that is not a URL at all is finished.
+        assert_eq!(pr_mentions_so_far("nothing here"), Vec::new());
+        assert_eq!(
+            pr_mentions_so_far("done: https://github.com/o/n/pull/7\n"),
+            vec![mention("o/n", 7)]
+        );
     }
 
     /// What `gh pr create` prints when it has made one: the URL on its own

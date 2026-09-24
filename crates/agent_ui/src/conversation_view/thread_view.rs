@@ -2418,10 +2418,34 @@ impl ThreadView {
         // it is the one that can say which of the PRs already in the set the
         // current rules would not have mined.
         let whole_thread = self.mined_entries == 0;
+        let generating = self.thread.read(cx).status() == acp_thread::ThreadStatus::Generating;
         let mut found: Vec<WatchedPr> = Vec::new();
-        for entry in &entries[self.mined_entries.min(entries.len())..] {
+        // Where the next pass picks up: the first entry that had not finished
+        // arriving. Everything before it has said all it is going to say.
+        let mut resume_at = entries.len();
+        let mut read_everything = true;
+        for (ix, entry) in entries
+            .iter()
+            .enumerate()
+            .skip(self.mined_entries.min(entries.len()))
+        {
+            let finished = Self::entry_has_finished(entry, ix + 1 == entries.len(), generating);
+            if !finished {
+                resume_at = resume_at.min(ix);
+                read_everything = false;
+            }
             for text in Self::pr_mention_sources(entry, cx) {
-                for mention in acp_thread::pr_mentions(&text) {
+                // An unfinished entry is still read, so a chip appears while
+                // the agent is talking rather than a turn later, but a URL
+                // that runs to the end of what has arrived is left for the
+                // next pass: the number it names now is a prefix of the one
+                // it will name.
+                let mentions = if finished {
+                    acp_thread::pr_mentions(&text)
+                } else {
+                    acp_thread::pr_mentions_so_far(&text)
+                };
+                for mention in mentions {
                     let pr = WatchedPr {
                         repo: Some(mention.repo),
                         number: mention.number,
@@ -2432,10 +2456,12 @@ impl ThreadView {
                 }
             }
         }
-        // The last entry is still being written to while a command runs, so
-        // it stays unread until there is an entry after it.
-        self.mined_entries = entries.len() - 1;
-        if found.is_empty() && !whole_thread {
+        self.mined_entries = resume_at;
+        // Dropping what the current rules would not have mined is only safe
+        // off a complete reading: judging the set against a thread that is
+        // still being written would drop a PR whose sentence has not arrived.
+        let adopt_rules = whole_thread && read_everything;
+        if found.is_empty() && !adopt_rules {
             return;
         }
 
@@ -2445,7 +2471,7 @@ impl ThreadView {
                 thread_id,
                 |snapshot| {
                     let mut changed = false;
-                    if whole_thread {
+                    if adopt_rules {
                         changed |= snapshot.adopt_mining_rules(&found);
                     }
                     for pr in found {
@@ -2456,6 +2482,29 @@ impl ThreadView {
                 cx,
             );
         });
+    }
+
+    /// Whether an entry has finished arriving, and so can be read as a
+    /// statement rather than as a sentence someone is halfway through.
+    ///
+    /// "Not the last entry" is not this test. A message a tool call started
+    /// after is finished, and one still streaming at the end of a turn is not,
+    /// and the two are told apart by the turn rather than by position.
+    fn entry_has_finished(entry: &AgentThreadEntry, is_last: bool, generating: bool) -> bool {
+        match entry {
+            // A message grows until something else starts after it or the
+            // turn ends.
+            AgentThreadEntry::AssistantMessage(_) => !is_last || !generating,
+            // A call says so itself, and its terminals report their output
+            // only once the process has exited.
+            AgentThreadEntry::ToolCall(call) => !matches!(
+                call.status,
+                ToolCallStatus::Pending
+                    | ToolCallStatus::InProgress
+                    | ToolCallStatus::WaitingForConfirmation { .. }
+            ),
+            _ => true,
+        }
     }
 
     /// The pieces of text in an entry that say which pull requests the thread
@@ -15590,6 +15639,61 @@ mod tests {
             )),
             cx,
         ))
+    }
+
+    /// A tool call with a status of its own, for the mining tests.
+    fn test_tool_call_with_status(
+        id: &str,
+        status: ToolCallStatus,
+        cx: &mut App,
+    ) -> AgentThreadEntry {
+        let AgentThreadEntry::ToolCall(mut call) =
+            test_tool_call(id, "gh pr create", acp::ToolKind::Execute, None, cx)
+        else {
+            unreachable!()
+        };
+        call.status = status;
+        AgentThreadEntry::ToolCall(call)
+    }
+
+    #[gpui::test]
+    fn only_a_finished_entry_is_read_as_a_statement(cx: &mut gpui::TestAppContext) {
+        crate::test_support::init_test(cx);
+
+        cx.update(|cx| {
+            let message = test_assistant_message(&[("Opened a PR.", false)], cx);
+
+            // A message still streaming at the end of a turn is not finished;
+            // the same message once the turn ends is.
+            assert!(!ThreadView::entry_has_finished(&message, true, true));
+            assert!(ThreadView::entry_has_finished(&message, true, false));
+
+            // And a message a tool call started after is finished even though
+            // the turn is still running, which is the case "not the last
+            // entry" got right and nothing else did.
+            assert!(ThreadView::entry_has_finished(&message, false, true));
+
+            // A call says so itself, whatever its position: one of several
+            // commands running at once is not finished just because another
+            // entry landed after it.
+            for status in [
+                ToolCallStatus::Pending,
+                ToolCallStatus::InProgress,
+            ] {
+                let call = test_tool_call_with_status("1", status, cx);
+                assert!(!ThreadView::entry_has_finished(&call, false, true));
+                assert!(!ThreadView::entry_has_finished(&call, true, false));
+            }
+            for status in [
+                ToolCallStatus::Completed,
+                ToolCallStatus::Failed,
+                ToolCallStatus::Canceled,
+                ToolCallStatus::Rejected,
+            ] {
+                let call = test_tool_call_with_status("1", status, cx);
+                assert!(ThreadView::entry_has_finished(&call, true, true));
+            }
+        });
     }
 
     #[gpui::test]
