@@ -844,7 +844,6 @@ Dev builds run with `incremental = false` (the cache regrew to 80GB+ and filled 
 agent_ui base-view degradation tests are `#[ignore]`d with a reason, so a red suite means
 something.
 
-
 ## Work queue
 
 What to build next, most wanted first. Entries are complaints, tidied: what is wrong and roughly
@@ -861,37 +860,37 @@ does is removed as it lands.
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
-**The app leaks about eighty entities a minute. Find the type and stop it. Top priority.**
-The counts added on 2026-09-23 made this visible. On the build carrying last night's fixes, fourteen
-minutes of ordinary use on 2026-09-24:
+**The app leaks entities. The instrument to name the type is in; read it and stop it.**
+Still top priority, and now half answered. The complaint was about eighty entities a minute on top
+of a baseline of fifty thousand, with global observers rising in step, which says each leaked
+object watches a global the way `Markdown` and `Editor` do.
 
-    14:40  50,013 entities  50,450 observers  55,289 global observers  110,677 focus handles
-    14:54  51,105 entities  51,610 observers  56,586 global observers  112,551 focus handles
-           +1,092 entities   +1,160 observers   +1,297 global observers   +1,874 focus handles
+What 2026-09-24 did was the first half the entry asked for: gpui counts live entities by concrete
+type, and the reliability line reports the ten largest and the ten that grew since the previous
+line. **This is the thing to bring back.** Two consecutive `quiet-ui perf: N entities live;
+largest: …; grown since the last line: …` lines from a session that has been up a while name the
+type, and the rest of this entry stops being guesswork.
 
-Two problems. The baseline: fifty thousand live entities and a hundred and ten thousand focus
-handles is far more than a window showing a sidebar and a few threads needs, and every walk gpui
-makes over any of those sets pays for it. And the growth: roughly eighty entities a minute that are
-never released, while nothing much is happening, which is why the freezes still come back with
-uptime even after the focus-handle sweep was fixed. Global observers rise in step with entities,
-which says each leaked object watches a global (settings, theme), the way `Markdown` and `Editor`
-do.
+The two candidates the old entry listed were both read, and neither is the growth:
 
-First make it name itself. Extend the reliability line with live counts *by type*, the ten largest
-and the ten fastest-growing since the previous line (`std::any::type_name` per `TypeId` in the
-entity map; it only needs to be computed when the line is written). Then find what creates the
-growing type and stop it. Candidates from reading, unconfirmed:
+- `render_any_thread_error` does not make a `Markdown` per frame. It caches one in
+  `thread_error_markdown` and reuses it, and has for a while. (It never replaces that one when the
+  error text changes, so a second error shows the first one's words. Small, real, unrelated.)
+- `command_file_diffs` was a genuine unbounded cache of `Editor`s, and is now capped at the eight
+  most recently hovered. But it only grows on hover, so it was never the steady eighty a minute.
 
-- `render_any_thread_error` creates a `Markdown` entity (`crates/agent_ui/src/conversation_view/
-  thread_view.rs:13698`) and is reached from `render_thread_error`, which is a render path: a thread
-  showing an error card may make a new one every frame.
-- `command_file_diffs` caches an `Editor` per path with no eviction (`chips.rs:122`), and every
-  editor carries focus handles and global observers.
-- Every open thread keeps a full view tree for every entry, visible or not. A thread with two
-  thousand entries in a background tab is thousands of entities doing nothing. That is baseline
-  rather than growth, but it is most of the fifty thousand, and dropping the views of threads that
-  are not on screen (rebuilding them on return, which is 400ms for the largest measured) is the
-  lever for it.
+One more cache of the same shape was found by reading and capped the same way: the scripts a
+command carried, which is a `Markdown` each, per command ever expanded. Nothing found by reading
+accounts for growth while the app sits still, which is why the next pass wants the line rather
+than another read.
+
+The baseline is the other half and is untouched: every open thread keeps a full view tree for
+every entry, visible or not, which is most of the fifty thousand. Dropping the views of threads
+that are not on screen and rebuilding them on return (400ms for the largest measured) is the lever.
+Worth knowing before trying it: `ConversationView` builds every entry's views up front and splices
+a focus handle per entry into the list state, and a previous attempt at building only the last
+screenful was reverted on 2026-08-19 because the build carrying it died. Whatever replaces it has
+to survive a thread being opened, resumed, and truncated.
 
 Report the by-type counts before and after in the log entry.
 
@@ -924,52 +923,11 @@ leak entry above does. Work from the logged numbers and the code, fix what they 
 the instrumentation that would have named the next problem, so the following night has more to
 work from than this one did.
 
-**Chips have regressed: scattered across rows, and sometimes squeezed very narrow.**
-Reported from use on 2026-09-24, after a stretch where they looked right. The timing matches a
-change underneath the chip layer rather than in it. Upstream moved agent messages from one content
-block to an ordered list of blocks (`acp_thread: Preserve ordered mixed content in agent messages`,
-#64456, 2026-09-21); this fork followed with "Draw an assistant message's blocks, not only its
-markdown"; and upstream has reshaped the same code again since (`acp_thread: Consolidate agent
-message content ownership`, #64667), which the next rebase brings in. The chip rows were designed
-for the old shape: consecutive tool calls collapsing into one row of chips between messages.
-
-Two symptoms, likely two causes:
-
-- *Scattered.* A run of chips is broken into many short rows. Anything the row builder now treats as
-  a boundary between tool calls splits a run: a message that has become several blocks, an empty
-  or whitespace-only text block the agent emits between tool calls, a block that renders nothing
-  but still counts as an entry. Make the builder skip what draws nothing, and treat the new block
-  list as one message for the purpose of grouping.
-- *Narrow.* A chip rendered inside a row that now shrinks its children gets squeezed below its
-  own content. A chip's label and glyphs are its minimum width: nothing in a chip row should be
-  allowed to shrink a chip past that, and a row that runs out of width should wrap to a new line
-  rather than squeeze. Check `flex_shrink` and `min_w` on the chip base and on every row that
-  holds chips, including the band beneath a running command.
-
-Do this after tonight's rebase, against #64667's shape, not before it: fixing the layout against the
-version that is about to be replaced is the fastest way to have to do it twice.
-
-**PR mining reads text that is still arriving, and a half-written URL is a different PR.**
-Adding #15700 also added #157. The thread's snapshot shows the pattern plainly: its dismissed list
-holds `1`, `157`, `1563`, `1567` and `1570` beside the real `15635`, `15678` and `15700`. Those are
-truncations, the numbers a URL passes through as it streams: `.../pull/1`, `.../pull/157`,
-`.../pull/1570`, `.../pull/15700`, and every one of them is a valid PR number to `pr_mentions`.
-
-`mine_pr_mentions` (`crates/agent_ui/src/conversation_view/thread_view.rs:2302`) excludes only the
-last entry, on the reasoning that the last one is what is still being written. That stops holding
-as soon as the text being written is not last: an assistant message a tool call has started after,
-or one of several commands running at once whose output is still arriving in chunks. A chunk
-boundary inside a URL mines a shorter number, and the next pass mines the full one, so both land.
-
-Mine an entry only once it is finished: an assistant message when the message is complete, a
-command's output when the command has exited. "Not the last entry" is not the same test. As a second
-guard, a URL that runs to the very end of text still being written is not a mention yet, since the
-next chunk may extend it. Take this exact case as the test: a message streamed in chunks that split
-`.../pull/15700` after `157` must watch 15700 and nothing else.
-
-The prefixes already dismissed in existing snapshots can stay dismissed; they are harmless there.
-If any prefix-shaped number is currently *watched* (a real PR whose number is a prefix of another
-watched one and which no source ever named in full), it came from this and can be dropped.
+2026-09-24 took the first shape ("repeated on every frame") through the chip layer by reading, and
+found two: the run an entry belongs to was walked once per entry drawn inside it, and a multi-file
+edit worked out which files a call touched once per file per file. Both are answered once a frame
+now. The rest of the shapes are untouched, and the ones about foreground work and about scaling
+with threads or worktrees want the running app.
 
 ## Verification queue
 
@@ -2024,7 +1982,6 @@ ran. Earlier gates did not hit this because they did not include `-p markdown`; 
 `libxkbcommon-dev libxkbcommon-x11-dev` to the standing environment setup alongside
 `libasound2-dev`.
 
-
 **2026-08-21**: onto main fd82517a1 (24 upstream commits). A working night: the Work queue held
 five entries. Squash-then-rebase first folded the standing squash and the four queue-only commits
 (the ghost thread, proving the update path, the worktree wait, and the hover chips plus the stop
@@ -2279,7 +2236,6 @@ release-profile `script/clippy` freed 27GB. Do it every time, not when it starts
 fired at 15:37 UTC rather than 19:00, which gave nine hours of runway instead of six and is why
 all eight entries fit — the opposite of the previous run's problem, but the schedule is drifting
 in both directions and is worth a look.
-
 
 **2026-08-23**: onto main d9ad6aff6 (1 upstream commit). A working night: the Work queue held one
 entry and it is built. Squash-then-rebase folded the standing squash and eight follow-ups (the
@@ -3035,7 +2991,6 @@ it. One click, one worktree, forever. It is a new Work queue entry rather than a
 the three questions it turns on (what counts as abandoned when closing the last tab does not close
 the window; what makes removal safe; whether it should be silent) are calls to make, not details
 to infer overnight.
-
 
 **2026-09-03**: onto main 28e52a287 (47 upstream commits: a Zed v1.20.0 bump, LSP dynamic document
 selectors and per-project log scoping, a `which_key` pending-binding indicator, gpui touch-drag and
@@ -4602,3 +4557,159 @@ examples, 2.7 GB of binaries nothing runs, so pass `--lib --tests`; and `zed` is
 UTC is the schedule; the 05:12 start recorded last night was GitHub's scheduler running late, which
 the workflow's own header comment says it was written to absorb. Reason from 00:45 and expect the
 dmg to be later than two and a half hours after it.
+
+**2026-09-24**: onto main 2c4bc2d7b (15 upstream commits). Squash-then-rebase folded nine fork
+commits into one — the standing squash, the five from the 09-23 run (four code changes and the log
+entry that also corrected three tests), and the three queue entries written during the day —
+reusing the squash's own message; tree-identical to the old tip before rebasing.
+
+**Four files conflicted, and three of the four were the log's own patterns.**
+`threads_archive_view.rs` is the same-branch replay the log has recorded twice: upstream still
+carries the full `ThreadsArchiveView` modal this fork deleted when the archive surface merged into
+the sidebar list, so the fork's 118-line helpers-only file was taken wholesale. `acp_thread.rs`
+had four hunks. Two were the recurring seam in a new place: #64708 reshaped the "tool call not
+found" placeholder this fork deletes (it drops the update with a warning instead of pushing an
+entry that renders as a useless chip), and reshaped the test that asserts it; the fork's side won
+both. One was a pure append/append at the same `#[test]`, upstream's two new streaming-cursor
+tests against the fork's own — kept both, upstream's first. The fourth was a genuine two-sided
+hunk: `ToolCall::new_label` takes the call's locations in this fork and now also needs its
+language registry after the call, so it is the fork's argument and upstream's `.clone()`.
+`thread_view.rs` had four. An import union (the fork's list is the superset: it still uses both
+`AcpThreadEvent` and `PlanEntry`). The fork's `render_compaction_barrier` aligned against
+upstream's `render_plan_summary` and `render_plan_entries`, which this fork replaced with its own
+`render_plan` long ago — the fork's side, and the two upstream helpers went with it. Upstream's
+collapse-chevron button under a non-card tool output, which the fork deleted at the merge base and
+#64708 only moved — the fork's side again, with upstream's `content()` accessor adopted inside it.
+And the `CompletedPlan` arm, below.
+
+**What the fork can now delete because upstream built it.** `acp_thread: Remove completed plan
+cards from conversation history` (#64719) removes `AgentThreadEntry::CompletedPlan` outright:
+completed plans stay in the plan panel instead of gaining a second transcript presentation. That
+is exactly what this fork's `AgentThreadEntry::CompletedPlan(_) => Empty.into_any()` arm was doing
+by hand, so the arm and its `bookmarks.rs` counterpart are gone and the behaviour is upstream's
+now.
+
+**Markerless drift, four kinds of it, and the conflict count said nothing about any.** `cargo
+check --workspace --all-targets` after the replay found ten errors across three crates. #64719
+removed the `CompletedPlan` variant (`bookmarks.rs` still matched it). #64708 turned
+`ToolCall::content` from a field into a `content()` accessor over separate structured and raw
+content — five sites, including two test helpers that assigned to it, which now go through a
+`set_content_for_test` in the same `#[cfg(any(test, feature = "test-support"))]` block as the
+fork's existing `ToolCall::for_test`. #64708 also turned `ContentBlock` from an enum into an
+opaque struct over a private `RenderBlock`, so the fork's two matches on its `Markdown` variant
+became `plain_markdown()`, widened from private to `pub` — its public `markdown()` sibling also
+answers for embedded resources and unsupported blocks, which is a different question from the one
+the read-hover card asks. And #64667 moved a user message's blocks from `chunks` to
+`content.source_blocks()`, in the one place this fork filters review comments out of them. After
+those, 0 errors and 0 warnings.
+
+**What was built.** Two of the four Work queue entries in full, the first half of a third, and the
+first shape of the fourth.
+
+- *Chips.* Both symptoms, and they were two causes as the entry guessed. **Scattered:** only a
+  thoughts-only message was allowed to sit inside a run without breaking it, so an agent emitting
+  a blank text block between two tool calls — which upstream's ordered block list makes ordinary —
+  produced an entry that drew nothing and split one run of actions into two. What matters is that
+  an entry draws nothing, not that it thinks. **The trap in that**, which the gate caught and is
+  worth writing down: "draws nothing" is not "has no prose". A message whose only content is an
+  image has no markdown at all, so the first version of this hid an image-only reply inside an
+  empty run — upstream's own `visible_content` (nonblank markdown, a resource link, or an image)
+  is the right question and is what asks it now. **Narrow:** a chip's label and glyphs are its
+  width, and nothing said so, so a full row spent the chips' own `min_w_0` squeezing them below
+  their content instead of wrapping. Chips do not shrink now. The `min_w_0` stays and is
+  load-bearing for the other half: a flex item's default minimum is its content, a content minimum
+  beats a maximum, and without it a long label would push a chip past its 75% cap and out of the
+  row instead of truncating inside it.
+
+- *PR mining.* The old test was "not the last entry", and the entry was right that it is not the
+  same test. An entry is read once it has finished — a message when another entry follows it or
+  the turn ends, a call when every terminal it carries has exited — and mining resumes from the
+  first entry that had not. **A first version of this read unfinished entries too, with the
+  entry's "second guard" (a URL running to the end of what has arrived is not a mention yet)
+  making that safe, so a chip would appear while the agent was still talking. Reviewing it before
+  the gate found the guard does not cover the other half of reading half a message:** three
+  distinct URLs are a list and join nothing, but the first two of them, alone, are two pull
+  requests worth watching, and once mined they stay. Prompt chips are not worth that, so nothing
+  half-written is read at all, and the guard went with it. The prefix hazard is a test now rather
+  than a mechanism — read as it streams, one message naming `.../pull/15700` names five pull
+  requests. The gate then caught the first rule for "finished" being wrong about tool calls: it
+  asked the call's own status, and an agent reports a call completed some time after the command
+  it ran actually stopped, so a PR that `gh pr create` had already printed went unread. A call is
+  judged by its terminals — a terminal reports no output at all until its process exits, which is
+  the entry's own wording and also says nothing about the other commands running beside it. And
+  the already-watched prefixes clean themselves up, because 09-23 built the mechanism for exactly
+  this — `adopt_mining_rules` re-reads a thread's transcript under the current rules on open and
+  drops the mined PRs those rules would not have taken. It is gated on a rules version, so the
+  version is bumped to 2; a PR the user asked for stays, and a dropped one is not dismissed.
+
+- *The entity leak: the half that can be done from here.* The entry's own first instruction was
+  "make it name itself", and that is in: gpui counts live entities by concrete type (a `TypeId`
+  has no way back to a name, so the name is recorded when a type is first inserted; the walk is on
+  the diagnostics timer, never a frame), and the reliability line reports the ten largest and the
+  ten that grew since the previous line. **Both named candidates were read and neither is the
+  growth.** `render_any_thread_error` already caches its `Markdown` in `thread_error_markdown` and
+  has for a while — it is not a per-frame allocation. (It also never replaces that one when the
+  error text changes, so a second error shows the first one's words: small, real, unrelated, not
+  fixed here.) `command_file_diffs` was a genuine unbounded cache of `Editor`s — each with a
+  multibuffer, focus handles and two global observers — and is capped at the eight most recently
+  hovered now, but it only grows on hover and so was never eighty a minute. One more of the same
+  shape was found by reading and capped the same way: the scripts a command carried, a `Markdown`
+  per script per command ever expanded. **Nothing found by reading accounts for growth while the
+  app sits still,** which is why the entry now asks for the line rather than another read: two
+  consecutive by-type lines from a session that has been up a while name the type outright.
+
+- *The general pass, first shape only.* "Work repeated on every frame" through the chip layer, by
+  reading rather than by profiling, found two. The run an entry belongs to was walked to both ends
+  once per entry drawn inside it, so a screenful inside one run of N chips walked it once per
+  visible entry — the walk now records its answer for the whole run and for the two entries that
+  stopped it. And a multi-file edit worked out which files a call touched once per chip, which is
+  once per file per file, and that reads every diff the call carries and builds a path from each —
+  held for the frame now. No numbers for either: measuring them needs the running app, which is
+  the standing limit on this entry.
+
+**The gate, five crates: the core three plus gpui and zed.** The Verification queue was empty, so
+nothing was owed a suite beyond tonight's own work. `cargo test`: acp_thread 269, agent_ui 494 (32
+intentionally `#[ignore]`d), sidebar 188, gpui 420 plus 1, zed 93 (1 `#[ignore]`d). Zero failures
+on the run that counted.
+
+**Three failures across two passes, all of them this run's own code, and every one of them the
+test being right.** `test_empty_assistant_text_followed_by_image_is_rendered` and
+`blank_thoughts_are_not_chips` both failed on the first pass over the chip fix, and between them
+they say the same thing: the fix read "an entry that draws nothing" as "a message with no prose",
+and a message whose only content is a picture has no prose at all. The first is upstream's own,
+and it arrived with #64456, the very commit that made an agent message an ordered list of blocks —
+the change this whole entry is downstream of. It was right: an image-only reply was being folded
+into a run of chips and drawn by a group that had no chip to draw, which is to say it vanished.
+The second is the fork's own, and its expectation genuinely had moved: a blank thought is now
+inside the run rather than a boundary, which is the point of the change, and what it must still be
+is not a chip. It asserts that instead, and a run made only of those draws nothing because
+`render_action_group` already returns `Empty` when it built no chip.
+`test_a_created_pr_joins_from_the_command_that_made_it` failed on the pass after that, on the
+mining rule, and it too was right: it leaves its tool call `InProgress` after the command exits,
+which is exactly what a real agent does for a while, and the first rule would not read it. That is
+the correction recorded in the PR mining entry above.
+
+**`script/clippy` green across all five** (`--release --all-targets --all-features -- --deny
+warnings`), 0 warnings, 6m22s — the same surprise 09-23 recorded, that the release-profile lint is
+not the night's long pole because clippy needs no codegen for what it is only checking. It fits,
+so run it. `cargo-shear`, `typos` and `buf` are not installed here, so the script exits after the
+lint, as it has every night in this log.
+
+**Environment: the two prerequisites, and the disk as the night's real constraint.**
+`CARGO_NET_GIT_FETCH_WITH_CLI=true` and `libasound2-dev` as always, the install run on its own
+because `apt-get update` still 403s on the `deadsnakes` and `ondrej` PPAs baked into the image and
+exits non-zero — chaining it with `&&` silently skips the install, as 09-23 recorded.
+`libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev` for the `zed` test binary, as 09-22
+recorded.
+
+The disk is what shaped the gate. A `cargo clean` before the test pass (the standing note from
+three nights running) gave 27GB and was not enough: **the four lib crates and `zed` cannot be
+tested in one `cargo test` invocation in this container.** The combined run reached 100% full and
+died, and with it every background watcher, because the harness writes its task output to the same
+filesystem — so the failure arrived as tooling breaking rather than as a build error, which is
+worth knowing before diagnosing the wrong thing. What works is one batch per fill: the four lib
+crates together (peak ~26GB), `rm -rf target/debug`, then `zed` alone, then `rm -rf target/debug`
+again before the release-profile clippy, which shares nothing with the debug artifacts anyway.
+Deleting `.dwo` files between builds freed 2.4GB and is safe; during one it breaks archive
+creation, as 09-23 recorded. `~/.cargo/registry/cache` is another 123MB of pure reclaim (the
+sources are already extracted) and can go at any time.
