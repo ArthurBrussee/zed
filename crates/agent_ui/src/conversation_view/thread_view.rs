@@ -9255,16 +9255,12 @@ impl ThreadView {
         }
     }
 
-    /// Whether an entry renders as compact action chips. Every tool call does,
-    /// except permission prompts and subagent calls, which keep their full
-    /// rendering (and so break a chip run). So does an assistant message that is
-    /// nothing but thoughts: thinking is an agent action, and its chips belong
-    /// in the same grid as the tool calls around it. An assistant message that
-    /// says something (any non-blank prose chunk) is not a chip and ends the run.
-    /// Whether an entry belongs to a run of chips. A thoughts-only message
-    /// draws no chip of its own (thinking is shown beside the progress
-    /// indicator), but it counts here so that it does not split the chips
-    /// around it into separate groups.
+    /// Whether an entry belongs to a run of chips. Every tool call does, except
+    /// permission prompts and subagent calls, which keep their full rendering
+    /// and so end the run. So does an assistant message that puts nothing in
+    /// the transcript: it draws no chip of its own, but it counts here so that
+    /// it does not split the chips around it into separate groups. An assistant
+    /// message that says something (any non-blank prose chunk) ends the run.
     fn is_chip_entry(entry: &AgentThreadEntry, cx: &App) -> bool {
         match entry {
             AgentThreadEntry::ToolCall(tool_call) => {
@@ -9276,23 +9272,40 @@ impl ThreadView {
                     // as an action chip.
                     && !tool_call.is_compaction(cx)
             }
-            AgentThreadEntry::AssistantMessage(_) => Self::is_thoughts_only_message(entry, cx),
+            AgentThreadEntry::AssistantMessage(_) => Self::draws_no_transcript_content(entry, cx),
             _ => false,
         }
     }
 
-    /// A message that only thinks. Thinking is shown live beside the progress
-    /// indicator and nowhere else, so the transcript skips these entirely.
-    fn is_thoughts_only_message(entry: &AgentThreadEntry, cx: &App) -> bool {
+    /// A message with nothing in it for the transcript to draw: one that only
+    /// thinks (thinking is shown beside the progress indicator and nowhere
+    /// else), and one that is empty.
+    ///
+    /// The empty case is not hypothetical. An agent message is an ordered list
+    /// of blocks, and an agent that emits a blank text block between two tool
+    /// calls produces an entry that renders nothing at all. An entry nobody can
+    /// see must not break the run of chips it sits in, or one run of actions
+    /// arrives as several short rows.
+    fn draws_no_transcript_content(entry: &AgentThreadEntry, cx: &App) -> bool {
         match entry {
             AgentThreadEntry::AssistantMessage(message) => {
                 !message.indented
                     && !message.is_subagent_output
                     && !Self::has_prose(message, cx)
-                    && Self::thought_chunks(message, cx).next().is_some()
             }
             _ => false,
         }
+    }
+
+    /// A message that only thinks: silent in the transcript, and with a thought
+    /// to show beside the progress indicator.
+    fn is_thoughts_only_message(entry: &AgentThreadEntry, cx: &App) -> bool {
+        Self::draws_no_transcript_content(entry, cx)
+            && matches!(
+                entry,
+                AgentThreadEntry::AssistantMessage(message)
+                    if Self::thought_chunks(message, cx).next().is_some()
+            )
     }
 
     /// The distinct edited-file locations of an edit tool call, as indices into
@@ -15801,6 +15814,64 @@ mod tests {
             indented: false,
             is_subagent_output: false,
         })
+    }
+
+    #[gpui::test]
+    fn a_message_that_draws_nothing_does_not_split_a_run_of_chips(cx: &mut gpui::TestAppContext) {
+        crate::test_support::init_test(cx);
+
+        cx.update(|cx| {
+            // The shape that scattered a run of chips across several short
+            // rows: an agent message is an ordered list of blocks, and a blank
+            // text block between two tool calls is an entry that renders
+            // nothing at all.
+            let entries = vec![
+                test_tool_call("1", "Read foo.rs", acp::ToolKind::Read, None, cx),
+                test_assistant_message(&[("", false)], cx),
+                test_tool_call("2", "Read bar.rs", acp::ToolKind::Read, None, cx),
+                test_assistant_message(&[("  \n\t ", false)], cx),
+                test_tool_call("3", "Read baz.rs", acp::ToolKind::Read, None, cx),
+                // A message with no blocks at all, which is the same thing.
+                test_assistant_message(&[], cx),
+                test_tool_call("4", "Read qux.rs", acp::ToolKind::Read, None, cx),
+            ];
+
+            for ix in [1, 3, 5] {
+                assert!(
+                    ThreadView::draws_no_transcript_content(&entries[ix], cx),
+                    "entry {ix} renders nothing, so it is not a boundary"
+                );
+                assert!(
+                    !ThreadView::is_thoughts_only_message(&entries[ix], cx),
+                    "entry {ix} has no thought to show beside the indicator either"
+                );
+            }
+
+            // One run, not four.
+            for ix in 0..entries.len() {
+                assert_eq!(
+                    ThreadView::action_run_bounds_in(&entries, ix, cx),
+                    Some((0, entries.len())),
+                    "entry {ix} belongs to the one run"
+                );
+            }
+
+            // Prose still ends it, which is the whole point of the boundary.
+            let entries = vec![
+                test_tool_call("1", "Read foo.rs", acp::ToolKind::Read, None, cx),
+                test_assistant_message(&[("", false), ("Here is what I found.", false)], cx),
+                test_tool_call("2", "Read bar.rs", acp::ToolKind::Read, None, cx),
+            ];
+            assert_eq!(
+                ThreadView::action_run_bounds_in(&entries, 0, cx),
+                Some((0, 1))
+            );
+            assert_eq!(ThreadView::action_run_bounds_in(&entries, 1, cx), None);
+            assert_eq!(
+                ThreadView::action_run_bounds_in(&entries, 2, cx),
+                Some((2, 1))
+            );
+        });
     }
 
     #[gpui::test]

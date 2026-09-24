@@ -2471,7 +2471,18 @@ impl ThreadView {
     ) -> Stateful<Div> {
         h_flex()
             .id(id)
+            // The pair is deliberate. `min_w_0` is what lets the cap below
+            // actually bind: a flex item's default minimum is its content, and
+            // a content minimum beats a maximum, so without it a long label
+            // pushes the chip past the cap and out of the row instead of
+            // truncating inside it. `flex_shrink_0` then keeps the chip's
+            // neighbours from spending that permission on its behalf — a chip's
+            // label and glyphs are its width, and a row that has run out of it
+            // wraps to the next line rather than squeezing what is already on
+            // it. A chip is never wider than the row (the cap is a fraction of
+            // it), so refusing to shrink can never overflow.
             .min_w_0()
+            .flex_shrink_0()
             .max_w(relative(0.75))
             .h(rems_from_px(24_f32))
             .gap_1()
