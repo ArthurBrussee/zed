@@ -14,7 +14,7 @@ use serde::Deserialize;
 use smol::stream::StreamExt;
 use std::{
     cell::RefCell,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ffi::OsStr,
     fs,
     rc::Rc,
@@ -186,6 +186,63 @@ fn log_callback_counts(cx: &App) {
         counts.global_observers,
         counts.focus_handles,
     );
+    log_entity_counts(cx);
+}
+
+/// How many of each kind of entity are alive, and which kinds grew since the
+/// last line.
+///
+/// The counts above say how much a flush costs without saying what is holding
+/// the handles. A leak names itself here: the type whose count climbs while
+/// the app sits still is the one nobody is releasing, and the largest types
+/// are the baseline a window pays for before anything happens at all.
+const ENTITY_TYPES_LOGGED: usize = 10;
+
+fn log_entity_counts(cx: &App) {
+    thread_local! {
+        /// The previous line's counts, so this one can say what moved.
+        static PREVIOUS: RefCell<HashMap<&'static str, usize>> = RefCell::new(HashMap::new());
+    }
+
+    let counts = cx.entity_counts_by_type();
+    let total: usize = counts.iter().map(|(_, count)| count).sum();
+
+    PREVIOUS.with_borrow_mut(|previous| {
+        let largest = describe(counts.iter().take(ENTITY_TYPES_LOGGED).copied());
+
+        if previous.is_empty() {
+            log::info!("quiet-ui perf: {total} entities live; largest: {largest}");
+        } else {
+            let mut grown = counts
+                .iter()
+                .filter_map(|&(name, count)| {
+                    let before = previous.get(name).copied().unwrap_or(0);
+                    let grew = count.checked_sub(before)?;
+                    (grew > 0).then_some((name, grew))
+                })
+                .collect::<Vec<_>>();
+            grown.sort_unstable_by(|(a_name, a), (b_name, b)| b.cmp(a).then(a_name.cmp(b_name)));
+            let grown = describe(grown.into_iter().take(ENTITY_TYPES_LOGGED));
+            log::info!(
+                "quiet-ui perf: {total} entities live; largest: {largest}; grown since the \
+                 last line: {grown}"
+            );
+        }
+
+        previous.clear();
+        previous.extend(counts);
+    });
+}
+
+fn describe(counts: impl Iterator<Item = (&'static str, usize)>) -> String {
+    let described = counts
+        .map(|(name, count)| format!("{name} {count}"))
+        .collect::<Vec<_>>();
+    if described.is_empty() {
+        "nothing".to_string()
+    } else {
+        described.join(", ")
+    }
 }
 
 fn log_worktree_diagnostics(

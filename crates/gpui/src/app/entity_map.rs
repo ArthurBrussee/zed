@@ -1,6 +1,6 @@
 use crate::{App, AppContext, GpuiBorrow, VisualContext, Window, seal::Sealed};
 use anyhow::{Context as _, Result};
-use collections::FxHashSet;
+use collections::{FxHashMap, FxHashSet};
 use derive_more::{Deref, DerefMut};
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use slotmap::{KeyData, SecondaryMap, SlotMap};
@@ -55,6 +55,11 @@ impl Display for EntityId {
 
 pub(crate) struct EntityMap {
     entities: SecondaryMap<EntityId, Box<dyn Any>>,
+    /// The name of every entity type ever inserted. A count taken from the
+    /// map's `TypeId`s can say nothing about what it is looking at, because
+    /// there is no way back from a `TypeId` to a name, so the name is recorded
+    /// the first time the type is seen.
+    type_names: FxHashMap<TypeId, &'static str>,
     pub accessed_entities: RefCell<FxHashSet<EntityId>>,
     ref_counts: Arc<RwLock<EntityRefCounts>>,
 }
@@ -67,6 +72,17 @@ pub(crate) struct EntityRefCounts {
     leak_detector: LeakDetector,
 }
 
+/// A type's name without its module path, which is what makes a line of twenty
+/// of them readable. A generic type keeps its full name: both halves of it are
+/// long, and the last segment alone would not say which one it is.
+fn short_type_name(name: &'static str) -> &'static str {
+    if name.contains('<') {
+        name
+    } else {
+        name.rsplit("::").next().unwrap_or(name)
+    }
+}
+
 pub(super) struct LeaseInner {
     pub(super) entity: Option<Box<dyn Any>>,
 }
@@ -75,6 +91,7 @@ impl EntityMap {
     pub fn new() -> Self {
         Self {
             entities: SecondaryMap::new(),
+            type_names: FxHashMap::default(),
             accessed_entities: RefCell::new(FxHashSet::default()),
             ref_counts: Arc::new(RwLock::new(EntityRefCounts {
                 counts: SlotMap::with_key(),
@@ -129,8 +146,32 @@ impl EntityMap {
         accessed_entities.insert(slot.entity_id);
 
         let handle = slot.0;
+        self.type_names
+            .entry(TypeId::of::<T>())
+            .or_insert_with(type_name::<T>);
         self.entities.insert(handle.entity_id, Box::new(entity));
         handle
+    }
+
+    /// How many live entities there are of each concrete type, largest first.
+    ///
+    /// Walks the whole map, so ask on a timer rather than on a frame. An
+    /// entity currently leased for an update is not in the map and so is not
+    /// counted; at most one is leased at a time, so the undercount is one.
+    pub fn counts_by_type(&self) -> Vec<(&'static str, usize)> {
+        let mut by_type: FxHashMap<TypeId, usize> = FxHashMap::default();
+        for (_, entity) in self.entities.iter() {
+            *by_type.entry((**entity).type_id()).or_default() += 1;
+        }
+        let mut counts = by_type
+            .into_iter()
+            .map(|(type_id, count)| {
+                let name = self.type_names.get(&type_id).copied().unwrap_or("<unnamed>");
+                (short_type_name(name), count)
+            })
+            .collect::<Vec<_>>();
+        counts.sort_unstable_by(|(a_name, a), (b_name, b)| b.cmp(a).then(a_name.cmp(b_name)));
+        counts
     }
 
     /// Move an entity to the stack.
@@ -1212,6 +1253,39 @@ mod test {
 
     struct TestEntity {
         pub i: i32,
+    }
+
+    struct OtherTestEntity;
+
+    #[test]
+    fn counts_by_type_names_what_is_holding_the_entities() {
+        // The counts are what a leaking type is found by, so they have to say
+        // which type, and put the largest first.
+        let mut entity_map = EntityMap::new();
+        assert!(entity_map.counts_by_type().is_empty());
+
+        let mut held = Vec::new();
+        for i in 0..3 {
+            let slot = entity_map.reserve::<TestEntity>();
+            held.push(entity_map.insert(slot, TestEntity { i }));
+        }
+        let slot = entity_map.reserve::<OtherTestEntity>();
+        let other = entity_map.insert(slot, OtherTestEntity);
+
+        assert_eq!(
+            entity_map.counts_by_type(),
+            vec![("TestEntity", 3), ("OtherTestEntity", 1)]
+        );
+
+        // A type nothing holds any more drops out of the counts, rather than
+        // lingering as a zero that reads like a leak that stopped.
+        drop(other);
+        entity_map.take_dropped();
+        assert_eq!(entity_map.counts_by_type(), vec![("TestEntity", 3)]);
+
+        drop(held);
+        entity_map.take_dropped();
+        assert!(entity_map.counts_by_type().is_empty());
     }
 
     #[test]

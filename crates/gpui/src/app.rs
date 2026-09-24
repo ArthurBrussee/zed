@@ -2807,6 +2807,16 @@ impl App {
         }
     }
 
+    /// How many live entities there are of each concrete type, largest first.
+    ///
+    /// The counts above say how much a flush costs; this says what is holding
+    /// the handles, which is the only way to name a type that is leaking.
+    ///
+    /// Walks the entity map, so ask on a timer rather than on a frame.
+    pub fn entity_counts_by_type(&self) -> Vec<(&'static str, usize)> {
+        self.entities.counts_by_type()
+    }
+
     /// Obtain a new [`FocusHandle`], which allows you to track and manipulate the keyboard focus
     /// for elements rendered within this window.
     #[track_caller]
