@@ -102,6 +102,7 @@ pub struct StatusBar {
     right_items: Vec<Box<dyn StatusItemViewHandle>>,
     active_pane: Entity<Pane>,
     multi_workspace: Option<WeakEntity<MultiWorkspace>>,
+    show_sidebar_toggle: bool,
     focus_handle: FocusHandle,
     _observe_active_pane: Subscription,
 }
@@ -187,6 +188,12 @@ impl Render for StatusBar {
 }
 
 impl StatusBar {
+    /// Whether this status bar draws the open-sidebar toggle. Off for a
+    /// window whose title bar carries it instead.
+    pub fn set_show_sidebar_toggle(&mut self, show: bool) {
+        self.show_sidebar_toggle = show;
+    }
+
     fn render_left_tools(
         &self,
         sidebar: &SidebarStatus,
@@ -197,7 +204,10 @@ impl StatusBar {
             .min_w_0()
             .overflow_x_hidden()
             .when(
-                sidebar.show_toggle && !sidebar.open && sidebar.side == SidebarSide::Left,
+                self.show_sidebar_toggle
+                    && sidebar.show_toggle
+                    && !sidebar.open
+                    && sidebar.side == SidebarSide::Left,
                 |this| this.child(self.render_sidebar_toggle(sidebar, cx)),
             )
             .children(self.left_items.iter().enumerate().map(|(index, item)| {
@@ -224,7 +234,10 @@ impl StatusBar {
                     }),
             )
             .when(
-                sidebar.show_toggle && !sidebar.open && sidebar.side == SidebarSide::Right,
+                self.show_sidebar_toggle
+                    && sidebar.show_toggle
+                    && !sidebar.open
+                    && sidebar.side == SidebarSide::Right,
                 |this| this.child(self.render_sidebar_toggle(sidebar, cx)),
             )
     }
@@ -335,6 +348,7 @@ impl StatusBar {
             right_items: Default::default(),
             active_pane: active_pane.clone(),
             multi_workspace,
+            show_sidebar_toggle: true,
             focus_handle: cx.focus_handle(),
             _observe_active_pane: cx.observe_in(active_pane, window, |this, _, window, cx| {
                 this.update_active_pane_item(window, cx)

@@ -37,6 +37,7 @@ pub struct Tab {
     close_side: TabCloseSide,
     start_slot: Option<AnyElement>,
     end_slot: Option<AnyElement>,
+    fit_to_content: bool,
     children: SmallVec<[AnyElement; 2]>,
 }
 
@@ -52,6 +53,7 @@ impl Tab {
             close_side: TabCloseSide::End,
             start_slot: None,
             end_slot: None,
+            fit_to_content: false,
             children: SmallVec::new(),
         }
     }
@@ -63,6 +65,14 @@ impl Tab {
 
     pub fn close_side(mut self, close_side: TabCloseSide) -> Self {
         self.close_side = close_side;
+        self
+    }
+
+    /// Reserves nothing for a slot this tab does not fill, so its width is its
+    /// content's. Off by default: an editor tab's width should not move as an
+    /// indicator or a close button comes and goes.
+    pub fn fit_to_content(mut self) -> Self {
+        self.fit_to_content = true;
         self
     }
 
@@ -124,16 +134,17 @@ impl RenderOnce for Tab {
             ),
         };
 
+        let fit_to_content = self.fit_to_content;
+        let slot = move |size: Pixels, content: Option<AnyElement>| {
+            if fit_to_content {
+                content.map(|content| h_flex().justify_center().child(content))
+            } else {
+                Some(h_flex().size(size).justify_center().children(content))
+            }
+        };
         let (start_slot, end_slot) = {
-            let start_slot = h_flex()
-                .size(START_TAB_SLOT_SIZE)
-                .justify_center()
-                .children(self.start_slot);
-
-            let end_slot = h_flex()
-                .size(END_TAB_SLOT_SIZE)
-                .justify_center()
-                .children(self.end_slot);
+            let start_slot = slot(START_TAB_SLOT_SIZE, self.start_slot);
+            let end_slot = slot(END_TAB_SLOT_SIZE, self.end_slot);
 
             match self.close_side {
                 TabCloseSide::End => (start_slot, end_slot),
@@ -170,12 +181,16 @@ impl RenderOnce for Tab {
                     .group("")
                     .relative()
                     .h(Tab::content_height(cx))
-                    .px(DynamicSpacing::Base04.px(cx))
+                    .px(if fit_to_content {
+                        DynamicSpacing::Base06.px(cx)
+                    } else {
+                        DynamicSpacing::Base04.px(cx)
+                    })
                     .gap(DynamicSpacing::Base04.rems(cx))
                     .text_color(text_color)
-                    .child(start_slot)
+                    .children(start_slot)
                     .children(self.children)
-                    .child(end_slot),
+                    .children(end_slot),
             )
     }
 }
@@ -231,5 +246,53 @@ impl Component for Tab {
                 ],
             )])
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{TestAppContext, px};
+
+    /// A tab that fills neither slot is narrower than one that reserves them,
+    /// by the two slot boxes, the two gaps beside them, and the difference in
+    /// horizontal padding.
+    #[gpui::test]
+    async fn test_fitted_tab_is_narrower_than_one_reserving_its_slots(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        struct Tabs;
+        impl Render for Tabs {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                h_flex()
+                    .child(Tab::new("reserved").child("Fix the sidebar drag"))
+                    .child(Tab::new("fitted").fit_to_content().child("Fix the sidebar drag"))
+            }
+        }
+
+        let (_tabs, cx) = cx.add_window_view(|_, _| Tabs);
+        cx.run_until_parked();
+
+        let reserved = cx
+            .debug_bounds("TAB-reserved")
+            .expect("the reserving tab should be measured");
+        let fitted = cx
+            .debug_bounds("TAB-fitted")
+            .expect("the fitted tab should be measured");
+
+        // Printed because the width of a tab with a real title is the measure
+        // this exists to report; the assertion is the part that cannot drift.
+        println!(
+            "tab width with a five-word title: {} reserving its slots, {} fitted",
+            reserved.size.width, fitted.size.width
+        );
+        // 12px + 14px of slot boxes and a gap beside each, less the 2px more
+        // padding the fitted tab takes on each side. The gaps are sized in
+        // rems, so the total lands a pixel off the arithmetic.
+        assert_eq!(reserved.size.width - fitted.size.width, px(31.));
     }
 }

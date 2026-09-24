@@ -31,7 +31,6 @@ use feature_flags::{FeatureFlagAppExt as _, PanicFeatureFlag};
 use fs::Fs;
 use futures::FutureExt as _;
 use futures::{StreamExt, channel::mpsc, select_biased};
-use git_ui::branch_diff::BranchDiffToolbar;
 use git_ui::commit_view::CommitViewToolbar;
 use git_ui::git_panel::GitPanel;
 use git_ui::project_diff::ProjectDiffToolbar;
@@ -615,6 +614,13 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             cx.new(|cx| which_key::PendingKeystrokesIndicator::new(window, cx));
         let image_info = cx.new(|_cx| ImageInfo::new(workspace));
 
+        // Beside the LSP state, since it is what decides whether there is any.
+        let worktree_language_servers = cx.new(|cx| {
+            git_ui_core::worktree_language_server_switch::WorktreeLanguageServerSwitch::new(
+                workspace, cx,
+            )
+        });
+
         let lsp_button_menu_handle = PopoverMenuHandle::default();
         let lsp_button =
             cx.new(|cx| LspButton::new(workspace, lsp_button_menu_handle.clone(), window, cx));
@@ -634,6 +640,7 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         workspace.status_bar().update(cx, |status_bar, cx| {
             status_bar.add_left_item(search_button, window, cx);
             status_bar.add_left_item(lsp_button, window, cx);
+            status_bar.add_left_item(worktree_language_servers, window, cx);
             status_bar.add_left_item(diagnostic_summary, window, cx);
             status_bar.add_left_item(active_file_name, window, cx);
             status_bar.add_left_item(git_blame_status, window, cx);
@@ -1509,8 +1516,6 @@ fn initialize_pane(
             toolbar.add_item(staged_diff_toolbar, window, cx);
             let unstaged_diff_toolbar = cx.new(|cx| UnstagedDiffToolbar::new(workspace, cx));
             toolbar.add_item(unstaged_diff_toolbar, window, cx);
-            let branch_diff_toolbar = cx.new(BranchDiffToolbar::new);
-            toolbar.add_item(branch_diff_toolbar, window, cx);
             let solo_diff_git_toolbar = cx.new(SoloDiffGitToolbar::new);
             toolbar.add_item(solo_diff_git_toolbar, window, cx);
             let commit_view_toolbar = cx.new(|_| CommitViewToolbar::new());
@@ -3009,6 +3014,41 @@ mod tests {
         indicator.update(cx, |indicator, cx| {
             assert_eq!(indicator.message_to_render(cx), None);
         });
+    }
+
+    /// A status item that reads the workspace from `set_active_pane_item` is a
+    /// double lease, and gpui panics on the first frame rather than deadlocking.
+    /// No other suite builds a real status bar inside a live workspace update,
+    /// so this is the one place that failure is visible before the morning.
+    #[gpui::test]
+    async fn test_a_fresh_window_renders_its_status_bar(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(path!("/root"), json!({ "a.txt": "" }))
+            .await;
+
+        let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+        let (_multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        cx.draw(
+            gpui::Point::default(),
+            gpui::size(px(1200.), px(800.)),
+            |_, _| gpui::Empty,
+        );
+        cx.run_until_parked();
+
+        // The fork's own status item, which is what makes the frame worth
+        // drawing here: it is the one that speaks for the active pane's
+        // worktree, so it exercises the callback the panic came from. It
+        // wears the outlined bolt because language servers are off in every
+        // worktree until one is switched on, which is what a fresh window's
+        // worktree is.
+        assert!(
+            cx.debug_bounds("ICON-BoltOutlined").is_some(),
+            "the worktree language-server switch should be in the status bar"
+        );
     }
 
     #[gpui::test]
@@ -6206,6 +6246,7 @@ mod tests {
                 false,
                 cx,
             );
+            gh_status::init(cx);
 
             repl::init(app_state.fs.clone(), cx);
             repl::notebook::init(cx);
@@ -6215,6 +6256,7 @@ mod tests {
             );
             project::debugger::dap_store::DapStore::init(&app_state.client.clone().into(), cx);
             debugger_ui::init(cx);
+            git_ui_core::worktree_language_server_switch::init(cx);
             initialize_workspace(app_state.clone(), cx);
             search::init(cx);
             lsp_locations::init(cx);

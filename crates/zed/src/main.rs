@@ -720,6 +720,8 @@ fn main() {
             false,
             cx,
         );
+        gh_status::init(cx);
+        git_ui_core::worktree_language_server_switch::init(cx);
         zed::watch_user_agents_md(app_state.fs.clone(), cx);
 
         repl::init(app_state.fs.clone(), cx);

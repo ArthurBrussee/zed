@@ -11,9 +11,11 @@ pub mod askpass_modal;
 pub mod created_worktrees;
 pub mod file_diff_view;
 pub mod notifications;
+pub mod worktree_language_server_switch;
 pub mod worktree_names;
 pub mod worktree_picker;
 pub mod worktree_service;
+pub mod worktree_spares;
 
 /// A type-erased picker view, e.g. for the title bar's branch popover.
 ///

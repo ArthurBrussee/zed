@@ -80,6 +80,13 @@ pub(super) fn spawn_stdio(
         arguments
     );
     log::trace!("Spawned (pid: {})", child.id());
+    // The steps of a launch are logged as they are passed, so a launch that
+    // stops says where rather than needing a process sample to rule out a
+    // deadlock. This is the last one before the agent answers.
+    log::info!(
+        "quiet-ui launch: spawned {path} (pid {}) {arguments:?}",
+        child.id()
+    );
 
     let debug_log = AcpDebugLog::default();
     let incoming = BufReader::new(stdout)

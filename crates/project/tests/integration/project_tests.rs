@@ -3613,6 +3613,81 @@ async fn test_max_buffer_line_length_can_be_overridden(cx: &mut gpui::TestAppCon
     );
 }
 
+/// A worktree can be switched out of language servers entirely, which is what
+/// an agent's worktree starts as. Nothing is written to the worktree to say
+/// so, and the switch is per worktree rather than per language.
+#[gpui::test]
+async fn test_a_worktree_switched_off_runs_no_language_server(cx: &mut gpui::TestAppContext) {
+    use project::worktree_language_servers::WorktreeLanguageServers;
+
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "a.rs": "" })).await;
+
+    let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    let mut fake_rust_servers = language_registry.register_fake_lsp(
+        "Rust",
+        FakeLspAdapter {
+            name: "rust-lsp",
+            ..Default::default()
+        },
+    );
+    language_registry.add(rust_lang());
+
+    cx.update(|cx| {
+        project::worktree_language_servers::init(cx);
+        WorktreeLanguageServers::global(cx).update(cx, |store, cx| {
+            store.set_enabled(Path::new(path!("/dir")), false, cx);
+        });
+    });
+
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/a.rs"), cx)
+        })
+        .await
+        .unwrap()
+        .0;
+    cx.run_until_parked();
+    assert!(
+        fake_rust_servers.try_recv().is_err(),
+        "a worktree switched off started a language server anyway"
+    );
+
+    // Switching it back on is what the status bar control does: the buffers
+    // open in that worktree get their servers.
+    cx.update(|cx| {
+        WorktreeLanguageServers::global(cx).update(cx, |store, cx| {
+            store.set_enabled(Path::new(path!("/dir")), true, cx);
+        });
+    });
+    project.update(cx, |project, cx| {
+        project.lsp_store().update(cx, |lsp_store, cx| {
+            lsp_store.restart_language_servers_for_buffers(
+                vec![buffer.clone()],
+                Default::default(),
+                true,
+                cx,
+            );
+        })
+    });
+    let mut server = fake_rust_servers
+        .next()
+        .await
+        .expect("switching a worktree back on starts its servers");
+    assert_eq!(
+        server
+            .receive_notification::<lsp::notification::DidOpenTextDocument>()
+            .await
+            .text_document
+            .uri
+            .as_str(),
+        uri!("file:///dir/a.rs")
+    );
+}
+
 #[gpui::test]
 async fn test_toggling_enable_language_server(cx: &mut gpui::TestAppContext) {
     init_test(cx);

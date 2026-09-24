@@ -419,6 +419,7 @@ pub struct Pane {
     can_split_predicate:
         Option<Arc<dyn Fn(&mut Self, &dyn Any, &mut Window, &mut Context<Self>) -> bool>>,
     can_toggle_zoom: bool,
+    tabs_fit_content: bool,
     should_display_tab_bar: Rc<dyn Fn(&Window, &mut Context<Pane>) -> bool>,
     should_display_welcome_page: bool,
     render_tab_bar_buttons: Rc<
@@ -604,6 +605,7 @@ impl Pane {
             can_drop_predicate,
             can_split_predicate: None,
             can_toggle_zoom: true,
+            tabs_fit_content: false,
             should_display_tab_bar: Rc::new(|_, cx| TabBarSettings::get_global(cx).show),
             should_display_welcome_page: false,
             render_tab_bar_buttons: Rc::new(default_render_tab_bar_buttons),
@@ -862,6 +864,13 @@ impl Pane {
         self.toolbar.update(cx, |toolbar, cx| {
             toolbar.set_can_navigate(can_navigate, cx);
         });
+        cx.notify();
+    }
+
+    /// Narrows this pane's tabs to what they draw, for a pane whose items fill
+    /// neither the indicator nor the close-button slot.
+    pub fn set_tabs_fit_content(&mut self, fit_content: bool, cx: &mut Context<Self>) {
+        self.tabs_fit_content = fit_content;
         cx.notify();
     }
 
@@ -2906,6 +2915,7 @@ impl Pane {
 
         let capability = item.capability(cx);
         let tab = Tab::new(ix)
+            .when(self.tabs_fit_content, Tab::fit_to_content)
             .position(if is_first_item {
                 TabPosition::First
             } else if is_last_item {

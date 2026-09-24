@@ -167,11 +167,33 @@ fn start_memory_usage_logging(
     .detach();
 }
 
+/// What gpui is holding, beside the memory line that prompted the question.
+///
+/// A freeze in steady state looks like a flush walking something very large,
+/// and the only way to tell which list is growing is to watch the counts
+/// over a session: they should sit still while the app does. This is the
+/// line to read first the next time the main thread spins.
+fn log_callback_counts(cx: &App) {
+    let counts = cx.callback_counts();
+    log::info!(
+        "quiet-ui perf: gpui holds {} observers over {} entities, {} listeners over {}, \
+         {} release observers, {} global observers, {} focus handles",
+        counts.observers,
+        counts.observed_entities,
+        counts.event_listeners,
+        counts.emitting_entities,
+        counts.release_listeners,
+        counts.global_observers,
+        counts.focus_handles,
+    );
+}
+
 fn log_worktree_diagnostics(
     workspace_store: &Entity<WorkspaceStore>,
     projects: &ProjectRegistry,
     cx: &App,
 ) {
+    log_callback_counts(cx);
     let workspace_project_ids = workspace_store
         .read(cx)
         .workspaces()

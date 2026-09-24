@@ -345,9 +345,21 @@ upload_debug_symbols
 # Sentry receives the extracted zed.dwarf, not the binary, so debug symbols
 # must be extracted before the binaries are stripped below. The .dwarf files
 # also keep symbols recoverable when the sentry upload is skipped.
+#
+# quiet-ui keeps the symbols in `zed` itself. The .dwarf this extracts stays
+# on the runner and is thrown away with it, and there is nowhere on this
+# branch to send it: the nightly uploads the files its own workflow names, and
+# that workflow lives on `main`. Without symbols a `sample` of a freeze is a
+# column of addresses — which is what the 2026-09-23 freeze report had to work
+# from, and it cost a night of guessing at which of them was the hot loop. A
+# larger download is the cheaper half of that trade for a build with one user.
+# `cli` and `remote_server` are nobody's profiling target and stay stripped.
+#
+# The tidier version of this is a dSYM published beside the dmg, which is one
+# `gh release upload` argument in `.github/workflows/quiet_ui_nightly.yml` on
+# `main`. Add it there and this can go back to stripping.
 if [[ "$target_dir" == "release" && "$local_install" != true ]]; then
     extract_debug_symbols
-    strip -x "target/${target_triple}/${target_dir}/zed"
     strip -x "target/${target_triple}/${target_dir}/cli"
     strip -x "target/${target_triple}/${target_dir}/remote_server"
 fi

@@ -37,7 +37,7 @@ use gpui_util::post_inc;
 use gpui_util::{ResultExt, measure};
 use itertools::FoldWhile::{Continue, Done};
 use itertools::Itertools;
-use parking_lot::RwLock;
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use raw_window_handle::{HandleError, HasDisplayHandle, HasWindowHandle};
 use refineable::Refineable;
 use scheduler::Instant;
@@ -486,7 +486,38 @@ impl ArenaClearNeeded {
     }
 }
 
-pub(crate) type FocusMap = RwLock<SlotMap<FocusId, FocusRef>>;
+/// Every focus handle in the process, and whether any of them has been let
+/// go since the last sweep.
+///
+/// The flag is what keeps [`App::release_dropped_focus_handles`] off the hot
+/// path. That sweep runs once per effect inside gpui's flush loop and walks
+/// this whole map looking for handles nobody holds any more; in a window that
+/// has been open for an hour, with thousands of handles and hundreds of
+/// effects per flush, it is a million reference-count loads that almost never
+/// find anything. Dropping the last handle for an entry is the only thing
+/// that gives the sweep something to do, so that is what arms it.
+#[derive(Default)]
+pub(crate) struct FocusMap {
+    handles: RwLock<SlotMap<FocusId, FocusRef>>,
+    dropped: AtomicBool,
+}
+
+impl FocusMap {
+    pub(crate) fn read(&self) -> RwLockReadGuard<'_, SlotMap<FocusId, FocusRef>> {
+        self.handles.read()
+    }
+
+    pub(crate) fn write(&self) -> RwLockWriteGuard<'_, SlotMap<FocusId, FocusRef>> {
+        self.handles.write()
+    }
+
+    /// Whether a handle has been dropped since this was last asked, clearing
+    /// the mark. A drop that lands while a sweep is running arms it again, so
+    /// the next sweep still sees it.
+    pub(crate) fn take_dropped(&self) -> bool {
+        self.dropped.swap(false, SeqCst)
+    }
+}
 pub(crate) struct FocusRef {
     pub(crate) ref_count: AtomicUsize,
     pub(crate) tab_index: isize,
@@ -652,12 +683,18 @@ impl Eq for FocusHandle {}
 
 impl Drop for FocusHandle {
     fn drop(&mut self) {
-        self.handles
+        let remaining = self
+            .handles
             .read()
             .get(self.id)
             .unwrap()
             .ref_count
             .fetch_sub(1, SeqCst);
+        if remaining == 1 {
+            // The last handle for this entry went, so the map has something
+            // to sweep. Nothing else puts work there.
+            self.handles.dropped.store(true, SeqCst);
+        }
     }
 }
 
@@ -7676,6 +7713,54 @@ mod tests {
         TouchId, TouchPhase, Underline, UnderlineStyle, Window, WindowAppearance, WindowOptions,
         canvas, div, hsla, point, px, size,
     };
+
+    /// The focus map is swept when a handle is let go, and not otherwise.
+    ///
+    /// The sweep walks every handle in the process and runs once per effect
+    /// inside the flush loop, so an app that sweeps whether or not anything
+    /// was dropped spends its main thread there. Handles still held must
+    /// survive, and one let go must be gone by the next flush.
+    #[gpui::test]
+    fn test_dropped_focus_handles_are_swept_and_held_ones_are_not(cx: &mut TestAppContext) {
+        let _window = cx.add_window(|_, _| EmptyView);
+
+        let before = cx.update(|cx| cx.callback_counts().focus_handles);
+        let held: Vec<FocusHandle> = cx.update(|cx| (0..4).map(|_| cx.focus_handle()).collect());
+        let dropped: Vec<FocusHandle> = cx.update(|cx| (0..4).map(|_| cx.focus_handle()).collect());
+        cx.update(|cx| {
+            assert_eq!(
+                cx.callback_counts().focus_handles,
+                before + 8,
+                "every handle should be in the map while it is held"
+            );
+        });
+
+        drop(dropped);
+        // A flush is what sweeps, and the drop is what gives it something to
+        // do; nothing else asks.
+        cx.update(|cx| cx.refresh_windows());
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            assert_eq!(
+                cx.callback_counts().focus_handles,
+                before + 4,
+                "the handles nobody holds should have left the map"
+            );
+        });
+        // And the other half: with nothing dropped since, the next flush has
+        // no reason to walk the map at all. This is what the whole change is
+        // for, so it is asserted rather than assumed.
+        cx.update(|cx| {
+            assert!(
+                !cx.focus_handles.take_dropped(),
+                "a flush that dropped nothing should not arm the sweep"
+            );
+        });
+
+        assert_eq!(held.len(), 4, "the held handles are still held");
+        drop(held);
+    }
 
     /// Visibility transitions reach observers exactly once each, with the new
     /// state already stored on the window, and never wake the platform for a

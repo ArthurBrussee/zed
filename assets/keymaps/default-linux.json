@@ -222,8 +222,6 @@
       "shift-alt-i": "agent::ToggleOptionsMenu",
       "ctrl-alt-shift-n": "agent::ToggleNewThreadMenu",
       "ctrl-shift-e": "project_panel::ToggleFocus",
-      "ctrl-tab": "agents_sidebar::ToggleThreadSwitcher",
-      "ctrl-shift-tab": ["agents_sidebar::ToggleThreadSwitcher", { "select_last": true }],
     },
   },
   {
@@ -268,6 +266,7 @@
       "down": "agent::ScrollOutputLineDown",
       "shift-pageup": "agent::ScrollOutputToPreviousMessage",
       "shift-pagedown": "agent::ScrollOutputToNextMessage",
+      "shift-alt-m": "agent::ToggleBookmark",
       "ctrl-alt-pageup": "agent::ScrollOutputPageUp",
       "ctrl-alt-pagedown": "agent::ScrollOutputPageDown",
       "ctrl-alt-home": "agent::ScrollOutputToTop",
@@ -392,12 +391,6 @@
     "context": "ThreadHistory",
     "bindings": {
       "backspace": "agent::RemoveSelectedThread",
-    },
-  },
-  {
-    "context": "ThreadsArchiveView",
-    "bindings": {
-      "shift-backspace": "agent::ArchiveSelectedThread",
     },
   },
 
@@ -751,7 +744,6 @@
       "right": "menu::SelectChild",
       "enter": "menu::Confirm",
       "ctrl-f": "agents_sidebar::FocusSidebarFilter",
-      "ctrl-g": "agents_sidebar::ToggleThreadHistory",
       "shift-backspace": "agent::ArchiveSelectedThread",
       "ctrl-backspace": "agent::RemoveSelectedThread",
       "ctrl-tab": "agents_sidebar::ToggleThreadSwitcher",
@@ -1674,6 +1666,18 @@
       "ctrl-enter": "skill_creator::SaveSkill",
       "tab": "skill_creator::FocusNextField",
       "shift-tab": "skill_creator::FocusPreviousField",
+    },
+  },
+  {
+    "context": "Editor && diff_review_input",
+    "bindings": {
+      "enter": "editor::SubmitDiffReviewComment",
+    },
+  },
+  {
+    "context": "Editor && diff_review",
+    "bindings": {
+      "ctrl-alt-enter": "agent::AddReviewComment",
     },
   },
 ]
