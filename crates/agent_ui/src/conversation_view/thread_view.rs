@@ -2532,23 +2532,18 @@ impl ThreadView {
             .enumerate()
             .skip(self.mined_entries.min(entries.len()))
         {
-            let finished = Self::entry_has_finished(entry, ix + 1 == entries.len(), generating);
-            if !finished {
+            // An entry still being written is not read at all, and the pass
+            // after this one starts again from it. Reading half of one does
+            // not just mine the prefix a URL is passing through: it also
+            // shows the miner two of the three pull requests that would have
+            // made the sentence a list, and a list is meant to join nothing.
+            if !Self::entry_has_finished(entry, ix + 1 == entries.len(), generating, cx) {
                 resume_at = resume_at.min(ix);
                 read_everything = false;
+                continue;
             }
             for text in Self::pr_mention_sources(entry, cx) {
-                // An unfinished entry is still read, so a chip appears while
-                // the agent is talking rather than a turn later, but a URL
-                // that runs to the end of what has arrived is left for the
-                // next pass: the number it names now is a prefix of the one
-                // it will name.
-                let mentions = if finished {
-                    acp_thread::pr_mentions(&text)
-                } else {
-                    acp_thread::pr_mentions_so_far(&text)
-                };
-                for mention in mentions {
+                for mention in acp_thread::pr_mentions(&text) {
                     let pr = WatchedPr {
                         repo: Some(mention.repo),
                         number: mention.number,
@@ -2593,19 +2588,24 @@ impl ThreadView {
     /// "Not the last entry" is not this test. A message a tool call started
     /// after is finished, and one still streaming at the end of a turn is not,
     /// and the two are told apart by the turn rather than by position.
-    fn entry_has_finished(entry: &AgentThreadEntry, is_last: bool, generating: bool) -> bool {
+    fn entry_has_finished(
+        entry: &AgentThreadEntry,
+        is_last: bool,
+        generating: bool,
+        cx: &App,
+    ) -> bool {
         match entry {
             // A message grows until something else starts after it or the
             // turn ends.
             AgentThreadEntry::AssistantMessage(_) => !is_last || !generating,
-            // A call says so itself, and its terminals report their output
-            // only once the process has exited.
-            AgentThreadEntry::ToolCall(call) => !matches!(
-                call.status,
-                ToolCallStatus::Pending
-                    | ToolCallStatus::InProgress
-                    | ToolCallStatus::WaitingForConfirmation { .. }
-            ),
+            // A command's output is the thing being written, and a terminal
+            // reports none until its process has exited. The call's own
+            // status is not the test: the agent reports a call completed some
+            // time after the command it ran actually stopped, and one of
+            // several commands running at once says nothing about the others.
+            AgentThreadEntry::ToolCall(call) => call
+                .terminals()
+                .all(|terminal| terminal.read(cx).output().is_some()),
             _ => true,
         }
     }
@@ -15742,21 +15742,6 @@ mod tests {
         ))
     }
 
-    /// A tool call with a status of its own, for the mining tests.
-    fn test_tool_call_with_status(
-        id: &str,
-        status: ToolCallStatus,
-        cx: &mut App,
-    ) -> AgentThreadEntry {
-        let AgentThreadEntry::ToolCall(mut call) =
-            test_tool_call(id, "gh pr create", acp::ToolKind::Execute, None, cx)
-        else {
-            unreachable!()
-        };
-        call.status = status;
-        AgentThreadEntry::ToolCall(call)
-    }
-
     #[gpui::test]
     fn only_a_finished_entry_is_read_as_a_statement(cx: &mut gpui::TestAppContext) {
         crate::test_support::init_test(cx);
@@ -15766,33 +15751,34 @@ mod tests {
 
             // A message still streaming at the end of a turn is not finished;
             // the same message once the turn ends is.
-            assert!(!ThreadView::entry_has_finished(&message, true, true));
-            assert!(ThreadView::entry_has_finished(&message, true, false));
+            assert!(!ThreadView::entry_has_finished(&message, true, true, cx));
+            assert!(ThreadView::entry_has_finished(&message, true, false, cx));
 
             // And a message a tool call started after is finished even though
             // the turn is still running, which is the case "not the last
             // entry" got right and nothing else did.
-            assert!(ThreadView::entry_has_finished(&message, false, true));
+            assert!(ThreadView::entry_has_finished(&message, false, true, cx));
 
-            // A call says so itself, whatever its position: one of several
-            // commands running at once is not finished just because another
-            // entry landed after it.
+            // A call is judged by its terminals, not by its own status: the
+            // agent reports a call completed some time after the command it
+            // ran actually stopped. One carrying no terminal has nothing left
+            // to arrive whatever its status says.
             for status in [
                 ToolCallStatus::Pending,
                 ToolCallStatus::InProgress,
-            ] {
-                let call = test_tool_call_with_status("1", status, cx);
-                assert!(!ThreadView::entry_has_finished(&call, false, true));
-                assert!(!ThreadView::entry_has_finished(&call, true, false));
-            }
-            for status in [
                 ToolCallStatus::Completed,
                 ToolCallStatus::Failed,
                 ToolCallStatus::Canceled,
                 ToolCallStatus::Rejected,
             ] {
-                let call = test_tool_call_with_status("1", status, cx);
-                assert!(ThreadView::entry_has_finished(&call, true, true));
+                let AgentThreadEntry::ToolCall(mut call) =
+                    test_tool_call("1", "gh pr create", acp::ToolKind::Execute, None, cx)
+                else {
+                    unreachable!()
+                };
+                call.status = status;
+                let call = AgentThreadEntry::ToolCall(call);
+                assert!(ThreadView::entry_has_finished(&call, true, true, cx));
             }
         });
     }

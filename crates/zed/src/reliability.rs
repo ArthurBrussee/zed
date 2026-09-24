@@ -189,6 +189,9 @@ fn log_callback_counts(cx: &App) {
     log_entity_counts(cx);
 }
 
+/// How many types the line names, at each end of it.
+const ENTITY_TYPES_LOGGED: usize = 10;
+
 /// How many of each kind of entity are alive, and which kinds grew since the
 /// last line.
 ///
@@ -196,8 +199,6 @@ fn log_callback_counts(cx: &App) {
 /// the handles. A leak names itself here: the type whose count climbs while
 /// the app sits still is the one nobody is releasing, and the largest types
 /// are the baseline a window pays for before anything happens at all.
-const ENTITY_TYPES_LOGGED: usize = 10;
-
 fn log_entity_counts(cx: &App) {
     thread_local! {
         /// The previous line's counts, so this one can say what moved.

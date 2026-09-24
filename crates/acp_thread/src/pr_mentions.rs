@@ -32,8 +32,11 @@ const LIST_THRESHOLD: usize = 3;
 /// The pull requests named in a message or a command's output, in the order
 /// they appear and without repeats.
 ///
-/// The text must be finished. For text that is still arriving, see
-/// [`pr_mentions_so_far`].
+/// **The text must have finished arriving.** Half of a message is not a
+/// smaller message: every number a URL passes through on its way is itself a
+/// valid pull request, and two of the three URLs that would have made a
+/// sentence a list read as two pull requests worth watching. The caller reads
+/// an entry only once it is done; see the test below for what it is avoiding.
 pub fn pr_mentions(text: &str) -> Vec<PrMention> {
     let mut found: Vec<PrMention> = Vec::new();
     let mut searched = 0;
@@ -76,35 +79,6 @@ pub fn creates_pull_request(command: &str) -> bool {
                 crate::SegmentKind::GitHub { operation, .. } if operation == "pr create"
             )
         })
-}
-
-/// The pull requests named so far in text that is still being written.
-///
-/// A URL that runs to the very end of what has arrived is not a mention yet:
-/// the next chunk may extend it, and every number a URL passes through on its
-/// way is itself a valid pull request. A chunk boundary inside
-/// `.../pull/15700` mines `157`, the pass after it mines `15700`, and both
-/// land in the set — which is how `#157` appeared beside `#15700`.
-pub fn pr_mentions_so_far(text: &str) -> Vec<PrMention> {
-    pr_mentions(&text[..unfinished_url_start(text).unwrap_or(text.len())])
-}
-
-/// Where the URL the text ends inside begins, if it ends inside one. A span
-/// that nothing has closed — no whitespace, no delimiter — is one the writer
-/// has not finished.
-fn unfinished_url_start(text: &str) -> Option<usize> {
-    let mut searched = 0;
-    let mut last_host = None;
-    while let Some(offset) = text[searched..].find(HOST) {
-        let host_at = searched + offset;
-        searched = host_at + HOST.len();
-        if host_is_its_own_word(&text[..host_at]) {
-            last_host = Some(host_at);
-        }
-    }
-    let host_at = last_host?;
-    let closed = text[host_at + HOST.len()..].contains(is_url_end);
-    (!closed).then_some(host_at)
 }
 
 const HOST: &str = "github.com/";
@@ -171,56 +145,41 @@ mod tests {
         }
     }
 
-    /// The case from the report: adding #15700 also added #157.
+    /// The case from the report: adding #15700 also added #157, and why the
+    /// caller may not read an entry until it has finished arriving.
     ///
-    /// A message arriving in chunks is read on every pass, and the numbers a
-    /// URL passes through on its way are all valid pull requests, so a chunk
-    /// boundary inside one mines a shorter PR that nobody ever named.
+    /// Every prefix of a message is itself readable, and the numbers a URL
+    /// passes through on its way are all valid pull requests, so reading a
+    /// message as it streams mines a PR nobody ever named. This test is the
+    /// hazard, not a guard against it: the guard is that mining reads only
+    /// entries that are done.
     #[test]
-    fn test_a_url_still_arriving_is_not_a_mention_yet() {
+    fn test_half_a_url_reads_as_a_different_pull_request() {
         let whole = "Opened https://github.com/zed-industries/zed/pull/15700";
-        // Every prefix of the message, as the chunks would deliver it.
-        for split in 0..whole.len() {
-            let so_far = &whole[..split];
-            assert_eq!(
-                pr_mentions_so_far(so_far),
-                Vec::new(),
-                "{so_far:?} names no finished pull request"
-            );
-        }
-        // Including the whole message: nothing has closed the URL, so as far
-        // as this can tell the next chunk may still extend it. It is the
-        // entry finishing that settles it, and a finished entry is read with
-        // `pr_mentions`, which names the one it actually says.
-        assert_eq!(pr_mentions_so_far(whole), Vec::new());
-        assert_eq!(pr_mentions(whole), vec![mention("zed-industries/zed", 15700)]);
+        let mined: Vec<u64> = (0..=whole.len())
+            .flat_map(|split| pr_mentions(&whole[..split]))
+            .map(|mention| mention.number)
+            .collect();
+        // Read as it arrives, one message names five pull requests.
+        assert_eq!(mined, vec![1, 15, 157, 1570, 15700]);
 
-        // A URL something has closed is finished even with more to come: the
-        // chips should not wait for the end of a paragraph.
+        // Read once, when it is finished, it names the one it says.
         assert_eq!(
-            pr_mentions_so_far("Opened https://github.com/zed-industries/zed/pull/15700 and now"),
+            pr_mentions(whole),
             vec![mention("zed-industries/zed", 15700)]
         );
-        assert_eq!(
-            pr_mentions_so_far("See (https://github.com/zed-industries/zed/pull/15700)"),
-            vec![mention("zed-industries/zed", 15700)],
-            "a closing bracket ends the span the same way whitespace does"
-        );
 
-        // Only the last URL can be the unfinished one; the ones before it
-        // were closed by whatever came after them.
+        // The other half of reading half: three distinct URLs are a list and
+        // join nothing, but the first two of them, alone, are two pull
+        // requests worth watching.
+        let list = "Looked at https://github.com/o/n/pull/1, \
+                    https://github.com/o/n/pull/2 and https://github.com/o/n/pull/3.";
+        assert_eq!(pr_mentions(list), Vec::new(), "three is a list");
+        let first_two = &list[..list.find("and").unwrap()];
         assert_eq!(
-            pr_mentions_so_far(
-                "First https://github.com/o/n/pull/12, then https://github.com/o/n/pull/34"
-            ),
-            vec![mention("o/n", 12)]
-        );
-
-        // Text that ends in something that is not a URL at all is finished.
-        assert_eq!(pr_mentions_so_far("nothing here"), Vec::new());
-        assert_eq!(
-            pr_mentions_so_far("done: https://github.com/o/n/pull/7\n"),
-            vec![mention("o/n", 7)]
+            pr_mentions(first_two),
+            vec![mention("o/n", 1), mention("o/n", 2)],
+            "and two thirds of that list is not a list"
         );
     }
 

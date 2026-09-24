@@ -156,8 +156,9 @@ impl EntityMap {
     /// How many live entities there are of each concrete type, largest first.
     ///
     /// Walks the whole map, so ask on a timer rather than on a frame. An
-    /// entity currently leased for an update is not in the map and so is not
-    /// counted; at most one is leased at a time, so the undercount is one.
+    /// entity currently leased for an update is out of the map and so is not
+    /// counted; updates nest only a few deep, so the undercount is a handful
+    /// against a population this is asked about in thousands.
     pub fn counts_by_type(&self) -> Vec<(&'static str, usize)> {
         let mut by_type: FxHashMap<TypeId, usize> = FxHashMap::default();
         for (_, entity) in self.entities.iter() {
