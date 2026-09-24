@@ -664,8 +664,7 @@ pub struct ThreadView {
     /// Markdown entities for the scripts a command carried (heredoc bodies,
     /// `-c` payloads), built the first time the call is expanded so the code
     /// can be shown highlighted rather than as one long line.
-    command_script_markdown:
-        RefCell<HashMap<acp::ToolCallId, Vec<(SharedString, Entity<Markdown>)>>>,
+    command_script_markdown: RefCell<CommandScripts>,
     /// Image read chips the user explicitly collapsed. Image chips start
     /// expanded (seeing the image is the point), so this records the
     /// exception rather than the rule.
@@ -1261,6 +1260,51 @@ enum CommandFileDiff {
     },
 }
 
+/// How many commands' scripts are kept. One chip is expanded at a time, so
+/// anything further back than the last few is a command nobody is reading.
+const KEPT_COMMAND_SCRIPTS: usize = 8;
+
+/// The highlighted scripts commands carried, and how recently each was drawn.
+///
+/// Every script is a `Markdown`, and every `Markdown` watches the theme, so
+/// holding one per command ever expanded meant a session's worth of entities
+/// and global observers for code nobody was still looking at.
+#[derive(Default)]
+struct CommandScripts {
+    by_call: HashMap<acp::ToolCallId, CommandScript>,
+    /// Ticks on every use, which is what "recently" is measured in.
+    uses: u64,
+}
+
+struct CommandScript {
+    scripts: Vec<(SharedString, Entity<Markdown>)>,
+    last_used: u64,
+}
+
+impl CommandScripts {
+    /// The scripts of one command, marking it as the most recently drawn.
+    fn get(&mut self, id: &acp::ToolCallId) -> Option<Vec<(SharedString, Entity<Markdown>)>> {
+        self.uses += 1;
+        let uses = self.uses;
+        let script = self.by_call.get_mut(id)?;
+        script.last_used = uses;
+        Some(script.scripts.clone())
+    }
+
+    fn insert(&mut self, id: acp::ToolCallId, scripts: Vec<(SharedString, Entity<Markdown>)>) {
+        self.uses += 1;
+        let last_used = self.uses;
+        self.by_call.insert(id, CommandScript { scripts, last_used });
+        let used = self
+            .by_call
+            .iter()
+            .map(|(id, script)| (script.last_used, id.clone()));
+        for id in stale_by_use(used, KEPT_COMMAND_SCRIPTS) {
+            self.by_call.remove(&id);
+        }
+    }
+}
+
 /// How many built diff editors are kept. A card shows one at a time; the rest
 /// are there so that hovering back over a file is instant.
 const KEPT_COMMAND_FILE_DIFFS: usize = 8;
@@ -1301,18 +1345,24 @@ impl CommandFileDiffs {
 }
 
 /// Of things stamped with when they were last used, the ones to drop so that
-/// only the `keep` most recent remain. Ties go to the smaller key, so an
-/// eviction is the same every time rather than however the map iterated.
-fn stale_by_use<K: Ord>(used: impl Iterator<Item = (u64, K)>, keep: usize) -> Vec<K> {
-    let mut used = used.collect::<Vec<_>>();
+/// only the `keep` most recent remain.
+///
+/// Two things cannot share a stamp — it comes from a counter that only goes
+/// up — so equal stamps are only possible in a test, and they keep the order
+/// they were handed over in.
+fn stale_by_use<K>(used: impl Iterator<Item = (u64, K)>, keep: usize) -> Vec<K> {
+    let mut used = used
+        .enumerate()
+        .map(|(position, (last_used, key))| (last_used, position, key))
+        .collect::<Vec<_>>();
     if used.len() <= keep {
         return Vec::new();
     }
-    used.sort_unstable_by(|(a_use, a_key), (b_use, b_key)| {
-        b_use.cmp(a_use).then(a_key.cmp(b_key))
+    used.sort_unstable_by(|(a_use, a_pos, _), (b_use, b_pos, _)| {
+        b_use.cmp(a_use).then(a_pos.cmp(b_pos))
     });
     used.drain(..keep);
-    used.into_iter().map(|(_, key)| key).collect()
+    used.into_iter().map(|(_, _, key)| key).collect()
 }
 
 /// A picture a chip stands for, however the agent delivered it.
@@ -13925,8 +13975,9 @@ impl ThreadView {
     fn prepare_command_scripts(&mut self, tool_call_id: &acp::ToolCallId, cx: &mut Context<Self>) {
         if self
             .command_script_markdown
-            .borrow()
-            .contains_key(tool_call_id)
+            .borrow_mut()
+            .get(tool_call_id)
+            .is_some()
         {
             return;
         }
@@ -13963,12 +14014,7 @@ impl ThreadView {
         window: &Window,
         cx: &Context<Self>,
     ) -> Vec<AnyElement> {
-        let Some(entries) = self
-            .command_script_markdown
-            .borrow()
-            .get(&tool_call.id)
-            .cloned()
-        else {
+        let Some(entries) = self.command_script_markdown.borrow_mut().get(&tool_call.id) else {
             return Vec::new();
         };
         entries
@@ -15411,7 +15457,8 @@ mod tests {
         let held = vec![(1, "a"), (2, "b"), (3, "c"), (9, "d"), (8, "e")];
         assert_eq!(stale_by_use(held.into_iter(), 2), vec!["c", "b", "a"]);
 
-        // A tie is broken by the key, so the same two survive every time.
+        // Equal stamps keep the order they arrived in, so the oldest still
+        // goes. Real stamps come from a counter and are never equal.
         let held = vec![(5, "b"), (5, "a"), (1, "c")];
         assert_eq!(stale_by_use(held.into_iter(), 2), vec!["c"]);
 
