@@ -678,7 +678,7 @@ pub struct ThreadView {
     /// commands that touched one file each changed something different about
     /// it. Nobody declared these edits, so the diff is built from the text the
     /// command found and the text on disk now.
-    command_file_diffs: RefCell<HashMap<(usize, project::ProjectPath), CommandFileDiff>>,
+    command_file_diffs: RefCell<CommandFileDiffs>,
     /// The real-file editors an edit chip decorated with the agent's diff,
     /// keyed by project path, so a chip does not re-decorate an editor that is
     /// already showing the diff (opening the file is idempotent; adding the
@@ -1202,7 +1202,64 @@ enum CommandFileDiff {
     Ready {
         editor: Entity<Editor>,
         _diff: Entity<acp_thread::Diff>,
+        /// When a card last asked for this editor, so the ones nobody has
+        /// come back to can be told from the ones they have.
+        last_used: u64,
     },
+}
+
+/// How many built diff editors are kept. A card shows one at a time; the rest
+/// are there so that hovering back over a file is instant.
+const KEPT_COMMAND_FILE_DIFFS: usize = 8;
+
+/// The diff editors built for files commands changed, and how recently each
+/// was looked at.
+///
+/// Every editor here holds a multibuffer, its own focus handles and a pair of
+/// global observers, and every one of them is walked whenever gpui sweeps any
+/// of those sets. Without a bound, a session spent reading chips is a session
+/// spent accumulating editors nobody can see.
+#[derive(Default)]
+struct CommandFileDiffs {
+    by_file: HashMap<(usize, project::ProjectPath), CommandFileDiff>,
+    /// Ticks on every use, which is what "recently" is measured in.
+    uses: u64,
+}
+
+impl CommandFileDiffs {
+    /// Marks a use and returns its stamp.
+    fn touch(&mut self) -> u64 {
+        self.uses += 1;
+        self.uses
+    }
+
+    /// Drops all but the [`KEPT_COMMAND_FILE_DIFFS`] most recently used
+    /// editors. A diff still loading is left alone: it has no editor yet, and
+    /// dropping it would cancel the read a card is waiting on.
+    fn evict_stale(&mut self) {
+        let used = self.by_file.iter().filter_map(|(key, state)| match state {
+            CommandFileDiff::Ready { last_used, .. } => Some((*last_used, key.clone())),
+            CommandFileDiff::Loading { .. } => None,
+        });
+        for key in stale_by_use(used, KEPT_COMMAND_FILE_DIFFS) {
+            self.by_file.remove(&key);
+        }
+    }
+}
+
+/// Of things stamped with when they were last used, the ones to drop so that
+/// only the `keep` most recent remain. Ties go to the smaller key, so an
+/// eviction is the same every time rather than however the map iterated.
+fn stale_by_use<K: Ord>(used: impl Iterator<Item = (u64, K)>, keep: usize) -> Vec<K> {
+    let mut used = used.collect::<Vec<_>>();
+    if used.len() <= keep {
+        return Vec::new();
+    }
+    used.sort_unstable_by(|(a_use, a_key), (b_use, b_key)| {
+        b_use.cmp(a_use).then(a_key.cmp(b_key))
+    });
+    used.drain(..keep);
+    used.into_iter().map(|(_, key)| key).collect()
 }
 
 /// A picture a chip stands for, however the agent delivered it.
@@ -15225,6 +15282,26 @@ mod tests {
                 expected,
             );
         }
+    }
+
+    #[test]
+    fn a_diff_editor_nobody_came_back_to_is_the_one_dropped() {
+        // Nothing to do until there are more than the cache keeps.
+        let held = (1..=3).map(|use_| (use_, use_ as usize)).collect::<Vec<_>>();
+        assert_eq!(stale_by_use(held.into_iter(), 3), Vec::<usize>::new());
+
+        // Five kept, two of them looked at again: the three nobody came back
+        // to go, and the order they are named in does not depend on the map.
+        let held = vec![(1, "a"), (2, "b"), (3, "c"), (9, "d"), (8, "e")];
+        assert_eq!(stale_by_use(held.into_iter(), 2), vec!["c", "b", "a"]);
+
+        // A tie is broken by the key, so the same two survive every time.
+        let held = vec![(5, "b"), (5, "a"), (1, "c")];
+        assert_eq!(stale_by_use(held.into_iter(), 2), vec!["c"]);
+
+        // Keeping none drops everything, newest first.
+        let held = vec![(1, "a"), (2, "b")];
+        assert_eq!(stale_by_use(held.into_iter(), 0), vec!["b", "a"]);
     }
 
     fn box_height(width: u32, height: u32) -> f32 {

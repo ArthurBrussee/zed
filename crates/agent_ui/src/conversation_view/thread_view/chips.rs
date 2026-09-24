@@ -2532,11 +2532,20 @@ impl ThreadView {
         cx: &mut Context<Self>,
     ) -> Option<Entity<Editor>> {
         let key = (entry_ix, file.path.clone());
-        if let Some(state) = self.command_file_diffs.borrow().get(&key) {
-            return match state {
-                CommandFileDiff::Ready { editor, .. } => Some(editor.clone()),
-                CommandFileDiff::Loading { .. } => None,
-            };
+        {
+            let mut cache = self.command_file_diffs.borrow_mut();
+            let used = cache.touch();
+            if let Some(state) = cache.by_file.get_mut(&key) {
+                return match state {
+                    CommandFileDiff::Ready {
+                        editor, last_used, ..
+                    } => {
+                        *last_used = used;
+                        Some(editor.clone())
+                    }
+                    CommandFileDiff::Loading { .. } => None,
+                };
+            }
         }
         let project = self.project.upgrade()?;
         let path = file.path.clone();
@@ -2592,19 +2601,23 @@ impl ThreadView {
                 this.update(cx, |this, cx| {
                     match opened {
                         Ok((diff, editor)) => {
-                            this.command_file_diffs.borrow_mut().insert(
+                            let mut cache = this.command_file_diffs.borrow_mut();
+                            let last_used = cache.touch();
+                            cache.by_file.insert(
                                 key,
                                 CommandFileDiff::Ready {
                                     editor,
                                     _diff: diff,
+                                    last_used,
                                 },
                             );
+                            cache.evict_stale();
                         }
                         // A file the project cannot open (deleted by the
                         // command, or outside every worktree) has no diff to
                         // show. Forgetting it lets a later hover try again.
                         Err(_) => {
-                            this.command_file_diffs.borrow_mut().remove(&key);
+                            this.command_file_diffs.borrow_mut().by_file.remove(&key);
                         }
                     }
                     cx.notify();
@@ -2614,6 +2627,7 @@ impl ThreadView {
         });
         self.command_file_diffs
             .borrow_mut()
+            .by_file
             .insert(key, CommandFileDiff::Loading { _task: task });
         None
     }
