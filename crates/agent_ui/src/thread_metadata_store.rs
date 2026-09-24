@@ -359,12 +359,15 @@ pub struct ThreadPrSnapshot {
     pub mining_rules: u32,
 }
 
-/// The mining rules as they stand: prose and `gh pr create` only, and no
-/// piece of text naming three or more. A snapshot filled by anything older
-/// gets its mined PRs re-decided the next time its thread is opened. Bump
-/// this whenever a change to the rules would leave PRs in a set that the new
-/// rules would not have put there.
-pub const MINING_RULES: u32 = 1;
+/// The mining rules as they stand: prose and `gh pr create` only, no piece of
+/// text naming three or more, and only text that has finished arriving. A
+/// snapshot filled by anything older gets its mined PRs re-decided the next
+/// time its thread is opened. Bump this whenever a change to the rules would
+/// leave PRs in a set that the new rules would not have put there.
+///
+/// 2: reading half-written text mined the numbers a URL passes through on its
+/// way, so a set can hold a PR that is a prefix of the one beside it.
+pub const MINING_RULES: u32 = 2;
 
 /// One pull request a thread watches.
 ///
