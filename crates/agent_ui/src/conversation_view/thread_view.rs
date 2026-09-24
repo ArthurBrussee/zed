@@ -9441,9 +9441,7 @@ impl ThreadView {
     fn draws_no_transcript_content(entry: &AgentThreadEntry, cx: &App) -> bool {
         match entry {
             AgentThreadEntry::AssistantMessage(message) => {
-                !message.indented
-                    && !message.is_subagent_output
-                    && !Self::has_prose(message, cx)
+                !message.indented && !message.is_subagent_output && !Self::has_content(message, cx)
             }
             _ => false,
         }
@@ -9528,11 +9526,13 @@ impl ThreadView {
             })
     }
 
-    fn has_prose(message: &AssistantMessage, cx: &App) -> bool {
+    /// Whether a message has anything for the transcript to draw: prose, but
+    /// also a picture or a resource link, which say nothing in markdown and
+    /// are still the whole content of the message that carries them.
+    /// Thinking does not count; it is shown beside the progress indicator.
+    fn has_content(message: &AssistantMessage, cx: &App) -> bool {
         message.chunks.iter().any(|chunk| match chunk {
-            AssistantMessageChunk::Message { block, .. } => block
-                .markdowns()
-                .any(|markdown| !markdown.read(cx).source().trim().is_empty()),
+            AssistantMessageChunk::Message { block, .. } => block.visible_content(cx),
             AssistantMessageChunk::Thought { .. } => false,
         })
     }
@@ -16062,6 +16062,27 @@ mod tests {
         assert_eq!(find_run(1, all.len(), |ix| all[ix], &mut memo), Some((0, 2)));
     }
 
+    /// An assistant message whose only content is a picture: no markdown in
+    /// it at all, and nothing about it invisible.
+    fn test_assistant_message_with_image(cx: &mut App) -> AgentThreadEntry {
+        let language_registry =
+            std::sync::Arc::new(language::LanguageRegistry::test(cx.background_executor().clone()));
+        let block = acp_thread::MessageContent::new(
+            acp::ContentBlock::Image(acp::ImageContent::new(
+                "iVBORw0KGgo=".to_string(),
+                "image/png".to_string(),
+            )),
+            &language_registry,
+            util::paths::PathStyle::local(),
+            cx,
+        );
+        AgentThreadEntry::AssistantMessage(AssistantMessage {
+            chunks: vec![AssistantMessageChunk::Message { id: None, block }],
+            indented: false,
+            is_subagent_output: false,
+        })
+    }
+
     #[gpui::test]
     fn a_message_that_draws_nothing_does_not_split_a_run_of_chips(cx: &mut gpui::TestAppContext) {
         crate::test_support::init_test(cx);
@@ -16101,6 +16122,15 @@ mod tests {
                     "entry {ix} belongs to the one run"
                 );
             }
+
+            // A message whose only content is a picture draws plenty, even
+            // though it says nothing in markdown. Reading "draws nothing" as
+            // "has no prose" hid an image-only reply behind an empty run.
+            let with_image = test_assistant_message_with_image(cx);
+            assert!(
+                !ThreadView::draws_no_transcript_content(&with_image, cx),
+                "an image is content, so the message that carries one ends a run"
+            );
 
             // Prose still ends it, which is the whole point of the boundary.
             let entries = vec![
@@ -16353,9 +16383,17 @@ mod tests {
         crate::test_support::init_test(cx);
 
         cx.update(|cx| {
+            // A blank thought draws nothing, so it belongs to whatever run it
+            // sits in rather than splitting it — but it is still not a chip of
+            // its own, and a run made only of these draws nothing at all
+            // (`render_action_group` returns `Empty` when no chip was built).
             let entries = vec![test_assistant_message(&[("  \n", true)], cx)];
-            assert!(!ThreadView::is_chip_entry(&entries[0], cx));
-            assert_eq!(ThreadView::action_run_bounds_in(&entries, 0, cx), None);
+            assert!(ThreadView::draws_no_transcript_content(&entries[0], cx));
+            assert!(!ThreadView::is_thoughts_only_message(&entries[0], cx));
+            assert!(
+                ThreadView::action_chips_in(&entries, 0, 1, cx).is_empty(),
+                "a blank thought is not a chip"
+            );
         });
     }
 
