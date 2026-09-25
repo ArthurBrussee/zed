@@ -929,6 +929,30 @@ edit worked out which files a call touched once per file per file. Both are answ
 now. The rest of the shapes are untouched, and the ones about foreground work and about scaling
 with threads or worktrees want the running app.
 
+**GitHub still rate-limits: fetches go out as one burst, and the burst scales with every watched PR.**
+The 2026-09-21 fix made each poll cheaper and added a backoff; the budget still runs out. On
+2026-09-25 the app logged "GitHub's API budget is spent" 118 times in the same second, 33 seconds
+after launch, and the previous log holds 142 more from the hour before. Four things, and the first
+is most of it:
+
+- *Ask once for many.* Every watched PR or branch is its own `gh` process and its own request.
+  GraphQL answers many at once: one query with an alias per PR (`pr15700: pullRequest(number:
+  15700) { ... }`, grouped by repository) turns a hundred requests into one or two, and asking the
+  query for `rateLimit { cost remaining resetAt }` says exactly what each poll spent.
+- *Poll what is on screen.* The count is the multiplier. A burst of 118 right after launch means
+  every watched PR in every thread is polled, not the few threads visible. The 2026-09-21 entry
+  asked for threads that are open or on screen only; make sure that is what the code does, and that
+  merged and closed PRs cost nothing.
+- *Back off to GitHub's clock, not a fixed ten minutes.* `RATE_LIMIT_BACKOFF`
+  (`crates/gh_status/src/gh_status.rs`) holds every fetch for ten minutes and releases them all
+  together, which is the next burst. Hold until the reset time GitHub gives, and cap how many
+  requests are in flight at once, so a refusal stops a trickle rather than arriving after a flood
+  is already out. And fix the log guard in the refusal branch: it compares against `now + backoff`,
+  which is always later than the stored value, so "say it once" says it for every request.
+- *Log what Zed spends.* Once a query returns its own cost, write the hour's total beside the
+  other perf lines. That settles whether it is this app spending the budget or something else on
+  the same account, which the log cannot currently answer.
+
 ## Verification queue
 
 Where the day's edits go unverified. `cargo check` and `script/clippy` run here as usual; what
