@@ -929,6 +929,42 @@ edit worked out which files a call touched once per file per file. Both are answ
 now. The rest of the shapes are untouched, and the ones about foreground work and about scaling
 with threads or worktrees want the running app.
 
+**Restoring an archived worktree fails when the repository has submodules.**
+Unarchiving a thread in the mech repository fails, and the user reports worktrees with submodules or
+other git complications as generally flaky. The failure from 2026-09-25 12:09:
+
+    Failed to restore worktree: failed to restore archive checkpoint: failed to restore working
+    directory from unstaged commit: Git command failed:
+    fatal: not a git repository: ../../../../../../../mech/.git/worktrees/mech50/modules/ios/tailnet/libtailscale
+    fatal: could not reset submodule index
+
+The mech checkout sets `submodule.recurse true` (in `.git/config.worktree`), which is a common and
+reasonable setting. Restoring recreates the worktree and then runs
+`git read-tree --reset -u <unstaged>` (upstream's `restore_archive_checkpoint`,
+`crates/git/src/repository.rs`). With recursion on, that read-tree reaches into the submodule to
+reset it, but the fresh worktree's submodule has no git directory yet, because nothing has run
+`git submodule update --init` in it, and the restore aborts. The admin directory named in the error
+did grow its `modules/.../libtailscale` afterwards, so the submodule was one step late, not missing.
+
+Fix it at the fork's call site in `thread_worktree_archive.rs`, not inside upstream's
+`restore_archive_checkpoint`: initialise the new worktree's submodules before restoring the
+checkpoint, or run the restore with recursion off and bring the submodules to their recorded
+commits afterwards. Either way the superproject restore must not depend on the user's recursion
+setting. Test it with a repository that has a submodule and `submodule.recurse` on, since that is the
+case that fails and the one the existing submodule tests do not cover.
+
+The more serious half, which this failure points at: the archive checkpoint records a submodule only
+as the commit its gitlink names. Anything *inside* a submodule — uncommitted edits, or commits made
+there and never pushed — lives in the worktree's `.git/worktrees/<name>/modules/`, and archiving
+deletes that directory with the worktree. That is silent data loss for work done inside a
+submodule. Before archiving a worktree, check each submodule for local changes and for commits its
+remote does not have; if there are any, either keep them (a checkpoint per submodule) or refuse to
+delete the worktree and say why.
+
+While there, the other complications worth a test each, since "other git complications" was part
+of the report: a worktree using Git LFS, a sparse checkout, and a nested repository that is not a
+submodule. Say which of them restore cleanly and fix the ones that do not.
+
 **GitHub still rate-limits: fetches go out as one burst, and the burst scales with every watched PR.**
 The 2026-09-21 fix made each poll cheaper and added a backoff; the budget still runs out. On
 2026-09-25 the app logged "GitHub's API budget is spent" 118 times in the same second, 33 seconds
