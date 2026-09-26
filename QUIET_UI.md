@@ -965,6 +965,35 @@ While there, the other complications worth a test each, since "other git complic
 of the report: a worktree using Git LFS, a sparse checkout, and a nested repository that is not a
 submodule. Say which of them restore cleanly and fix the ones that do not.
 
+**Remove the thread tab bar. The sidebar is the vertical tab list.**
+
+The sidebar's active section already shows every open thread with its logo, title, running
+state, unread dot and PR chips, in tab order, and it can be reordered by dragging. The tab bar
+across the top of the agent panel repeats that and costs a row of height. Stop drawing it
+(`set_should_display_tab_bar` in `AgentPanel::new_thread_pane`) and give the row back to the
+thread.
+
+Keep `thread_pane` as the model underneath. An open pane item is still what "open in Zed"
+means, and the sidebar still reads its order from pane item order (`tab_positions`). This is a
+change to what's shown, not a rewrite of the model.
+
+Anything only the tab bar could do needs another way to do it:
+- Closing a thread without archiving it: `cmd-w` on the active thread keeps working, and the
+  sidebar row's right-click menu gets "Close" next to Archive. Middle-click on a row closes it
+  too.
+- Switching threads while the sidebar is collapsed: ctrl-tab (the tab switcher scoped to the
+  thread pane) and next/previous item must still work and show the thread titles.
+- Sidebar reordering must write pane item order directly, not rely on dragging tabs. If
+  anything still depends on `DraggedTab` from the thread pane (the drop predicate, sidebar drop
+  handling), move it to the sidebar's own drag type or delete it.
+
+Then delete the fork code that only existed for the tab bar. This also serves the diff
+minimization goal. That means `Pane::set_tabs_fit_content` and its use in `pane.rs`, the fork's
+changes to `crates/ui/src/components/tab.rs` (about +85 lines) if nothing else needs them, and
+whatever tab-bar-only styling in `thread_tab.rs` the tab switcher doesn't use. Keep
+`tab_content`, because the tab switcher renders it. Update the "Threads as tabs" and
+implementation notes in this file to say the tab bar is gone.
+
 **GitHub still rate-limits: fetches go out as one burst, and the burst scales with every watched PR.**
 The 2026-09-21 fix made each poll cheaper and added a backoff; the budget still runs out. On
 2026-09-25 the app logged "GitHub's API budget is spent" 118 times in the same second, 33 seconds
