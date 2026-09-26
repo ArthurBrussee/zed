@@ -983,6 +983,13 @@ Anything only the tab bar could do needs another way to do it:
   too.
 - Switching threads while the sidebar is collapsed: ctrl-tab (the tab switcher scoped to the
   thread pane) and next/previous item must still work and show the thread titles.
+- Unsent new threads must stay in the sidebar. Today `rebuild_contents` in `sidebar.rs` drops an
+  empty draft as soon as it stops being the active thread (the retain on `DraftKind::Empty`),
+  and the panel's `draft_thread` slot is a view with no tab. With tabs gone, a dropped row
+  leaves no way back to that thread. Every open thread shows in the sidebar, empty drafts
+  included, until it is closed or sent. Make the `draft_thread` slot a pane item like any other
+  thread, so "open" still has a single definition, and restore drafts across restarts
+  (`restore_new_draft` does this only for the one slot).
 - Sidebar reordering must write pane item order directly, not rely on dragging tabs. If
   anything still depends on `DraggedTab` from the thread pane (the drop predicate, sidebar drop
   handling), move it to the sidebar's own drag type or delete it.
@@ -993,6 +1000,21 @@ changes to `crates/ui/src/components/tab.rs` (about +85 lines) if nothing else n
 whatever tab-bar-only styling in `thread_tab.rs` the tab switcher doesn't use. Keep
 `tab_content`, because the tab switcher renders it. Update the "Threads as tabs" and
 implementation notes in this file to say the tab bar is gone.
+
+**Sidebar rows: move the agent icon to the second line so the title gets the whole first line.**
+
+The sidebar is narrow and titles get cut off. In `ThreadItem::render`
+(`crates/ui/src/components/ai/thread_item.rs`) the title row starts with the agent icon, and
+the metadata line below leaves an empty icon-width spacer (`icon_container()` "Icon Spacing")
+to line up under it. Put the icon at the start of the metadata line in place of that spacer,
+and start the title at the row's left edge. The running spinner and action slot stay at the
+right of the title row as they are.
+
+Every row then needs a second line to carry the icon. Nearly all rows already have one (age,
+size, worktree, PR). One that doesn't gets a second line holding just the icon, so all rows are
+the same height and the icons stay in one column. Terminal rows (`ThreadItem` built for
+terminals in `sidebar.rs`) and archived rows get the same layout. Check the worktree group
+header rows and the rows nested under them still line up.
 
 **GitHub still rate-limits: fetches go out as one burst, and the burst scales with every watched PR.**
 The 2026-09-21 fix made each poll cheaper and added a backoff; the budget still runs out. On
