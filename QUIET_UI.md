@@ -1016,6 +1016,42 @@ the same height and the icons stay in one column. Terminal rows (`ThreadItem` bu
 terminals in `sidebar.rs`) and archived rows get the same layout. Check the worktree group
 header rows and the rows nested under them still line up.
 
+**A thread running commands shows no activity in the sidebar once the agent's turn has ended.**
+
+Arthur sees threads with no activity indication while they are running commands. There are two
+causes, and both need fixing.
+
+1. The row only lights up while the turn is running. `ThreadItem::render`
+   (`crates/ui/src/components/ai/thread_item.rs`) draws the accent wash, the edge and the
+   activity pill only when `status == AgentThreadStatus::Running`. A thread whose turn has ended
+   with commands still running (`running_work.terminals > 0`) looks idle. Make the row count as
+   working whenever the turn is running OR `running_work` is non-empty. The pill still shows the
+   counts. The thread view's bottom-bar pill gets the same rule.
+
+2. Claude's backgrounded commands are invisible to Zed. The Claude adapter
+   (`@agentclientprotocol/claude-agent-acp` 0.81.2 on Arthur's machine; see `dist/async-tasks.js`
+   and `dist/air-extension.js`) reports `run_in_background` Bash commands and other background
+   tasks only to clients that advertise its AIR `asyncTasks` capability. That is
+   `clientCapabilities._meta.jetbrains.air = { version: 1, capabilities: ["asyncTasks"] }`.
+   Zed doesn't advertise it (`agent_servers/src/acp.rs` sets only `terminal_output` in that
+   `_meta`). The Bash card therefore goes to completed the moment the command detaches, while
+   the command runs on for minutes, and nothing in Zed knows. Advertise the capability and
+   handle what the adapter then sends:
+   - Session updates `async_task_spawned` (asyncTaskId, name, description, toolCallId,
+     outputFilePath, canStop), `async_task_progress` and `async_task_state_update` (state,
+     summary). These are not standard ACP `sessionUpdate` kinds. Check how the Rust schema
+     deserializes an unknown kind before advertising: if it rejects the notification, it has to
+     be parsed from the raw message first.
+   - The `_meta.jetbrains.air.asyncTasks.backgrounded: true` marker on the Bash
+     `tool_call_update`. Render that card as still running, not finished.
+   - `_session/async_task/stop` (params `sessionId`, `asyncTaskId`) to stop one task without
+     cancelling the turn. Wire the existing stop-a-running-terminal control to it for
+     backgrounded commands.
+
+   Count live async tasks in `AcpThread::running_work`, so the sidebar row and the pills show
+   them under point 1. A task that reaches a terminal state, or a session that closes, must drop
+   out of the count. Test both an adapter that advertises the capability and one that doesn't.
+
 **GitHub still rate-limits: fetches go out as one burst, and the burst scales with every watched PR.**
 The 2026-09-21 fix made each poll cheaper and added a backoff; the budget still runs out. On
 2026-09-25 the app logged "GitHub's API budget is spent" 118 times in the same second, 33 seconds
