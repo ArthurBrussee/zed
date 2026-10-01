@@ -894,12 +894,6 @@ struct ChipCache {
     /// scrolled past; the text of a chip rarely changes, and the style it is
     /// drawn in changes only with the theme.
     highlights: RefCell<HighlightCache>,
-    /// The last line each running command has printed. A running chip repaints
-    /// continuously for its pulse and reading the line walks the terminal's
-    /// grid, so it is sampled on a slow interval rather than read per frame —
-    /// which also makes it readable, since a stream of output redrawn at frame
-    /// rate is a blur.
-    tails: RefCell<HashMap<acp_v1::ToolCallId, CommandTail>>,
     /// How many times each call's command has been parsed. The cache exists so
     /// that happens once, and a chip that reparses as it draws is what made a
     /// long thread crawl. Kept so the next report of a slow thread is a number
@@ -1023,12 +1017,6 @@ struct OutputFacts {
     /// so a length that has not changed means a scan that need not be redone.
     scanned_len: usize,
     summary: Option<acp_thread::OutputSummary>,
-}
-
-/// The last line a command had printed when it was last looked at.
-struct CommandTail {
-    sampled_at: std::time::Instant,
-    line: Option<SharedString>,
 }
 
 impl CommandFacts {
@@ -1186,31 +1174,6 @@ impl ChipCache {
         facts
     }
 
-    /// The last line a still-running command has printed, resampled at most
-    /// once a second. A long test run and a hung one look the same without it.
-    fn tail(&self, tool_call: &ToolCall, cx: &App) -> Option<SharedString> {
-        const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
-
-        if let Some(tail) = self.tails.borrow().get(&tool_call.id)
-            && tail.sampled_at.elapsed() < SAMPLE_INTERVAL
-        {
-            return tail.line.clone();
-        }
-
-        let line = tool_call
-            .terminals()
-            .next()
-            .and_then(|terminal| terminal.read(cx).last_output_line(cx))
-            .map(SharedString::from);
-        self.tails.borrow_mut().insert(
-            tool_call.id.clone(),
-            CommandTail {
-                sampled_at: std::time::Instant::now(),
-                line: line.clone(),
-            },
-        );
-        line
-    }
 }
 
 /// The call of an entry that is a command which has finished running: a tool
@@ -10823,18 +10786,7 @@ impl ThreadView {
                             {
                                 div().h_72().child(terminal_view).into_any_element()
                             } else {
-                                // Static captured output: cap it and let long
-                                // output scroll instead of growing the row
-                                // without bound.
-                                div()
-                                    .id(("terminal-output-scroll", terminal.entity_id()))
-                                    .max_h_96()
-                                    .overflow_y_scroll()
-                                    // Scrolling the output is about the output;
-                                    // without this the thread list scrolls too.
-                                    .occlude()
-                                    .child(terminal_view)
-                                    .into_any_element()
+                                terminal_view.into_any_element()
                             };
 
                             div()
@@ -10845,6 +10797,7 @@ impl ThreadView {
                                 // light band over a dark terminal.
                                 .bg(cx.theme().colors().terminal_background)
                                 .text_ui_sm(cx)
+                                .h_full()
                                 .on_action(cx.listener(|_this, _: &NewTerminal, window, cx| {
                                     window.dispatch_action(NewThread.boxed_clone(), cx);
                                     cx.stop_propagation();
@@ -16601,68 +16554,6 @@ mod tests {
         });
     }
 
-    #[gpui::test]
-    fn a_command_that_has_printed_nothing_has_no_line_for_the_band(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        crate::test_support::init_test(cx);
-
-        cx.update(|cx| {
-            let AgentThreadEntry::ToolCall(mut tool_call) = test_tool_call(
-                "1",
-                "```bash\ncargo test\n```",
-                acp_v1::ToolKind::Execute,
-                None,
-                cx,
-            ) else {
-                unreachable!()
-            };
-            let inner = cx.new(|cx| {
-                ::terminal::TerminalBuilder::new_display_only(
-                    ::terminal::terminal_settings::CursorShape::default(),
-                    ::terminal::terminal_settings::AlternateScroll::On,
-                    None,
-                    0,
-                    cx.background_executor(),
-                    util::paths::PathStyle::local(),
-                )
-                .subscribe(cx)
-            });
-            let language_registry = Arc::new(language::LanguageRegistry::test(
-                cx.background_executor().clone(),
-            ));
-            let terminal = cx.new(|cx| {
-                acp_thread::Terminal::new(
-                    acp_v1::TerminalId::new("terminal-1"),
-                    "cargo test",
-                    None,
-                    None,
-                    inner.clone(),
-                    language_registry,
-                    None,
-                    cx,
-                )
-            });
-            tool_call.set_content_for_test(vec![acp_thread::ToolCallContent::Terminal {
-                terminal,
-                meta: None,
-            }]);
-
-            // A command that has started but printed nothing has no line, so
-            // the chip stays one line rather than reserving an empty band.
-            assert_eq!(ChipCache::default().tail(&tool_call, cx), None);
-
-            // The first line it prints is the one the band is taken for. The
-            // cache samples at most once a second, so this asks a fresh one.
-            inner.update(cx, |inner, cx| {
-                inner.write_output(b"Compiling acp_thread v0.1.0\n", cx)
-            });
-            assert_eq!(
-                ChipCache::default().tail(&tool_call, cx).as_deref(),
-                Some("Compiling acp_thread v0.1.0")
-            );
-        });
-    }
 
     /// An edit tool call whose locations name the given files (no diffs, so the
     /// chip split is exercised from locations alone).

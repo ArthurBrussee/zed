@@ -2094,19 +2094,6 @@ impl ThreadView {
             .flatten();
         let full_command =
             has_terminals.then(|| self.chip_cache.command(tool_call, cx).command.clone());
-        // A collapsed chip that is still running says what it is up to; the
-        // expanded one shows the output itself, so it needs no excerpt. The
-        // band that holds the line is the chip's second row, so a command that
-        // has printed nothing, or has not printed yet, would pay an empty row
-        // for it: take the band when the first line arrives and give it back
-        // when the last one goes. The list re-renders and re-measures every
-        // visible entry each frame, and one that is off-screen when its output
-        // starts is re-measured when it scrolls back, before it is painted.
-        let running_tail = (running && has_terminals && !is_expanded)
-            .then(|| self.chip_cache.tail(tool_call, cx))
-            .flatten();
-        let two_line = running_tail.is_some();
-
         // Only a command Zed actually started has a process to kill: a display
         // terminal is somebody else's, and `stop_by_user` refuses it anyway.
         let stoppable_terminal = running
@@ -2131,14 +2118,6 @@ impl ThreadView {
         let chip = self
             .action_chip_base(("action-chip", entry_ix), is_expanded, cx)
             .group(chip_group.clone())
-            // Room for the output line beneath the label, for as long as the
-            // command is running.
-            .when(two_line, |this| {
-                this.relative()
-                    .h(rems_from_px(44_f32))
-                    .items_start()
-                    .pt(rems_from_px(3_f32))
-            })
             // A chain names every act it performed, so the chip may need the
             // whole row for them rather than the three quarters a one-label
             // chip is capped at.
@@ -2212,59 +2191,6 @@ impl ThreadView {
                 )
             })
             .child(label_element)
-            // What it is doing right now, while it is still doing it: a long
-            // test run and a hung one are otherwise the same pulsing chip. The
-            // line sits in the band the chip reserves for it below the label,
-            // out of the row's flow, so the full width is its own and a
-            // command printing at speed still cannot reflow the chip grid
-            // under the list's measured heights.
-            .when(two_line, |this| {
-                this.child(
-                    div()
-                        .absolute()
-                        .left_1p5()
-                        .right_1p5()
-                        .bottom_0p5()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .children(running_tail.map(|tail| {
-                            // Where the line states a real fraction of the
-                            // work — pytest's trailing `[ 50%]` — say so as a
-                            // fraction. Everything else, including the tools
-                            // that print counts with no denominator, keeps the
-                            // line itself.
-                            match acp_thread::progress_fraction(&tail) {
-                                Some(fraction) => h_flex()
-                                    .gap_1()
-                                    .child(
-                                        div().flex_1().child(
-                                            ui::ProgressBar::new(
-                                                ("command-progress", entry_ix),
-                                                fraction,
-                                                1.0,
-                                                cx,
-                                            )
-                                            .fg_color(cx.theme().colors().text_accent),
-                                        ),
-                                    )
-                                    .child(
-                                        Label::new(format!("{}%", (fraction * 100.0).round()))
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Muted)
-                                            .buffer_font(cx),
-                                    )
-                                    .into_any_element(),
-                                None => Label::new(tail)
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted)
-                                    .buffer_font(cx)
-                                    .into_any_element(),
-                            }
-                        })),
-                )
-            })
             .when_some(first_error, |this, location| {
                 let label: SharedString = format!(
                     "{}:{}",

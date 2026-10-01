@@ -1472,19 +1472,6 @@ impl Terminal {
         self.output.as_ref()
     }
 
-    /// The last thing the command has printed, for a surface that has to say
-    /// something while it is still running. [`Self::output`] is only filled on
-    /// exit, so a running command has nothing there; the live text is in the
-    /// terminal itself, which is where the final output comes from too.
-    ///
-    /// Reading it walks the terminal's grid, so callers sample rather than ask
-    /// on every frame.
-    pub fn last_output_line(&self, cx: &App) -> Option<String> {
-        let line = self.terminal.read(cx).last_n_non_empty_lines(1).pop()?;
-        let line = output_line_excerpt(&line);
-        (!line.is_empty()).then(|| line.to_owned())
-    }
-
     pub fn inner(&self) -> &Entity<terminal::Terminal> {
         &self.terminal
     }
@@ -1581,22 +1568,6 @@ pub async fn create_terminal_entity(
         .await
 }
 
-/// One line of terminal output, cut down to something a single-line box can
-/// hold: no surrounding whitespace, no carriage-return leftovers from a
-/// progress line that redrew itself, and short enough that laying it out costs
-/// nothing however much the command printed.
-fn output_line_excerpt(line: &str) -> &str {
-    const MAX_CHARS: usize = 160;
-
-    // A line rewritten in place (`\r`) is really its last revision; the grid
-    // usually resolves that, but a line that arrived in one write does not.
-    let line = line.rsplit('\r').next().unwrap_or(line).trim();
-    match line.char_indices().nth(MAX_CHARS) {
-        Some((end, _)) => line[..end].trim_end(),
-        None => line,
-    }
-}
-
 // Disable pagers so agent/terminal commands don't hang behind interactive UIs
 pub(crate) fn disable_pagers_through_env(env: &mut collections::HashMap<String, String>) {
     env.insert("PAGER".into(), "".into());
@@ -1653,31 +1624,6 @@ mod tests {
             Some("what the command found\n".to_string())
         );
         assert_eq!(captured.len(), 1, "a clean file needs nothing kept");
-    }
-
-    #[test]
-    fn a_running_commands_last_line_is_shown_as_it_stands() {
-        // Real lines from a test run and a build, which is what the chip is
-        // there to distinguish from a hang.
-        assert_eq!(
-            output_line_excerpt("   Compiling gpui v0.1.0 (/home/x/zed/crates/gpui)  "),
-            "Compiling gpui v0.1.0 (/home/x/zed/crates/gpui)"
-        );
-        assert_eq!(output_line_excerpt(" Tests  31 of 88 "), "Tests  31 of 88");
-
-        // A progress line redrawing itself is worth only its last revision.
-        assert_eq!(
-            output_line_excerpt("Downloading 12%\rDownloading 47%\rDownloading 92%"),
-            "Downloading 92%"
-        );
-
-        // However much it printed, the chip gets one boxful.
-        let long = "x".repeat(400);
-        assert_eq!(output_line_excerpt(&long).chars().count(), 160);
-
-        // Nothing to say reads as nothing, not as an empty box.
-        assert!(output_line_excerpt("   ").is_empty());
-        assert!(output_line_excerpt("").is_empty());
     }
 
     #[test]
