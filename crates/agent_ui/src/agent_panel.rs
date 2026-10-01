@@ -11000,6 +11000,17 @@ mod tests {
         }
     }
 
+    // Upstream's panel opens a thread that connects straight away, so this
+    // drives a gated agent server and expects the selections queued during the
+    // load to arrive in the loaded thread's editor. A thread this panel makes
+    // is a draft that starts no server until its first send: it never enters
+    // that flow, and the selections never reach the draft this test holds
+    // (checked: nothing is queued and the draft keeps its own empty editor).
+    // What the test is about is covered here by
+    // `test_a_selection_on_an_unstarted_draft_lands_in_its_editor`, and the
+    // queue's own drain by `test_pending_selections_survive_connection_retry`
+    // in `conversation_view.rs`.
+    #[ignore = "upstream's panel thread connects on open; this fork's draft waits for the first send"]
     #[gpui::test]
     async fn test_add_selection_to_loading_thread(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_visible_panel(cx).await;
@@ -11126,6 +11137,48 @@ mod tests {
         );
         cx.update(|window, cx| {
             assert!(editor.focus_handle(cx).is_focused(window));
+        });
+    }
+
+    /// A selection added to a draft that has not started a server yet belongs
+    /// in the editor the reader is looking at. Upstream queues it for the
+    /// active thread's editor, which a draft of this kind does not have until
+    /// its first message has already been sent, so the selection would sit
+    /// invisible in the queue until then.
+    #[gpui::test]
+    async fn test_a_selection_on_an_unstarted_draft_lands_in_its_editor(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        let draft = panel.update_in(&mut cx, |panel, window, cx| {
+            let draft = panel.ensure_draft(AgentThreadSource::AgentPanel, window, cx);
+            draft.update(cx, |view, cx| {
+                assert!(
+                    view.active_thread().is_none(),
+                    "a panel draft starts no server until its first send"
+                );
+                view.insert_selection(
+                    AgentContextSelection::Terminal(vec!["captured output".into()]),
+                    window,
+                    cx,
+                );
+            });
+            draft
+        });
+        cx.run_until_parked();
+
+        draft.read_with(&cx, |view, cx| {
+            assert!(
+                !view.has_pending_selections(),
+                "the selection should have gone into the draft's editor, not a queue"
+            );
+            let text = view
+                .unstarted_message_editor()
+                .expect("the draft keeps its own editor")
+                .read(cx)
+                .text(cx);
+            assert!(
+                !text.trim().is_empty(),
+                "the draft's editor should show the selection, got {text:?}"
+            );
         });
     }
 

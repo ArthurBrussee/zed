@@ -4104,6 +4104,15 @@ impl ConversationView {
                     editor.insert_selections(selection, window, cx);
                 })
             });
+        } else if let Some(message_editor) = self.unstarted_message_editor().cloned() {
+            // A draft that starts no server until its first send has no active
+            // thread, but it does have the editor the reader is looking at. The
+            // selection belongs there rather than in a queue that only drains
+            // when the thread connects, which for this kind of draft is after
+            // the message has already been sent.
+            message_editor.update(cx, |editor, cx| {
+                editor.insert_selections(selection, window, cx);
+            });
         } else {
             self.pending_selections.push(selection);
             cx.notify();
