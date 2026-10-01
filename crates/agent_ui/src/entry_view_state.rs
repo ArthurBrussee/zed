@@ -49,6 +49,15 @@ pub struct EntryViewState {
     user_toggled_thinking_blocks: HashSet<(usize, usize)>,
     expanded_compactions: HashSet<usize>,
     expanded_tool_calls: HashSet<acp_v1::ToolCallId>,
+    user_collapsed_tool_calls: HashSet<acp_v1::ToolCallId>,
+    /// Whether `entries` holds this thread's views. A thread that has been off
+    /// screen long enough drops them (see `ThreadView::drop_entry_views`) and
+    /// builds them again from the same entries when it comes back, so the
+    /// threads left open all day cost their view tree only while someone is
+    /// looking at one. Everything else here is keyed by entry index or tool
+    /// call id rather than by view, so it survives the drop and the thread
+    /// returns with its expansions intact.
+    views_built: bool,
 }
 
 impl EntryViewState {
@@ -71,7 +80,26 @@ impl EntryViewState {
             user_toggled_thinking_blocks: HashSet::default(),
             expanded_compactions: HashSet::default(),
             expanded_tool_calls: HashSet::default(),
+            user_collapsed_tool_calls: HashSet::default(),
+            views_built: true,
         }
+    }
+
+    pub fn views_are_built(&self) -> bool {
+        self.views_built
+    }
+
+    /// Drops every per-entry view. The caller is responsible for the list state
+    /// that holds their focus handles.
+    pub fn drop_views(&mut self) {
+        self.entries.clear();
+        self.views_built = false;
+    }
+
+    /// Opens the gate `sync_entry` closes while the views are dropped. Called
+    /// once by the rebuild, immediately before it syncs every entry.
+    pub fn mark_views_built(&mut self) {
+        self.views_built = true;
     }
 
     pub(crate) fn is_tool_call_expanded(&self, tool_call_id: &acp_v1::ToolCallId) -> bool {
@@ -96,6 +124,26 @@ impl EntryViewState {
         }
     }
 
+    /// Whether the user explicitly collapsed this tool call, overriding any
+    /// auto-expansion (e.g. a failed terminal command opening its output).
+    pub(crate) fn is_tool_call_user_collapsed(&self, tool_call_id: &acp_v1::ToolCallId) -> bool {
+        self.user_collapsed_tool_calls.contains(tool_call_id)
+    }
+
+    pub(crate) fn set_tool_call_expanded(
+        &mut self,
+        tool_call_id: &acp_v1::ToolCallId,
+        expanded: bool,
+    ) {
+        if expanded {
+            self.expanded_tool_calls.insert(tool_call_id.clone());
+            self.user_collapsed_tool_calls.remove(tool_call_id);
+        } else {
+            self.expanded_tool_calls.remove(tool_call_id);
+            self.user_collapsed_tool_calls.insert(tool_call_id.clone());
+        }
+    }
+
     pub(crate) fn is_compaction_expanded(&self, entry_ix: usize) -> bool {
         self.expanded_compactions.contains(&entry_ix)
     }
@@ -112,10 +160,6 @@ impl EntryViewState {
 
     pub(crate) fn clear_auto_expand_tracking(&mut self) {
         self.auto_expanded_thinking_block = None;
-    }
-
-    pub(crate) fn is_auto_expanded_thinking_block(&self, key: (usize, usize)) -> bool {
-        self.auto_expanded_thinking_block == Some(key)
     }
 
     pub(crate) fn auto_expand_streaming_thought(&mut self, thread: &AcpThread, cx: &App) -> bool {
@@ -159,6 +203,10 @@ impl EntryViewState {
         false
     }
 
+    // Thoughts no longer expand in the transcript (their full text is a hover
+    // card), so nothing in production toggles them; the thread-search test still
+    // drives this to assert expanded thinking content is searchable.
+    #[cfg(test)]
     pub(crate) fn toggle_thinking_block_expansion(&mut self, key: (usize, usize), cx: &App) {
         match AgentSettings::get_global(cx).thinking_display {
             ThinkingBlockDisplay::Auto => {
@@ -236,6 +284,13 @@ impl EntryViewState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A thread whose views are dropped has no `entries` to sync into, and
+        // the rebuild syncs every entry anyway. Both of the callers that reach
+        // here while the agent works on an off-screen thread (a new entry, an
+        // updated one) are answered by that rebuild.
+        if !self.views_built {
+            return;
+        }
         let Some(thread_entry) = thread.read(cx).entries().get(index) else {
             return;
         };
@@ -245,7 +300,11 @@ impl EntryViewState {
                 let can_rewind = thread.read(cx).supports_truncate(cx);
                 let has_client_id = message.client_id.is_some();
                 let is_subagent = thread.read(cx).parent_session_id().is_some();
-                let source_blocks = message.content.source_blocks();
+                // Attached review comments render as a chip next to the
+                // message, not as the wall of quoted diff they compose into.
+                let source_blocks = crate::diff_review::without_review_blocks(
+                    message.content.source_blocks().to_vec(),
+                );
                 let source_version = message.content.source_version();
                 let source_is_representable = source_blocks
                     .iter()
@@ -263,7 +322,7 @@ impl EntryViewState {
                     let refreshed_source = ((!was_read_only
                         || *synced_source_version != source_version)
                         && (!is_editable || !editor.focus_handle(cx).is_focused(window)))
-                    .then(|| source_blocks.to_vec());
+                    .then(|| source_blocks.clone());
                     editor.update(cx, |editor, cx| editor.set_read_only(!is_editable, cx));
                     if let Some(source_blocks) = refreshed_source {
                         editor.update(cx, |editor, cx| {
@@ -272,7 +331,6 @@ impl EntryViewState {
                         *synced_source_version = source_version;
                     }
                 } else {
-                    let source_blocks = source_blocks.to_vec();
                     let message_editor = cx.new(|cx| {
                         let mut editor = MessageEditor::new(
                             self.workspace.clone(),
@@ -291,6 +349,10 @@ impl EntryViewState {
                         if !is_editable {
                             editor.set_read_only(true, cx);
                         }
+                        // The editor sits inside the accent-tinted message
+                        // bubble; its own background would paint over the
+                        // tint.
+                        editor.set_transparent_background(true, cx);
                         editor.set_source_message(source_blocks, window, cx);
                         editor
                     });
@@ -494,7 +556,12 @@ impl EntryViewState {
     }
 
     pub fn remove(&mut self, range: Range<usize>) {
-        self.entries.drain(range.clone());
+        // The reindexing below still has to happen with the views dropped: a
+        // thread truncated while off screen comes back with its expansions
+        // pointing at the entries that are left.
+        if self.views_built {
+            self.entries.drain(range.clone());
+        }
 
         self.expanded_compactions = self
             .expanded_compactions
@@ -792,7 +859,7 @@ fn create_multibuffer_diff_editor(
     })
 }
 
-fn diff_editor_text_style_refinement(cx: &mut App) -> TextStyleRefinement {
+pub(crate) fn diff_editor_text_style_refinement(cx: &mut App) -> TextStyleRefinement {
     TextStyleRefinement {
         font_size: Some(
             TextSize::Small
@@ -1023,6 +1090,152 @@ mod tests {
                 view_state.entry(1),
                 Some(Entry::AssistantMessage(_))
             ));
+        });
+    }
+
+    /// A thread that goes off screen drops its views, keeps taking entries while
+    /// it is away, and comes back with a view for every one of them — including
+    /// the ones that arrived while it had none.
+    #[gpui::test]
+    async fn test_dropped_views_are_rebuilt_with_the_entries_that_arrived_meanwhile(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({})).await;
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        let connection = Rc::new(StubAgentConnection::new());
+        let thread = cx
+            .update(|_, cx| {
+                connection.clone().new_session(
+                    project.clone(),
+                    PathList::new(&[Path::new(path!("/project"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let session_id = thread.update(cx, |thread, _| thread.session_id().clone());
+
+        let view_state = cx.new(|_cx| {
+            EntryViewState::new(
+                workspace.downgrade(),
+                project.downgrade(),
+                None,
+                Arc::new(RwLock::new(SessionCapabilities::default())),
+                "Test Agent".into(),
+            )
+        });
+
+        cx.update(|_, cx| {
+            connection.send_update(
+                session_id.clone(),
+                acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                    acp_v1::ContentBlock::Text(acp_v1::TextContent::new("first")),
+                )),
+                cx,
+            );
+        });
+        view_state.update_in(cx, |view_state, window, cx| {
+            view_state.sync_entry(0, &thread, window, cx);
+        });
+        view_state.read_with(cx, |view_state, _cx| {
+            assert!(view_state.views_are_built());
+            assert!(matches!(
+                view_state.entry(0),
+                Some(Entry::AssistantMessage(_))
+            ));
+        });
+
+        // Off screen: the views go.
+        view_state.update(cx, |view_state, _cx| view_state.drop_views());
+        view_state.read_with(cx, |view_state, _cx| {
+            assert!(!view_state.views_are_built());
+            assert!(view_state.entry(0).is_none());
+        });
+
+        // The agent keeps working. Syncing an entry while the views are dropped
+        // is the no-op that keeps this from indexing past the end of an empty
+        // list, which is what a running thread would otherwise do here.
+        cx.update(|_, cx| {
+            connection.send_update(
+                session_id.clone(),
+                acp_v1::SessionUpdate::ToolCall(
+                    acp_v1::ToolCall::new("tool", "Tool call")
+                        .status(acp_v1::ToolCallStatus::InProgress),
+                ),
+                cx,
+            );
+        });
+        view_state.update_in(cx, |view_state, window, cx| {
+            view_state.sync_entry(1, &thread, window, cx);
+        });
+        view_state.read_with(cx, |view_state, _cx| {
+            assert!(!view_state.views_are_built());
+            assert!(view_state.entry(0).is_none());
+            assert!(view_state.entry(1).is_none());
+        });
+
+        // Back on screen: a view per entry, the one from while it was away
+        // included.
+        let count = thread.read_with(cx, |thread, _cx| thread.entries().len());
+        assert_eq!(count, 2);
+        view_state.update_in(cx, |view_state, window, cx| {
+            view_state.mark_views_built();
+            for ix in 0..count {
+                view_state.sync_entry(ix, &thread, window, cx);
+            }
+        });
+        view_state.read_with(cx, |view_state, _cx| {
+            assert!(view_state.views_are_built());
+            assert!(matches!(
+                view_state.entry(0),
+                Some(Entry::AssistantMessage(_))
+            ));
+            assert!(matches!(view_state.entry(1), Some(Entry::ToolCall(_))));
+        });
+    }
+
+    /// Truncating a thread while its views are dropped still moves the
+    /// expansions the remaining entries carry, so the thread does not come back
+    /// with a compaction expanded that belongs to an entry that is gone.
+    #[gpui::test]
+    async fn test_truncation_while_dropped_still_reindexes_expansions(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({})).await;
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        let view_state = cx.new(|_cx| {
+            EntryViewState::new(
+                workspace.downgrade(),
+                project.downgrade(),
+                None,
+                Arc::new(RwLock::new(SessionCapabilities::default())),
+                "Test Agent".into(),
+            )
+        });
+
+        view_state.update(cx, |view_state, _cx| {
+            view_state.toggle_compaction_expansion(3);
+            assert!(view_state.is_compaction_expanded(3));
+            view_state.drop_views();
+            // The drain is skipped (there is nothing to drain), the reindexing
+            // is not.
+            view_state.remove(0..2);
+            assert!(!view_state.is_compaction_expanded(3));
+            assert!(view_state.is_compaction_expanded(1));
         });
     }
 
