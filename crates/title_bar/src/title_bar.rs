@@ -511,6 +511,7 @@ impl TitleBar {
                 cx.notify();
             }));
         }
+
         let update_version = cx.new(|cx| UpdateVersion::new(cx));
         let platform_titlebar = cx.new(|cx| {
             let mut titlebar = PlatformTitleBar::new(id, cx);

@@ -133,9 +133,6 @@ pub struct MarkdownStyle {
     pub prevent_mouse_interaction: bool,
     pub table_columns_min_size: bool,
     pub soft_break_as_hard_break: bool,
-    /// Prefix web links (http/https destinations) with a small globe glyph,
-    /// so they read as leaving the editor.
-    pub web_link_globe: bool,
     /// A definite height for an inline image whose source did not declare one.
     /// A `ListState` measures an entry once and paints it at that height, so an
     /// entry that grows after its image loads paints over the entries below.
@@ -173,7 +170,6 @@ impl Default for MarkdownStyle {
             prevent_mouse_interaction: false,
             table_columns_min_size: false,
             soft_break_as_hard_break: false,
-            web_link_globe: false,
             inline_image_height: None,
         }
     }
@@ -320,8 +316,6 @@ impl MarkdownStyle {
                 ..Default::default()
             },
             soft_break_as_hard_break: matches!(font, MarkdownFont::Agent),
-            // Agent prose marks links that leave the editor.
-            web_link_globe: matches!(font, MarkdownFont::Agent),
             heading_level_styles: matches!(font, MarkdownFont::Agent).then_some(
                 HeadingLevelStyles {
                     h1: Some(TextStyleRefinement {
@@ -2975,13 +2969,7 @@ impl Element for MarkdownElement {
                                     .as_ref()
                                     .and_then(|callback| callback(dest_url, cx))
                                     .unwrap_or_else(|| self.style.link.clone());
-                                builder.push_text_style(style);
-                                if self.style.web_link_globe
-                                    && (dest_url.starts_with("http://")
-                                        || dest_url.starts_with("https://"))
-                                {
-                                    builder.push_text("\u{1F310}\u{2009}", range.clone());
-                                }
+                                builder.push_text_style(style)
                             }
                         }
                         MarkdownTag::FootnoteDefinition(label) => {

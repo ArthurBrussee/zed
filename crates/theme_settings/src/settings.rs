@@ -388,15 +388,13 @@ impl ThemeSettings {
         clamp_font_size(font_size)
     }
 
-    /// Returns the agent panel font size. When unset it defaults a touch larger
-    /// than the UI font size; an explicit `agent_ui_font_size` setting (or the
-    /// runtime adjust override) still wins.
+    /// Returns the agent panel font size. Falls back to the UI font size if unset.
     pub fn agent_ui_font_size(&self, cx: &App) -> Pixels {
         cx.try_global::<AgentUiFontSize>()
             .map(|size| size.0)
             .or(self.agent_ui_font_size)
             .map(clamp_font_size)
-            .unwrap_or_else(|| clamp_font_size(self.ui_font_size(cx) + px(1.0)))
+            .unwrap_or_else(|| self.ui_font_size(cx))
     }
 
     pub fn agent_ui_font_family(&self) -> &SharedString {
