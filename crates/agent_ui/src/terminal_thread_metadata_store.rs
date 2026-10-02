@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
@@ -156,7 +159,9 @@ pub fn terminal_title_prefix(title: &str) -> Option<&str> {
 
 pub struct TerminalThreadMetadataStore {
     db: TerminalThreadMetadataDb,
-    terminals: HashMap<TerminalId, TerminalThreadMetadata>,
+    /// Rows are handed out as `Arc`s, for the reason `ThreadMetadataStore`
+    /// gives: the sidebar rebuilds from every stored terminal.
+    terminals: HashMap<TerminalId, Arc<TerminalThreadMetadata>>,
     terminals_by_paths: HashMap<PathList, HashSet<TerminalId>>,
     terminals_by_main_paths: HashMap<PathList, HashSet<TerminalId>>,
     reload_task: Option<Shared<Task<()>>>,
@@ -209,10 +214,11 @@ impl TerminalThreadMetadataStore {
     }
 
     pub fn entry(&self, terminal_id: TerminalId) -> Option<&TerminalThreadMetadata> {
-        self.terminals.get(&terminal_id)
+        self.terminals.get(&terminal_id).map(Arc::as_ref)
     }
 
-    pub fn entries(&self) -> impl Iterator<Item = &TerminalThreadMetadata> + '_ {
+    /// Returns all terminals, as the shared rows the store holds.
+    pub fn entries(&self) -> impl Iterator<Item = &Arc<TerminalThreadMetadata>> + '_ {
         self.terminals.values()
     }
 
@@ -231,7 +237,7 @@ impl TerminalThreadMetadataStore {
             .get(path_list)
             .into_iter()
             .flatten()
-            .filter_map(|id| self.terminals.get(id))
+            .filter_map(|id| self.terminals.get(id).map(Arc::as_ref))
             .filter(move |terminal| {
                 same_remote_connection_identity(
                     terminal.remote_connection.as_ref(),
@@ -249,7 +255,7 @@ impl TerminalThreadMetadataStore {
             .get(path_list)
             .into_iter()
             .flatten()
-            .filter_map(|id| self.terminals.get(id))
+            .filter_map(|id| self.terminals.get(id).map(Arc::as_ref))
             .filter(move |terminal| {
                 same_remote_connection_identity(
                     terminal.remote_connection.as_ref(),
@@ -330,7 +336,8 @@ impl TerminalThreadMetadataStore {
         }
 
         for terminal_id in terminal_ids {
-            if let Some(mut terminal) = self.terminals.get(&terminal_id).cloned() {
+            if let Some(mut terminal) = self.terminals.get(&terminal_id).map(|t| t.as_ref().clone())
+            {
                 mutate(&mut terminal.worktree_paths);
                 self.save_internal(terminal);
             }
@@ -364,7 +371,7 @@ impl TerminalThreadMetadataStore {
 
     fn cache_terminal_metadata(&mut self, metadata: TerminalThreadMetadata) {
         self.terminals
-            .insert(metadata.terminal_id, metadata.clone());
+            .insert(metadata.terminal_id, Arc::new(metadata.clone()));
 
         self.terminals_by_paths
             .entry(metadata.folder_paths().clone())

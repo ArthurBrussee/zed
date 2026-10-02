@@ -1,9 +1,10 @@
 use anyhow::{Context as _, bail};
+use async_lock::Semaphore;
 use futures::{FutureExt, StreamExt as _, channel::mpsc, future::Shared};
 use language::Buffer;
 use remote::RemoteClient;
 use rpc::proto::{self, REMOTE_SERVER_PROJECT_ID};
-use std::{collections::VecDeque, path::Path, sync::Arc};
+use std::{collections::VecDeque, path::Path, sync::Arc, sync::LazyLock, time::Instant};
 use task::{Shell, shell_to_proto};
 use util::{ResultExt, command::new_command};
 use worktree::Worktree;
@@ -16,6 +17,33 @@ use crate::{
     project_settings::{DirenvSettings, ProjectSettings},
     worktree_store::WorktreeStore,
 };
+
+/// How long a directory's shell may take to print its environment before the
+/// capture gives up on it. The answer is cached for the life of the process,
+/// so a login shell that never returns is not one slow launch: it is every
+/// later one joining a task that will never finish, with nothing in the log to
+/// say so.
+const SHELL_ENVIRONMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// How many directories may have their shell environment captured at once,
+/// across the whole process.
+///
+/// A capture runs a login shell in the directory, and a direnv that evaluates
+/// a nix flake turns that into a full flake evaluation. Restoring fourteen
+/// worktree windows ran fourteen of those at once through the nix daemon: a
+/// load average of 188 on a 15-core machine, a `git fetch` to GitHub timing
+/// out, and an agent's own startup call failing because its process had
+/// starved. They were competing for the same cores either way, so taking
+/// turns costs them nothing between them and leaves the machine usable while
+/// they finish.
+///
+/// Process-wide rather than per project, because each window has its own
+/// [`ProjectEnvironment`]: a cap that each one kept for itself would bound
+/// nothing at all in the case that hurt.
+const CONCURRENT_SHELL_ENVIRONMENT_CAPTURES: usize = 2;
+
+static SHELL_ENVIRONMENT_CAPTURES: LazyLock<Semaphore> =
+    LazyLock::new(|| Semaphore::new(CONCURRENT_SHELL_ENVIRONMENT_CAPTURES));
 
 pub struct ProjectEnvironment {
     cli_environment: Option<HashMap<String, String>>,
@@ -210,23 +238,61 @@ impl ProjectEnvironment {
                 let shell = shell.clone();
                 let tx = self.environment_error_messages_tx.clone();
                 cx.spawn(async move |cx| {
-                    let mut shell_env = match cx
-                        .background_spawn(load_directory_shell_environment(
-                            shell,
-                            abs_path.clone(),
-                            load_direnv,
-                            tx,
-                        ))
-                        .await
-                    {
-                        Ok(shell_env) => Some(shell_env),
-                        Err(e) => {
+                    // Take a turn before starting the clock: the timeout is
+                    // for a shell that will not answer, not for one that has
+                    // not been given a turn yet.
+                    let queued_at = Instant::now();
+                    let permit = SHELL_ENVIRONMENT_CAPTURES.acquire().await;
+                    let queued_for = queued_at.elapsed();
+                    let started_at = Instant::now();
+                    let mut capture = cx
+                        .background_spawn({
+                            let abs_path = abs_path.clone();
+                            async move {
+                                let _permit = permit;
+                                load_directory_shell_environment(
+                                    shell,
+                                    abs_path,
+                                    load_direnv,
+                                    tx,
+                                )
+                                .await
+                            }
+                        })
+                        .fuse();
+                    let mut timeout = cx
+                        .background_executor()
+                        .timer(SHELL_ENVIRONMENT_TIMEOUT)
+                        .fuse();
+                    let captured = futures::select_biased! {
+                        captured = capture => Some(captured),
+                        _ = timeout => None,
+                    };
+                    let mut shell_env = match captured {
+                        Some(Ok(shell_env)) => Some(shell_env),
+                        Some(Err(e)) => {
                             log::error!(
                                 "Failed to load shell environment for directory {abs_path:?}: {e:#}"
                             );
                             None
                         }
+                        None => {
+                            log::error!(
+                                "Gave up loading the shell environment for {abs_path:?} after {}s; \
+                                 continuing without it",
+                                SHELL_ENVIRONMENT_TIMEOUT.as_secs()
+                            );
+                            None
+                        }
                     };
+
+                    log::info!(
+                        "quiet-ui perf: shell environment for {:?} waited {:.0}ms for a turn, \
+                         then took {:.0}ms",
+                        abs_path,
+                        queued_for.as_secs_f64() * 1000.0,
+                        started_at.elapsed().as_secs_f64() * 1000.0,
+                    );
 
                     if let Some(shell_env) = shell_env.as_mut() {
                         let path = shell_env
