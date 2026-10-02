@@ -355,6 +355,26 @@ reloads, drop its async tasks. Replayed history never counts as running. Test ea
 cancelled turn, a reloaded thread with commands in its history, a subagent from a cancelled
 turn, and an agent restart with a background task out.
 
+**Re-opening a worktree adds an empty "New thread" to it every time.**
+
+Arthur sees a fresh "New thread" row appear whenever he re-opens a worktree, whether by
+clicking one of its threads while its workspace is closed or by restoring an archived one. The
+likely cause is the panel load path in `agent_panel.rs`. After restoring tabs it always calls
+`ensure_pane_has_thread_tab`, which creates a draft whenever the pane has no `ThreadTab` *at
+that moment*. A workspace opened to show a particular thread
+(`open_workspace_and_activate_thread`, or the archive restore) hasn't opened that thread yet
+when the load path runs, and restored tabs may still be loading. So the check sees an empty
+pane, makes a draft, and then the requested thread opens next to it. The persisted
+`new_draft_thread_id` brings back yet another empty draft on top of that.
+
+The rule this was protecting, "every workspace keeps at least one thread tab", came from the tab
+bar, and the tab bar is gone. Fix: drop the automatic draft at load. A panel with no open
+thread shows upstream's empty state, or the composer without writing a thread row until
+something is typed into it (the same rule as the stale-drafts fix). Don't restore an empty
+`new_draft_thread_id`. Test: open a closed worktree by clicking one of its threads, restore an
+archived thread, and restart with a worktree open. Each must end with no empty "New thread"
+row that the user didn't create.
+
 **Ask GitHub about many pull requests in one query.** What is left of the rate-limit entry, and
 what 2026-09-29 did not do.
 
