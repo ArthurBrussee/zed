@@ -135,29 +135,10 @@ does is removed as it lands.
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
-**Many sidebar rows show as busy when nothing is running.**
-
-Arthur sees lots of threads marked as working with nothing visibly running. Since the activity
-fix, a row counts as working when the turn is running OR `AcpThread::running_work` is non-empty
-(`thread_item.rs`: `running = status == Running || !running_work.is_empty()`). `running_work`
-counts every terminal whose `output()` is `None`, every subagent call still `InProgress`, and
-every async task not yet terminal. All three can stay "running" forever with nothing behind
-them:
-- a terminal that never gets its exit: a turn cancelled mid-command, an agent process that died
-  or restarted, or a terminal rebuilt from history when a thread is loaded or replayed (the
-  `terminal_output` meta can arrive without a matching `terminal_exit`);
-- a subagent tool call left `InProgress` when its turn was cancelled or errored;
-- an async task whose terminal state never arrived because the adapter restarted or the session
-  closed.
-
-With about eleven thousand live terminals in Arthur's session (see the leak entry), many of
-them from loaded history, the first is likely most of it. Fix: outside a running turn, count
-only work with evidence it is alive. That means a live async task the agent reported this
-session, or a terminal whose tool call is still `InProgress` or backgrounded. When a turn ends,
-is cancelled, or errors, settle its terminals and subagent calls. When a session closes or
-reloads, drop its async tasks. Replayed history never counts as running. Test each case: a
-cancelled turn, a reloaded thread with commands in its history, a subagent from a cancelled
-turn, and an agent restart with a background task out.
+**Tonight is about efficiency (Arthur, 2026-10-02).** Work the entries below in order and spend
+the night on making the app cheaper to run. The leak and the perf pass now have real numbers
+from his machine, so work from those numbers, fix what they point at, and report before and
+after for each.
 
 **The app leaks entities. The by-type lines are in; they name terminals and markdown.**
 
@@ -315,6 +296,65 @@ Tonight's real finding allocated a `String` per assistant chunk and cloned a who
 per command; these two touch an enum tag and a path. **Size the per-item cost before writing a
 cache, because a cache that can go stale is a behaviour bug and a 5µs walk is not.**
 
+**Numbers from Arthur's machine, 2026-10-02 10:03 to 11:11** (`Zed.log.old` + `Zed.log`, app up
+since 21:14 the night before). These are the input this entry asked for. Fix each one:
+
+- **The sidebar rebuilds about four times a second, almost always for nothing.** 17,629
+  rebuilds in 68 minutes. Typical lines: `sidebar rebuilt 365 rows in 42ms, after 1522 rebuilds
+  nobody felt (1295 of them built the list that was already there)` and `after 2958 rebuilds
+  nobody felt (2754 of them built the list that was already there)`. A felt rebuild of 365 rows
+  costs 20 to 73ms. If the unfelt ones run `rebuild_contents` in full before the "unchanged"
+  comparison throws the result away, which is how `update_entries` reads, that is on the order
+  of 100ms of foreground per second. Find what calls `update_entries` that often (log the
+  trigger, then fix the noisy ones at the source). Make the no-change case cheap: compare
+  inputs before rebuilding, not outputs after.
+- **Shell environment capture runs twice per directory, and for submodules.** Every new
+  worktree logged two captures of the same path at the same moment (`roomy-flower/mech` took
+  1573ms and 1494ms, `zephyr-mantle/mech` 1482ms and 1597ms). The main checkout `mech` took
+  7964ms and then 7109ms eight seconds later, and its submodule `mech/ios/tailnet/libtailscale`
+  was captured separately each time (6823ms, 6891ms). Capture once per directory and share
+  in-flight requests. A submodule inside a worktree uses its superproject's environment.
+  Re-capture only when the `.envrc`/flake inputs change.
+- **The spare worktree doesn't save the checkout.** Both new worktrees logged `worktree claimed
+  from the spare, not checked out`, `window shown in ~440ms`, then `checked out in 8233ms` /
+  `9814ms` and `workspace opened in 12054ms` / `14333ms`. The window is fast, but the thread is
+  usable only after 12 to 14 seconds. Find why the spare was claimed unchecked out (it said ready
+  at 10:06:25, then was claimed at 10:24:23 still needing a checkout). Make the spare's checkout
+  happen while it waits, not when it is claimed.
+- **A burst of background hangs at 10:31:02**: 13 tasks of 115 to 310ms each, all at
+  `crates/gpui/src/executor.rs:143:27`, so the hang detector cannot see the caller. Make it
+  report the spawning call site (`#[track_caller]` through the spawn path, or record the
+  `Location` at spawn), then find what ran. One foreground hang: 151ms at
+  `crates/languages/src/lib.rs:300:8` at 10:23:26.
+- **Resident memory swings from 204MB to 1594MB** over the hour (`memory usage` lines). It follows
+  the leak entry's terminals and markdown. Report it before and after that fix.
+- No `mined N thread entries` lines appeared, so the PR miner is not repeating work in this
+  session.
+
+**Many sidebar rows show as busy when nothing is running.**
+
+Arthur sees lots of threads marked as working with nothing visibly running. Since the activity
+fix, a row counts as working when the turn is running OR `AcpThread::running_work` is non-empty
+(`thread_item.rs`: `running = status == Running || !running_work.is_empty()`). `running_work`
+counts every terminal whose `output()` is `None`, every subagent call still `InProgress`, and
+every async task not yet terminal. All three can stay "running" forever with nothing behind
+them:
+- a terminal that never gets its exit: a turn cancelled mid-command, an agent process that died
+  or restarted, or a terminal rebuilt from history when a thread is loaded or replayed (the
+  `terminal_output` meta can arrive without a matching `terminal_exit`);
+- a subagent tool call left `InProgress` when its turn was cancelled or errored;
+- an async task whose terminal state never arrived because the adapter restarted or the session
+  closed.
+
+With about eleven thousand live terminals in Arthur's session (see the leak entry), many of
+them from loaded history, the first is likely most of it. Fix: outside a running turn, count
+only work with evidence it is alive. That means a live async task the agent reported this
+session, or a terminal whose tool call is still `InProgress` or backgrounded. When a turn ends,
+is cancelled, or errors, settle its terminals and subagent calls. When a session closes or
+reloads, drop its async tasks. Replayed history never counts as running. Test each case: a
+cancelled turn, a reloaded thread with commands in its history, a subagent from a cancelled
+turn, and an agent restart with a background task out.
+
 **Ask GitHub about many pull requests in one query.** What is left of the rate-limit entry, and
 what 2026-09-29 did not do.
 
@@ -330,26 +370,193 @@ its own request. One GraphQL query with an alias per PR (`pr15700: pullRequest(n
 `rateLimit { cost remaining resetAt }` replaces the request count above with what each poll
 actually spent.
 
-**Why it did not get built, and what would let it.** It replaces the mechanism behind every PR
-chip in the app, and nothing in the sandbox can exercise it: no network to GitHub, no `gh` auth,
-and the fields it has to reproduce are the ones `gh --json statusCheckRollup` flattens out of a
-nested `commits(last:1) { ... }` subtree. A query written blind passes every test that can be run
-here and blanks every chip in the morning. Either of these unblocks it:
+**Unblocked (2026-10-02): the sample response is below, from Arthur's own `gh`.** Build it now.
+Also put a fallback in: if the GraphQL call fails or a field doesn't parse, fall back to the
+existing `gh pr list` path for that poll and log once. A wrong query then costs an extra
+request rather than blank chips. `a` is an open PR with CI running (checks `QUEUED`,
+`IN_PROGRESS` and `COMPLETED`/`SKIPPED`, rollup `PENDING`, `mergeStateStatus` `BLOCKED` with
+`mergeable` `MERGEABLE`). `b` is a merged one. The query asked for the check run's workflow name
+through `checkSuite { workflowRun { workflow { name } } }`, which is what `gh` reports as
+`workflowName`. Note `rateLimit.cost` is 1 for two PRs in one query.
 
-- The output of `gh api graphql -f query='{ repository(owner:"zed-industries", name:"zed") {
-  pullRequest(number: 1) { number url title state isDraft reviewDecision mergeable
-  mergeStateStatus commits(last:1) { nodes { commit { statusCheckRollup { state contexts(first:10)
-  { nodes { __typename ... on CheckRun { name status conclusion } ... on StatusContext { context
-  state } } } } } } } } } rateLimit { cost remaining resetAt } }'` pasted in, which is enough to
-  write the parser against and to test it with.
-- Or a say-so that a try-GraphQL-then-fall-back-to-`gh pr list` design is wanted, in which case a
-  wrong query costs an extra failed request rather than a blank chip, and it can go in untested.
-
-**One thing that will not unblock it, so nobody spends another night on it.** This container does
-have a `GITHUB_TOKEN` in its environment, and 2026-09-30 tried to use it to fetch that one sample
-response. The sandbox's permission classifier refused the call as credential exploration, which is
-the right answer: that token is the session's, not a GitHub client's, and the refusal covers the
-outcome rather than the one command. The sample has to come from Arthur's own `gh`.
+```json
+{
+ "data": {
+  "repository": {
+   "a": {
+    "number": 65077,
+    "url": "https://github.com/zed-industries/zed/pull/65077",
+    "title": "Remove descriptive comments in default settings",
+    "state": "OPEN",
+    "isDraft": false,
+    "reviewDecision": null,
+    "mergeable": "MERGEABLE",
+    "mergeStateStatus": "BLOCKED",
+    "commits": {
+     "nodes": [
+      {
+       "commit": {
+        "statusCheckRollup": {
+         "state": "PENDING",
+         "contexts": {
+          "nodes": [
+           {
+            "__typename": "CheckRun",
+            "name": "route-pr",
+            "status": "QUEUED",
+            "conclusion": null,
+            "checkSuite": {
+             "workflowRun": {
+              "workflow": {
+               "name": "Community PR Board"
+              }
+             }
+            }
+           },
+           {
+            "__typename": "CheckRun",
+            "name": "danger",
+            "status": "QUEUED",
+            "conclusion": null,
+            "checkSuite": {
+             "workflowRun": {
+              "workflow": {
+               "name": "danger"
+              }
+             }
+            }
+           },
+           {
+            "__typename": "CheckRun",
+            "name": "check-authorship-and-label",
+            "status": "IN_PROGRESS",
+            "conclusion": null,
+            "checkSuite": {
+             "workflowRun": {
+              "workflow": {
+               "name": "PR Issue Labeler"
+              }
+             }
+            }
+           },
+           {
+            "__typename": "CheckRun",
+            "name": "orchestrate",
+            "status": "IN_PROGRESS",
+            "conclusion": null,
+            "checkSuite": {
+             "workflowRun": {
+              "workflow": {
+               "name": "run_tests"
+              }
+             }
+            }
+           },
+           {
+            "__typename": "CheckRun",
+            "name": "build_nix_linux_x86_64",
+            "status": "COMPLETED",
+            "conclusion": "SKIPPED",
+            "checkSuite": {
+             "workflowRun": {
+              "workflow": {
+               "name": "nix_build"
+              }
+             }
+            }
+           },
+           {
+            "__typename": "CheckRun",
+            "name": "bundle_linux_aarch64",
+            "status": "COMPLETED",
+            "conclusion": "SKIPPED",
+            "checkSuite": {
+             "workflowRun": {
+              "workflow": {
+               "name": "run_bundling"
+              }
+             }
+            }
+           },
+           {
+            "__typename": "CheckRun",
+            "name": "check_style",
+            "status": "QUEUED",
+            "conclusion": null,
+            "checkSuite": {
+             "workflowRun": {
+              "workflow": {
+               "name": "run_tests"
+              }
+             }
+            }
+           },
+           {
+            "__typename": "CheckRun",
+            "name": "bundle_mac_aarch64",
+            "status": "COMPLETED",
+            "conclusion": "SKIPPED",
+            "checkSuite": {
+             "workflowRun": {
+              "workflow": {
+               "name": "run_bundling"
+              }
+             }
+            }
+           },
+           {
+            "__typename": "CheckRun",
+            "name": "bundle_mac_x86_64",
+            "status": "COMPLETED",
+            "conclusion": "SKIPPED",
+            "checkSuite": {
+             "workflowRun": {
+              "workflow": {
+               "name": "run_bundling"
+              }
+             }
+            }
+           },
+           {
+            "__typename": "StatusContext",
+            "context": "verification/cla-signed",
+            "state": "SUCCESS"
+           }
+          ]
+         }
+        }
+       }
+      }
+     ]
+    }
+   },
+   "b": {
+    "number": 65043,
+    "state": "MERGED",
+    "isDraft": false,
+    "mergeable": "UNKNOWN",
+    "mergeStateStatus": "UNKNOWN",
+    "commits": {
+     "nodes": [
+      {
+       "commit": {
+        "statusCheckRollup": {
+         "state": "SUCCESS"
+        }
+       }
+      }
+     ]
+    }
+   }
+  },
+  "rateLimit": {
+   "cost": 1,
+   "remaining": 4074,
+   "resetAt": "2026-10-02T09:23:33Z"
+  }
+ }
+}
+```
 
 ## Verification queue
 
