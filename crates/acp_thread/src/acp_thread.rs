@@ -4068,15 +4068,38 @@ impl AcpThread {
     }
 
     /// What this thread is running right now, counted from the entries it
-    /// already holds. Only work still in flight counts: a terminal until its
-    /// process exits (its output is only filled then), a subagent until its
-    /// call leaves `InProgress`.
+    /// already holds. Only work with evidence it is alive counts: a terminal
+    /// whose own tool call is still in flight or which the agent said it
+    /// detached, a subagent whose call is still `InProgress`, and a task the
+    /// agent reported as still out. Replayed history counts for nothing.
     pub fn running_work(&self, cx: &App) -> RunningWork {
         let mut work = RunningWork::default();
+        // A terminal's output is only filled by its exit, so "no output" on
+        // its own says nothing about whether anything is running: a terminal
+        // rebuilt from history when a thread is loaded or replayed never gets
+        // one, and neither does one whose turn was cancelled mid-command. The
+        // call it belongs to knows more, but not enough on its own either — a
+        // call can be left reading `InProgress` by an agent that died, by a
+        // cancellation, or by a transcript that records a turn which never
+        // finished. What settles all of them at once is that no turn is
+        // running: there is then nobody left to finish the call, so it is
+        // stuck rather than busy. Outside a turn the only evidence a command
+        // is alive is the agent having said it detached, which is what keeps a
+        // backgrounded command counted for the minutes it runs on.
+        let turn_is_running = !matches!(self.foreground_activity(), ForegroundActivity::Idle);
         for entry in &self.entries {
             let AgentThreadEntry::ToolCall(call) = entry else {
                 continue;
             };
+            let in_flight = matches!(
+                call.status(),
+                ToolCallStatus::Pending
+                    | ToolCallStatus::InProgress
+                    | ToolCallStatus::WaitingForConfirmation
+            );
+            if !(in_flight && turn_is_running) && !self.tool_call_is_backgrounded(&call.id) {
+                continue;
+            }
             work.terminals += call
                 .terminals()
                 .filter(|terminal| terminal.read(cx).output().is_none())
@@ -11370,6 +11393,142 @@ mod tests {
         });
     }
 
+    /// A thread read back from history, and a turn cut off mid-command, both
+    /// leave terminals with no output behind them. Neither is work in flight,
+    /// and counting them is what marked thousands of sidebar rows as busy with
+    /// nothing running.
+    #[gpui::test]
+    async fn test_settled_commands_are_not_running_work(cx: &mut gpui::TestAppContext) {
+        use ::terminal::TerminalBuilder;
+        use ::terminal::terminal_settings::{AlternateScroll, CursorShape};
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(
+                    project.clone(),
+                    PathList::new(&[Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        let display_terminal = |thread: &mut AcpThread,
+                                terminal_id: &acp_v1::TerminalId,
+                                cx: &mut Context<AcpThread>| {
+            let builder = TerminalBuilder::new_display_only(
+                CursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                thread.project().read(cx).path_style(cx),
+            );
+            let lower = cx.new(|cx| builder.subscribe(cx));
+            thread.on_terminal_provider_event(
+                TerminalProviderEvent::Created {
+                    terminal_id: terminal_id.clone(),
+                    label: "cargo test".to_string(),
+                    cwd: None,
+                    output_byte_limit: None,
+                    terminal: lower,
+                },
+                cx,
+            );
+        };
+
+        // History: a finished call whose terminal never reported an exit, which
+        // is what a replayed `terminal_output` without a `terminal_exit` looks
+        // like.
+        let replayed = acp_v1::TerminalId::new("replayed-command");
+        thread.update(cx, |thread, cx| {
+            display_terminal(thread, &replayed, cx);
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::ToolCall(
+                        acp_v1::ToolCall::new("replayed-call", "cargo test")
+                            .kind(acp_v1::ToolKind::Execute)
+                            .status(acp_v1::ToolCallStatus::Completed)
+                            .content(vec![acp_v1::ToolCallContent::Terminal(acp_v1::Terminal::new(
+                                replayed.clone(),
+                            ))]),
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            assert!(
+                thread.running_work(cx).is_empty(),
+                "a finished call's terminal is not running, whatever its output says"
+            );
+        });
+
+        // A turn cut off mid-command: the call is in flight while the turn runs,
+        // and settles with it. A subagent left `InProgress` goes the same way.
+        let (complete, request) = start_test_turn(&thread, cx);
+        cx.run_until_parked();
+        let cancelled = acp_v1::TerminalId::new("cancelled-command");
+        thread.update(cx, |thread, cx| {
+            display_terminal(thread, &cancelled, cx);
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::ToolCall(
+                        acp_v1::ToolCall::new("cancelled-call", "cargo test")
+                            .kind(acp_v1::ToolKind::Execute)
+                            .status(acp_v1::ToolCallStatus::InProgress)
+                            .content(vec![acp_v1::ToolCallContent::Terminal(acp_v1::Terminal::new(
+                                cancelled.clone(),
+                            ))]),
+                    ),
+                    cx,
+                )
+                .unwrap();
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::ToolCall(
+                        acp_v1::ToolCall::new("cancelled-subagent", "Investigate the failure")
+                            .status(acp_v1::ToolCallStatus::InProgress)
+                            .meta(meta_with_tool_name("spawn_agent")),
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(
+                thread.running_work(cx),
+                RunningWork {
+                    terminals: 1,
+                    subagents: 1,
+                    async_tasks: 0,
+                },
+                "a call still in flight is still work in flight"
+            );
+        });
+
+        // `cancel` settles the turn's entries before it returns, then waits for
+        // the turn's own send task. This test holds that turn's completion, so
+        // letting go of it is what lets the wait finish.
+        let cancelled_turn = thread.update(cx, |thread, cx| thread.cancel(cx));
+        drop(complete);
+        cancelled_turn.await;
+        let _ = request.await;
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            assert!(
+                thread.running_work(cx).is_empty(),
+                "cancelling the turn settles the command and the subagent it left behind"
+            );
+        });
+    }
+
     #[gpui::test]
     async fn test_running_work_counts_only_what_is_still_in_flight(cx: &mut gpui::TestAppContext) {
         use ::terminal::TerminalBuilder;
@@ -11396,6 +11555,11 @@ mod tests {
                 "a thread that has done nothing is running nothing"
             );
         });
+
+        // A turn has to be running for a call to be in flight: a call nobody is
+        // working on is stuck, not busy, which is what the counts now say.
+        let (complete, request) = start_test_turn(&thread, cx);
+        cx.run_until_parked();
 
         let terminal_id = acp_v1::TerminalId::new("running-command");
         thread.update(cx, |thread, cx| {
@@ -11483,6 +11647,11 @@ mod tests {
                 "work that has finished is not work in flight"
             );
         });
+
+        complete
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .expect("turn should still be running");
+        request.await.expect("turn should complete");
     }
 
     #[gpui::test]
