@@ -716,7 +716,7 @@ impl ThreadView {
     pub(super) fn toggle_action_chip(
         &mut self,
         id: ActionChipId,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // Single expand across the whole group: collapse whichever chip the user
@@ -740,6 +740,11 @@ impl ThreadView {
                 });
                 let tool_call_id = tool_call_id.clone();
                 self.prepare_command_scripts(&tool_call_id, cx);
+                // The body about to be drawn may need views that are only
+                // built for a call somebody opened.
+                if let Some(entry_ix) = self.entry_ix_for_chip(&id, cx) {
+                    self.sync_entry_views(entry_ix, window, cx);
+                }
             }
             // A per-file chip shows only its own file's diff, so it does not
             // touch the tool call's overall expansion state. The collapsed

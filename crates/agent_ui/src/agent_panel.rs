@@ -1256,10 +1256,14 @@ pub struct AgentPanel {
     /// side effect of closing a real tab.
     pending_foreign_activation: Option<(ThreadId, WeakEntity<Workspace>)>,
     /// Restarted on every activation; drops the view trees of the thread tabs
-    /// that are still off screen when it fires. See
-    /// [`OFFSCREEN_VIEW_GRACE`].
+    /// that are still off screen when it fires, then sleeps and looks again.
+    /// See [`OFFSCREEN_VIEW_GRACE`].
     offscreen_view_sweep: Option<Task<()>>,
     _thread_tabs_registry_observation: Subscription,
+    /// A window at the back shows none of its threads, so its panel has to
+    /// hear about the window going away and coming back rather than only
+    /// about its own tabs being activated.
+    _view_residency_observation: Subscription,
     terminals: HashMap<TerminalId, AgentTerminal>,
     pending_terminal_spawn: Option<TerminalId>,
     #[cfg(test)]
@@ -1793,6 +1797,10 @@ impl AgentPanel {
             },
         );
 
+        let _view_residency_observation = cx.observe_window_activation(window, |this, window, cx| {
+            this.sync_thread_view_residency(window, cx);
+        });
+
         let mut panel = Self {
             workspace_id,
             base_view,
@@ -1822,6 +1830,7 @@ impl AgentPanel {
             pending_foreign_activation: None,
             offscreen_view_sweep: None,
             _thread_tabs_registry_observation,
+            _view_residency_observation,
             terminals: HashMap::default(),
             pending_terminal_spawn: None,
             #[cfg(test)]
@@ -1923,9 +1932,13 @@ impl AgentPanel {
                 self.handle_thread_pane_item_removed(item.as_ref(), window, cx);
                 self.thread_pane_changed(cx);
             }
-            pane::Event::AddItem { .. } | pane::Event::Remove { .. } => {
-                self.thread_pane_changed(cx)
+            pane::Event::AddItem { .. } => {
+                self.thread_pane_changed(cx);
+                // A tab opened behind the one being read never activates, so
+                // without this the sweep has nothing to start it.
+                self.sync_thread_view_residency(window, cx);
             }
+            pane::Event::Remove { .. } => self.thread_pane_changed(cx),
             pane::Event::ZoomIn => {
                 self.thread_pane
                     .update(cx, |pane, cx| pane.set_zoomed(true, cx));
@@ -1983,40 +1996,69 @@ impl AgentPanel {
     }
 
     /// Gives the thread on screen its views back, and starts the clock on the
-    /// ones that are not. Called on every activation, so a run of tab switches
-    /// keeps pushing the sweep out and only a tab left alone loses its views.
+    /// ones that are not. Called on every activation and whenever the window
+    /// comes forward or goes to the back, so a run of tab switches keeps
+    /// pushing the sweep out and only a thread left alone loses its views.
     fn sync_thread_view_residency(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(active) = self.active_tab_thread.clone() {
+        // A window at the back is showing nothing, so there is nothing to give
+        // views back to; the sweep below takes them instead.
+        if window.is_window_active()
+            && let Some(active) = self.active_tab_thread.clone()
+        {
             active.update(cx, |conversation, cx| {
                 conversation.rebuild_active_entry_views(window, cx);
             });
         }
+        // One pass per activation was not enough to run at all in practice: a
+        // panel nobody touches again never activates another item, so threads
+        // opened behind the one being read kept their view trees for as long
+        // as the app was up. The sweep now looks again every grace period, and
+        // an activation restarts the clock rather than being the only thing
+        // that starts it.
         self.offscreen_view_sweep = Some(cx.spawn_in(window, async move |this, cx| {
-            cx.background_executor().timer(OFFSCREEN_VIEW_GRACE).await;
-            this.update(cx, |this, cx| this.drop_offscreen_thread_views(cx))
-                .ok();
+            loop {
+                cx.background_executor().timer(OFFSCREEN_VIEW_GRACE).await;
+                if this
+                    .update_in(cx, |this, window, cx| {
+                        this.drop_offscreen_thread_views(window, cx)
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
         }));
     }
 
     /// Drops the view trees of every thread tab that is not the one on screen.
     /// A thread refuses while a past message is being edited, so nothing that
     /// holds unsaved text goes.
-    fn drop_offscreen_thread_views(&mut self, cx: &mut Context<Self>) {
-        // No active tab means the panel does not currently know which thread is
-        // on screen — a `ForeignThreadTab` can be transiently active while its
-        // activation is re-routed, and `thread_pane_changed` leaves the slot
-        // empty until a real tab claims it. Dropping "everything that is not the
-        // active one" then would drop the views of the thread being read.
-        let Some(active) = self.active_tab_thread.clone() else {
-            return;
+    fn drop_offscreen_thread_views(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Nothing in a window the user is not looking at is on screen, its
+        // active tab included. With one worktree per window that is most of
+        // what there is to reclaim: from its own pane's point of view the one
+        // thread in a window at the back was never off screen, so a sweep that
+        // only spared "the active tab of this pane" spared everything.
+        let on_screen = if window.is_window_active() {
+            // No active tab means the panel does not currently know which
+            // thread is on screen — a `ForeignThreadTab` can be transiently
+            // active while its activation is re-routed, and
+            // `thread_pane_changed` leaves the slot empty until a real tab
+            // claims it. Dropping "everything that is not the active one" then
+            // would drop the views of the thread being read.
+            let Some(active) = self.active_tab_thread.clone() else {
+                return;
+            };
+            Some(active)
+        } else {
+            None
         };
-        let active = Some(active);
         let offscreen: Vec<_> = self
             .thread_pane
             .read(cx)
             .items_of_type::<crate::thread_tab::ThreadTab>()
             .map(|tab| tab.read(cx).conversation_view().clone())
-            .filter(|conversation| Some(conversation) != active.as_ref())
+            .filter(|conversation| Some(conversation) != on_screen.as_ref())
             .collect();
         let mut dropped = 0;
         for conversation in offscreen {
@@ -13524,6 +13566,51 @@ mod tests {
         assert!(
             missing.is_none(),
             "unknown session ids should not produce initial content"
+        );
+    }
+
+    /// The sweep's idea of "off screen" has to include a window the user is not
+    /// looking at. With one worktree per window the thread in a background
+    /// window is its pane's active tab, so a sweep that only spared "the active
+    /// tab of this pane" spared every thread in the app. The thread actually
+    /// being read must survive the sweep running on its own clock, which is the
+    /// other half of the same change.
+    #[gpui::test]
+    async fn test_a_window_at_the_back_drops_the_views_of_the_thread_it_showed(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let connection = StubAgentConnection::new();
+        let (_session_id, _thread_id) =
+            open_generating_thread_with_loadable_connection(&panel, &connection, &mut cx);
+        cx.run_until_parked();
+
+        let views_are_built = |panel: &Entity<AgentPanel>, cx: &mut VisualTestContext| {
+            panel.read_with(cx, |panel, cx| {
+                panel
+                    .active_tab_thread
+                    .as_ref()
+                    .expect("the opened thread should be the active tab")
+                    .read(cx)
+                    .active_entry_views_are_built(cx)
+            })
+        };
+
+        // The sweep now runs on a clock of its own rather than once per
+        // activation, so the thread being read has to keep its views across it.
+        cx.executor().advance_clock(OFFSCREEN_VIEW_GRACE * 3);
+        cx.run_until_parked();
+        assert!(
+            views_are_built(&panel, &mut cx),
+            "the thread on screen should keep its views however long it sits there"
+        );
+
+        cx.deactivate_window();
+        cx.executor().advance_clock(OFFSCREEN_VIEW_GRACE * 2);
+        cx.run_until_parked();
+        assert!(
+            !views_are_built(&panel, &mut cx),
+            "a window at the back is showing nothing, so its thread's views should go"
         );
     }
 

@@ -393,55 +393,91 @@ impl EntryViewState {
                     .map(|buffer| buffer.entity_id())
                     .collect();
 
-                let views = if let Some(Entry::ToolCall(tool_call)) = self.entries.get_mut(index) {
-                    &mut tool_call.content
+                let is_tool_call_completed =
+                    matches!(tool_call.status(), acp_thread::ToolCallStatus::Completed);
+                // Decided before the borrow below, which takes `self.entries`.
+                let terminal_output_wanted = self.is_tool_call_content_visible(tool_call);
+                let workspace = self.workspace.clone();
+                let project = self.project.clone();
+
+                let tool_call_entry = if let Some(Entry::ToolCall(tool_call)) =
+                    self.entries.get_mut(index)
+                {
+                    tool_call
                 } else {
                     self.set_entry(
                         index,
                         Entry::ToolCall(ToolCallEntry {
                             content: HashMap::default(),
                             patch_hunk_ids: HashSet::default(),
+                            terminals_seen: HashSet::default(),
                             focus_handle: cx.focus_handle(),
                         }),
                     );
                     let Some(Entry::ToolCall(tool_call)) = self.entries.get_mut(index) else {
                         unreachable!()
                     };
-                    &mut tool_call.content
+                    tool_call
                 };
-
-                let is_tool_call_completed =
-                    matches!(tool_call.status(), acp_thread::ToolCallStatus::Completed);
+                let ToolCallEntry {
+                    content: views,
+                    terminals_seen,
+                    ..
+                } = tool_call_entry;
 
                 for terminal in terminals {
-                    match views.entry(terminal.entity_id()) {
-                        collections::hash_map::Entry::Vacant(entry) => {
-                            let element = create_terminal(
-                                self.workspace.clone(),
-                                self.project.clone(),
-                                terminal.clone(),
-                                window,
-                                cx,
-                            )
-                            .into_any();
+                    let terminal_id = terminal.entity_id();
+                    if terminals_seen.insert(terminal_id) {
+                        // A command that has already exited the first time this
+                        // entry is synced is history being replayed, not a
+                        // command that just started, and `expand_terminal_card`
+                        // is about the latter. Opening every command in a
+                        // restored thread was both wrong (the fork's card is a
+                        // quiet one-line chip) and the reason a loaded thread
+                        // built a terminal view per command in its history. A
+                        // failure still opens itself, through `auto_expanded`.
+                        let already_finished =
+                            is_tool_call_completed && terminal.read(cx).output().is_some();
+                        if !already_finished {
                             cx.emit(EntryViewEvent {
                                 entry_index: index,
                                 view_event: ViewEvent::NewTerminal(id.clone()),
                             });
-                            entry.insert(element);
                         }
-                        collections::hash_map::Entry::Occupied(_entry) => {
-                            let terminal = terminal.read(cx);
-                            if is_tool_call_completed
-                                && terminal.is_process_backed()
-                                && terminal.output().is_none()
-                            {
-                                cx.emit(EntryViewEvent {
-                                    entry_index: index,
-                                    view_event: ViewEvent::TerminalMovedToBackground(id.clone()),
-                                });
-                            }
+                    } else {
+                        let terminal = terminal.read(cx);
+                        if is_tool_call_completed
+                            && terminal.is_process_backed()
+                            && terminal.output().is_none()
+                        {
+                            cx.emit(EntryViewEvent {
+                                entry_index: index,
+                                view_event: ViewEvent::TerminalMovedToBackground(id.clone()),
+                            });
                         }
+                    }
+
+                    // The output is only drawn while the call is open, and in a
+                    // long thread almost none of them are. A `TerminalView` and
+                    // the `BlinkManager` behind it per command, for every
+                    // command the thread ever ran, is what the thread being
+                    // read was holding — and the off-screen sweep cannot help
+                    // the one thread that is on screen. Built when something
+                    // asks to see it; the toggles that open a call sync the
+                    // entry again so the view is there for the next frame.
+                    if terminal_output_wanted {
+                        views.entry(terminal_id).or_insert_with(|| {
+                            create_terminal(
+                                workspace.clone(),
+                                project.clone(),
+                                terminal.clone(),
+                                window,
+                                cx,
+                            )
+                            .into_any()
+                        });
+                    } else {
+                        views.remove(&terminal_id);
                     }
                 }
 
@@ -661,6 +697,12 @@ impl AssistantMessageEntry {
 pub struct ToolCallEntry {
     content: HashMap<EntityId, AnyEntity>,
     patch_hunk_ids: HashSet<EntityId>,
+    /// The terminals this call has reported, whether or not a view was built
+    /// for one. A terminal's view is only built once something asks to see it,
+    /// so `content` can no longer stand in for "have we met this terminal
+    /// before" — which is what decides whether the card auto-expands and when
+    /// a command has carried on past its turn.
+    terminals_seen: HashSet<EntityId>,
     focus_handle: FocusHandle,
 }
 
@@ -1236,6 +1278,118 @@ mod tests {
             view_state.remove(0..2);
             assert!(!view_state.is_compaction_expanded(3));
             assert!(view_state.is_compaction_expanded(1));
+        });
+    }
+
+    /// A command that had already finished the first time its entry was synced
+    /// — every command in a thread restored from history — gets no terminal
+    /// view, because nothing is drawing its output. Opening the call is what
+    /// builds one.
+    #[gpui::test]
+    async fn test_a_finished_commands_output_has_no_view_until_the_call_is_opened(
+        cx: &mut TestAppContext,
+    ) {
+        use agent_client_protocol::schema::{MaybeUndefined, v2 as acp_v2};
+
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({})).await;
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        let connection = Rc::new(StubAgentConnection::new());
+        let thread = cx
+            .update(|_, cx| {
+                connection.clone().new_session(
+                    project.clone(),
+                    PathList::new(&[Path::new(path!("/project"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        let view_state = cx.new(|_cx| {
+            EntryViewState::new(
+                workspace.downgrade(),
+                project.downgrade(),
+                None,
+                Arc::new(RwLock::new(SessionCapabilities::default())),
+                "Test Agent".into(),
+            )
+        });
+
+        // A finished command, exit status and all, before anything draws it.
+        thread.update(cx, |thread, cx| {
+            thread
+                .upsert_tool_call_patch(
+                    acp_v2::ToolCallUpdate::new("tool")
+                        .title("Run command")
+                        .kind(acp_v2::ToolKind::Execute)
+                        .status(acp_v2::ToolCallStatus::Completed)
+                        .content(vec![acp_v2::ToolCallContent::Terminal(
+                            acp_v2::Terminal::new("display"),
+                        )]),
+                    cx,
+                )
+                .expect("a tool call carrying a terminal");
+            thread
+                .upsert_display_terminal(
+                    "display".into(),
+                    acp_thread::DisplayTerminalPatch {
+                        command: MaybeUndefined::Value("cargo test".into()),
+                        output: MaybeUndefined::Value(acp_thread::DisplayTerminalOutput {
+                            data: b"ok".to_vec(),
+                            meta: None,
+                        }),
+                        exit_status: MaybeUndefined::Value(
+                            acp_v2::TerminalExitStatus::new().exit_code(0),
+                        ),
+                        ..Default::default()
+                    },
+                    cx,
+                )
+                .expect("the command's captured output");
+        });
+        cx.run_until_parked();
+
+        let terminal = thread.read_with(cx, |thread, _| {
+            thread
+                .terminal(acp_v1::TerminalId::new("display"))
+                .expect("the terminal the tool call named")
+        });
+
+        view_state.update_in(cx, |view_state, window, cx| {
+            view_state.sync_entry(0, &thread, window, cx);
+        });
+        view_state.read_with(cx, |view_state, _cx| {
+            assert!(
+                view_state
+                    .entry(0)
+                    .expect("the tool call entry")
+                    .terminal(&terminal)
+                    .is_none(),
+                "a command nobody has opened should not hold a terminal view"
+            );
+        });
+
+        view_state.update_in(cx, |view_state, window, cx| {
+            view_state.expand_tool_call(acp_v1::ToolCallId::new("tool"));
+            view_state.sync_entry(0, &thread, window, cx);
+        });
+        view_state.read_with(cx, |view_state, _cx| {
+            assert!(
+                view_state
+                    .entry(0)
+                    .expect("the tool call entry")
+                    .terminal(&terminal)
+                    .is_some(),
+                "opening the call should build the view its output is drawn with"
+            );
         });
     }
 

@@ -852,6 +852,14 @@ impl ConversationView {
         }
     }
 
+    /// Whether the thread this conversation is showing still holds its views.
+    /// What the off-screen sweep is observed by.
+    #[cfg(test)]
+    pub(crate) fn active_entry_views_are_built(&self, cx: &App) -> bool {
+        self.active_thread()
+            .is_some_and(|thread_view| entry_views_are_built(thread_view, cx))
+    }
+
     /// The agent/model logo icon, for showing the agent a thread belongs to
     /// (e.g. on its tab).
     pub fn agent_logo(&self) -> IconName {

@@ -896,6 +896,14 @@ impl Terminal {
                         );
                         this.terminal.update(cx, |terminal, _cx| {
                             terminal.release_pty_resources();
+                            // The output is captured above, so the grid only
+                            // has to hold what it actually printed. Both
+                            // display paths already truncate here; a
+                            // process-backed command kept its whole scrollback
+                            // reservation for as long as the thread was open,
+                            // which with a few thousand commands is most of
+                            // what the app was holding.
+                            terminal.shrink_to_used();
                         });
                         // Free the sandbox (and its network proxy) as soon as
                         // the command finishes, rather than holding it until

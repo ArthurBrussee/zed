@@ -2082,12 +2082,14 @@ impl ThreadView {
                     self.entry_view_state.update(cx, |state, _cx| {
                         state.expand_tool_call(tool_call_id.clone());
                     });
+                    self.sync_entry_views(event.entry_index, window, cx);
                 }
             }
             ViewEvent::TerminalMovedToBackground(tool_call_id) => {
                 self.entry_view_state.update(cx, |state, _cx| {
                     state.collapse_tool_call(tool_call_id);
                 });
+                self.sync_entry_views(event.entry_index, window, cx);
             }
             ViewEvent::MessageEditorEvent(_editor, MessageEditorEvent::Focus) => {
                 if self.can_edit_user_message(event.entry_index, cx) {
@@ -4143,6 +4145,16 @@ impl ThreadView {
         self.list_state.reset(0);
         cx.notify();
         true
+    }
+
+    /// Re-syncs one entry's views after its expansion changed. Views that are
+    /// only drawn while a call is open — a command's terminal — are built when
+    /// something asks to see them, so a toggle has to say so.
+    fn sync_entry_views(&mut self, entry_ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let thread = self.thread.clone();
+        self.entry_view_state.update(cx, |state, cx| {
+            state.sync_entry(entry_ix, &thread, window, cx);
+        });
     }
 
     /// Builds the views for every entry again, the same way opening the thread
@@ -10778,6 +10790,7 @@ impl ThreadView {
                                 this.entry_view_state.update(cx, |state, _cx| {
                                     state.set_tool_call_expanded(&id, !now_expanded);
                                 });
+                                this.sync_entry_views(entry_ix, window, cx);
                                 this.refresh_thread_search(window, cx);
                                 cx.notify();
                             }
@@ -10891,6 +10904,7 @@ impl ThreadView {
                                 this.entry_view_state.update(cx, |state, _cx| {
                                     state.set_tool_call_expanded(&id, !now_expanded);
                                 });
+                                this.sync_entry_views(entry_ix, window, cx);
                                 this.refresh_thread_search(window, cx);
                                 cx.notify();
                             }
