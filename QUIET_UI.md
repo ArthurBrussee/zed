@@ -135,7 +135,60 @@ does is removed as it lands.
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
-**The app leaks entities. The instrument to name the type is in; read it and stop it.**
+**Many sidebar rows show as busy when nothing is running.**
+
+Arthur sees lots of threads marked as working with nothing visibly running. Since the activity
+fix, a row counts as working when the turn is running OR `AcpThread::running_work` is non-empty
+(`thread_item.rs`: `running = status == Running || !running_work.is_empty()`). `running_work`
+counts every terminal whose `output()` is `None`, every subagent call still `InProgress`, and
+every async task not yet terminal. All three can stay "running" forever with nothing behind
+them:
+- a terminal that never gets its exit: a turn cancelled mid-command, an agent process that died
+  or restarted, or a terminal rebuilt from history when a thread is loaded or replayed (the
+  `terminal_output` meta can arrive without a matching `terminal_exit`);
+- a subagent tool call left `InProgress` when its turn was cancelled or errored;
+- an async task whose terminal state never arrived because the adapter restarted or the session
+  closed.
+
+With about eleven thousand live terminals in Arthur's session (see the leak entry), many of
+them from loaded history, the first is likely most of it. Fix: outside a running turn, count
+only work with evidence it is alive. That means a live async task the agent reported this
+session, or a terminal whose tool call is still `InProgress` or backgrounded. When a turn ends,
+is cancelled, or errors, settle its terminals and subagent calls. When a session closes or
+reloads, drop its async tasks. Replayed history never counts as running. Test each case: a
+cancelled turn, a reloaded thread with commands in its history, a subagent from a cancelled
+turn, and an agent restart with a background task out.
+
+**The app leaks entities. The by-type lines are in; they name terminals and markdown.**
+
+From Arthur's log on 2026-10-02 (app up since 21:14 the night before, build from the morning of
+10-01), two consecutive lines a minute apart:
+
+    11:09 118828 entities live; largest: Markdown 47251, BlinkManager 13367, Terminal 11276, TerminalView 11276, Terminal 11266, Buffer 4708, DisplayMap 2689, MultiBuffer 2689, WrapMap 2689, Editor 2091; grown since the last line: Markdown 14, Terminal 14, BlinkManager 4, Terminal 4, TerminalView 4
+    11:10 119166 entities live; largest: Markdown 47289, BlinkManager 13378, Terminal 11287, TerminalView 11287, Terminal 11277, Buffer 4817, ...; grown since the last line: Buffer 109, BufferDiff 73, Markdown 38, BufferGitState 36, ConflictSet 36, Terminal 21, BlinkManager 11, Terminal 11, TerminalView 11, OpenLspBuffer 1
+    gpui holds 46684 observers over 46095 entities, 30342 listeners over 23218, 2128 release observers, 48961 global observers, 81694 focus handles
+
+At 10:03 it was 111252 (Markdown 44173, Terminal 10381). That is about eleven thousand live
+command terminals, each holding an `acp_thread::Terminal`, a `terminal::Terminal` (a full
+alacritty grid), a `TerminalView` and its `BlinkManager`. There are 47 thousand `Markdown`, and
+both counts grow by about ten a minute. **The terminals are the leak to stop first.**
+
+- The off-screen sweep never runs. Neither `Zed.log` nor `Zed.log.old` has a single
+  `dropped the views of N off-screen threads` or `rebuilt views` line. The sweep was built
+  (2026-09-27) around a thread *tab* going off screen. The tab bar went on 09-28, so check
+  whether it still has anything to trigger on, and make it trigger on "not the thread being
+  shown" instead.
+- Even when the sweep works, a finished command should not keep a live `terminal::Terminal` and
+  `TerminalView` forever. Once a command has exited and its output is captured, the chip needs
+  the captured text, not a live terminal. Drop the terminal and its view, or never create a
+  `TerminalView` for a command until its output is expanded.
+- The `Buffer`/`BufferDiff`/`BufferGitState`/`ConflictSet` jump of 109/73/36/36 in one minute
+  is the command diff hovers or the git refresh opening buffers. Find which, and check those
+  buffers are released.
+- Report the same two lines, before and after, in the log entry.
+
+The older notes below still hold.
+
 Still top priority, and now half answered. The complaint was about eighty entities a minute on top
 of a baseline of fifty thousand, with global observers rising in step, which says each leaked
 object watches a global the way `Markdown` and `Editor` do.
