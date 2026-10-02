@@ -127,24 +127,40 @@ impl BackgroundExecutor {
         }
     }
 
+    /// Like [`Self::spawn_with_priority`], but attributed to a call site the
+    /// caller names rather than to this one.
+    pub fn spawn_with_priority_at<R>(
+        &self,
+        priority: Priority,
+        location: &'static core::panic::Location<'static>,
+        future: impl Future<Output = R> + Send + 'static,
+    ) -> Task<R>
+    where
+        R: Send + 'static,
+    {
+        if priority == Priority::RealtimeAudio {
+            self.inner.spawn_realtime(future)
+        } else {
+            self.inner
+                .spawn_with_priority_at(priority, location, future.boxed())
+        }
+    }
+
     /// Runs background tasks that may borrow from their environment and waits for all of them to complete.
     ///
     /// Dropping the returned future cancels its tasks and synchronously waits for their futures to
     /// be destroyed before returning.
     #[cfg(not(target_family = "wasm"))]
-    pub async fn scoped<'scope, F>(&self, scheduler: F)
+    #[track_caller]
+    pub fn scoped<'scope, F>(&self, scheduler: F) -> impl Future<Output = ()>
     where
         F: FnOnce(&mut Scope<'scope>),
     {
-        let mut scope = Scope::new(self.clone(), Priority::default());
-        (scheduler)(&mut scope);
-        let spawned = mem::take(&mut scope.futures)
-            .into_iter()
-            .map(|f| self.spawn_with_priority(scope.priority, f))
-            .collect::<Vec<_>>();
-        for task in spawned {
-            task.await;
-        }
+        self.scoped_at(
+            Priority::default(),
+            core::panic::Location::caller(),
+            scheduler,
+        )
     }
 
     /// Runs prioritized background tasks that may borrow from their environment and waits for all
@@ -153,18 +169,45 @@ impl BackgroundExecutor {
     /// Dropping the returned future cancels its tasks and synchronously waits for their futures to
     /// be destroyed before returning.
     #[cfg(not(target_family = "wasm"))]
-    pub async fn scoped_priority<'scope, F>(&self, priority: Priority, scheduler: F)
+    #[track_caller]
+    pub fn scoped_priority<'scope, F>(
+        &self,
+        priority: Priority,
+        scheduler: F,
+    ) -> impl Future<Output = ()>
     where
         F: FnOnce(&mut Scope<'scope>),
     {
-        let mut scope = Scope::new(self.clone(), priority);
-        (scheduler)(&mut scope);
-        let spawned = mem::take(&mut scope.futures)
-            .into_iter()
-            .map(|f| self.spawn_with_priority(scope.priority, f))
-            .collect::<Vec<_>>();
-        for task in spawned {
-            task.await;
+        self.scoped_at(priority, core::panic::Location::caller(), scheduler)
+    }
+
+    /// A scope's tasks are reported at the call site that opened the scope.
+    ///
+    /// They used to be reported where they are spawned, which is inside here,
+    /// so a burst of slow background tasks named this file and said nothing
+    /// about the scan that asked for them. The two public entry points are not
+    /// `async fn` for the same reason: `#[track_caller]` on an `async fn` is a
+    /// no-op, so the location has to be taken before the future is built.
+    #[cfg(not(target_family = "wasm"))]
+    fn scoped_at<'scope, F>(
+        &self,
+        priority: Priority,
+        location: &'static core::panic::Location<'static>,
+        scheduler: F,
+    ) -> impl Future<Output = ()>
+    where
+        F: FnOnce(&mut Scope<'scope>),
+    {
+        async move {
+            let mut scope = Scope::new(self.clone(), priority);
+            (scheduler)(&mut scope);
+            let spawned = mem::take(&mut scope.futures)
+                .into_iter()
+                .map(|f| self.spawn_with_priority_at(scope.priority, location, f))
+                .collect::<Vec<_>>();
+            for task in spawned {
+                task.await;
+            }
         }
     }
 
