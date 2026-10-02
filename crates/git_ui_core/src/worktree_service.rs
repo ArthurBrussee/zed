@@ -1483,6 +1483,10 @@ async fn do_create_worktree(
     activation: WorktreeWorkspaceActivation,
     cx: &mut AsyncWindowContext,
 ) -> anyhow::Result<CreatedWorktreeWorkspace> {
+    // Nothing else may start a spare's checkout until this creation's window is
+    // open, whichever way this returns.
+    let creating = crate::worktree_spares::CreationInFlight::begin();
+
     // A worktree made before anyone pressed `+` is this creation's checkout,
     // already done — as long as it was made for these repositories, at the
     // base being asked for, and under the generated name a `+` uses rather
@@ -1618,7 +1622,6 @@ async fn do_create_worktree(
         fetch_started.elapsed().as_secs_f64() * 1000.
     );
 
-    let claimed_a_spare = claimed.is_some();
     let (created_paths, path_remapping, consolidated_worktrees) = match claimed {
         // A spare is the whole checkout, already done: what is left of this
         // creation is opening a window over it. It stops being a spare here,
@@ -1662,14 +1665,14 @@ async fn do_create_worktree(
 
     // The next `+` wants a spare too, and starting it is deferred until the
     // window this one was spared for is open: a checkout running against the
-    // open would spend what it just saved.
-    let refill = claimed_a_spare.then(|| {
-        (
-            git_repos.clone(),
-            branch_target.clone(),
-            remote_connection_options.clone(),
-        )
-    });
+    // open would spend what it just saved. Asked for whether or not a spare was
+    // claimed — a creation that found none is exactly a repository set with no
+    // spare — since `start_building` already refuses when there is one.
+    let refill = (
+        git_repos.clone(),
+        branch_target.clone(),
+        remote_connection_options.clone(),
+    );
 
     let mut all_paths = created_paths;
     let has_non_git = !non_git_paths.is_empty();
@@ -1695,9 +1698,11 @@ async fn do_create_worktree(
         open_started.elapsed().as_secs_f64() * 1000.
     );
 
-    if let Some((git_repos, branch_target, remote_connection_options)) = refill {
-        start_spare_worktree(git_repos, branch_target, remote_connection_options, cx);
-    }
+    // The window is up, so the gap this guard covers is over and the spare
+    // below is free to start.
+    drop(creating);
+    let (spare_repos, spare_branch_target, spare_remote) = refill;
+    start_spare_worktree(spare_repos, spare_branch_target, spare_remote, cx);
 
     if let Some(deferred) = fetch_behind_creation
         && let Some(base_ref) = base_ref

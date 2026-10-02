@@ -15,9 +15,47 @@
 //! collects.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use collections::HashMap;
 use gpui::{App, Global};
+
+/// How many `+` creations are between claiming their worktree and having their
+/// window open.
+static CREATIONS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// Held for as long as a `+` is creating a worktree and opening its window.
+///
+/// A spare's checkout is background work, but a checkout is git writing files
+/// and opening the window is reading them, so starting a spare while a `+` is
+/// still opening its own window spends exactly what the spare was there to
+/// save. The creation defers its own refill until the window is up; this is
+/// what stops everything else that asks for a spare from starting one in the
+/// gap — and the sidebar asks on every change to a repository's worktree list,
+/// which creating a worktree is. The window open that was measured at 12 to 14
+/// seconds was racing a replacement spare's 8-second checkout.
+///
+/// A static rather than a [`Global`], so that the guard releases on every path
+/// out of the creation, including the error ones, where nothing can reach an
+/// `App`.
+pub struct CreationInFlight;
+
+impl CreationInFlight {
+    pub fn begin() -> Self {
+        CREATIONS_IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+
+    pub fn any() -> bool {
+        CREATIONS_IN_FLIGHT.load(Ordering::SeqCst) > 0
+    }
+}
+
+impl Drop for CreationInFlight {
+    fn drop(&mut self) {
+        CREATIONS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// A worktree that has been created and not yet claimed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,6 +126,11 @@ impl SpareWorktrees {
     /// Claims the right to build this set's spare. `false` means one is
     /// already ready or already being built, and nothing should be started.
     pub fn start_building(key: SpareKey, cx: &mut App) -> bool {
+        // Not while a `+` is still opening its window: see
+        // [`CreationInFlight`]. The creation starts one itself once it is done.
+        if CreationInFlight::any() {
+            return false;
+        }
         let spares = &mut Self::global(cx).spares;
         if spares.contains_key(&key) {
             return false;
