@@ -355,6 +355,28 @@ reloads, drop its async tasks. Replayed history never counts as running. Test ea
 cancelled turn, a reloaded thread with commands in its history, a subagent from a cancelled
 turn, and an agent restart with a background task out.
 
+**Command chips collapse to an icon and "…".**
+
+Arthur's screenshot (2026-10-02) shows a row of terminal chips, passed and failed, each just its
+glyph and an ellipsis, all the same narrow width. Search chips in the same thread (`window\.|
+globalThis|sw…`, `AGENTS.md`, `Searched "window\\.|globalThis\\."`) render at full width. So
+it is the terminal-label branch of the chip in `chips.rs`, the `else if has_terminals` arm that
+builds the label `div`. That `div` is `.flex_1().min_w_0()` with `overflow_hidden`,
+`whitespace_nowrap`, `line_clamp(1)` and `text_ellipsis`, inside `action_chip_base`, which is
+`min_w_0`, `flex_shrink_0` and `max_w(relative(0.75))` with no width of its own. `flex_1` means a
+flex basis of 0. With `min_w_0` and hidden overflow, the label contributes nothing to the chip's
+intrinsic width, so the chip sizes to its glyphs and the label gets an ellipsis's worth of
+room. The comment there says `flex_1` was meant to give the label "a definite width once the
+chip clamps against its cap", but it also takes the label's width away *before* the cap is
+reached.
+
+Fix it so the chip is as wide as its label up to the cap and truncates only beyond it. Give the
+label an auto basis that may shrink (`flex_initial`/`flex_shrink` with `min_w_0`) instead of
+`flex_1`, or measure the label and set the chip's width. Then check the other chip kinds for the
+same pattern (`flex_1` on a label inside a content-sized chip). Add a layout test that renders a
+terminal chip for `cargo test -p sidebar` in a wide row and asserts the label is not truncated,
+and one in a narrow row that asserts it truncates at the cap rather than collapsing.
+
 **No more drafts: clicking `+` makes a real worktree and a real thread, messages or not.**
 
 Arthur wants the draft concept gone. The moment he clicks `+`, he has a full worktree with a
