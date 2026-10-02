@@ -371,6 +371,31 @@ through `checkSuite { workflowRun { workflow { name } } }`, which is what `gh` r
 }
 ```
 
+**The activity pill: no gradient behind it, a pill shape, and Claude's subagents counted.**
+
+Arthur's screenshot (2026-10-02) shows the running spinner and `[terminal] 1` sitting on a
+visible horizontal gradient. In the sidebar row (`ThreadItem::render` in
+`crates/ui/src/components/ai/thread_item.rs`), the title's truncation fade (`gradient_overlay`,
+a `GradientFade` 64px wide) is drawn just before the `status_slot` that holds the pill, so the
+pill sits on the fade. Remove the gradient from behind the pill. Then make
+`agent_activity_pill` an actual pill: a rounded-full container with a subtle solid fill and a
+little horizontal padding, holding the spinner and the counts. It is the same component in the
+sidebar row and in the thread's bottom bar (`render_input_activity_pill`), so both change. The
+title still truncates cleanly against the pill without a fade, or with one that ends before the
+pill starts.
+
+Subagents: the pill already shows a subagent count when `RunningWork::subagents > 0`, but
+`ToolCall::is_subagent` (`acp_thread.rs`) only recognises a tool named `spawn_agent` (Codex) or
+a call carrying Zed's `subagent_session_info` meta. Claude's subagents are its `Agent`/`Task` tool
+calls. The Claude adapter reports the tool name in `_meta.claudeCode.toolName`, and stamps
+`_meta.claudeCode.parentToolUseId` on everything the subagent does
+(`@agentclientprotocol/claude-agent-acp` `dist/acp-agent.js`; see also `dist/acp-subagents.js`
+and `dist/native-subagents.js` for any capability Zed could advertise to get richer subagent
+reporting). So a running Claude subagent never counts. Recognise Claude's `Agent`/`Task` calls
+as subagents while they are in progress, and settle them when the call completes or the turn
+ends (the same settling rule as the stale-busy fix). Test with a Claude turn that runs two
+subagents in parallel: the pill shows 2 while both run and drops as each finishes.
+
 ## Verification queue
 
 Where the day's edits go unverified. `cargo check` and `script/clippy` run here as usual; what
