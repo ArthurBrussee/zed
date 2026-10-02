@@ -86,7 +86,6 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use sum_tree::{Edit, SumTree, TreeMap};
-use task::Shell;
 use text::{Bias, BufferId, OffsetRangeExt, Rope, ToOffset};
 use util::{
     ResultExt, debug_panic,
@@ -773,7 +772,10 @@ impl LocalRepositoryState {
     ) -> anyhow::Result<Self> {
         let environment = project_environment
                 .update(cx, |project_environment, cx| {
-                    project_environment.local_directory_environment(&Shell::System, work_directory_abs_path.clone(), cx)
+                    // The worktree's environment, not this repository's: a
+                    // submodule shares its superproject's checkout, and all
+                    // this is used for is finding a `git` on PATH.
+                    project_environment.containing_worktree_environment(work_directory_abs_path.clone(), cx)
                 })?
                 .await
                 .unwrap_or_else(|| {
