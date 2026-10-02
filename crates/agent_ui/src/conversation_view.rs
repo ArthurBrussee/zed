@@ -14117,6 +14117,101 @@ pub(crate) mod tests {
     /// offers to kill that one terminal, and says afterwards that it was
     /// stopped rather than that it failed.
     #[cfg(unix)]
+    /// A command chip is as wide as its command, up to the chip's cap.
+    ///
+    /// It was as wide as its glyphs: the label had a flex basis of zero inside
+    /// a content-sized chip, so it contributed nothing to the chip's intrinsic
+    /// width and every terminal chip came out the same narrow width with an
+    /// ellipsis in it, whatever the command said.
+    #[gpui::test]
+    async fn test_a_command_chip_is_as_wide_as_its_command_up_to_the_cap(
+        cx: &mut TestAppContext,
+    ) {
+        use agent_client_protocol::schema::{MaybeUndefined, v2 as acp_v2};
+
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(StubAgentConnection::new()), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+
+        // Two finished commands in the same run, one short and one long. Under
+        // the old basis both chips were the width of their glyphs, so the
+        // difference between these two labels is what the fix is about.
+        for (tool_id, terminal_id, command) in [
+            ("short-command", "short-terminal", "ls"),
+            (
+                "long-command",
+                "long-terminal",
+                "cargo test -p sidebar --all-features",
+            ),
+        ] {
+            thread.update(cx, |thread, cx| {
+                thread
+                    .upsert_tool_call_patch(
+                        acp_v2::ToolCallUpdate::new(tool_id)
+                            .title(command)
+                            .kind(acp_v2::ToolKind::Execute)
+                            .status(acp_v2::ToolCallStatus::Completed)
+                            .content(vec![acp_v2::ToolCallContent::Terminal(
+                                acp_v2::Terminal::new(terminal_id),
+                            )]),
+                        cx,
+                    )
+                    .expect("a finished command");
+                thread
+                    .upsert_display_terminal(
+                        terminal_id.into(),
+                        acp_thread::DisplayTerminalPatch {
+                            command: MaybeUndefined::Value(command.into()),
+                            output: MaybeUndefined::Value(acp_thread::DisplayTerminalOutput {
+                                data: b"ok".to_vec(),
+                                meta: None,
+                            }),
+                            exit_status: MaybeUndefined::Value(
+                                acp_v2::TerminalExitStatus::new().exit_code(0),
+                            ),
+                            ..Default::default()
+                        },
+                        cx,
+                    )
+                    .expect("the command's captured output");
+            });
+        }
+        cx.simulate_resize(size(px(1200.), px(800.)));
+        cx.run_until_parked();
+
+        let label_width = |tool_id: &str, cx: &mut VisualTestContext| {
+            cx.debug_bounds(&format!("COMMAND_CHIP_LABEL-{tool_id}"))
+                .unwrap_or_else(|| panic!("the chip for {tool_id} should render its label"))
+                .size
+                .width
+        };
+
+        let short = label_width("short-command", cx);
+        let wide = label_width("long-command", cx);
+        assert!(
+            wide > short * 2.,
+            "a long command's label should take the room it needs in a wide row, \
+             got {wide:?} against {short:?} for `ls`"
+        );
+
+        // Narrow enough that the cap binds: the label truncates inside the
+        // chip rather than the chip growing out of the row.
+        cx.simulate_resize(size(px(260.), px(800.)));
+        cx.run_until_parked();
+        let capped = label_width("long-command", cx);
+        assert!(
+            capped < wide,
+            "past the cap the label should truncate, got {capped:?} against {wide:?}"
+        );
+        assert!(
+            capped <= px(260.),
+            "the chip should stay inside the row, got a label of {capped:?}"
+        );
+    }
+
     #[gpui::test]
     async fn test_a_running_command_can_be_stopped_from_its_chip(cx: &mut TestAppContext) {
         init_test(cx);

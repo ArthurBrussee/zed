@@ -1881,7 +1881,9 @@ impl ThreadView {
             command_text_style.color = cx.theme().colors().text_muted;
             let code_language = tool_call.label.read(cx).first_code_block_language();
             h_flex()
-                .flex_1()
+                // Auto basis, as in the single-command branch below: a zero
+                // basis costs a content-sized chip its label's width.
+                .flex_initial()
                 .min_w_0()
                 .gap_1()
                 .overflow_hidden()
@@ -1945,11 +1947,20 @@ impl ThreadView {
                 &markdown_style,
             );
             div()
-                // flex_1 so the label receives a definite width once the chip
-                // clamps against its cap: truncation only engages under a
-                // definite measure (and only together with a line clamp).
-                .flex_1()
+                // `flex_initial`, not `flex_1`: a basis of auto, which may
+                // shrink. `flex_1` means a basis of zero, so with `min_w_0` and
+                // hidden overflow the label contributed nothing to the chip's
+                // intrinsic width — a content-sized chip then sized to its
+                // glyphs and gave the label an ellipsis's worth of room,
+                // whatever the command said. Shrinking against the chip's cap
+                // still hands the label a definite width, so truncation beyond
+                // the cap works as it did.
+                .flex_initial()
                 .min_w_0()
+                .debug_selector({
+                    let tool_call_id = tool_call.id.clone();
+                    move || format!("COMMAND_CHIP_LABEL-{tool_call_id}")
+                })
                 .map(|this| {
                     if is_expanded {
                         // The full command, wrapped over as many lines as it
@@ -2763,7 +2774,8 @@ impl ThreadView {
             .child(icon)
             .child(
                 div()
-                    .flex_1()
+                    // Auto basis: see the command chip's label.
+                    .flex_initial()
                     .min_w_0()
                     .overflow_hidden()
                     .whitespace_nowrap()
