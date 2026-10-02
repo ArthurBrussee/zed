@@ -59,6 +59,9 @@ use util::path_list::PathList;
 /// A sidebar rebuild costing more than a frame at 60Hz is one the user can feel
 /// between two keystrokes. Rebuilds under it are counted, not logged.
 const SLOW_REBUILD: std::time::Duration = std::time::Duration::from_millis(16);
+/// Foreground time in rebuilds that is worth a line of its own, however fast
+/// the individual rebuilds were.
+const REPORTABLE_REBUILD_TIME: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Repositories already swept for abandoned worktrees this launch, so the
 /// second window opened over the same project does not sweep it again.
@@ -187,6 +190,7 @@ impl ActiveEntry {
 }
 
 #[derive(Clone, Debug)]
+#[derive(PartialEq)]
 struct ActiveThreadInfo {
     session_id: acp::SessionId,
     title: SharedString,
@@ -835,6 +839,21 @@ pub struct Sidebar {
     /// How many of those rebuilds produced the list that was already there,
     /// and so stopped before paying for anything downstream of it.
     skipped_rebuilds: usize,
+    /// What asked for those rebuilds, by call site. A rebuild is asked for from
+    /// forty places and the log only ever said how many there had been, never
+    /// which of them, so the noisy one could not be named without this.
+    rebuild_triggers: HashMap<&'static std::panic::Location<'static>, usize>,
+    /// Foreground time spent rebuilding since the last logged line, the
+    /// rebuilds under the slow threshold included. Only the ones over it were
+    /// ever reported, so what the quiet thousands cost between them was never a
+    /// number.
+    rebuild_time: std::time::Duration,
+    /// The live thread state last folded into the rows, per workspace. A thread
+    /// entry changing is the most frequent reason a rebuild is asked for — once
+    /// per streamed chunk — and the rows only carry a thread's status, its
+    /// running work, its title and its diff stats, so when none of those moved
+    /// the 365-row rebuild behind it had nothing to say.
+    live_thread_info: HashMap<EntityId, Vec<ActiveThreadInfo>>,
     _subscriptions: Vec<gpui::Subscription>,
     /// What this sidebar watches in each open workspace, keyed by the
     /// workspace it belongs to.
@@ -1055,6 +1074,9 @@ impl Sidebar {
             worktree_sizes_pending: Vec::new(),
             quiet_rebuilds: 0,
             skipped_rebuilds: 0,
+            rebuild_triggers: HashMap::default(),
+            rebuild_time: std::time::Duration::ZERO,
+            live_thread_info: HashMap::default(),
             _subscriptions: Vec::new(),
             _draft_editor_observations: Vec::new(),
             update_task: None,
@@ -1255,10 +1277,22 @@ impl Sidebar {
             agent_panel,
             window,
             move |this, agent_panel, event: &AgentPanelEvent, window, cx| match event {
-                AgentPanelEvent::ActiveViewChanged
-                | AgentPanelEvent::ActiveViewFocused
-                | AgentPanelEvent::EntryChanged => {
+                AgentPanelEvent::ActiveViewChanged | AgentPanelEvent::ActiveViewFocused => {
                     this.sync_active_entry_from_panel(agent_panel, cx);
+                    this.schedule_update_entries(false, cx);
+                }
+                AgentPanelEvent::EntryChanged => {
+                    this.sync_active_entry_from_panel(agent_panel, cx);
+                    // Once per streamed chunk, for every thread in every open
+                    // window. A row carries only what `apply_active_info`
+                    // writes into it, so when none of that moved the rebuild
+                    // behind this walked every stored thread and every open
+                    // workspace to produce the list it already had.
+                    if let Some(workspace) = workspace.upgrade()
+                        && !this.live_thread_info_changed(&workspace, cx)
+                    {
+                        return;
+                    }
                     this.schedule_update_entries(false, cx);
                 }
                 AgentPanelEvent::TerminalCloseRequested { metadata } => {
@@ -2468,7 +2502,11 @@ impl Sidebar {
         }));
     }
 
+    #[track_caller]
     fn schedule_update_entries(&mut self, select_first_after_update: bool, cx: &mut Context<Self>) {
+        // Recorded here rather than inside the task: by the time that runs the
+        // caller is this function's own closure, which names nothing.
+        let trigger = std::panic::Location::caller();
         if self.update_task.is_some() && !select_first_after_update {
             return;
         }
@@ -2476,7 +2514,7 @@ impl Sidebar {
         self.update_task = Some(cx.spawn(async move |this, cx| {
             this.update(cx, |this, cx| {
                 this.update_task = None;
-                this.update_entries(cx);
+                this.update_entries_triggered_by(trigger, cx);
                 if select_first_after_update {
                     this.select_first_entry();
                     cx.notify();
@@ -2486,8 +2524,42 @@ impl Sidebar {
         }));
     }
 
+    /// Whether the live thread state a workspace contributes to its rows has
+    /// moved since the last time it was looked at. Reading it costs a status, a
+    /// title and a walk of each open thread's entries for its running work —
+    /// a few microseconds against the tens of milliseconds of a rebuild — so it
+    /// is worth asking before paying for one.
+    ///
+    /// Only this path consults and updates the snapshot, so a rebuild asked for
+    /// by anything else can leave it stale. That costs one extra rebuild on the
+    /// next chunk and never a stale row, which is the safe direction.
+    fn live_thread_info_changed(&mut self, workspace: &Entity<Workspace>, cx: &App) -> bool {
+        let current: Vec<ActiveThreadInfo> =
+            all_thread_infos_for_workspace(workspace, cx).collect();
+        match self.live_thread_info.get_mut(&workspace.entity_id()) {
+            Some(previous) if *previous == current => false,
+            Some(previous) => {
+                *previous = current;
+                true
+            }
+            None => {
+                self.live_thread_info.insert(workspace.entity_id(), current);
+                true
+            }
+        }
+    }
+
     /// Rebuilds the sidebar's visible entries from already-cached state.
+    #[track_caller]
     fn update_entries(&mut self, cx: &mut Context<Self>) {
+        self.update_entries_triggered_by(std::panic::Location::caller(), cx);
+    }
+
+    fn update_entries_triggered_by(
+        &mut self,
+        trigger: &'static std::panic::Location<'static>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(multi_workspace) = self.multi_workspace.upgrade() else {
             return;
         };
@@ -2500,6 +2572,7 @@ impl Sidebar {
         // of them there are has ever been a number, so the slow ones say so and
         // carry the count of the quiet ones they follow.
         let rebuild_started = std::time::Instant::now();
+        *self.rebuild_triggers.entry(trigger).or_insert(0) += 1;
         let had_notifications = self.has_notifications(cx);
         let previous_shapes: Vec<EntryShape> = self.entry_shapes().collect();
         // What the list already says. A rebuild that produces exactly this is
@@ -2541,6 +2614,8 @@ impl Sidebar {
             self.sync_gh_watches(cx);
             self.quiet_rebuilds += 1;
             self.skipped_rebuilds += 1;
+            self.rebuild_time += rebuild_started.elapsed();
+            self.log_rebuild_cost(None);
             return;
         }
 
@@ -2590,20 +2665,50 @@ impl Sidebar {
 
         self.quiet_rebuilds += 1;
         let elapsed = rebuild_started.elapsed();
-        if elapsed >= SLOW_REBUILD {
-            log::info!(
-                "quiet-ui perf: sidebar rebuilt {} rows in {:.0}ms, after {} rebuilds nobody felt \
-                 ({} of them built the list that was already there)",
-                self.contents.all_entries.len(),
-                elapsed.as_secs_f64() * 1000.,
-                self.quiet_rebuilds - 1,
-                self.skipped_rebuilds,
-            );
-            self.quiet_rebuilds = 0;
-            self.skipped_rebuilds = 0;
-        }
+        self.rebuild_time += elapsed;
+        self.log_rebuild_cost(Some(elapsed));
 
         cx.notify();
+    }
+
+    /// Says what the rebuilds have cost and what asked for them. Reported when
+    /// one rebuild is slow enough to feel, and also once the quiet ones have
+    /// added up to [`REPORTABLE_REBUILD_TIME`] of foreground between lines —
+    /// without which a thousand rebuilds of 2ms each were invisible and a
+    /// thousand of 15ms each looked the same.
+    fn log_rebuild_cost(&mut self, slow: Option<std::time::Duration>) {
+        let felt = slow.is_some_and(|elapsed| elapsed >= SLOW_REBUILD);
+        if !felt && self.rebuild_time < REPORTABLE_REBUILD_TIME {
+            return;
+        }
+        let mut triggers: Vec<_> = self.rebuild_triggers.drain().collect();
+        triggers.sort_unstable_by_key(|&(location, count)| {
+            (std::cmp::Reverse(count), location.line())
+        });
+        let triggers = triggers
+            .iter()
+            .take(4)
+            .map(|(location, count)| {
+                format!("{}:{} {count}", location.file(), location.line())
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        log::info!(
+            "quiet-ui perf: sidebar rebuilt {} rows in {}, over {} rebuilds nobody felt \
+             ({} of them built the list that was already there) costing {:.0}ms in all; \
+             asked for by {triggers}",
+            self.contents.all_entries.len(),
+            slow.map_or_else(
+                || "under the threshold".to_string(),
+                |elapsed| format!("{:.0}ms", elapsed.as_secs_f64() * 1000.)
+            ),
+            self.quiet_rebuilds.saturating_sub(1),
+            self.skipped_rebuilds,
+            self.rebuild_time.as_secs_f64() * 1000.,
+        );
+        self.quiet_rebuilds = 0;
+        self.skipped_rebuilds = 0;
+        self.rebuild_time = std::time::Duration::ZERO;
     }
 
     /// Ask gh about every watched branch now. The chips are read often enough
