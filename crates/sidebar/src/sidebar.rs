@@ -190,7 +190,21 @@ impl ActiveEntry {
 }
 
 #[derive(Clone, Debug)]
+/// Everything an agent panel contributes to the sidebar's rows, which is the
+/// whole of what one of its events can have moved. Taken from every read of a
+/// panel in `rebuild_contents`: its threads' live state, which of its terminals
+/// are ringing, and which threads it holds open. A row's other inputs — the
+/// metadata stores, the read state, the tab registry, git — each have an
+/// observer of their own that asks for a rebuild directly, so they are not
+/// this comparison's business.
 #[derive(PartialEq)]
+struct LivePanelState {
+    threads: Vec<ActiveThreadInfo>,
+    notified_terminals: HashSet<TerminalId>,
+    open_threads: HashSet<agent_ui::ThreadId>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 struct ActiveThreadInfo {
     session_id: acp::SessionId,
     title: SharedString,
@@ -340,8 +354,6 @@ enum DraftKind {
 enum ThreadRowDisposal {
     /// Close the tab. The thread stays in history.
     Close,
-    /// Throw away a draft that has something typed into it.
-    DiscardDraft,
     /// Archive, taking the linked worktree the thread has to itself.
     ArchiveWorktree,
     /// Archive the thread, leaving its worktree where it is.
@@ -803,11 +815,6 @@ pub struct Sidebar {
     draft_kinds: HashMap<ThreadId, DraftKind>,
     /// Debounces the rebuild that typing into a draft triggers.
     draft_typing_task: Option<Task<()>>,
-    /// Whether the empty drafts left behind by earlier runs have been dropped
-    /// yet. The purge walks every stored thread and reads each draft's
-    /// prompt, so it runs on the first rebuild that knows which threads are
-    /// open and not again.
-    purged_stale_empty_drafts: bool,
     restoring_tasks: HashMap<agent_ui::ThreadId, Task<()>>,
     recent_projects_popover_handle: PopoverMenuHandle<SidebarRecentProjects>,
     /// Branches currently watched in the [`GhStatusStore`], keyed by
@@ -848,12 +855,11 @@ pub struct Sidebar {
     /// ever reported, so what the quiet thousands cost between them was never a
     /// number.
     rebuild_time: std::time::Duration,
-    /// The live thread state last folded into the rows, per workspace. A thread
+    /// What each workspace's agent panel last contributed to the rows. A thread
     /// entry changing is the most frequent reason a rebuild is asked for — once
-    /// per streamed chunk — and the rows only carry a thread's status, its
-    /// running work, its title and its diff stats, so when none of those moved
-    /// the 365-row rebuild behind it had nothing to say.
-    live_thread_info: HashMap<EntityId, Vec<ActiveThreadInfo>>,
+    /// per streamed chunk, for every thread in every open window — and when
+    /// none of it moved the 365-row rebuild behind it had nothing to say.
+    live_panel_state: HashMap<EntityId, LivePanelState>,
     _subscriptions: Vec<gpui::Subscription>,
     /// What this sidebar watches in each open workspace, keyed by the
     /// workspace it belongs to.
@@ -1063,7 +1069,6 @@ impl Sidebar {
             pending_new_thread_workspace: None,
             draft_kinds: HashMap::new(),
             draft_typing_task: None,
-            purged_stale_empty_drafts: false,
             restoring_tasks: HashMap::new(),
             recent_projects_popover_handle: PopoverMenuHandle::default(),
             gh_watched_branches: HashSet::new(),
@@ -1076,7 +1081,7 @@ impl Sidebar {
             skipped_rebuilds: 0,
             rebuild_triggers: HashMap::default(),
             rebuild_time: std::time::Duration::ZERO,
-            live_thread_info: HashMap::default(),
+            live_panel_state: HashMap::default(),
             _subscriptions: Vec::new(),
             _draft_editor_observations: Vec::new(),
             update_task: None,
@@ -1289,7 +1294,7 @@ impl Sidebar {
                     // behind this walked every stored thread and every open
                     // workspace to produce the list it already had.
                     if let Some(workspace) = workspace.upgrade()
-                        && !this.live_thread_info_changed(&workspace, cx)
+                        && !this.live_panel_state_changed(&workspace, cx)
                     {
                         return;
                     }
@@ -1729,19 +1734,12 @@ impl Sidebar {
             }
         }
 
-        // Every open thread shows here, empty drafts included: this list is
-        // the only tab strip there is, so a draft dropped from it the moment
-        // it stopped being active would leave no way back to what was typed
-        // into it. But *open* is the whole of it. An empty draft that nobody
-        // has open holds nothing and says nothing, and the store is full of
-        // them — every workspace that restores with no tab is handed a fresh
-        // one (`ensure_pane_has_thread_tab`), so drawing them all put months
-        // of "New thread" rows under every worktree. Drafts with content show
-        // wherever they are; they hold what someone typed.
-        threads.retain(|thread| {
-            thread.draft != Some(DraftKind::Empty)
-                || open_thread_ids.contains(&thread.metadata.thread_id)
-        });
+        // Every thread shows here, typed into or not. A thread exists from the
+        // moment the user asks for one, so there is nothing to hide: the row
+        // that used to be dropped was the row for a worktree someone had just
+        // made and could no longer find. What filled the store with months of
+        // "New thread" rows was threads nobody created — a workspace
+        // restoring with no tab was handed one — and that is gone instead.
 
         // Where each tabbed thread sits in the tab strip. The Active section is
         // sorted by this so a row is where its tab is: the tabs are the order
@@ -1959,19 +1957,13 @@ impl Sidebar {
             .solo_worktree
             .as_ref()
             .is_some_and(|solo| solo.is_linked_worktree);
-        match thread.draft {
-            // A draft has no conversation to archive. What is worth throwing
-            // away is the text, and what is worth reclaiming is the worktree
-            // it was going to be typed in — which is what someone
-            // right-clicking a leftover draft is after. An empty draft in a
-            // shared worktree has neither, and Close already deletes its row.
-            Some(_) if takes_worktree => disposals.push(ThreadRowDisposal::ArchiveWorktree),
-            Some(DraftKind::WithContent) => disposals.push(ThreadRowDisposal::DiscardDraft),
-            Some(DraftKind::Empty) => {}
-            // The only thread in a linked worktree takes the worktree with
-            // it, so the entry says what it will do.
-            None if takes_worktree => disposals.push(ThreadRowDisposal::ArchiveWorktree),
-            None => disposals.push(ThreadRowDisposal::ArchiveThread),
+        // Whether a message has been sent makes no difference to how a thread
+        // is disposed of: the only thread in a linked worktree takes the
+        // worktree with it, and the entry says so.
+        if takes_worktree {
+            disposals.push(ThreadRowDisposal::ArchiveWorktree);
+        } else {
+            disposals.push(ThreadRowDisposal::ArchiveThread);
         }
         disposals
     }
@@ -2299,6 +2291,9 @@ impl Sidebar {
     ) -> Vec<ListEntry> {
         fn display_time(entry: &ListEntry) -> DateTime<Utc> {
             match entry {
+                // A thread with nothing sent in it yet sits at the top: it is
+                // the one you are about to use, and its own timestamps say
+                // nothing useful about where to look for it.
                 ListEntry::Thread(thread) if thread.draft == Some(DraftKind::Empty) => {
                     DateTime::<Utc>::MAX_UTC
                 }
@@ -2524,26 +2519,46 @@ impl Sidebar {
         }));
     }
 
-    /// Whether the live thread state a workspace contributes to its rows has
-    /// moved since the last time it was looked at. Reading it costs a status, a
-    /// title and a walk of each open thread's entries for its running work —
-    /// a few microseconds against the tens of milliseconds of a rebuild — so it
-    /// is worth asking before paying for one.
+    /// Whether what a workspace's agent panel contributes to its rows has moved
+    /// since the last time it was looked at. Reading it costs a status, a title
+    /// and a walk of each open thread's entries for its running work — a few
+    /// microseconds against the tens of milliseconds of a rebuild — so it is
+    /// worth asking before paying for one.
     ///
     /// Only this path consults and updates the snapshot, so a rebuild asked for
     /// by anything else can leave it stale. That costs one extra rebuild on the
-    /// next chunk and never a stale row, which is the safe direction.
-    fn live_thread_info_changed(&mut self, workspace: &Entity<Workspace>, cx: &App) -> bool {
-        let current: Vec<ActiveThreadInfo> =
+    /// next event and never a stale row, which is the safe direction.
+    fn live_panel_state_changed(&mut self, workspace: &Entity<Workspace>, cx: &App) -> bool {
+        let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) else {
+            return true;
+        };
+        let threads: Vec<ActiveThreadInfo> =
             all_thread_infos_for_workspace(workspace, cx).collect();
-        match self.live_thread_info.get_mut(&workspace.entity_id()) {
+        let panel = panel.read(cx);
+        let notified_terminals = panel
+            .terminals(cx)
+            .into_iter()
+            .filter_map(|terminal| terminal.has_notification.then_some(terminal.id))
+            .collect();
+        let open_threads = panel
+            .active_conversation_view()
+            .map(|conversation_view| conversation_view.read(cx).parent_id())
+            .into_iter()
+            .chain(panel.open_thread_tab_ids(cx))
+            .collect();
+        let current = LivePanelState {
+            threads,
+            notified_terminals,
+            open_threads,
+        };
+        match self.live_panel_state.get_mut(&workspace.entity_id()) {
             Some(previous) if *previous == current => false,
             Some(previous) => {
                 *previous = current;
                 true
             }
             None => {
-                self.live_thread_info.insert(workspace.entity_id(), current);
+                self.live_panel_state.insert(workspace.entity_id(), current);
                 true
             }
         }
@@ -2596,7 +2611,6 @@ impl Sidebar {
         let previously_tabbed = std::mem::take(&mut self.contents.tabbed_threads);
 
         self.rebuild_contents(cx);
-        self.purge_stale_empty_drafts(cx);
 
         let unchanged = self.contents.entries == previous_entries
             && self.contents.all_entries == previous_all_entries
@@ -4815,11 +4829,14 @@ impl Sidebar {
         archive_workspaces: &[Entity<Workspace>],
         cx: &App,
     ) -> bool {
+        let _ = (archive_workspaces, cx);
+        // Every thread the user made blocks its worktree's archival, whether
+        // or not a message was ever sent in it.
         thread_store.path_is_referenced_by_unarchived_threads_matching(
             except_thread_id,
             path,
             remote_connection,
-            |thread| Self::thread_blocks_worktree_archive(thread, archive_workspaces, cx),
+            |_| true,
         )
     }
 
@@ -4835,12 +4852,10 @@ impl Sidebar {
         except_thread_id: Option<ThreadId>,
         cx: &App,
     ) -> usize {
-        let archive_workspaces = self.archive_workspaces(cx);
         ThreadMetadataStore::global(cx)
             .read(cx)
             .entries_for_path(path_list, remote_connection)
             .filter(|thread| Some(thread.thread_id) != except_thread_id)
-            .filter(|thread| Self::thread_blocks_worktree_archive(thread, &archive_workspaces, cx))
             .count()
     }
 
@@ -4938,40 +4953,13 @@ impl Sidebar {
         (group_key.path_list() != folder_paths).then_some(workspace)
     }
 
-    fn delete_empty_drafts_for_archive_roots(
-        &self,
-        roots: &[thread_worktree_archive::RootPlan],
-        cx: &mut Context<Self>,
-    ) {
-        self.delete_empty_drafts_for_archive_targets(
-            roots
-                .iter()
-                .map(|root| (root.root_path.as_path(), root.remote_connection.as_ref())),
-            cx,
-        );
-    }
-
-    fn delete_empty_drafts_for_archive_paths(
-        &self,
-        paths: &PathList,
-        remote_connection: Option<&RemoteConnectionOptions>,
-        cx: &mut Context<Self>,
-    ) {
-        self.delete_empty_drafts_for_archive_targets(
-            paths
-                .ordered_paths()
-                .map(|path| (path.as_path(), remote_connection)),
-            cx,
-        );
-    }
-
-    /// Take the worktrees an abandoned `+` left behind off disk.
+    /// Take the spare worktrees of earlier sessions off disk.
     ///
-    /// Every worktree Zed creates is recorded, and archiving a thread takes
-    /// its worktree with it. Pressing `+` and walking away produces neither:
-    /// the draft has no typed text, so it is filtered out of the list, which
-    /// means there is no row to archive and nothing ever calls the pipeline.
-    /// One click, one worktree, forever.
+    /// A spare is the one worktree with no thread behind it: made before
+    /// anyone pressed `+`, and left over when the session that made it quit
+    /// before handing it to anyone. Everything else a `+` creates belongs to
+    /// the thread that click also created, and goes when that thread is
+    /// archived.
     ///
     /// This runs once per repository per launch rather than when the window
     /// closes. Closing is the moment a worktree becomes abandoned, but it is
@@ -5070,12 +5058,6 @@ impl Sidebar {
                 forget.await.log_err();
             }
             this.update(cx, |this, cx| {
-                this.delete_empty_drafts_for_archive_targets(
-                    reclaimed
-                        .iter()
-                        .map(|path| (path.as_path(), remote_connection.as_ref())),
-                    cx,
-                );
                 this.update_entries(cx);
             })?;
             anyhow::Ok(())
@@ -5133,22 +5115,14 @@ impl Sidebar {
             })
             .filter(|path| !ready_spares.contains(path.as_path()))
             .filter(|path| {
-                // What this reclaims is the empty draft's worktree, so there
-                // has to be an empty draft. A worktree with no row at all is
-                // not what this is about, and leaving it is the conservative
-                // reading of a store that may simply not know about it yet.
-                //
-                // A spare is the exception, and the reason it is recorded as
-                // one: it is a worktree Zed made with no thread and no draft
-                // beside it, so one still marked here is one a previous
-                // session made and never handed over.
+                // Only a spare. A spare is a worktree Zed made with no thread
+                // beside it, so one still marked as such is one a previous
+                // session made and never handed over; it is the only worktree
+                // nobody asked for. A worktree a `+` made belongs to the
+                // thread the same click created, and it stays until that
+                // thread is archived — which is the whole of why this used to
+                // reclaim it and no longer does.
                 git_ui_core::created_worktrees::recorded_as_spare(path, remote_connection, cx)
-                    || !store
-                        .unarchived_draft_ids_matching(|thread| {
-                            thread.matches_remote_connection(remote_connection)
-                                && thread.references_folder_path(path)
-                        })
-                        .is_empty()
             })
             .filter(|path| {
                 !Self::path_is_referenced_by_unarchived_threads_for_archive(
@@ -5170,95 +5144,6 @@ impl Sidebar {
                 })
             })
             .collect()
-    }
-
-    /// Drops the empty drafts left behind by earlier runs, once per run.
-    ///
-    /// A workspace that restores with no thread tab is handed a fresh draft
-    /// (`ensure_pane_has_thread_tab`), and a draft that is never typed into
-    /// and never closed by hand keeps its row for good, so the store holds
-    /// one per workspace per restore going back months. An empty draft holds
-    /// nothing and the workspace it belonged to makes another the next time
-    /// it opens, so a stale one is worth nothing and costs a row. Drafts
-    /// with content are left alone: they hold what someone typed.
-    fn purge_stale_empty_drafts(&mut self, cx: &mut Context<Self>) {
-        if self.purged_stale_empty_drafts {
-            return;
-        }
-        // Panels restore their tabs asynchronously, and a purge that runs
-        // before they have is a purge with nothing open to spare. Every
-        // workspace with a project ends up with at least one open thread
-        // (`ensure_pane_has_thread_tab` sees to it), so the first rebuild
-        // that sees one is the first rebuild that knows what is open.
-        if self.contents.open_threads.is_empty() {
-            return;
-        }
-        self.purged_stale_empty_drafts = true;
-
-        let open_threads = self.contents.open_threads.clone();
-        let workspaces = self.archive_workspaces(cx);
-        let Some(store) = ThreadMetadataStore::try_global(cx) else {
-            return;
-        };
-        let stale = store.read(cx).unarchived_draft_ids_matching(|thread| {
-            !open_threads.contains(&thread.thread_id)
-                && !agent_ui::draft_prompt_store::draft_has_user_content(
-                    thread.thread_id,
-                    &workspaces,
-                    cx,
-                )
-        });
-        if stale.is_empty() {
-            return;
-        }
-        log::info!("quiet-ui: dropped {} stale empty drafts", stale.len());
-        store.update(cx, |store, cx| {
-            store.delete_all(stale, cx);
-        });
-    }
-
-    fn delete_empty_drafts_for_archive_targets<'a>(
-        &self,
-        targets: impl IntoIterator<Item = (&'a Path, Option<&'a RemoteConnectionOptions>)>,
-        cx: &mut Context<Self>,
-    ) {
-        let targets = targets.into_iter().collect::<Vec<_>>();
-        if targets.is_empty() {
-            return;
-        }
-
-        let archive_workspaces = self.archive_workspaces(cx);
-        let draft_thread_ids = ThreadMetadataStore::global(cx)
-            .read(cx)
-            .unarchived_draft_ids_matching(|thread| {
-                targets.iter().any(|(path, remote_connection)| {
-                    thread.matches_remote_connection(*remote_connection)
-                        && thread.references_folder_path(path)
-                }) && !Self::thread_blocks_worktree_archive(thread, &archive_workspaces, cx)
-            });
-        if draft_thread_ids.is_empty() {
-            return;
-        }
-
-        ThreadMetadataStore::global(cx).update(cx, |store, cx| {
-            store.delete_all(draft_thread_ids, cx);
-        });
-    }
-
-    fn thread_blocks_worktree_archive(
-        thread: &ThreadMetadata,
-        archive_workspaces: &[Entity<Workspace>],
-        cx: &App,
-    ) -> bool {
-        if !thread.is_draft() {
-            return true;
-        }
-
-        agent_ui::draft_prompt_store::draft_has_user_content(
-            thread.thread_id,
-            archive_workspaces,
-            cx,
-        )
     }
 
     async fn wait_for_archive_workspace_metadata(
@@ -5435,13 +5320,6 @@ impl Sidebar {
             window,
             cx,
             move |this, window, cx| {
-                if terminal_workspace_removed {
-                    this.delete_empty_drafts_for_archive_paths(
-                        metadata.folder_paths(),
-                        metadata.remote_connection.as_ref(),
-                        cx,
-                    );
-                }
                 // If the terminal's workspace has already been removed, don't
                 // synthesize a fallback draft in the detached AgentPanel.
                 this.close_terminal_entry(
@@ -5910,7 +5788,6 @@ impl Sidebar {
             cx,
         );
 
-        let removed_workspace = !workspaces_to_remove.is_empty();
         let thread_remote_connection = metadata
             .as_ref()
             .and_then(|metadata| metadata.remote_connection.clone());
@@ -5921,14 +5798,6 @@ impl Sidebar {
             window,
             cx,
             move |this, window, cx| {
-                if removed_workspace && let Some(thread_folder_paths) = thread_folder_paths.as_ref()
-                {
-                    this.delete_empty_drafts_for_archive_paths(
-                        thread_folder_paths,
-                        thread_remote_connection.as_ref(),
-                        cx,
-                    );
-                }
                 let in_flight = this.start_archive_worktree_task(thread_id, roots_to_archive, cx);
                 this.archive_and_activate(
                     thread_id,
@@ -6025,7 +5894,6 @@ impl Sidebar {
                     window,
                     cx,
                 );
-                let removed_workspace = !workspaces_to_remove.is_empty();
 
                 this.remove_workspaces_then(
                     workspaces_to_remove,
@@ -6033,13 +5901,6 @@ impl Sidebar {
                     window,
                     cx,
                     move |this, _window, cx| {
-                        if removed_workspace {
-                            this.delete_empty_drafts_for_archive_paths(
-                                &thread_folder_paths,
-                                remote_connection.as_ref(),
-                                cx,
-                            );
-                        }
                         if let Some(job) =
                             this.start_archive_worktree_task(thread_id, roots_to_archive, cx)
                         {
@@ -6158,7 +6019,6 @@ impl Sidebar {
             return None;
         }
 
-        self.delete_empty_drafts_for_archive_roots(&roots, cx);
 
         let (cancel_tx, cancel_rx) = async_channel::bounded::<()>(1);
         let task = cx.spawn(async move |_this, cx| {
@@ -6194,7 +6054,6 @@ impl Sidebar {
             return;
         }
 
-        self.delete_empty_drafts_for_archive_roots(&roots, cx);
 
         let (cancel_tx, cancel_rx) = async_channel::bounded::<()>(1);
         cx.spawn(async move |_this, cx| {
@@ -6291,13 +6150,7 @@ impl Sidebar {
                     }
                     AgentThreadStatus::Completed | AgentThreadStatus::Error => {}
                 }
-                if thread.draft.is_some() {
-                    let workspace = thread.workspace.clone();
-                    let draft_id = thread.metadata.thread_id;
-                    self.remove_draft(draft_id, &workspace, window, cx);
-                } else {
-                    self.archive_thread(thread.metadata.thread_id, window, cx);
-                }
+                self.archive_thread(thread.metadata.thread_id, window, cx);
             }
             Some(ListEntry::Terminal(terminal)) => {
                 let metadata = terminal.metadata.clone();
@@ -6429,6 +6282,9 @@ impl Sidebar {
             .filter_map(|entry| match entry {
                 ListEntry::SectionHeader(_) | ListEntry::WorkspaceHeader(_) => None,
                 ListEntry::Thread(thread) => {
+                    // Ctrl-tab is for switching between the things you are
+                    // working in. A thread with nothing sent in it yet is real
+                    // and keeps its row, but it is not something to switch to.
                     if thread.draft == Some(DraftKind::Empty) {
                         return None;
                     }
@@ -6971,26 +6827,11 @@ impl Sidebar {
                     )
                 } else {
                     match thread.draft {
-                        Some(DraftKind::Empty) => None,
-                        Some(DraftKind::WithContent) => Some(
-                            IconButton::new("discard_thread", IconName::Close)
-                                .hover_background(button_hover_bg)
-                                .active_background(button_active_bg)
-                                .icon_size(IconSize::Small)
-                                .tooltip(Tooltip::text("Discard Draft"))
-                                .on_click({
-                                    let thread_workspace = thread_workspace.clone();
-                                    cx.listener(move |this, _, window, cx| {
-                                        this.remove_draft(
-                                            thread_id_for_actions,
-                                            &thread_workspace,
-                                            window,
-                                            cx,
-                                        );
-                                    })
-                                })
-                                .into_any_element(),
-                        ),
+                        // A thread with nothing typed into it is an ordinary
+                        // thread: archiving and starting a thread in this
+                        // worktree live on its context menu like any other
+                        // row's.
+                        Some(_) => None,
                         // Archiving and starting a thread in this worktree live
                         // on the row's context menu: a button that appears
                         // under the pointer covers the row it is about, on a
@@ -7055,7 +6896,6 @@ impl Sidebar {
         // Discarding a draft needs the row's workspace whether it is open or
         // closed, so the enum is kept beside the handle the rest of the menu
         // uses.
-        let draft_workspace = thread_workspace.clone();
         let thread_workspace = match &thread_workspace {
             ThreadEntryWorkspace::Open(workspace) => Some(workspace.clone()),
             ThreadEntryWorkspace::Closed { .. } => None,
@@ -7126,7 +6966,6 @@ impl Sidebar {
                 move |_window, cx| {
                     let disposals = disposals.clone();
                     let session_id = session_id.clone();
-                    let draft_workspace = draft_workspace.clone();
                     let sidebar = sidebar.clone();
                     let active_workspace = active_workspace.clone();
                     let thread_workspace = thread_workspace.clone();
@@ -7245,34 +7084,6 @@ impl Sidebar {
                                             .ok();
                                     }
                                 }),
-                                // `remove_draft` covers both draft disposals:
-                                // it drops the draft and takes a linked
-                                // worktree with nothing else in it along with
-                                // it.
-                                ThreadRowDisposal::DiscardDraft
-                                | ThreadRowDisposal::ArchiveWorktree if is_draft => {
-                                    let label = if disposal == ThreadRowDisposal::DiscardDraft {
-                                        "Discard Draft"
-                                    } else {
-                                        "Archive Worktree"
-                                    };
-                                    menu.entry(label, None, {
-                                        let sidebar = sidebar.clone();
-                                        let draft_workspace = draft_workspace.clone();
-                                        move |window, cx| {
-                                            sidebar
-                                                .update(cx, |sidebar, cx| {
-                                                    sidebar.remove_draft(
-                                                        thread_id,
-                                                        &draft_workspace,
-                                                        window,
-                                                        cx,
-                                                    );
-                                                })
-                                                .ok();
-                                        }
-                                    })
-                                }
                                 ThreadRowDisposal::ArchiveWorktree
                                 | ThreadRowDisposal::ArchiveThread => menu.entry(
                                     if disposal == ThreadRowDisposal::ArchiveWorktree {
@@ -7292,7 +7103,6 @@ impl Sidebar {
                                         }
                                     },
                                 ),
-                                ThreadRowDisposal::DiscardDraft => menu,
                                 ThreadRowDisposal::RestoreWorktree => {
                                     menu.entry("Restore Worktree", None, {
                                         let sidebar = sidebar.clone();
@@ -7550,204 +7360,6 @@ impl Sidebar {
         if let Some(workspace) = self.active_workspace(cx) {
             self.create_new_terminal(&workspace, window, cx);
         }
-    }
-
-    fn remove_draft(
-        &mut self,
-        draft_id: ThreadId,
-        workspace: &ThreadEntryWorkspace,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let metadata = ThreadMetadataStore::global(cx)
-            .read(cx)
-            .entry(draft_id)
-            .cloned();
-
-        if let ThreadEntryWorkspace::Closed {
-            folder_paths,
-            project_group_key,
-        } = workspace
-            && self.should_load_closed_workspace_for_archive(
-                folder_paths,
-                project_group_key,
-                metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.remote_connection.as_ref()),
-                Some(draft_id),
-                None,
-                cx,
-            )
-        {
-            self.open_workspace_for_archive(
-                folder_paths.clone(),
-                project_group_key.clone(),
-                window,
-                cx,
-                move |this, workspace, window, cx| {
-                    this.remove_draft(draft_id, &ThreadEntryWorkspace::Open(workspace), window, cx);
-                },
-            );
-            return;
-        }
-
-        let draft_folder_paths = metadata
-            .as_ref()
-            .map(|metadata| metadata.folder_paths().clone())
-            .or_else(|| match workspace {
-                ThreadEntryWorkspace::Open(workspace) => {
-                    Some(PathList::new(&workspace.read(cx).root_paths(cx)))
-                }
-                ThreadEntryWorkspace::Closed { folder_paths, .. } => Some(folder_paths.clone()),
-            });
-        let draft_remote_connection = metadata
-            .as_ref()
-            .and_then(|metadata| metadata.remote_connection.clone());
-        let roots_to_archive = metadata
-            .as_ref()
-            .map(|metadata| {
-                self.roots_to_archive_for_paths(
-                    metadata.folder_paths(),
-                    metadata.remote_connection.as_ref(),
-                    Some(draft_id),
-                    None,
-                    cx,
-                )
-            })
-            .unwrap_or_default();
-
-        let was_active = self
-            .active_entry
-            .as_ref()
-            .is_some_and(|entry| entry.is_active_thread(&draft_id));
-        let neighbor = self
-            .contents
-            .entries
-            .iter()
-            .position(|entry| {
-                matches!(
-                    entry,
-                    ListEntry::Thread(thread) if thread.metadata.thread_id == draft_id
-                )
-            })
-            .and_then(|position| {
-                self.neighboring_activatable_entry(
-                    position,
-                    draft_remote_connection.as_ref(),
-                    Some(EntryIdentity::Thread(draft_id)),
-                )
-            });
-
-        let workspace_to_remove = draft_folder_paths.as_ref().and_then(|folder_paths| {
-            self.linked_worktree_workspace_to_remove(
-                folder_paths,
-                draft_remote_connection.as_ref(),
-                Some(draft_id),
-                None,
-                &roots_to_archive,
-                cx,
-            )
-        });
-        let mut workspaces_to_remove: Vec<Entity<Workspace>> =
-            workspace_to_remove.into_iter().collect();
-        let close_item_tasks = self.close_items_for_archived_worktrees(
-            &roots_to_archive,
-            &mut workspaces_to_remove,
-            window,
-            cx,
-        );
-
-        let draft_workspace_removed = matches!(
-            workspace,
-            ThreadEntryWorkspace::Open(workspace) if workspaces_to_remove.contains(workspace)
-        );
-        let workspace = workspace.clone();
-
-        self.remove_workspaces_then(
-            workspaces_to_remove,
-            close_item_tasks,
-            window,
-            cx,
-            move |this, window, cx| {
-                if draft_workspace_removed
-                    && let Some(draft_folder_paths) = draft_folder_paths.as_ref()
-                {
-                    this.delete_empty_drafts_for_archive_paths(
-                        draft_folder_paths,
-                        draft_remote_connection.as_ref(),
-                        cx,
-                    );
-                }
-                this.remove_draft_entry(
-                    draft_id,
-                    &workspace,
-                    was_active,
-                    neighbor.as_ref(),
-                    !draft_workspace_removed,
-                    roots_to_archive,
-                    window,
-                    cx,
-                );
-            },
-        );
-    }
-
-    fn remove_draft_entry(
-        &mut self,
-        draft_id: ThreadId,
-        workspace: &ThreadEntryWorkspace,
-        was_active: bool,
-        neighbor: Option<&ActivatableEntry>,
-        activate_panel_draft: bool,
-        roots_to_archive: Vec<thread_worktree_archive::RootPlan>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        // Fallback to a neighbor thread when the discarded
-        // draft was the active entry.
-        let activate_panel_draft = activate_panel_draft && !(was_active && neighbor.is_some());
-
-        let removed_from_panel = if let ThreadEntryWorkspace::Open(workspace) = workspace {
-            workspace.update(cx, |workspace, cx| {
-                if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
-                    panel.update(cx, |panel, cx| {
-                        if activate_panel_draft {
-                            panel.remove_thread(draft_id, window, cx);
-                        } else {
-                            panel.remove_thread_without_activating_draft(draft_id, window, cx);
-                        }
-                    });
-                    true
-                } else {
-                    false
-                }
-            })
-        } else {
-            false
-        };
-
-        if !removed_from_panel {
-            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
-                store.delete(draft_id, cx);
-            });
-        }
-
-        self.start_detached_archive_worktree_task(roots_to_archive, cx);
-
-        if was_active {
-            self.active_entry = None;
-            if !activate_panel_draft {
-                if neighbor
-                    .as_ref()
-                    .is_some_and(|neighbor| self.activate_entry(neighbor, window, cx))
-                {
-                    return;
-                }
-                self.sync_active_entry_from_active_workspace(cx);
-            }
-        }
-
-        self.update_entries(cx);
     }
 
     fn create_new_entry(

@@ -158,6 +158,28 @@ pub async fn record_zed_created_worktree(
     .unwrap();
 }
 
+/// Records a worktree the way the spare pool does: made before anyone asked
+/// for one, and never handed over. The only kind the reclaim sweep still takes.
+pub async fn record_zed_created_spare_worktree(
+    fs: &dyn fs::Fs,
+    worktree_path: &Path,
+    remote: Option<&remote::RemoteConnectionOptions>,
+    cx: &mut TestAppContext,
+) {
+    let created_at = fake_worktree_created_at(fs, worktree_path).await;
+    cx.update(|cx| {
+        git_ui_core::created_worktrees::record_created_worktree(
+            worktree_path,
+            remote,
+            created_at,
+            true,
+            cx,
+        )
+    })
+    .await
+    .unwrap();
+}
+
 pub struct TestWorkspaceSidebar {
     focus_handle: FocusHandle,
     threads_list_active: bool,

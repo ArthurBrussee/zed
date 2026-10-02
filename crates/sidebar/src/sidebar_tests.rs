@@ -2110,50 +2110,45 @@ async fn test_terminal_close_event_on_archived_linked_worktree_removes_workspace
         terminal_metadata_deleted,
         "terminal metadata should be deleted after close"
     );
-    let empty_draft_metadata_deleted = cx.update(|_, cx| {
+    let empty_draft_metadata_kept = cx.update(|_, cx| {
         ThreadMetadataStore::global(cx)
             .read(cx)
             .entry(empty_draft_id)
-            .is_none()
+            .is_some()
     });
     assert!(
-        empty_draft_metadata_deleted,
-        "empty draft metadata should be deleted before archiving the linked worktree"
+        empty_draft_metadata_kept,
+        "a thread the user made is never dropped on their behalf"
     );
-    let unarchived_worktree_threads = cx.update(|_, cx| {
+    // The thread in that worktree is the one thing still holding it, and
+    // holding it is what a thread does: closing the terminal beside it takes
+    // neither the workspace nor the directory.
+    let worktree_threads = cx.update(|_, cx| {
         ThreadMetadataStore::global(cx)
             .read(cx)
             .entries_for_path(&worktree_folder_paths, None)
             .count()
     });
     assert_eq!(
-        unarchived_worktree_threads, 0,
-        "closing the terminal must not create a fallback draft for the removed worktree"
+        worktree_threads, 1,
+        "the thread that holds the worktree is still there"
     );
     assert_eq!(
         multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace
             .workspaces()
             .count()),
-        1,
-        "linked worktree workspace should be removed after closing its last terminal"
-    );
-    // Only the archived row may still carry the worktree chip.
-    let entries_after = visible_entries_as_strings(&sidebar, cx);
-    assert!(
-        entries_after
-            .iter()
-            .all(|entry| !entry.contains('{') || entry.contains("(archived)")),
-        "only archived rows may reference the archived worktree, got: {entries_after:?}"
+        2,
+        "the linked worktree workspace stays while a thread of its own holds it"
     );
     assert!(
-        !fs.is_dir(Path::new("/worktrees/project/feature-a/project"))
+        fs.is_dir(Path::new("/worktrees/project/feature-a/project"))
             .await,
-        "linked worktree directory should be removed from disk after closing its last terminal"
+        "and so does the directory; archiving that thread is what takes it"
     );
 }
 
 #[gpui::test]
-async fn test_terminal_close_event_deletes_empty_draft_when_linked_worktree_has_no_archive_root(
+async fn test_terminal_close_event_keeps_other_threads_when_linked_worktree_has_no_archive_root(
     cx: &mut TestAppContext,
 ) {
     init_test(cx);
@@ -2235,23 +2230,23 @@ async fn test_terminal_close_event_deletes_empty_draft_when_linked_worktree_has_
         cx.run_until_parked();
     }
 
-    let empty_draft_metadata_deleted = cx.update(|_, cx| {
+    let empty_draft_metadata_kept = cx.update(|_, cx| {
         ThreadMetadataStore::global(cx)
             .read(cx)
             .entry(empty_draft_id)
-            .is_none()
+            .is_some()
     });
     assert!(
-        empty_draft_metadata_deleted,
-        "empty draft metadata should be deleted when removing the linked worktree workspace"
+        empty_draft_metadata_kept,
+        "a thread the user made is never dropped on their behalf"
     );
     assert!(
         multi_workspace
             .read_with(cx, |multi_workspace, cx| {
                 multi_workspace.workspace_for_paths(&worktree_folder_paths, None, cx)
             })
-            .is_none(),
-        "linked worktree workspace should be removed after closing its last terminal"
+            .is_some(),
+        "the workspace stays while a thread of its own holds the worktree"
     );
     assert!(
         fs.is_dir(Path::new("/external-worktree")).await,
@@ -2583,15 +2578,15 @@ async fn test_archive_selected_draft_archives_linked_worktree_after_last_draft(
         cx.run_until_parked();
     }
 
-    let first_draft_metadata_deleted = cx.update(|_, cx| {
+    let first_draft_metadata_kept = cx.update(|_, cx| {
         ThreadMetadataStore::global(cx)
             .read(cx)
             .entry(first_draft_id)
-            .is_none()
+            .is_some()
     });
     assert!(
-        first_draft_metadata_deleted,
-        "first discarded draft metadata should be deleted"
+        first_draft_metadata_kept,
+        "a thread the user made is never dropped on their behalf"
     );
     let second_draft_metadata_kept = cx.update(|_, cx| {
         ThreadMetadataStore::global(cx)
@@ -2638,15 +2633,15 @@ async fn test_archive_selected_draft_archives_linked_worktree_after_last_draft(
         cx.run_until_parked();
     }
 
-    let second_draft_metadata_deleted = cx.update(|_, cx| {
+    let second_draft_metadata_kept = cx.update(|_, cx| {
         ThreadMetadataStore::global(cx)
             .read(cx)
             .entry(second_draft_id)
-            .is_none()
+            .is_some()
     });
     assert!(
-        second_draft_metadata_deleted,
-        "last discarded draft metadata should be deleted"
+        second_draft_metadata_kept,
+        "a thread the user made is never dropped on their behalf"
     );
     assert!(
         multi_workspace
@@ -2790,15 +2785,15 @@ async fn test_archive_selected_draft_archives_closed_linked_worktree(cx: &mut Te
         cx.run_until_parked();
     }
 
-    let draft_metadata_deleted = cx.update(|_, cx| {
+    let draft_metadata_kept = cx.update(|_, cx| {
         ThreadMetadataStore::global(cx)
             .read(cx)
             .entry(draft_id)
-            .is_none()
+            .is_some()
     });
     assert!(
-        draft_metadata_deleted,
-        "discarded closed worktree draft metadata should be deleted"
+        draft_metadata_kept,
+        "a thread the user made is never dropped on their behalf"
     );
     assert!(
         multi_workspace
@@ -3400,15 +3395,15 @@ async fn test_archive_selected_terminal_archives_closed_linked_worktree(cx: &mut
         terminal_metadata_deleted,
         "terminal metadata should be deleted after closing from the sidebar"
     );
-    let empty_draft_metadata_deleted = cx.update(|_, cx| {
+    let empty_draft_metadata_kept = cx.update(|_, cx| {
         ThreadMetadataStore::global(cx)
             .read(cx)
             .entry(empty_draft_id)
-            .is_none()
+            .is_some()
     });
     assert!(
-        empty_draft_metadata_deleted,
-        "empty draft metadata should be deleted before archiving the linked worktree"
+        empty_draft_metadata_kept,
+        "a thread the user made is never dropped on their behalf"
     );
     assert!(
         multi_workspace
@@ -3418,17 +3413,11 @@ async fn test_archive_selected_terminal_archives_closed_linked_worktree(cx: &mut
             .is_none(),
         "temporary linked worktree workspace should be removed after archiving"
     );
-    assert_eq!(
-        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace
-            .workspaces()
-            .count()),
-        1,
-        "closing a closed linked worktree terminal should leave only the main workspace"
-    );
     assert!(
-        !fs.is_dir(Path::new("/worktrees/project/feature-a/project"))
+        fs.is_dir(Path::new("/worktrees/project/feature-a/project"))
             .await,
-        "linked worktree directory should be removed from disk after closing its terminal"
+        "the directory stays while a thread of its own holds the worktree; \
+         archiving that thread is what takes it"
     );
 }
 
@@ -3568,15 +3557,15 @@ async fn test_archive_selected_thread_archives_closed_linked_worktree(cx: &mut T
         Some(true),
         "thread metadata should remain archived after worktree archival"
     );
-    let empty_draft_metadata_deleted = cx.update(|_, cx| {
+    let empty_draft_metadata_kept = cx.update(|_, cx| {
         ThreadMetadataStore::global(cx)
             .read(cx)
             .entry(empty_draft_id)
-            .is_none()
+            .is_some()
     });
     assert!(
-        empty_draft_metadata_deleted,
-        "empty draft metadata should be deleted before archiving the linked worktree"
+        empty_draft_metadata_kept,
+        "a thread the user made is never dropped on their behalf"
     );
     assert!(
         multi_workspace
@@ -3586,22 +3575,16 @@ async fn test_archive_selected_thread_archives_closed_linked_worktree(cx: &mut T
             .is_none(),
         "temporary linked worktree workspace should be removed after archiving"
     );
-    assert_eq!(
-        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace
-            .workspaces()
-            .count()),
-        1,
-        "archiving a closed linked worktree thread should leave only the main workspace"
-    );
     assert!(
-        !fs.is_dir(Path::new("/worktrees/project/feature-a/project"))
+        fs.is_dir(Path::new("/worktrees/project/feature-a/project"))
             .await,
-        "linked worktree directory should be removed from disk after archiving its thread"
+        "the directory stays while the other thread in it holds the worktree; \
+         archiving that one too is what takes it"
     );
 }
 
 #[gpui::test]
-async fn test_archive_selected_thread_deletes_empty_draft_when_linked_worktree_has_no_archive_root(
+async fn test_archive_selected_thread_keeps_other_threads_when_linked_worktree_has_no_archive_root(
     cx: &mut TestAppContext,
 ) {
     init_test(cx);
@@ -3697,15 +3680,15 @@ async fn test_archive_selected_thread_deletes_empty_draft_when_linked_worktree_h
         Some(true),
         "thread metadata should remain archived after workspace removal"
     );
-    let empty_draft_metadata_deleted = cx.update(|_, cx| {
+    let empty_draft_metadata_kept = cx.update(|_, cx| {
         ThreadMetadataStore::global(cx)
             .read(cx)
             .entry(empty_draft_id)
-            .is_none()
+            .is_some()
     });
     assert!(
-        empty_draft_metadata_deleted,
-        "empty draft metadata should be deleted when removing the linked worktree workspace"
+        empty_draft_metadata_kept,
+        "a thread the user made is never dropped on their behalf"
     );
     assert!(
         multi_workspace
@@ -5986,9 +5969,10 @@ async fn test_plus_button_parks_nonempty_draft(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn test_remove_draft_deletes_metadata_row(cx: &mut TestAppContext) {
-    // The close-draft button deletes the metadata row and the kvp draft prompt,
-    // and the draft disappears from the sidebar.
+async fn test_an_unsent_thread_archives_rather_than_being_discarded(cx: &mut TestAppContext) {
+    // There is no discarding a thread any more: a thread the user made is
+    // archived through the same path as every other one, keyed on its thread
+    // id, so what someone typed into it is still there to come back to.
     let project = init_test_project_with_agent_panel("/my-project", cx).await;
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
@@ -6016,39 +6000,26 @@ async fn test_remove_draft_deletes_metadata_row(cx: &mut TestAppContext) {
             .expect("parked draft should be visible before removal")
     });
 
-    // Select the parked draft and dispatch the action a real user would
-    // (Shift-Backspace, bound to `ArchiveSelectedThread`). The handler
-    // routes to `remove_draft` for parked drafts.
+    // Select the parked thread and dispatch the action a real user would
+    // (Shift-Backspace, bound to `ArchiveSelectedThread`).
     sidebar.update_in(cx, |sidebar, window, cx| {
         sidebar.selection = Some(draft_index);
         sidebar.archive_selected_thread(&agent_ui::ArchiveSelectedThread, window, cx);
     });
     cx.run_until_parked();
 
-    // Metadata row and persisted draft prompt should both be gone.
+    // Archived, not deleted: the row and what was typed into it both survive.
     cx.update(|_window, cx| {
         let store = ThreadMetadataStore::global(cx).read(cx);
+        let entry = store
+            .entry(draft_id)
+            .expect("an archived thread keeps its row");
+        assert!(entry.archived, "the thread should read as archived");
         assert!(
-            store.entry(draft_id).is_none(),
-            "removed draft metadata should be deleted"
-        );
-        assert!(
-            agent_ui::draft_prompt_store::read(draft_id, cx).is_none(),
-            "removed draft's kvp prompt should also be deleted"
+            agent_ui::draft_prompt_store::read(draft_id, cx).is_some(),
+            "what was typed into it is still there"
         );
     });
-    // And the row should be gone from the sidebar.
-    let still_visible = sidebar.read_with(cx, |sidebar, _| {
-        sidebar
-            .contents
-            .entries
-            .iter()
-            .any(|e| matches!(e, ListEntry::Thread(t) if t.metadata.thread_id == draft_id))
-    });
-    assert!(
-        !still_visible,
-        "removed draft should no longer appear in the sidebar"
-    );
 }
 
 #[gpui::test]
@@ -13820,7 +13791,7 @@ async fn test_archive_mixed_workspace_closes_only_archived_worktree_items(cx: &m
 }
 
 #[gpui::test]
-async fn test_discard_mixed_workspace_draft_closes_only_archived_worktree_items(
+async fn test_archiving_a_mixed_workspace_thread_closes_only_archived_worktree_items(
     cx: &mut TestAppContext,
 ) {
     init_test(cx);
@@ -14023,15 +13994,15 @@ async fn test_discard_mixed_workspace_draft_closes_only_archived_worktree_items(
         "feature-b file should have been closed"
     );
 
-    let draft_metadata_deleted = cx.update(|_, cx| {
+    let draft_metadata_kept = cx.update(|_, cx| {
         ThreadMetadataStore::global(cx)
             .read(cx)
             .entry(draft_id)
-            .is_none()
+            .is_some()
     });
     assert!(
-        draft_metadata_deleted,
-        "discarded draft metadata should be deleted"
+        draft_metadata_kept,
+        "a thread the user made is never dropped on their behalf"
     );
 }
 

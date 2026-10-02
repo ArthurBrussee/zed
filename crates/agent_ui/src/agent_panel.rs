@@ -1629,9 +1629,17 @@ impl AgentPanel {
                     {
                         panel.restore_new_draft(new_draft_thread_id, window, cx);
                     }
-                    // Every workspace keeps at least one thread tab: fall
-                    // back to a quiet draft when nothing was restored.
-                    panel.ensure_pane_has_thread_tab(window, cx);
+                    // Nothing is created on the user's behalf beyond that, and
+                    // that one creates nothing: it reattaches the slot to a
+                    // thread that already exists, reusing its restored tab
+                    // where there is one. A panel that restored no tabs shows
+                    // upstream's empty state. The check that used to make one
+                    // here ran before the requested thread had opened and
+                    // before restored tabs had finished loading, so re-opening
+                    // a worktree — clicking one of its threads while its
+                    // workspace was closed, or restoring an archived one —
+                    // came back with an extra "New thread" beside the thread
+                    // that was asked for.
                     cx.notify();
                 });
 
@@ -5780,21 +5788,6 @@ impl AgentPanel {
     /// A workspace that opens (or restores) with no thread tabs gets a draft
     /// tab, quietly and unfocused, ready to type into. This runs only at
     /// workspace load: closing tabs never re-creates one.
-    fn ensure_pane_has_thread_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.has_open_project(cx) {
-            return;
-        }
-        let has_local_tab = self
-            .thread_pane
-            .read(cx)
-            .items_of_type::<crate::thread_tab::ThreadTab>()
-            .next()
-            .is_some();
-        if !has_local_tab {
-            self.activate_draft(false, AgentThreadSource::AgentPanel, window, cx);
-        }
-    }
-
     /// A thread hosted in a tab received user interaction: promote it out
     /// of the draft slot and notify listeners (sidebar).
     pub(crate) fn thread_tab_interacted(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
@@ -13569,6 +13562,47 @@ mod tests {
         );
     }
 
+    /// A panel that restored nothing creates nothing.
+    ///
+    /// It used to be handed a thread whenever the pane had no tab at the
+    /// moment the check ran — which is before the requested thread has opened
+    /// and while restored tabs may still be loading. So re-opening a worktree
+    /// by clicking one of its threads, or restoring an archived one, came back
+    /// with an extra "New thread" beside the thread that was asked for.
+    #[gpui::test]
+    async fn test_a_panel_that_restored_nothing_creates_no_thread(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let cx = &mut cx;
+        let workspace = panel.read_with(cx, |panel, _| panel.workspace.clone());
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, cx| {
+            assert!(
+                panel.has_open_project(cx),
+                "the fixture should have a project, or this proves nothing"
+            );
+        });
+
+        panel.update(cx, |panel, cx| panel.serialize(cx));
+        cx.run_until_parked();
+
+        let async_cx = cx.update(|window, cx| window.to_async(cx));
+        let loaded = AgentPanel::load(workspace, async_cx)
+            .await
+            .expect("panel load should succeed");
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+
+        loaded.read_with(cx, |panel, cx| {
+            assert!(
+                panel.open_thread_tab_ids(cx).is_empty(),
+                "a panel that restored no tabs should hold no thread nobody asked for, got {:?}",
+                panel.open_thread_tab_ids(cx)
+            );
+        });
+    }
+
     /// The sweep's idea of "off screen" has to include a window the user is not
     /// looking at. With one worktree per window the thread in a background
     /// window is its pane's active tab, so a sweep that only spared "the active
@@ -16368,8 +16402,8 @@ mod tests {
 
     /// The draft-first worktree flow's two sides: a source workspace whose
     /// panel holds the pending draft, and the freshly opened worktree
-    /// workspace whose panel has already created (and connected) its own draft
-    /// tab, the way `ensure_pane_has_thread_tab` does at panel load.
+    /// workspace whose panel has already created (and connected) its own
+    /// thread tab.
     async fn setup_worktree_draft_migration(
         cx: &mut TestAppContext,
     ) -> (

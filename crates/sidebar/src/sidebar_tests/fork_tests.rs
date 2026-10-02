@@ -437,11 +437,12 @@ async fn test_keyboard_expand_and_collapse_are_noops(cx: &mut TestAppContext) {
     );
 }
 
-/// Press `+`, get a worktree and an empty draft, walk away: the draft is
-/// filtered out of the list, so there was never a row to archive and nothing
-/// ever took the worktree off disk. One click, one worktree, forever.
+/// Only a spare is reclaimed. A worktree a `+` made belongs to the thread that
+/// click also created, whether or not a message was ever sent in it, and it
+/// stays until that thread is archived — which is how a `+` worktree someone
+/// left files in stops being thrown away behind them.
 #[gpui::test]
-async fn test_a_worktree_left_by_an_abandoned_new_thread_is_reclaimed(cx: &mut TestAppContext) {
+async fn test_only_a_spare_worktree_is_reclaimed(cx: &mut TestAppContext) {
     init_test(cx);
 
     let fs = FakeFs::new(cx.executor());
@@ -450,7 +451,8 @@ async fn test_a_worktree_left_by_an_abandoned_new_thread_is_reclaimed(cx: &mut T
         serde_json::json!({
             ".git": {
                 "worktrees": {
-                    "abandoned": { "commondir": "../../", "HEAD": "ref: refs/heads/abandoned" },
+                    "unsent": { "commondir": "../../", "HEAD": "ref: refs/heads/unsent" },
+                    "spare": { "commondir": "../../", "HEAD": "ref: refs/heads/spare" },
                     "in-use": { "commondir": "../../", "HEAD": "ref: refs/heads/in-use" },
                 },
             },
@@ -458,7 +460,7 @@ async fn test_a_worktree_left_by_an_abandoned_new_thread_is_reclaimed(cx: &mut T
         }),
     )
     .await;
-    for name in ["abandoned", "in-use"] {
+    for name in ["unsent", "spare", "in-use"] {
         fs.insert_tree(
             format!("/worktrees/reclaim/{name}/reclaim"),
             serde_json::json!({
@@ -479,13 +481,24 @@ async fn test_a_worktree_left_by_an_abandoned_new_thread_is_reclaimed(cx: &mut T
             },
         )
         .await;
-        agent_ui::test_support::record_zed_created_worktree(
-            fs.as_ref(),
-            Path::new(&format!("/worktrees/reclaim/{name}/reclaim")),
-            None,
-            cx,
-        )
-        .await;
+        let path = format!("/worktrees/reclaim/{name}/reclaim");
+        if name == "spare" {
+            agent_ui::test_support::record_zed_created_spare_worktree(
+                fs.as_ref(),
+                Path::new(&path),
+                None,
+                cx,
+            )
+            .await;
+        } else {
+            agent_ui::test_support::record_zed_created_worktree(
+                fs.as_ref(),
+                Path::new(&path),
+                None,
+                cx,
+            )
+            .await;
+        }
     }
     cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
 
@@ -494,12 +507,12 @@ async fn test_a_worktree_left_by_an_abandoned_new_thread_is_reclaimed(cx: &mut T
         .update(cx, |project, cx| project.git_scans_complete(cx))
         .await;
 
-    // The abandoned worktree gets the empty draft `+` leaves behind; the other
-    // one carries a real thread, which is what keeps a worktree alive.
-    let abandoned_paths = PathList::new(&[PathBuf::from("/worktrees/reclaim/abandoned/reclaim")]);
-    let abandoned_draft_id = save_draft_metadata_with_main_paths(
+    // One worktree holds a thread nothing was ever sent in, one holds a real
+    // thread, and one is a spare nobody was ever handed.
+    let unsent_paths = PathList::new(&[PathBuf::from("/worktrees/reclaim/unsent/reclaim")]);
+    let unsent_thread_id = save_draft_metadata_with_main_paths(
         None,
-        abandoned_paths.clone(),
+        unsent_paths.clone(),
         PathList::new(&[PathBuf::from("/reclaim")]),
         chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 0).unwrap(),
         cx,
@@ -521,24 +534,28 @@ async fn test_a_worktree_left_by_an_abandoned_new_thread_is_reclaimed(cx: &mut T
     }
 
     assert!(
-        !fs.is_dir(Path::new("/worktrees/reclaim/abandoned/reclaim"))
+        !fs.is_dir(Path::new("/worktrees/reclaim/spare/reclaim")).await,
+        "a spare from an earlier session, which nobody was handed, is reclaimed"
+    );
+    assert!(
+        fs.is_dir(Path::new("/worktrees/reclaim/unsent/reclaim"))
             .await,
-        "the worktree nothing ever used should be reclaimed"
+        "a worktree whose thread has sent nothing is still that thread's worktree"
     );
     assert!(
         fs.is_dir(Path::new("/worktrees/reclaim/in-use/reclaim"))
             .await,
         "a worktree a thread is using must be left alone"
     );
-    let draft_gone = cx.update(|_, cx| {
+    let unsent_kept = cx.update(|_, cx| {
         ThreadMetadataStore::global(cx)
             .read(cx)
-            .entry(abandoned_draft_id)
-            .is_none()
+            .entry(unsent_thread_id)
+            .is_some()
     });
     assert!(
-        draft_gone,
-        "the empty draft that held the reclaimed worktree should go with it"
+        unsent_kept,
+        "and the thread that holds it keeps its row, so it can still be archived"
     );
 }
 
@@ -1908,11 +1925,13 @@ async fn test_every_thread_row_offers_a_way_out(cx: &mut TestAppContext) {
             ]),
         "the archived row keeps its own pair, got {rows:?}"
     );
+    // A thread with nothing typed into it is archived like any other: there is
+    // no "discard" any more, because there is nothing disposable about it.
     assert!(
         rows.iter().any(|(_, disposals, _)| disposals
-            .contains(&ThreadRowDisposal::DiscardDraft)
-            || disposals.contains(&ThreadRowDisposal::ArchiveWorktree)),
-        "the draft with content can be thrown away, got {rows:?}"
+            .contains(&ThreadRowDisposal::ArchiveWorktree)
+            || disposals.contains(&ThreadRowDisposal::ArchiveThread)),
+        "an unsent thread archives like any other, got {rows:?}"
     );
 }
 
@@ -1980,12 +1999,13 @@ async fn test_only_open_threads_are_watched_on_github(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn test_stale_empty_drafts_are_hidden_and_purged(cx: &mut TestAppContext) {
-    // Every workspace that restores with no thread tab is handed a fresh
-    // empty draft, and one that is never typed into keeps its metadata row
-    // for good, so a store that has been around for months holds one per
-    // workspace per restore. None of them is open in anything. They do not
-    // get a row, and they do not survive the load.
+async fn test_an_unsent_thread_keeps_its_row_and_survives_a_restart(cx: &mut TestAppContext) {
+    // A thread exists from the moment the user asks for one. Nothing is
+    // disposable about one that has not been typed into: it keeps its row and
+    // it survives the load, so a worktree made by a `+` that was then left
+    // alone can still be found and still be archived. What used to fill the
+    // store was threads nobody created — a workspace restoring with no tab
+    // was handed one — and that is gone instead.
     agent_ui::test_support::init_test(cx);
     cx.update(|cx| {
         ThreadStore::init_global(cx);
@@ -2066,16 +2086,16 @@ async fn test_stale_empty_drafts_are_hidden_and_purged(cx: &mut TestAppContext) 
     });
     assert!(
         draft_rows.contains(&open_draft),
-        "the open draft keeps its row, got {draft_rows:?}"
+        "the open thread keeps its row, got {draft_rows:?}"
     );
     assert!(
         draft_rows.contains(&typed),
-        "a draft with content keeps its row whether or not it is open, got {draft_rows:?}"
+        "a thread with something typed into it keeps its row, got {draft_rows:?}"
     );
     for id in &stale {
         assert!(
-            !draft_rows.contains(id),
-            "a stale empty draft should not be listed, got {draft_rows:?}"
+            draft_rows.contains(id),
+            "a thread nobody has open still keeps its row, got {draft_rows:?}"
         );
     }
 
@@ -2084,18 +2104,15 @@ async fn test_stale_empty_drafts_are_hidden_and_purged(cx: &mut TestAppContext) 
         let store = store.read(cx);
         for id in &stale {
             assert!(
-                store.entry(*id).is_none(),
-                "a stale empty draft should be gone from the store after load"
+                store.entry(*id).is_some(),
+                "a thread with nothing typed into it survives the load"
             );
         }
         assert!(
             store.entry(typed).is_some(),
-            "a draft with content is not the backlog and stays"
+            "a thread with something typed into it survives the load"
         );
-        assert!(
-            store.entry(open_draft).is_some(),
-            "the open draft stays"
-        );
+        assert!(store.entry(open_draft).is_some(), "the open thread stays");
     });
 }
 

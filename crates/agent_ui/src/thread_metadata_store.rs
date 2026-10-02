@@ -1487,16 +1487,6 @@ impl ThreadMetadataStore {
         cx.notify();
     }
 
-    pub fn unarchived_draft_ids_matching(
-        &self,
-        matches: impl Fn(&ThreadMetadata) -> bool,
-    ) -> Vec<ThreadId> {
-        self.entries()
-            .filter(|thread| thread.is_draft() && !thread.archived && matches(thread))
-            .map(|thread| thread.thread_id)
-            .collect()
-    }
-
     pub fn delete_all(
         &mut self,
         thread_ids: impl IntoIterator<Item = ThreadId>,
@@ -3003,7 +2993,10 @@ mod tests {
         // The migration reads the workspace database on a real thread, which
         // the test executor does not wait for: one parked round is enough on
         // an idle machine and not under a full parallel run, where this has
-        // now come back empty on two separate nights. Poll for the row.
+        // now come back empty on two separate nights. Poll for the connection
+        // the migration writes, not for the row: the row is there from the
+        // `save` above, so waiting for it broke out of the loop before the
+        // migration had written anything and raced the assertion instead.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let metadata = loop {
             cx.run_until_parked();
@@ -3013,12 +3006,14 @@ mod tests {
                     .entry_by_session(&acp::SessionId::new("remote-session"))
                     .cloned()
             });
-            if let Some(metadata) = migrated {
+            if let Some(metadata) = migrated
+                && metadata.remote_connection.is_some()
+            {
                 break metadata;
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "expected migrated metadata row"
+                "expected the migration to backfill the thread's remote connection"
             );
         };
 
