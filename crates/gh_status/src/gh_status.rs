@@ -393,7 +393,7 @@ impl GhStatusStore {
     fn watch_key(&mut self, key: WatchKey, cx: &mut Context<Self>) {
         let watched = self
             .watched
-            .entry(key.clone())
+            .entry(key)
             .or_insert_with(WatchedBranch::default);
         watched.watch_count += 1;
         if watched.watch_count == 1 {

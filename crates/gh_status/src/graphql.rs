@@ -104,7 +104,7 @@ pub(crate) fn build_query(asks: &[(RepoId, String, Ask)]) -> String {
             None => by_repo.push((repo, vec![(alias, ask)])),
         }
     }
-    by_repo.sort_by(|(a, _), (b, _)| a.cmp(b));
+    by_repo.sort_by_key(|(repo, _)| *repo);
 
     let mut query = String::from("query {\n");
     for (index, (repo, subjects)) in by_repo.iter().enumerate() {
@@ -896,7 +896,7 @@ mod tests {
         };
         let asks = vec![
             (zed(), "b0".to_string(), Ask::Branch("main".into())),
-            (other.clone(), "p1".to_string(), Ask::Number(42)),
+            (other, "p1".to_string(), Ask::Number(42)),
             (zed(), "p2".to_string(), Ask::Number(65077)),
         ];
         let query = build_query(&asks);
