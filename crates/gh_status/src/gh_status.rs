@@ -1,5 +1,7 @@
 //! Tracks GitHub PR and CI status for git branches by polling the `gh` CLI.
 
+mod graphql;
+
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -13,6 +15,8 @@ use gpui::{
 use serde::{Deserialize, Serialize};
 use ui::{ChecksGlyph, Color, IconName, PrChipDetail, ThreadItemPrChip};
 use util::ResultExt as _;
+
+use crate::graphql::{Answer, Ask, RepoId};
 
 /// How often the poll loop wakes. What it does on a tick is decided per
 /// branch, by how long ago that branch was last asked about; this is only the
@@ -49,6 +53,44 @@ const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60 * 60);
 /// trickle, so the first refusal stops the ones behind it. What does not go
 /// out this tick goes out on the next; nothing is dropped.
 const MAX_FETCHES_IN_FLIGHT: usize = 4;
+
+/// How many subjects one batched query carries.
+///
+/// The batched query asks about every due branch and pull request at once, so
+/// this is not a budget cap — it is the point past which one query asks GitHub
+/// for more nodes than it will answer for. What does not fit goes out on the
+/// next tick, longest-waiting first, exactly as it did when the cap was on
+/// invocations.
+const MAX_SUBJECTS_PER_BATCH: usize = 50;
+
+/// How long a new watch waits for the watches arriving beside it.
+///
+/// A window opening with a hundred threads registers a hundred watches in the
+/// same breath and each one used to ask its own question immediately. They are
+/// all due at once, so pausing for a moment turns the hundred questions into
+/// one.
+const BATCH_DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// How many batched polls must fail in a row before the per-subject path is
+/// used for a while instead.
+///
+/// A query GitHub refuses structurally would otherwise cost one wasted request
+/// on top of the per-subject fallback on every poll, forever, which is worse
+/// than the flood this replaced.
+const GRAPHQL_FAILURES_BEFORE_BACKOFF: usize = 3;
+
+/// How long the batched query is left alone after failing that many times in
+/// a row.
+const GRAPHQL_BACKOFF: Duration = Duration::from_secs(10 * 60);
+
+/// How long a checkout `gh` could not name a repository for is left alone
+/// before asking again.
+///
+/// Those subjects fall back to the per-subject path, which resolves the
+/// repository from the directory and so works where this does not; without
+/// this the batch would spend a request rediscovering that on every poll.
+/// A checkout can gain a remote, so it is a hold rather than a verdict.
+const REPO_ID_RETRY: Duration = Duration::from_secs(30 * 60);
 
 /// How long one `gh` invocation gets before it is killed and counted as a
 /// failed refresh. `gh` used to be run with no timeout and no kill, so a single
@@ -226,6 +268,33 @@ pub struct GhStatusStore {
     /// an hourly limit of five thousand settles whether this app is the
     /// spender or a bystander, which the log could not answer at all.
     requests_this_hour: VecDeque<Instant>,
+    /// What the last batched poll cost and what GitHub says is left, from the
+    /// `rateLimit` the query asks for alongside the pull requests. This is the
+    /// other side of `requests_this_hour`: the count says how many questions
+    /// this app asked, this says what GitHub charged for them.
+    last_rate_limit: Option<graphql::RateLimit>,
+    /// `owner/name` per checkout, because GraphQL has no notion of "the
+    /// repository this directory is in" and the batched query has to name it.
+    /// Resolved once per checkout: a checkout's remote does not move while the
+    /// app is open.
+    repo_ids: HashMap<PathBuf, RepoId>,
+    /// Checkouts `gh` would not name a repository for, and when to ask again.
+    unresolvable_repos: HashMap<PathBuf, Instant>,
+    /// The one batched poll in flight, if there is one.
+    batch_task: Option<Task<()>>,
+    /// Armed by a new watch, so the watches registered alongside it are asked
+    /// about in the same question.
+    batch_arm_task: Option<Task<()>>,
+    /// Consecutive batched polls that failed outright. Reset by one that
+    /// works.
+    graphql_failures: usize,
+    /// Set once the batched query has failed enough times in a row to be
+    /// worth leaving alone. Until it passes, polls go out per subject.
+    graphql_quiet_until: Option<Instant>,
+    /// Whether the fall back to per-subject polling has already been said.
+    /// Cleared by a batched poll that works, so a spell of failure is
+    /// reported once rather than per poll.
+    graphql_fallback_logged: bool,
     _reset_task: Option<Task<()>>,
     _poll_task: Task<()>,
 }
@@ -328,7 +397,10 @@ impl GhStatusStore {
             .or_insert_with(WatchedBranch::default);
         watched.watch_count += 1;
         if watched.watch_count == 1 {
-            self.refresh_branch(key, cx);
+            // Not a fetch of its own: a newly watched subject has never been
+            // polled and is therefore due, so the armed batch picks it up
+            // along with everything else that arrived with it.
+            self.arm_batch(cx);
         }
     }
 
@@ -363,22 +435,11 @@ impl GhStatusStore {
 
     /// Refresh all watched branches now instead of waiting for the next poll.
     ///
-    /// "Now" is still capped: a window coming into focus with a hundred
-    /// branches behind it is the same flood as a poll tick with a hundred due,
-    /// and the next tick picks up what this one did not start.
+    /// One question, whatever the window holds. What does not fit in a single
+    /// query goes out on the next tick rather than being dropped.
     pub fn refresh_now(&mut self, cx: &mut Context<Self>) {
-        let mut keys = self
-            .watched
-            .iter()
-            .map(|(key, watched)| (key.clone(), watched.last_polled))
-            .collect::<Vec<_>>();
-        keys.sort_by_key(|(_, last_polled)| *last_polled);
-        for (key, _) in keys {
-            if self.fetches_in_flight() >= MAX_FETCHES_IN_FLIGHT {
-                break;
-            }
-            self.refresh_branch(key, cx);
-        }
+        let keys = self.keys_to_ask_about(|_| true);
+        self.ask_about(keys, cx);
     }
 
     fn new(cx: &mut Context<Self>) -> Self {
@@ -396,6 +457,14 @@ impl GhStatusStore {
             rate_limited_until: None,
             rate_limit_reset: None,
             requests_this_hour: VecDeque::new(),
+            last_rate_limit: None,
+            repo_ids: HashMap::default(),
+            unresolvable_repos: HashMap::default(),
+            batch_task: None,
+            batch_arm_task: None,
+            graphql_failures: 0,
+            graphql_quiet_until: None,
+            graphql_fallback_logged: false,
             _reset_task: None,
             _poll_task: poll_task,
         }
@@ -406,21 +475,228 @@ impl GhStatusStore {
     /// spending a call on, which is a push or the window coming into focus.
     fn refresh_due(&mut self, cx: &mut Context<Self>) {
         let now = Instant::now();
-        let mut due = self
+        let due = self.keys_to_ask_about(|watched| watched.is_due(now));
+        self.ask_about(due, cx);
+    }
+
+    /// The subjects worth asking about, longest-waiting first and capped at
+    /// what one query carries.
+    ///
+    /// Longest-waiting first so the cap delays a subject rather than starving
+    /// one; a subject never polled sorts ahead of every other. What does not
+    /// fit is not dropped — it is simply not asked about this tick.
+    fn keys_to_ask_about(
+        &self,
+        mut want: impl FnMut(&WatchedBranch) -> bool,
+    ) -> Vec<WatchKey> {
+        let mut keys = self
             .watched
             .iter()
-            .filter(|(_, watched)| watched.is_due(now))
+            .filter(|(_, watched)| !watched.is_refreshing() && want(watched))
             .map(|(key, watched)| (key.clone(), watched.last_polled))
             .collect::<Vec<_>>();
-        // Longest-waiting first, so the cap below delays a branch rather than
-        // starving one. A branch never polled sorts ahead of every other.
-        due.sort_by_key(|(_, last_polled)| *last_polled);
-        for (key, _) in due {
+        keys.sort_by_key(|(_, last_polled)| *last_polled);
+        keys.truncate(MAX_SUBJECTS_PER_BATCH);
+        keys.into_iter().map(|(key, _)| key).collect()
+    }
+
+    /// Asks about these subjects, in one query where that is working and one
+    /// invocation each where it is not.
+    fn ask_about(&mut self, keys: Vec<WatchKey>, cx: &mut Context<Self>) {
+        if self.batched_polling_is_quiet() {
+            self.ask_individually(keys, cx);
+        } else {
+            self.start_batch(keys, cx);
+        }
+    }
+
+    /// Whether the batched query has been left alone for failing too often.
+    fn batched_polling_is_quiet(&self) -> bool {
+        self.graphql_quiet_until
+            .is_some_and(|until| Instant::now() < until)
+    }
+
+    /// Asks about these subjects the old way, one `gh` invocation each, up to
+    /// the in-flight cap. What does not go out now goes out on the next tick.
+    fn ask_individually(&mut self, keys: Vec<WatchKey>, cx: &mut Context<Self>) {
+        for key in keys {
             if self.fetches_in_flight() >= MAX_FETCHES_IN_FLIGHT {
                 break;
             }
             self.refresh_branch(key, cx);
         }
+    }
+
+    /// A batch waits a moment for the watches registered alongside it, so a
+    /// window opening asks one question rather than one per thread.
+    fn arm_batch(&mut self, cx: &mut Context<Self>) {
+        if self.batch_arm_task.is_some() {
+            return;
+        }
+        self.batch_arm_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(BATCH_DEBOUNCE).await;
+            this.update(cx, |this, cx| {
+                this.batch_arm_task = None;
+                this.refresh_due(cx);
+            })
+            .ok();
+        }));
+    }
+
+    /// Asks about every subject given in one `gh api graphql` invocation.
+    ///
+    /// One request where there used to be one per subject, which is the whole
+    /// point: a session with a hundred watched branches and pull requests
+    /// spent a hundred of GitHub's hourly five thousand on every poll.
+    fn start_batch(&mut self, keys: Vec<WatchKey>, cx: &mut Context<Self>) {
+        if keys.is_empty() || self.batch_task.is_some() {
+            return;
+        }
+        // GitHub has said there is no budget left. One refused request is
+        // cheaper than a hundred were, but it is still not free.
+        if self
+            .rate_limited_until
+            .is_some_and(|until| Instant::now() < until)
+        {
+            return;
+        }
+        let now = Instant::now();
+        for key in &keys {
+            if let Some(watched) = self.watched.get_mut(key) {
+                watched.last_polled = Some(now);
+                watched.in_batch = true;
+            }
+        }
+        self.record_request();
+        let known_repos = self.repo_ids.clone();
+        let now = Instant::now();
+        let unresolvable = self
+            .unresolvable_repos
+            .iter()
+            .filter(|(_, retry_at)| now < **retry_at)
+            .map(|(repo_path, _)| repo_path.clone())
+            .collect();
+        let asked_about = keys.clone();
+        self.batch_task = Some(cx.spawn(async move |this, cx| {
+            let executor = cx.background_executor().clone();
+            let outcome = fetch_batch(asked_about, known_repos, unresolvable, &executor).await;
+            this.update(cx, |this, cx| this.finish_batch(outcome, cx)).ok();
+        }));
+    }
+
+    /// Reads one batched answer back: what each subject got, what the query
+    /// cost, and what has to be asked again the old way.
+    fn finish_batch(&mut self, outcome: BatchOutcome, cx: &mut Context<Self>) {
+        self.batch_task = None;
+        for key in &outcome.asked_about {
+            if let Some(watched) = self.watched.get_mut(key) {
+                watched.in_batch = false;
+            }
+        }
+        for (repo_path, repo) in outcome.resolved_repos {
+            // Resolving a checkout is its own request, so the hourly count
+            // says so.
+            self.record_request();
+            self.unresolvable_repos.remove(&repo_path);
+            self.repo_ids.insert(repo_path, repo);
+        }
+        let retry_at = Instant::now() + REPO_ID_RETRY;
+        for repo_path in outcome.unresolvable_repos {
+            self.record_request();
+            self.unresolvable_repos.insert(repo_path, retry_at);
+        }
+        if let Some(rate_limit) = &outcome.rate_limit {
+            // GitHub names the moment the window turns over in every answer,
+            // so the hold below never has to guess and the free `rate_limit`
+            // endpoint never has to be asked.
+            if let Some(reset_at) = &rate_limit.reset_at {
+                if let Some(reset_in) = reset_in(reset_at).log_err() {
+                    self.rate_limit_reset = Some(Instant::now() + reset_in);
+                }
+            }
+            self.last_rate_limit = Some(rate_limit.clone());
+        }
+        for error in &outcome.errors {
+            log::warn!("gh_status: GitHub reported on the batched query: {error}");
+        }
+
+        if let Some(error) = outcome.query_error {
+            self.fail_batch(error, outcome.asked_about, cx);
+            return;
+        }
+
+        self.graphql_failures = 0;
+        self.graphql_fallback_logged = false;
+        let mut ask_again = Vec::new();
+        for (key, answer) in outcome.answers {
+            match answer {
+                Answer::Prs(prs) => {
+                    let prs = prs.into_iter().map(PrStatus::from_gh).collect();
+                    self.finish_refresh(&key, Ok(prs), cx);
+                }
+                Answer::Missing => {
+                    let subject = key.subject.describe();
+                    self.finish_refresh(
+                        &key,
+                        Err(anyhow::anyhow!("GitHub knows no {subject}")),
+                        cx,
+                    );
+                }
+                Answer::Unanswered(why) => {
+                    log::warn!(
+                        "gh_status: the batched query said nothing about {}: {why}; asking on \
+                         its own",
+                        key.subject.describe()
+                    );
+                    ask_again.push(key);
+                }
+            }
+        }
+        // Only the subjects the batch did not answer for, so one unreadable
+        // repository costs one question rather than every chip its state.
+        self.ask_individually(ask_again, cx);
+    }
+
+    /// What to do with a batched poll that did not come back at all.
+    ///
+    /// A refusal is the store's answer for every subject the query spoke for,
+    /// and asking them again one at a time would only collect the same refusal
+    /// a hundred times. Anything else is the query's own failure, and there
+    /// the old path is what the chips fall back on for this poll.
+    fn fail_batch(
+        &mut self,
+        error: anyhow::Error,
+        asked_about: Vec<WatchKey>,
+        cx: &mut Context<Self>,
+    ) {
+        let message = format!("{error:#}");
+        if is_rate_limited(&message) {
+            for key in asked_about {
+                self.finish_refresh(&key, Err(anyhow::anyhow!(message.clone())), cx);
+            }
+            return;
+        }
+
+        self.graphql_failures += 1;
+        if !self.graphql_fallback_logged {
+            self.graphql_fallback_logged = true;
+            log::warn!(
+                "gh_status: the batched query failed ({message}); asking per branch for this \
+                 poll"
+            );
+        }
+        if self.graphql_failures >= GRAPHQL_FAILURES_BEFORE_BACKOFF {
+            self.graphql_quiet_until = Some(Instant::now() + GRAPHQL_BACKOFF);
+            log::warn!(
+                "gh_status: the batched query has failed {} times running; leaving it alone for \
+                 {} minutes",
+                self.graphql_failures,
+                GRAPHQL_BACKOFF.as_secs() / 60
+            );
+        }
+        self.last_error = Some(SharedString::from(message));
+        cx.notify();
+        self.ask_individually(asked_about, cx);
     }
 
     fn fetches_in_flight(&self) -> usize {
@@ -443,7 +719,7 @@ impl GhStatusStore {
         let Some(watched) = self.watched.get_mut(&key) else {
             return;
         };
-        if watched.refresh_task.is_some() {
+        if watched.is_refreshing() {
             return;
         }
         watched.last_polled = Some(Instant::now());
@@ -471,6 +747,26 @@ impl GhStatusStore {
             self.requests_this_hour.pop_front();
         }
         self.requests_this_hour.push_back(now);
+    }
+
+    /// What to say about GitHub's budget beside a refusal.
+    ///
+    /// GitHub's own numbers, from the `rateLimit` every batched poll asks for:
+    /// what the last poll was charged and what is left, which is the question
+    /// an exhausted budget actually raises. The invocation count is what there
+    /// is to go on before the first batched answer has arrived.
+    fn budget_line(&self) -> String {
+        match &self.last_rate_limit {
+            Some(rate_limit) => format!(
+                "quiet-ui perf: the last batched poll cost {} of GitHub's hourly budget, with \
+                 {} left",
+                rate_limit.cost, rate_limit.remaining
+            ),
+            None => format!(
+                "quiet-ui perf: this app made {} GitHub requests in the last hour",
+                self.requests_this_hour()
+            ),
+        }
     }
 
     /// How many requests this app has made in the last hour.
@@ -525,6 +821,7 @@ impl GhStatusStore {
             return;
         };
         watched.refresh_task = None;
+        watched.in_batch = false;
         match result {
             Ok(prs) => {
                 let changed = watched.prs.as_ref() != Some(&prs) || self.last_error.is_some();
@@ -562,10 +859,9 @@ impl GhStatusStore {
                     if !already_holding {
                         log::warn!(
                             "gh_status: GitHub's API budget is spent; not asking again for {} \
-                             minutes. quiet-ui perf: this app made {} GitHub requests in the \
-                             last hour",
+                             minutes. {}",
                             until.saturating_duration_since(Instant::now()).as_secs() / 60,
-                            self.requests_this_hour()
+                            self.budget_line()
                         );
                         self.ask_when_the_budget_returns(cx);
                     }
@@ -898,7 +1194,13 @@ impl WatchSubject {
 struct WatchedBranch {
     watch_count: usize,
     prs: Option<Vec<PrStatus>>,
+    /// The per-subject invocation asking about this one, when it is being
+    /// asked about on its own rather than inside a batch.
     refresh_task: Option<Task<()>>,
+    /// Whether the batched poll in flight speaks for this one. The batch holds
+    /// a single task for every subject it carries, so the marker that keeps a
+    /// subject from being asked about twice cannot be that task.
+    in_batch: bool,
     /// When this branch was last asked about, successfully or not, so the
     /// poll loop can ask about a branch with a run in flight often and one
     /// with nothing in flight rarely.
@@ -910,6 +1212,11 @@ struct WatchedBranch {
 }
 
 impl WatchedBranch {
+    /// Whether this one is already being asked about, either way.
+    fn is_refreshing(&self) -> bool {
+        self.refresh_task.is_some() || self.in_batch
+    }
+
     /// Whether any of this branch's pull requests still has checks running.
     /// A branch that has never been fetched counts as settled: there is no
     /// reason to think it is interesting until the first answer arrives.
@@ -987,10 +1294,29 @@ fn is_rate_limited(error: &str) -> bool {
 /// The `rate_limit` endpoint is documented as not counting against the limit,
 /// which is what makes it askable at the one moment the answer matters.
 async fn fetch_rate_limit_reset_in(executor: &BackgroundExecutor) -> Result<Duration> {
+    let mut command = util::command::new_command("gh");
+    command.args(["api", "rate_limit", "--jq", ".rate.reset - now"]);
+    let stdout = run_gh(command, "gh api rate_limit", executor).await?;
+    parse_rate_limit_reset_in(&stdout)
+}
+
+/// Runs one `gh` invocation and hands back its stdout.
+///
+/// Everything that runs `gh` here goes through this. `gh` must never be able
+/// to sit waiting to be typed at — a credential prompt with nowhere to read
+/// from is a hang, and a hang is what used to wedge a branch permanently — so
+/// stdin is closed; the child is killed rather than left behind when it is
+/// dropped; and an invocation that outlives the timeout is an ordinary failed
+/// refresh, after which the subject stops being "already refreshing" and the
+/// next poll tries again.
+async fn run_gh(
+    mut command: util::command::Command,
+    what: &str,
+    executor: &BackgroundExecutor,
+) -> Result<String> {
     use util::command::Stdio;
 
-    let child = util::command::new_command("gh")
-        .args(["api", "rate_limit", "--jq", ".rate.reset - now"])
+    let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1000,17 +1326,182 @@ async fn fetch_rate_limit_reset_in(executor: &BackgroundExecutor) -> Result<Dura
 
     let output = futures::select_biased! {
         output = child.output().fuse() => {
-            output.context("failed to run gh api rate_limit")?
+            output.with_context(|| format!("failed to run {what}"))?
         }
         _ = executor.timer(GH_TIMEOUT).fuse() => {
-            bail!("gh api rate_limit timed out after {} seconds", GH_TIMEOUT.as_secs());
+            bail!("{what} timed out after {} seconds", GH_TIMEOUT.as_secs());
         }
     };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("gh api rate_limit exited with {}: {}", output.status, stderr.trim());
+        bail!("{what} exited with {}: {}", output.status, stderr.trim());
     }
-    parse_rate_limit_reset_in(&String::from_utf8_lossy(&output.stdout))
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// How long until GitHub's budget refills, from the timestamp a batched answer
+/// carried.
+///
+/// Sanity-checked the same way the `rate_limit` endpoint's answer is: a window
+/// already turned over is no wait at all rather than a negative one, and a
+/// wait longer than the window itself is a clock disagreeing, where holding
+/// would be worse than guessing.
+fn reset_in(reset_at: &str) -> Result<Duration> {
+    let reset = chrono::DateTime::parse_from_rfc3339(reset_at.trim())
+        .with_context(|| format!("failed to read GitHub's resetAt {reset_at:?}"))?;
+    let seconds = (reset.timestamp() - chrono::Utc::now().timestamp()).max(0);
+    let reset_in = Duration::from_secs(seconds as u64);
+    if reset_in > RATE_LIMIT_WINDOW {
+        bail!("GitHub's budget resets in {reset_in:?}, which is longer than its own window");
+    }
+    Ok(reset_in)
+}
+
+/// Everything one batched poll brings back.
+struct BatchOutcome {
+    /// The subjects the poll spoke for, so their markers are cleared whatever
+    /// came of it.
+    asked_about: Vec<WatchKey>,
+    /// What came back for each subject, including the ones the query could not
+    /// be made to carry.
+    answers: Vec<(WatchKey, Answer)>,
+    /// Repositories resolved along the way, to remember for next time.
+    resolved_repos: Vec<(PathBuf, RepoId)>,
+    /// Checkouts `gh` would not name a repository for, so the next batch does
+    /// not spend a request rediscovering it.
+    unresolvable_repos: Vec<PathBuf>,
+    rate_limit: Option<graphql::RateLimit>,
+    /// Query-level complaints GitHub made while still answering.
+    errors: Vec<String>,
+    /// Set when the query itself did not come back, in which case nothing was
+    /// answered and every subject has to be asked again.
+    query_error: Option<anyhow::Error>,
+}
+
+/// Asks GitHub about every subject in one query.
+///
+/// A subject whose repository cannot be named comes back unanswered rather
+/// than keeping the rest of the batch from going out: GraphQL needs every
+/// repository spelled, and one checkout `gh` cannot resolve should cost one
+/// question, not all of them.
+async fn fetch_batch(
+    asked_about: Vec<WatchKey>,
+    known_repos: HashMap<PathBuf, RepoId>,
+    unresolvable: HashSet<PathBuf>,
+    executor: &BackgroundExecutor,
+) -> BatchOutcome {
+    let mut repos = known_repos;
+    let mut resolved_repos = Vec::new();
+    let mut unresolvable_repos = Vec::new();
+    let mut answers = Vec::new();
+    let mut asks: Vec<(RepoId, String, Ask)> = Vec::new();
+    let mut alias_keys: Vec<(String, WatchKey)> = Vec::new();
+
+    for (index, key) in asked_about.iter().enumerate() {
+        let repo = match &key.subject {
+            // A pull request that named its own repository is asked about
+            // there, whatever checkout the watch sits in.
+            WatchSubject::Number {
+                repo: Some(repo), ..
+            } => match RepoId::parse(repo) {
+                Ok(repo) => repo,
+                Err(error) => {
+                    answers.push((key.clone(), Answer::Unanswered(format!("{error:#}"))));
+                    continue;
+                }
+            },
+            _ => match repos.get(&key.repo_path) {
+                Some(repo) => repo.clone(),
+                // Asked about recently and not named then either. Its
+                // subjects go the old way, which resolves the repository from
+                // the directory and so works where this does not.
+                None if unresolvable.contains(&key.repo_path) => {
+                    answers.push((
+                        key.clone(),
+                        Answer::Unanswered(format!(
+                            "{} has no repository gh will name",
+                            key.repo_path.display()
+                        )),
+                    ));
+                    continue;
+                }
+                None => match fetch_repo_id(&key.repo_path, executor).await {
+                    Ok(repo) => {
+                        repos.insert(key.repo_path.clone(), repo.clone());
+                        resolved_repos.push((key.repo_path.clone(), repo.clone()));
+                        repo
+                    }
+                    Err(error) => {
+                        unresolvable_repos.push(key.repo_path.clone());
+                        answers.push((key.clone(), Answer::Unanswered(format!("{error:#}"))));
+                        continue;
+                    }
+                },
+            },
+        };
+        let ask = match &key.subject {
+            WatchSubject::Branch(branch) => Ask::Branch(branch.clone()),
+            WatchSubject::Number { number, .. } => Ask::Number(*number),
+        };
+        let alias = ask.alias(index);
+        alias_keys.push((alias.clone(), key.clone()));
+        asks.push((repo, alias, ask));
+    }
+
+    let outcome = |answers, rate_limit, errors, query_error| BatchOutcome {
+        asked_about: asked_about.clone(),
+        answers,
+        resolved_repos: resolved_repos.clone(),
+        unresolvable_repos: unresolvable_repos.clone(),
+        rate_limit,
+        errors,
+        query_error,
+    };
+    if asks.is_empty() {
+        return outcome(answers, None, Vec::new(), None);
+    }
+
+    let query = graphql::build_query(&asks);
+    let mut command = util::command::new_command("gh");
+    command.args(["api", "graphql", "-f"]).arg(format!("query={query}"));
+    // `gh api graphql` names its repositories in the query rather than taking
+    // them from the directory, but it still reads this checkout's own `gh`
+    // configuration, as every other invocation here does.
+    if let Some(key) = asked_about.first() {
+        command.current_dir(&key.repo_path);
+    }
+    let stdout = match run_gh(command, "gh api graphql", executor).await {
+        Ok(stdout) => stdout,
+        Err(error) => return outcome(answers, None, Vec::new(), Some(error)),
+    };
+    let mut batch = match graphql::parse_batch(&stdout, &asks) {
+        Ok(batch) => batch,
+        Err(error) => return outcome(answers, None, Vec::new(), Some(error)),
+    };
+    for (alias, key) in alias_keys {
+        let answer = batch.answers.remove(&alias).unwrap_or_else(|| {
+            Answer::Unanswered(format!("alias {alias} was not in the answer"))
+        });
+        answers.push((key, answer));
+    }
+    outcome(answers, batch.rate_limit, batch.errors, None)
+}
+
+/// The `owner/name` of the repository a watch's checkout sits in.
+///
+/// GraphQL has to be told which repository a question is about, and `gh` is
+/// what knows which one a directory is: it reads the same remotes, config and
+/// resolved-repository marker as every other `gh` call here, so asking it
+/// keeps one answer to that question rather than adding a second guess at
+/// parsing remote URLs. One request per checkout, once — a checkout's remote
+/// does not move while the app is open.
+async fn fetch_repo_id(repo_path: &Path, executor: &BackgroundExecutor) -> Result<RepoId> {
+    let mut command = util::command::new_command("gh");
+    command
+        .args(["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"])
+        .current_dir(repo_path);
+    let stdout = run_gh(command, "gh repo view", executor).await?;
+    RepoId::parse(&stdout)
 }
 
 /// Seconds until the reset, as `--jq '.rate.reset - now'` prints them.
@@ -1034,8 +1525,6 @@ async fn fetch_prs(
     subject: &WatchSubject,
     executor: &BackgroundExecutor,
 ) -> Result<Vec<PrStatus>> {
-    use util::command::Stdio;
-
     let mut command = util::command::new_command("gh");
     match subject {
         WatchSubject::Branch(branch) => {
@@ -1049,37 +1538,8 @@ async fn fetch_prs(
             command.arg("--json");
         }
     }
-    let child = command
-        .arg(GH_JSON_FIELDS)
-        .current_dir(repo_path)
-        // `gh` must never be able to sit waiting to be typed at: a credential
-        // prompt with nowhere to read from is a hang, and a hang is what used
-        // to wedge a branch permanently.
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // Losing the race below drops this child, and dropping it kills the
-        // process rather than leaving one behind for every poll.
-        .kill_on_drop(true)
-        .spawn()
-        .context("failed to run gh; is the GitHub CLI installed?")?;
-
-    let output = futures::select_biased! {
-        output = child.output().fuse() => {
-            output.context("failed to run gh; is the GitHub CLI installed?")?
-        }
-        _ = executor.timer(GH_TIMEOUT).fuse() => {
-            // A timeout is an ordinary failed refresh: the task finishes, the
-            // branch stops being "already refreshing", and the next poll tries
-            // again.
-            bail!("gh timed out after {} seconds", GH_TIMEOUT.as_secs());
-        }
-    };
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("gh exited with {}: {}", output.status, stderr.trim());
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    command.arg(GH_JSON_FIELDS).current_dir(repo_path);
+    let stdout = run_gh(command, "gh", executor).await?;
     match subject {
         WatchSubject::Branch(_) => parse_pr_list(&stdout),
         // `gh pr view` answers with the one pull request rather than a list.
@@ -1099,24 +1559,24 @@ fn parse_pr_list(json: &str) -> Result<Vec<PrStatus>> {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct GhPr {
-    number: u64,
-    url: String,
-    title: String,
-    state: String,
+pub(crate) struct GhPr {
+    pub(crate) number: u64,
+    pub(crate) url: String,
+    pub(crate) title: String,
+    pub(crate) state: String,
     #[serde(default)]
-    is_draft: bool,
+    pub(crate) is_draft: bool,
     #[serde(default)]
-    review_decision: Option<String>,
+    pub(crate) review_decision: Option<String>,
     #[serde(default)]
-    status_check_rollup: Option<Vec<GhCheck>>,
+    pub(crate) status_check_rollup: Option<Vec<GhCheck>>,
     /// The conflict question: `MERGEABLE`, `CONFLICTING`, or `UNKNOWN`.
     #[serde(default)]
-    mergeable: Option<String>,
+    pub(crate) mergeable: Option<String>,
     /// The richer "why not": `BEHIND`, `DIRTY`, `BLOCKED`, `UNSTABLE`,
     /// `CLEAN`, `DRAFT`, `HAS_HOOKS`, `UNKNOWN`.
     #[serde(default)]
-    merge_state_status: Option<String>,
+    pub(crate) merge_state_status: Option<String>,
 }
 
 /// One statusCheckRollup entry. Commit statuses report `state`; check runs
@@ -1127,17 +1587,17 @@ struct GhPr {
 /// workflow's own name); a commit status carries a `context` in place of both.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct GhCheck {
+pub(crate) struct GhCheck {
     #[serde(default)]
-    state: Option<String>,
+    pub(crate) state: Option<String>,
     #[serde(default)]
-    conclusion: Option<String>,
+    pub(crate) conclusion: Option<String>,
     #[serde(default)]
-    name: Option<String>,
+    pub(crate) name: Option<String>,
     #[serde(default)]
-    workflow_name: Option<String>,
+    pub(crate) workflow_name: Option<String>,
     #[serde(default)]
-    context: Option<String>,
+    pub(crate) context: Option<String>,
 }
 
 /// What one check in the rollup amounts to. Three answers, because a chip has
@@ -1610,63 +2070,298 @@ mod tests {
         });
     }
 
-    /// The flood. Every due branch used to be spawned in the same tick, so a
-    /// session with a hundred of them made a hundred requests before GitHub
-    /// had answered one — and the first refusal arrived after the whole flood
-    /// was already out. The cap is what turns it into a trickle a refusal can
-    /// stop.
+    /// The flood, and what finally replaced it. Every due subject used to be
+    /// its own `gh` invocation and so its own GitHub request, so a session
+    /// with a hundred watched branches and pull requests spent a hundred of
+    /// an hourly five thousand on every poll. One query asks about all of
+    /// them.
     #[gpui::test]
-    fn a_poll_tick_does_not_ask_about_everything_at_once(cx: &mut gpui::TestAppContext) {
+    fn a_poll_tick_asks_one_question_about_everything_due(cx: &mut gpui::TestAppContext) {
         let store = cx.new(GhStatusStore::new);
         store.update(cx, |store, cx| {
-            for n in 0..20u64 {
-                let key = WatchKey {
-                    repo_path: PathBuf::from("/repo"),
-                    subject: WatchSubject::Number {
-                        number: n,
-                        repo: None,
-                    },
-                };
-                let watched = store.watched.entry(key).or_default();
-                watched.watch_count = 1;
+            let over_the_cap = 10;
+            for n in 0..(MAX_SUBJECTS_PER_BATCH + over_the_cap) {
+                let key = number_key(n as u64);
+                store.watched.entry(key).or_default().watch_count = 1;
             }
 
             store.refresh_due(cx);
             assert_eq!(
-                store.fetches_in_flight(),
-                MAX_FETCHES_IN_FLIGHT,
-                "a tick starts the cap and no more"
+                store.requests_this_hour(),
+                1,
+                "a tick is one request however many subjects are due"
             );
-            let started: Vec<WatchKey> = store
-                .watched
-                .iter()
-                .filter(|(_, watched)| watched.refresh_task.is_some())
-                .map(|(key, _)| key.clone())
-                .collect();
+            assert!(store.batch_task.is_some(), "and it is the batched one");
+            assert_eq!(
+                store.fetches_in_flight(),
+                0,
+                "nothing goes out per subject while the batched query is working"
+            );
+            let first = in_batch(store);
+            assert_eq!(
+                first.len(),
+                MAX_SUBJECTS_PER_BATCH,
+                "one query carries up to the cap and no more"
+            );
 
-            // The tick after it starts nothing new while they are in flight,
-            // rather than piling a second round on top.
+            // The tick after it starts nothing new while that query is in
+            // flight, rather than piling a second question on top.
             store.refresh_due(cx);
-            assert_eq!(store.fetches_in_flight(), MAX_FETCHES_IN_FLIGHT);
+            assert_eq!(store.requests_this_hour(), 1);
 
-            // What did not go out is not dropped: it goes out once there is
-            // room, and the ones that have waited longest go first.
-            for key in &started {
-                store.watched.get_mut(key).unwrap().refresh_task = None;
+            // What did not fit is not dropped: it goes out next, and the
+            // subjects already asked about do not go again before the rest go
+            // once.
+            store.batch_task = None;
+            for watched in store.watched.values_mut() {
+                watched.in_batch = false;
             }
             store.refresh_due(cx);
-            let second_round: Vec<WatchKey> = store
-                .watched
-                .iter()
-                .filter(|(_, watched)| watched.refresh_task.is_some())
-                .map(|(key, _)| key.clone())
-                .collect();
-            assert_eq!(second_round.len(), MAX_FETCHES_IN_FLIGHT);
+            assert_eq!(store.requests_this_hour(), 2);
+            let second = in_batch(store);
+            assert_eq!(second.len(), over_the_cap);
             assert!(
-                second_round.iter().all(|key| !started.contains(key)),
-                "the branches already asked about do not go again before the rest go once"
+                second.iter().all(|key| !first.contains(key)),
+                "the subjects already asked about do not go again before the rest go once"
             );
         });
+    }
+
+    /// A window opening with twenty threads registers twenty watches in the
+    /// same breath, and each used to ask its own question the moment it was
+    /// registered. They are all due together, so one question covers every one
+    /// of them.
+    #[gpui::test]
+    fn a_window_opening_arms_one_question_rather_than_one_per_thread(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let store = cx.new(GhStatusStore::new);
+        store.update(cx, |store, cx| {
+            for n in 0..20u64 {
+                store.watch_pr(PathBuf::from("/repo"), n, None, cx);
+            }
+            assert_eq!(
+                store.requests_this_hour(),
+                0,
+                "nothing goes out while the watches are still arriving"
+            );
+            assert!(
+                store.batch_arm_task.is_some(),
+                "one batch is armed, however many watches arrive"
+            );
+
+            // What that armed batch does when it fires.
+            store.batch_arm_task = None;
+            store.refresh_due(cx);
+            assert_eq!(store.requests_this_hour(), 1, "twenty watches, one question");
+            assert_eq!(in_batch(store).len(), 20);
+        });
+    }
+
+    /// A query that fails still has to leave the chips with something, so the
+    /// subjects it spoke for are asked the old way for that poll. A query that
+    /// keeps failing is left alone instead: one wasted request on top of the
+    /// per-subject fallback, on every poll forever, would be worse than the
+    /// flood this replaced.
+    #[gpui::test]
+    fn a_batched_query_that_fails_falls_back_to_asking_one_at_a_time(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let store = cx.new(GhStatusStore::new);
+        store.update(cx, |store, cx| {
+            let keys = watch_numbers(store, 6);
+            store.refresh_due(cx);
+            assert_eq!(in_batch(store).len(), 6);
+
+            store.finish_batch(failed_batch(&keys, "gh api graphql exited with 1: nope"), cx);
+            assert!(
+                in_batch(store).is_empty(),
+                "the failed batch no longer speaks for them"
+            );
+            assert_eq!(
+                store.fetches_in_flight(),
+                MAX_FETCHES_IN_FLIGHT,
+                "they are asked the old way for this poll, up to the in-flight cap"
+            );
+            assert_eq!(store.graphql_failures, 1);
+            assert!(
+                !store.batched_polling_is_quiet(),
+                "one failure is not a pattern"
+            );
+
+            for _ in 1..GRAPHQL_FAILURES_BEFORE_BACKOFF {
+                store.finish_batch(failed_batch(&keys, "gh api graphql exited with 1: nope"), cx);
+            }
+            assert_eq!(store.graphql_failures, GRAPHQL_FAILURES_BEFORE_BACKOFF);
+            assert!(store.batched_polling_is_quiet());
+
+            // While it is quiet a tick still asks — per subject, which is
+            // where this started.
+            for watched in store.watched.values_mut() {
+                watched.refresh_task = None;
+                watched.last_polled = None;
+            }
+            store.refresh_due(cx);
+            assert!(store.batch_task.is_none());
+            assert_eq!(store.fetches_in_flight(), MAX_FETCHES_IN_FLIGHT);
+        });
+    }
+
+    /// A refusal is the store's answer for every subject the query spoke for.
+    /// Asking them again one at a time would collect the same refusal once per
+    /// subject, which is the flood this replaced.
+    #[gpui::test]
+    fn a_refused_batch_does_not_become_a_refusal_each(cx: &mut gpui::TestAppContext) {
+        let store = cx.new(GhStatusStore::new);
+        store.update(cx, |store, cx| {
+            let keys = watch_numbers(store, 6);
+            store.refresh_due(cx);
+
+            store.finish_batch(
+                failed_batch(&keys, "API rate limit exceeded for user ID 1"),
+                cx,
+            );
+            assert!(store.is_rate_limited());
+            assert_eq!(
+                store.fetches_in_flight(),
+                0,
+                "nothing is asked again; there is no budget to ask with"
+            );
+            assert_eq!(
+                store.graphql_failures, 0,
+                "a spent budget is not the query's own failure"
+            );
+        });
+    }
+
+    /// One repository the answer could not speak for costs one question, not
+    /// every chip in the batch its state.
+    #[gpui::test]
+    fn only_the_subjects_the_answer_missed_are_asked_again(cx: &mut gpui::TestAppContext) {
+        let store = cx.new(GhStatusStore::new);
+        store.update(cx, |store, cx| {
+            let keys = watch_numbers(store, 3);
+            store.refresh_due(cx);
+
+            store.finish_batch(
+                BatchOutcome {
+                    asked_about: keys.clone(),
+                    answers: vec![
+                        (keys[0].clone(), Answer::Prs(Vec::new())),
+                        (keys[1].clone(), Answer::Missing),
+                        (
+                            keys[2].clone(),
+                            Answer::Unanswered("alias p2 was not in the answer".into()),
+                        ),
+                    ],
+                    resolved_repos: Vec::new(),
+                    unresolvable_repos: Vec::new(),
+                    rate_limit: Some(graphql::RateLimit {
+                        cost: 1,
+                        remaining: 4074,
+                        reset_at: None,
+                    }),
+                    errors: Vec::new(),
+                    query_error: None,
+                },
+                cx,
+            );
+
+            // An empty answer is an answer: the branch has no pull request.
+            assert_eq!(store.watched[&keys[0]].prs.as_deref(), Some(&[][..]));
+            // GitHub said there is no such pull request, so there is nothing
+            // to ask again for.
+            assert!(store.watched[&keys[1]].prs.is_none());
+            assert_eq!(
+                store.fetches_in_flight(),
+                1,
+                "only the subject the answer said nothing about goes out alone"
+            );
+            assert_eq!(store.last_rate_limit.as_ref().map(|limit| limit.cost), Some(1));
+            assert!(in_batch(store).is_empty());
+        });
+    }
+
+    /// What a spent budget says now: what GitHub charged for the last poll,
+    /// rather than how many questions this app asked. The count is what there
+    /// is to go on before the first batched answer has arrived.
+    #[gpui::test]
+    fn a_spent_budget_reports_what_the_last_poll_cost(cx: &mut gpui::TestAppContext) {
+        let store = cx.new(GhStatusStore::new);
+        store.update(cx, |store, _| {
+            assert!(store.budget_line().contains("made 0 GitHub requests"));
+            store.last_rate_limit = Some(graphql::RateLimit {
+                cost: 3,
+                remaining: 4074,
+                reset_at: None,
+            });
+            let line = store.budget_line();
+            assert!(line.contains("cost 3"), "{line}");
+            assert!(line.contains("4074 left"), "{line}");
+        });
+    }
+
+    /// GitHub names the moment the window turns over in every batched answer,
+    /// so the hold no longer has to spend a call asking.
+    #[test]
+    fn the_reset_a_batched_answer_carries_is_read_and_sanity_checked() {
+        // A window already turned over is no wait at all, not a negative one.
+        assert_eq!(
+            reset_in("2020-01-01T00:00:00Z").unwrap(),
+            Duration::from_secs(0)
+        );
+        let soon = chrono::Utc::now() + chrono::Duration::minutes(30);
+        let read = reset_in(&soon.to_rfc3339()).unwrap();
+        assert!(
+            read > Duration::from_secs(29 * 60) && read <= Duration::from_secs(30 * 60),
+            "{read:?}"
+        );
+        // Longer than the window itself is a clock disagreeing, and holding a
+        // day on it would be worse than guessing.
+        let far = chrono::Utc::now() + chrono::Duration::days(2);
+        assert!(reset_in(&far.to_rfc3339()).is_err());
+        assert!(reset_in("soon").is_err());
+        assert!(reset_in("").is_err());
+    }
+
+    fn number_key(number: u64) -> WatchKey {
+        WatchKey {
+            repo_path: PathBuf::from("/repo"),
+            subject: WatchSubject::Number { number, repo: None },
+        }
+    }
+
+    /// Watches `count` pull requests by number, without the batch a real watch
+    /// would arm, and hands back their keys in order.
+    fn watch_numbers(store: &mut GhStatusStore, count: u64) -> Vec<WatchKey> {
+        (0..count)
+            .map(|n| {
+                let key = number_key(n);
+                store.watched.entry(key.clone()).or_default().watch_count = 1;
+                key
+            })
+            .collect()
+    }
+
+    fn in_batch(store: &GhStatusStore) -> Vec<WatchKey> {
+        store
+            .watched
+            .iter()
+            .filter(|(_, watched)| watched.in_batch)
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
+    fn failed_batch(asked_about: &[WatchKey], error: &str) -> BatchOutcome {
+        BatchOutcome {
+            asked_about: asked_about.to_vec(),
+            answers: Vec::new(),
+            resolved_repos: Vec::new(),
+            unresolvable_repos: Vec::new(),
+            rate_limit: None,
+            errors: Vec::new(),
+            query_error: Some(anyhow::anyhow!(error.to_string())),
+        }
     }
 
     /// "Say it once" said it for every request in the flood: the guard
@@ -1768,6 +2463,7 @@ mod tests {
             watch_count: 1,
             prs,
             refresh_task: None,
+            in_batch: false,
             last_polled: None,
             last_fetched: None,
         };
@@ -1801,6 +2497,7 @@ mod tests {
             watch_count: 1,
             prs,
             refresh_task: None,
+            in_batch: false,
             last_polled: None,
             last_fetched: None,
         };

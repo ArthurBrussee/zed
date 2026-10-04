@@ -7111,6 +7111,7 @@ name = "gh_status"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "collections",
  "futures 0.3.34",
  "gpui",
