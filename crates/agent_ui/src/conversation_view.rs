@@ -1193,7 +1193,7 @@ impl ConversationView {
         work_dirs: Option<PathList>,
         title: Option<SharedString>,
         initial_content: Option<AgentInitialContent>,
-        session_config: Vec<(acp_v1::SessionConfigId, acp_v1::SessionConfigOptionValue)>,
+        session_config: Vec<(acp_v2::SessionConfigId, acp_v2::SessionConfigOptionValue)>,
         workspace: WeakEntity<Workspace>,
         project: Entity<Project>,
         thread_store: Option<Entity<ThreadStore>>,
@@ -1439,7 +1439,7 @@ impl ConversationView {
                     Some(options) => {
                         let fs = this.project.read(cx).fs().clone();
                         let offers_model = options.config_options().iter().any(|option| {
-                            option.category == Some(acp_v1::SessionConfigOptionCategory::Model)
+                            option.category == Some(acp_v2::SessionConfigOptionCategory::Model)
                         });
                         let view = cx.new(|cx| {
                             ConfigOptionsView::new(
@@ -1500,7 +1500,7 @@ impl ConversationView {
     /// transfer onto the real session before the first message goes out.
     fn draft_session_config_snapshot(
         &self,
-    ) -> Vec<(acp_v1::SessionConfigId, acp_v1::SessionConfigOptionValue)> {
+    ) -> Vec<(acp_v2::SessionConfigId, acp_v2::SessionConfigOptionValue)> {
         let Some(preview) = &self.draft_model_preview else {
             return Vec::new();
         };
@@ -1512,15 +1512,15 @@ impl ConversationView {
             .into_iter()
             .filter_map(|option| {
                 let value = match &option.kind {
-                    acp_v1::SessionConfigKind::Select(select) => {
-                        acp_v1::SessionConfigOptionValue::value_id(select.current_value.clone())
+                    acp_v2::SessionConfigKind::Select(select) => {
+                        acp_v2::SessionConfigOptionValue::id(select.current_value.clone())
                     }
-                    acp_v1::SessionConfigKind::Boolean(boolean) => {
-                        acp_v1::SessionConfigOptionValue::boolean(boolean.current_value)
+                    acp_v2::SessionConfigKind::Boolean(boolean) => {
+                        acp_v2::SessionConfigOptionValue::boolean(boolean.current_value)
                     }
                     _ => return None,
                 };
-                Some((option.id, value))
+                Some((option.config_id, value))
             })
             .collect()
     }
@@ -1555,7 +1555,7 @@ impl ConversationView {
     pub fn start(
         &mut self,
         initial_content: Option<AgentInitialContent>,
-        session_config: Vec<(acp_v1::SessionConfigId, acp_v1::SessionConfigOptionValue)>,
+        session_config: Vec<(acp_v2::SessionConfigId, acp_v2::SessionConfigOptionValue)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1733,7 +1733,7 @@ impl ConversationView {
         title: Option<SharedString>,
         project: Entity<Project>,
         initial_content: Option<AgentInitialContent>,
-        session_config: Vec<(acp_v1::SessionConfigId, acp_v1::SessionConfigOptionValue)>,
+        session_config: Vec<(acp_v2::SessionConfigId, acp_v2::SessionConfigOptionValue)>,
         source: AgentThreadSource,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1934,18 +1934,18 @@ impl ConversationView {
                     && let Ok(Some(target)) =
                         cx.update(|_, cx| connection.session_config_options(&session_id, cx))
                 {
-                    let current: Vec<acp_v1::SessionConfigOption> = target.config_options();
+                    let current: Vec<acp_v2::SessionConfigOption> = target.config_options();
                     for (config_id, value) in session_config {
                         let already = current.iter().any(|option| {
-                            option.id == config_id
+                            option.config_id == config_id
                                 && match &option.kind {
-                                    acp_v1::SessionConfigKind::Select(select) => {
-                                        acp_v1::SessionConfigOptionValue::value_id(
+                                    acp_v2::SessionConfigKind::Select(select) => {
+                                        acp_v2::SessionConfigOptionValue::id(
                                             select.current_value.clone(),
                                         ) == value
                                     }
-                                    acp_v1::SessionConfigKind::Boolean(boolean) => {
-                                        acp_v1::SessionConfigOptionValue::boolean(
+                                    acp_v2::SessionConfigKind::Boolean(boolean) => {
+                                        acp_v2::SessionConfigOptionValue::boolean(
                                             boolean.current_value,
                                         ) == value
                                     }
@@ -2188,7 +2188,7 @@ impl ConversationView {
             let offers_model = config_options
                 .config_options()
                 .iter()
-                .any(|option| option.category == Some(acp_v1::SessionConfigOptionCategory::Model));
+                .any(|option| option.category == Some(acp_v2::SessionConfigOptionCategory::Model));
             config_options_view =
                 Some(cx.new(|cx| {
                     ConfigOptionsView::new(config_options, agent_server, fs, window, cx)

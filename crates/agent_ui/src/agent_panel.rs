@@ -12,7 +12,7 @@ use std::{
 
 use acp_thread::{AcpThread, AcpThreadEvent, MentionUri, line_range_suffix};
 use agent::{ContextServerRegistry, SharedThread, ThreadStore};
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::{v1 as acp, v2 as acp_v2};
 use agent_servers::AgentServer;
 use agent_settings::UserAgentsMd;
 use collections::HashSet;
@@ -1016,7 +1016,7 @@ pub struct CreateThreadOptions {
     /// Session config values (model, effort, ...) to apply to the new session
     /// before its first message, e.g. carried over from a draft's preview
     /// session.
-    pub session_config: Vec<(acp::SessionConfigId, acp::SessionConfigOptionValue)>,
+    pub session_config: Vec<(acp_v2::SessionConfigId, acp_v2::SessionConfigOptionValue)>,
     /// Working directories to attach to the new thread (e.g., the path of a
     /// freshly-created sibling worktree). When `None`, the thread inherits
     /// the project's default path list.
@@ -5927,7 +5927,7 @@ impl AgentPanel {
         title: Option<SharedString>,
         initial_content: Option<AgentInitialContent>,
         model_override: Option<String>,
-        session_config: Vec<(acp::SessionConfigId, acp::SessionConfigOptionValue)>,
+        session_config: Vec<(acp_v2::SessionConfigId, acp_v2::SessionConfigOptionValue)>,
         source: AgentThreadSource,
         start: crate::conversation_view::ConnectionStart,
         window: &mut Window,
@@ -6001,7 +6001,7 @@ impl AgentPanel {
         title: Option<SharedString>,
         initial_content: Option<AgentInitialContent>,
         model_override: Option<String>,
-        session_config: Vec<(acp::SessionConfigId, acp::SessionConfigOptionValue)>,
+        session_config: Vec<(acp_v2::SessionConfigId, acp_v2::SessionConfigOptionValue)>,
         source: AgentThreadSource,
         start: crate::conversation_view::ConnectionStart,
         window: &mut Window,
