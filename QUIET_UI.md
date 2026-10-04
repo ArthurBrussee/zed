@@ -12,10 +12,12 @@ names are the stable anchors; line numbers drift with every rebase and are not u
 
 ## Upstream first (from 2026-10-01)
 
-The fork stands at +42.9k / -10.8k lines across 106 files against upstream (+40.5k / -11.3k
-without this file and the sidebar test files; it was +42.0k / -10.7k on 2026-10-02 before that
-night's work, and +50.2k / -18.6k on 2026-10-01 before that night's trims). Every line is rebase
-cost and a place for bugs, and not all of it was asked for. Arthur's rule: **upstream wins by default, and the fork carries a
+The fork stands at +44.8k / -11.3k lines across 107 files against upstream (+39.9k / -9.4k
+without this file and the sidebar test files). It was +42.9k / -11.2k at the start of 2026-10-04,
+and +42.0k / -10.7k on 2026-10-02 before that night's work. So it went **up** by 1.8k on 10-04,
+which is the exception this rule allows for rather than a breach of it: nearly all of that is one
+new fork-only file and its tests, written because a Work queue entry asked for it. Every line is
+still rebase cost and a place for bugs, and not all of it was asked for. Arthur's rule: **upstream wins by default, and the fork carries a
 change only with an explicit reason.** An explicit reason is that Arthur asked for it (a Work
 queue entry or a request recorded in this file), or that something he asked for needs it.
 Routine-invented restyles, refactors of upstream code that change its shape without changing
@@ -82,7 +84,11 @@ to switch, drag to reorder across worktrees, close and archive from the row.
 archives a thread's worktree and restores it without losing work, submodules included. Whether a
 message has ever been sent in a thread makes no difference to any of this (2026-10-02): a thread
 is real from the click that made it, keyed on its `ThreadId`, and its worktree stays until it is
-archived. The only worktree anything reclaims is a spare nobody was handed.
+archived. The only worktree anything reclaims is a spare nobody was handed. A running thread says
+what it is running as one pill on its row — the spinner, the commands still going and the
+subagents still out, Claude's `Agent` and `Task` calls among them (2026-10-04) —
+`agent_activity_pill` in `ui/components/ai/thread_item.rs`, which the thread's own bottom bar
+draws too.
 
 **Threads as tabs.** `agent_ui/thread_tab.rs` wraps a `ConversationView` as a pane item in the
 agent panel's own pane, `thread_tab_registry.rs` is the window-spanning ordered list the sidebar
@@ -109,9 +115,13 @@ embedded terminal view below it (2026-10-01).
 left on a diff attach to the next message sent. `git_ui/generated_file.rs` and
 `git_ui/branch_diff.rs` sort generated files last and fold them shut with a tag saying why.
 
-**PR and CI state.** The `gh_status` crate polls the `gh` CLI per watched (repo, branch) and
-feeds the chips on a thread's sidebar row and in the thread itself: state, review decision,
-mergeability, and whether CI is running, passing or failing.
+**PR and CI state.** The `gh_status` crate feeds the chips on a thread's sidebar row and in the
+thread itself: state, review decision, mergeability, and whether CI is running, passing or
+failing. One poll is one `gh api graphql` invocation asking about every watched branch and pull
+request at once (2026-10-04) — `graphql.rs` builds that query and reads the answer back, lowering
+it to the same shape the per-subject `gh pr list` path produces, which is still there as the
+fallback for a query that fails. The `rateLimit` the query asks for alongside says what each poll
+actually cost, which is what a spent budget now reports.
 
 **Self-update and the nightly build.** `auto_update/quiet_ui_update.rs` updates from the fork's
 own release; `.github/workflows/quiet_ui_build.yml` builds the macOS app and
@@ -145,10 +155,11 @@ starts at 21:00.
 
 **The leak and the perf pass: the fixes are in, and the numbers that say whether they worked are not.**
 
-Everything the 10-02 entries asked for below the GraphQL item was built on 2026-10-02
-(see that night's rebase log entry for what each change was). What cannot be produced in
-the sandbox is the other half of those entries: the "after" lines. Bring from a session
-that has been up a while —
+Everything those entries asked for was built on 2026-10-02 (see that night's rebase log
+entry for what each change was), and on 2026-10-04 every line below was checked to have a
+live emitter that can still fire — so a number that has not moved is the code's answer and
+not a missing log line. What cannot be produced in the sandbox is the other half of the
+entries: the "after" lines themselves. Bring from a session that has been up a while —
 
 - two consecutive `quiet-ui perf: N entities live; largest: …; grown since the last line: …`
   lines, and the `gpui holds …` line under them. Before: 118,828 live, Markdown 47,251,
@@ -167,234 +178,6 @@ that has been up a while —
 
 If a number has not moved, that is the finding, and the entry it belongs to comes back with
 it. If it has, there is nothing here to build.
-
-**Ask GitHub about many pull requests in one query.** What is left of the rate-limit entry, and
-what 2026-09-29 did not do.
-
-The burst that entry was written about is gone: only open threads are watched, at most four `gh`
-invocations are in flight at once, the hold runs to the reset GitHub gives rather than a fixed ten
-minutes, and the "say it once" guard actually says it once. The app also counts its own requests
-over GitHub's own hour and reports the total beside the refusal, so a spent budget now says
-whether this app spent it.
-
-What remains is the first bullet, which was always most of it: every watched PR or branch is still
-its own request. One GraphQL query with an alias per PR (`pr15700: pullRequest(number: 15700) {
-... }`, grouped by repository) turns a hundred requests into one or two, and asking it for
-`rateLimit { cost remaining resetAt }` replaces the request count above with what each poll
-actually spent.
-
-**Unblocked (2026-10-02): the sample response is below, from Arthur's own `gh`.** Build it now.
-Also put a fallback in: if the GraphQL call fails or a field doesn't parse, fall back to the
-existing `gh pr list` path for that poll and log once. A wrong query then costs an extra
-request rather than blank chips. `a` is an open PR with CI running (checks `QUEUED`,
-`IN_PROGRESS` and `COMPLETED`/`SKIPPED`, rollup `PENDING`, `mergeStateStatus` `BLOCKED` with
-`mergeable` `MERGEABLE`). `b` is a merged one. The query asked for the check run's workflow name
-through `checkSuite { workflowRun { workflow { name } } }`, which is what `gh` reports as
-`workflowName`. Note `rateLimit.cost` is 1 for two PRs in one query.
-
-```json
-{
- "data": {
-  "repository": {
-   "a": {
-    "number": 65077,
-    "url": "https://github.com/zed-industries/zed/pull/65077",
-    "title": "Remove descriptive comments in default settings",
-    "state": "OPEN",
-    "isDraft": false,
-    "reviewDecision": null,
-    "mergeable": "MERGEABLE",
-    "mergeStateStatus": "BLOCKED",
-    "commits": {
-     "nodes": [
-      {
-       "commit": {
-        "statusCheckRollup": {
-         "state": "PENDING",
-         "contexts": {
-          "nodes": [
-           {
-            "__typename": "CheckRun",
-            "name": "route-pr",
-            "status": "QUEUED",
-            "conclusion": null,
-            "checkSuite": {
-             "workflowRun": {
-              "workflow": {
-               "name": "Community PR Board"
-              }
-             }
-            }
-           },
-           {
-            "__typename": "CheckRun",
-            "name": "danger",
-            "status": "QUEUED",
-            "conclusion": null,
-            "checkSuite": {
-             "workflowRun": {
-              "workflow": {
-               "name": "danger"
-              }
-             }
-            }
-           },
-           {
-            "__typename": "CheckRun",
-            "name": "check-authorship-and-label",
-            "status": "IN_PROGRESS",
-            "conclusion": null,
-            "checkSuite": {
-             "workflowRun": {
-              "workflow": {
-               "name": "PR Issue Labeler"
-              }
-             }
-            }
-           },
-           {
-            "__typename": "CheckRun",
-            "name": "orchestrate",
-            "status": "IN_PROGRESS",
-            "conclusion": null,
-            "checkSuite": {
-             "workflowRun": {
-              "workflow": {
-               "name": "run_tests"
-              }
-             }
-            }
-           },
-           {
-            "__typename": "CheckRun",
-            "name": "build_nix_linux_x86_64",
-            "status": "COMPLETED",
-            "conclusion": "SKIPPED",
-            "checkSuite": {
-             "workflowRun": {
-              "workflow": {
-               "name": "nix_build"
-              }
-             }
-            }
-           },
-           {
-            "__typename": "CheckRun",
-            "name": "bundle_linux_aarch64",
-            "status": "COMPLETED",
-            "conclusion": "SKIPPED",
-            "checkSuite": {
-             "workflowRun": {
-              "workflow": {
-               "name": "run_bundling"
-              }
-             }
-            }
-           },
-           {
-            "__typename": "CheckRun",
-            "name": "check_style",
-            "status": "QUEUED",
-            "conclusion": null,
-            "checkSuite": {
-             "workflowRun": {
-              "workflow": {
-               "name": "run_tests"
-              }
-             }
-            }
-           },
-           {
-            "__typename": "CheckRun",
-            "name": "bundle_mac_aarch64",
-            "status": "COMPLETED",
-            "conclusion": "SKIPPED",
-            "checkSuite": {
-             "workflowRun": {
-              "workflow": {
-               "name": "run_bundling"
-              }
-             }
-            }
-           },
-           {
-            "__typename": "CheckRun",
-            "name": "bundle_mac_x86_64",
-            "status": "COMPLETED",
-            "conclusion": "SKIPPED",
-            "checkSuite": {
-             "workflowRun": {
-              "workflow": {
-               "name": "run_bundling"
-              }
-             }
-            }
-           },
-           {
-            "__typename": "StatusContext",
-            "context": "verification/cla-signed",
-            "state": "SUCCESS"
-           }
-          ]
-         }
-        }
-       }
-      }
-     ]
-    }
-   },
-   "b": {
-    "number": 65043,
-    "state": "MERGED",
-    "isDraft": false,
-    "mergeable": "UNKNOWN",
-    "mergeStateStatus": "UNKNOWN",
-    "commits": {
-     "nodes": [
-      {
-       "commit": {
-        "statusCheckRollup": {
-         "state": "SUCCESS"
-        }
-       }
-      }
-     ]
-    }
-   }
-  },
-  "rateLimit": {
-   "cost": 1,
-   "remaining": 4074,
-   "resetAt": "2026-10-02T09:23:33Z"
-  }
- }
-}
-```
-
-**The activity pill: no gradient behind it, a pill shape, and Claude's subagents counted.**
-
-Arthur's screenshot (2026-10-02) shows the running spinner and `[terminal] 1` sitting on a
-visible horizontal gradient. In the sidebar row (`ThreadItem::render` in
-`crates/ui/src/components/ai/thread_item.rs`), the title's truncation fade (`gradient_overlay`,
-a `GradientFade` 64px wide) is drawn just before the `status_slot` that holds the pill, so the
-pill sits on the fade. Remove the gradient from behind the pill. Then make
-`agent_activity_pill` an actual pill: a rounded-full container with a subtle solid fill and a
-little horizontal padding, holding the spinner and the counts. It is the same component in the
-sidebar row and in the thread's bottom bar (`render_input_activity_pill`), so both change. The
-title still truncates cleanly against the pill without a fade, or with one that ends before the
-pill starts.
-
-Subagents: the pill already shows a subagent count when `RunningWork::subagents > 0`, but
-`ToolCall::is_subagent` (`acp_thread.rs`) only recognises a tool named `spawn_agent` (Codex) or
-a call carrying Zed's `subagent_session_info` meta. Claude's subagents are its `Agent`/`Task` tool
-calls. The Claude adapter reports the tool name in `_meta.claudeCode.toolName`, and stamps
-`_meta.claudeCode.parentToolUseId` on everything the subagent does
-(`@agentclientprotocol/claude-agent-acp` `dist/acp-agent.js`; see also `dist/acp-subagents.js`
-and `dist/native-subagents.js` for any capability Zed could advertise to get richer subagent
-reporting). So a running Claude subagent never counts. Recognise Claude's `Agent`/`Task` calls
-as subagents while they are in progress, and settle them when the call completes or the turn
-ends (the same settling rule as the stale-busy fix). Test with a Claude turn that runs two
-subagents in parallel: the pill shows 2 while both run and drops as each finishes.
 
 ## Verification queue
 
@@ -454,172 +237,6 @@ our `scroll_to_most_recent_user_prompt`. It shrinks the seam next time.
 git; our edit-chip diff needs the agent's pre-edit content as the base, which git cannot supply.
 Upstream's staged/unstaged diff surfaces, branch-picker work, and elicitation un-flagging are
 enablers our features consume rather than duplicates to delete.
-
-**2026-09-21**: onto main 4ab9b90bd (20 upstream commits). A working night three times over: the
-Work queue held nine items, the branch carried fourteen commits over the merge base, and the
-newest nine of those were queue entries written today. Squash-then-rebase folded all fourteen into
-one, reusing the squash's own message; tree-identical to the old tip (`2d5db82e5`) before rebasing.
-
-**What upstream has built that this fork had by hand: display terminals.** This is the night's
-most valuable finding and it came out of the conflict in `terminal.rs`. Upstream now models a
-terminal Zed did not start as a first-class thing — `TerminalExecution::{Process, Display}`,
-`Terminal::new_display`, `write_display_output`, `finish_display`, `is_process_backed`, and a
-`wait_for_exit` that returns `Result` because a display terminal has no task of ours to wait on.
-The fork had all of that as a `reported_exit` oneshot the `_output_task` awaited when there was no
-`command_task`, plus `report_exit`, `finish`, and an `exit_status_from_code` that fabricated a
-`std::process::ExitStatus` from a reported code. All four are deleted and upstream's are used;
-`Terminal::new` is back to upstream's unconditional `wait_for_completed_task`. The two call sites
-in `acp_thread.rs` that used to shrink the terminal and report the exit by hand are now one
-`finish_display` each. Both sides had independently factored the same body out as `cache_output`,
-under that name, which is how close the two designs had drifted.
-
-The fork's two watchers (changed files, output images) hang off `wait_for_exit`, so they now bail
-on a display terminal instead of awaiting a future that will never resolve. They were only ever
-attached to process-backed terminals, so nothing changes in use.
-
-**Six files conflicted, and one of them stopped being a conflict site for good.**
-
-- `acp_thread/src/terminal.rs`, one hunk in `Terminal::new`: upstream's `execution` field against
-  the fork's seven added fields and its `_output_task`. Resolved as above.
-- `acp_thread/src/acp_thread.rs`, four hunks. Two are the `finish_display` sites above, taken from
-  upstream. The other two are the fork's: upstream pushes a "Tool call not found" placeholder entry
-  for an update naming a tool call the thread never saw, and this fork drops it with a warning
-  rather than drawing a dead chip. Ours, with its test.
-- `agent_ui/src/conversation_view/thread_view.rs`, four hunks, all the recurring seam: upstream's
-  thinking-block rendering, its `render_message_content` and `toggle_thinking_block_expansion`,
-  and its `TerminalToolHeader` usage — which now carries an `on_stop` button, built tonight, on a
-  header this fork does not draw. Ours in every case. (The stop button is worth remembering: the
-  Work queue's "let a running terminal be killed" item can copy upstream's wiring rather than
-  invent it.)
-- `agent_ui/src/conversation_view.rs`, one hunk, a pure interleave: upstream appended two test
-  helpers exactly where this fork had put an `#[ignore]` on the test that follows. Both kept.
-- `sidebar/src/sidebar.rs`, one hunk: upstream's sidebar width moved to `threads_sidebar.
-  default_width` and now persists through `set_width`/`serialize`. Upstream's shape adopted whole,
-  including its one-line `serialize` helper, which the fork had been emitting inline.
-- `agent_ui/src/ui/terminal_tool_header.rs`: see the diff pass below. This one is now zero.
-
-**Markerless drift, which is what `cargo check --workspace --all-targets` is for.** Eight, and
-none of them carried a marker:
-
-- `ToolCall::from_acp` lost its `PathStyle` argument; the fork's `for_test` still passed one.
-- `ContentBlock::new` became `new_output` and also lost `PathStyle`.
-- `TerminalOutput::exit_status` is now an `acp::TerminalExitStatus` rather than an
-  `Option<std::process::ExitStatus>`. Four fork sites read it; the "did this command fail" test
-  they each spelled differently is now `TerminalOutput::failed()`, once.
-- `MessageContent::markdown()` became `markdowns()`, returning an iterator, because an assistant
-  message chunk now holds a `MessageContent` of several blocks rather than one `ContentBlock`.
-- The fork's `let style = MarkdownStyle::themed(...)` in the assistant-message arm was deleted by
-  the merge with no marker at all, which is the failure mode this section exists for.
-- `render_message_context_menu` gained a `markdown: Option<Entity<Markdown>>` parameter, so the
-  menu's copy entries can name the block under the pointer.
-- `AgentThreadWorktreeLabelFlag::watch(cx)` arrived in the sidebar's constructor. Dropped: the
-  `sidebar` crate does not depend on `feature_flags`, and the flag gates an upstream worktree-label
-  experiment on a row this fork draws itself.
-- `Tab`'s slot handling and `Pane::render_tab` were stable, which matters because tonight's tab
-  work adds to both.
-
-**The diff pass ("Another pass to shrink the diff"), in the form that entry asked for.**
-Before: 90 files, +37,225 / −10,431. After: 96 files, +37,989 / −9,900. The insertions are
-tonight's five items and their tests; the deletions are what this pass was about, and they fell by
-531 lines.
-
-- *Gated, not deleted: `agent_ui/src/ui/terminal_tool_header.rs`.* The fork kept 12 lines of that
-  396-line file — one struct, `TerminalSandboxWarning`, which upstream defines identically — and
-  deleted the rest, so upstream's every change to that component landed as a conflict. It did
-  tonight, as a single 443-line hunk. Upstream's file is now taken whole: it depends on nothing
-  but `ui::` primitives, so keeping it costs a component nobody renders and removes the conflict
-  permanently. The fork's diff for this file is zero. `mod ui` in `agent_ui.rs` became `pub mod ui`
-  so the unrendered builders are still reachable and do not read as dead code.
-- *Gated, not deleted: `workspace/src/status_bar.rs`.* The fork drew the open-sidebar toggle in
-  the title bar and paid for it by deleting the status bar's own, 90 lines of it. Upstream's code
-  is back, behind `StatusBar::set_show_sidebar_toggle`, which the fork turns off where the status
-  bar is built. That file's diff goes from +8 / −90 to +16 / −2. Former conflict site: any
-  upstream change to `render_left_tools`, `render_right_tools` or `render_sidebar_toggle`.
-- *Read and deliberately kept: `agent_ui/src/threads_archive_view.rs`, +16 / −1,589.* The biggest
-  single deletion left, and the obvious next candidate for the same trade. It is the wrong one.
-  Upstream's file is a `ModalView` picker wired into `ThreadMetadataStore`, `AgentConnectionStore`
-  and `DEFAULT_THREAD_TITLE` — all things this fork has changed — so restoring it would oblige the
-  fork to keep those APIs shaped the way upstream's picker expects, forever, and would turn a
-  conflict that announces itself into a compile error that does not. The lever works on leaf UI
-  that consumes stable primitives, and not on views wired into stores the fork owns. That is the
-  rule the next pass should apply.
-- *Read and deliberately kept: `thread_view.rs`, −5,859.* Not gateable on any reading: those are
-  the fork's own rewritten surfaces, not upstream code it declines to draw.
-
-**What was built: five of the nine Work queue items, in order, and they are off the queue.**
-
-- *The diff pass*, above.
-- *The sidebar drag.* The wiring read correctly and it turns out it works: a new test presses,
-  moves and releases over real row bounds — through the row's own `on_drag`, drop target and
-  `on_drop`, which nothing covered before — and two threads tabbed in one worktree reorder
-  exactly as they should. So the entry's first question is answered: no precondition fails in the
-  common case. What did fail is the entry's second point. A row lit up as a drop target for drops
-  it then swallowed, because the hover styling tested only the worktree while the drop also
-  refuses the dragged row itself; dropping a row on itself looked accepted and did nothing. The
-  refusals for another worktree's rows and for rows with no tab were already correct and already
-  silent-by-construction (no `on_drag` is attached at all), which is the right kind of silence.
-- *Thread tab width.* Upstream's `Tab` reserves a 12px box for the pane indicator and a 14px box
-  for the close button, with a gap beside each, filled or not. A thread tab fills neither. A pane
-  can now say so (`Pane::set_tabs_fit_content`) and `Tab::fit_to_content` drops the boxes and the
-  gaps beside them, with padding sized for a small label instead. Measured, which is what that
-  entry asked for: a tab with a five-word title goes from **236px to 205px**, 31px narrower, so a
-  row of six gives 186px back to titles. Editor tabs are untouched and keep the boxes on purpose.
-- *The PR poll.* Nineteen branches asked every minute for a check rollup is what spent GitHub's
-  hourly budget in twenty minutes. Each branch now carries its own interval — 20s with a run in
-  flight, 5 minutes open and quiet, never once every PR on it is merged or closed — and the
-  rollup, which is most of what a query costs, is only asked for while checks could be moving; a
-  cheap poll keeps the checks it already had. A rate-limit answer stops every fetch for ten
-  minutes rather than spending the rest of the hour proving the budget is gone. The refresh-on-push
-  and refresh-on-focus triggers are untouched, which is where the entry wanted the calls spent.
-- *The per-worktree language server switch.* A new `project::worktree_language_servers` store is
-  read where servers are resolved (`server_tree.rs`), a worktree this fork creates is switched off
-  as it is made, and the choice is remembered by path in the local database. The control is a
-  status-bar item beside the LSP state; turning it on restarts the servers for the buffers open in
-  that worktree, turning it off stops them. `set_local_settings`, which the entry suggested, was
-  read and not used: it is keyed by worktree root and directory, so an in-memory override there
-  would be overwritten by the worktree's own `.zed/settings.json` the next time it is scanned.
-
-**What was not built, and why: the clock, not the items.** Bookmarks in a thread, PRs as a watched
-set, killing a running terminal from its chip, and the sidebar rebuild storm are all still queued
-and all still worth doing. The night went on the five above; nothing in the remaining four looked
-wrong once the code was read.
-
-**The gate, eight crates: the core three plus the five touched tonight.** `cargo test`:
-`acp_thread` 246, `agent_ui` 473 (32 intentionally `#[ignore]`d), `sidebar` 186, `ui` 83 plus 41
-doctests, `gh_status` 31, `git_ui_core` 31, `workspace` 276, `project` 64 plus 399 integration
-(3 `#[ignore]`d). Zero failures anywhere. `editor` was not touched tonight and was not run, so the
-standing `test_code_lens_resolve_only_visible` failure this log has carried since 09-01 did not
-come up.
-
-**Six tests failed on the first pass and every one was tonight's own work, not upstream's.** Five
-were upstream tests arriving in this batch, all about the new multi-block `MessageContent`: an
-image-only assistant message rendered nothing, and the context menu tests could not find the
-per-block menus. The cause was this fork's resolution of the assistant-message arm, which rendered
-only markdown chunks. Fixed by rendering every visible block, each with its own context menu, the
-way upstream does, inside the fork's own chat bubble. The sixth,
-`test_display_terminal_does_not_move_to_background_when_tool_completes`, looks for a
-`terminal-tool-failed-{exit_code:?}` selector on upstream's terminal header; this fork says that
-on its chip instead, so the chip's failure glyph now carries the same name and the test covers the
-surface the fork actually draws. Two more were this run's own new test expectations being wrong
-rather than the code: a branch with no PR polls on the idle interval, and the tab saving is 31px
-rather than the 30 the arithmetic predicted, the odd pixel being the rem-sized gaps.
-
-`script/clippy` (`--release --all-targets --all-features -- --deny warnings`) across all eight
-crates plus `zed`. `cargo-shear`, `typos` and `buf` are not installed here, so `script/clippy`
-exits after the lint, as it has every night in this log.
-
-**Environment: the standing prerequisites, and the disk allowance again.**
-`CARGO_NET_GIT_FETCH_WITH_CLI=true` and `libasound2-dev` as always; `libx11-xcb-dev` and its
-companions and `rsync` installed up front. `apt-get update` still 403s on the `ondrej` PPA and
-the install was run separately rather than chained, per the standing note, and succeeded off the
-cached lists. The disk ran out twice. Worth adding to this log's standing advice: cargo leaves
-stale duplicate artifacts in `target/debug/deps` — two `libproject`, two `libgpui`, two
-`libmerman_render` — and sweeping every all-but-newest duplicate freed 9GB without forcing a single
-rebuild, which is much cheaper than the `rm -rf target/debug` this log has reached for before.
-Deleting just the finished test binaries (`agent_ui-*`, `sidebar-*`, `acp_thread-*`, ~0.9GB each)
-between phases is the next cheapest move. When the allowance does run out mid-run, the tooling's
-own temp directory fills too and commands start failing with lost output rather than a disk
-message, so `df` is the first thing to check.
 
 **2026-09-22**: onto main 16c9aa7ea (16 upstream commits). A working night three times over: the
 Work queue held five items, the branch carried ten commits over the merge base, and the first
@@ -2203,3 +1820,209 @@ difference were not thinking time: ten sidebar tests moved with the drafts chang
 be read rather than flipped, and the session's disk allowance ran out twice, which cost a full
 test rebuild each time. The entry is unchanged and unblocked — the sample response is still in it,
 and the fallback it asks for is still the right shape.
+
+**2026-10-04**: onto main a84689073 (15 upstream commits). Squash-then-rebase folded eleven fork
+commits into one, tree-identical to the old tip (`6e29b3ae8`) before rebasing. **Five conflicts,
+none of them in `thread_view.rs`** — the recurring seam has now stayed quiet three nights
+running — but the conflict count was again the wrong thing to read: the night's real cost was
+upstream moving session configuration options to the SDK's v2 shapes, which conflicted in one
+file and drifted silently in two others.
+
+- `assets/keymaps/default-{linux,macos,windows}.json`, one marker region each, all
+  append/append: #64916's `TableView` cell-navigation block landed exactly where the fork
+  appends its two `diff_review` contexts. **Union**, upstream's block closed off first. The
+  three files differ only in `use_key_equivalents` and the modifier, so all three resolved the
+  same way.
+- `crates/acp_thread/src/acp_thread.rs`, one region, append/append in the module list: #65093
+  added `pub mod config_options;` where the fork adds `command_output` and `command_parse`.
+  **Union**, in the sorted order the rest of the list is already in.
+- `crates/agent_ui/src/config_options.rs`, **seven regions, and the one place this fork
+  replaced an upstream render path wholesale** (the combined effort/fast-mode/config menu, *R*).
+  Upstream's change to the file is a data-model migration — `v1 as acp` becomes `v2 as acp`,
+  `option.id` becomes `option.config_id`, `SessionConfigOptionValue::value_id` becomes `::id` —
+  plus guards for option kinds it will not draw a control for. The fork's change is a different
+  *surface*: one popover with a section per option, in place of upstream's per-option trigger
+  button and fuzzy-search picker. **Took the fork's file whole and ported upstream's migration
+  into it by hand**, which is the smallest fork change that keeps the requested surface: the
+  type move applies to the fork's code line for line, while upstream's new guards live almost
+  entirely in the picker machinery the fork does not have.
+
+**Markerless drift, and a lesson about the check that is supposed to find it.** `cargo check
+--workspace --all-targets` was started immediately after the replay, and it came back with
+three errors — all of them in `gh_status`, all of them mine, because the run raced an edit I was
+making to that crate at the time. **A workspace check that fails early has not checked the
+workspace**: cargo stopped at `gh_status`, so nothing that depends on it was compiled, and
+`agent_ui` — which did have drift — was never reached. The drift surfaced an hour later from a
+`cargo check -p agent_ui`, which is an hour it did not need to take. Start the workspace check on
+a tree nothing else is touching, and read "could not compile X" as "and nothing downstream of X
+was looked at".
+
+The drift itself is #65093 again, in two files and carrying no markers:
+
+- `agent_ui/src/conversation_view.rs`: the fork's worktree-switch carry copies a preview
+  session's configuration onto the thread it starts, and the fork's model-offer check asks
+  whether an agent advertises a `Model` category at all. Both read the shared boundary, which is
+  v2 now. Four type declarations, two category comparisons, two `SessionConfigKind` matches, one
+  `option.id` and two `value_id` constructors.
+- `agent_ui/src/agent_panel.rs`: the same carried configuration, three more declarations. The
+  file's own `acp` alias is still v1 and everything else in it still wants v1, so it gained a
+  second alias rather than a migration.
+
+Run on its own at the end of the night, on a tree nothing else was touching, `cargo check
+--workspace --all-targets` came back **exit 0, zero errors and zero warnings in 11m37s** — which
+is the figure the first run was supposed to produce and could not.
+
+**What upstream now provides that the fork could delete: nothing this round, but #65093 is worth
+reading again next time.** Its new `acp_thread/src/config_options.rs` is a shared v1-to-v2
+adaptation at the model/UI boundary — `from_v1`, `value_to_v1`, and an explicit refusal of value
+shapes v1 cannot carry. The fork duplicates none of it and now consumes it, which is the right
+side of that trade; what it does mean is that the fork's combined menu sits on upstream's shared
+boundary rather than beside it, so the next change to that boundary will reach the fork's menu
+without a conflict marker. The other fourteen commits are a `PathStyle` reimplementation on
+`std::path` (which touched nothing the fork reads), git-graph and git-tag UI, two git hosting
+providers, headless windowing in gpui, and #65090's streamed tool-call content appending — which
+is in `acp_thread` and merged clean.
+
+**What was built: both of the Work queue's buildable entries, each its own commit.**
+
+*Ask GitHub about many pull requests in one query.* The entry's remaining bullet, and the one it
+always said was most of the work. Every watched branch and pull request was its own `gh`
+invocation and so its own GitHub request; one `gh api graphql` now carries an alias per subject,
+grouped under a `repository` alias each, with the fields named once as a fragment so the query
+does not grow a copy of them per subject. `graphql.rs` is new and holds the whole of it — query
+building, the wire types, and the lowering to the same `GhPr` the `gh pr list` path produces, so
+what a check amounts to is still decided in exactly one place and the fifteen tests that pin
+those judgements did not have to move.
+
+Three things the entry did not ask for, which the reading made necessary:
+
+- **A window opening was never the poll loop's problem.** The entry is written about poll ticks,
+  but `watch_key` asked its own question the moment a watch was registered — so a window opening
+  with a hundred threads made a hundred requests before the poll loop was involved at all. A new
+  watch now arms one batch and waits 150ms for the watches arriving beside it, which is what
+  turns that hundred into one. A newly watched subject has never been polled and is therefore
+  due, so the armed batch picks it up with no second code path.
+- **GraphQL has to be told which repository a question is about.** `gh pr list` takes it from the
+  directory; a query cannot. `gh repo view --json nameWithOwner` answers it with `gh`'s own
+  resolution rather than a second guess at parsing remote URLs, and the answer is cached per
+  checkout for the life of the process. A checkout it will not name is held off for half an hour
+  rather than asked again every poll, because those subjects fall back to the per-subject path,
+  which resolves from the directory and so works where this does not.
+- **A fallback that always fails is worse than the flood.** The entry asks for a fall back to
+  `gh pr list` when the query fails, and accepts that a wrong query "costs an extra request".
+  Taken literally that is one wasted request *plus* the per-subject flood, on every poll,
+  forever. Three consecutive failures now leave the batched query alone for ten minutes. A
+  refusal is handled separately and never falls back at all: the budget is the whole store's, so
+  asking the same hundred subjects one at a time would only collect the same refusal a hundred
+  times, which is precisely what this entry replaced.
+
+`rateLimit { cost remaining resetAt }` rides along, as the entry asks, and a spent budget now
+reports what GitHub charged the last poll instead of how many invocations this app made. `resetAt`
+also replaces the `gh api rate_limit` call the hold used to spend to find out when the window
+turns over — it is in every answer now.
+
+**The one thing the sandbox could not check, and why it is safe anyway.** `gh` is installed here
+but its token is invalid, so the query was never run against GitHub. What is checked: the
+generated text was read (it is one anonymous operation plus one fragment, and the test asserts
+the grouping, the substituted check limit and the escaping), and the parser is tested against the
+response in the Work queue entry itself, byte for byte inside the two pull requests, re-keyed only
+to the alias names this query generates. What is not checked is the live round-trip, and
+`mergeStateStatus` is the field to suspect if it fails — it wanted a preview `Accept` header
+historically. It was left off deliberately: overriding `Accept` on the GraphQL endpoint is the
+riskier of the two, the entry's own sample came back from a real `gh` with that field populated,
+and a query GitHub refuses is exactly what the fallback and the log line are for.
+
+*The activity pill: no gradient behind it, a pill shape, and Claude's subagents counted.* All
+three, and one of them turned out to be already done.
+
+- **The gradient.** Exactly as the entry diagnosed, and the fix is structural rather than
+  cosmetic. The title's truncation fade was a *sibling* of the status slot and positioned
+  `right: -10px` against a distant relative ancestor, so its 64px sat over the status slot and
+  the action slot rather than over the end of the title. It is now a child of the title's own
+  box, which is `relative()` and given a definite height so the fade is as tall as the row and
+  not merely as tall as the label. It dissolves the title and stops where the title's box does,
+  which is the entry's "one that ends before the pill starts".
+- **The pill.** `agent_activity_pill` is a fully rounded container with a solid fill and
+  horizontal padding now, sized to the 16px status slot it sits in. One component, so the
+  sidebar row and the thread's bottom bar both changed; the bottom bar's call site only needed
+  `cx` passed, which the pill now wants for the theme colour.
+- **The subagents, where the code had already done half of it.** `is_subagent` recognised
+  Codex's `spawn_agent` and Zed's own subagent metadata; Claude names its tools in its own
+  `claudeCode` namespace, which nothing in the workspace read outside two test fixtures, so a
+  running Claude subagent was never counted. Only `is_subagent` consults that namespace —
+  deliberately not `tool_name`, which also feeds labels, wait detection and tool-lookup
+  detection, and widening it would have changed how every Claude call reads for the sake of
+  counting two. **The settling the entry asks for needs no code**: the subagent count already
+  sits inside the guard the 10-02 stale-busy fix put there, so a subagent left `InProgress` by a
+  cancelled or dead turn settles with the turn exactly as a command does. The test the entry
+  asked for pins both halves — two subagents running in parallel read as 2, the count drops as
+  each finishes, a Claude `Bash` call is not counted as a subagent, and ending the turn settles
+  the one still in flight.
+
+**No test for the pill's shape, rather than one that asserts nothing.** The same wall 10-02 hit
+with the command chip: a rendered element's background, radius and padding are not exposed to
+gpui's tests, and asserting the fade's new parent would mean giving the fade a debug selector —
+fork code added for a test, which that night judged not worth it and this one agrees. Both halves
+compile and the subagent half is tested; the visual half is read, not measured.
+
+**What was not built: the leak-and-perf measurement entry, and nothing else.** It is the queue's
+remaining item and it stays there, because what it asks for cannot be produced in a sandbox —
+"two consecutive `entities live` lines from a session that has been up a while" is Arthur's own
+app's log and nothing here can stand in for it. What was done instead is the half that *can* be
+done from here: every log line the entry is waiting on was traced to a live emitter that can
+still fire. `agent_panel.rs` logs `dropped the views of N off-screen threads` whenever a sweep
+drops anything, and `sidebar.rs` logs the rebuild line with the per-call-site trigger names and
+the foreground total, both in the shape the entry describes. So a number that has not moved is
+the code's answer rather than a log line that was never wired, which is the one way that entry
+could have wasted another night. The entry is annotated to say so and is otherwise unchanged.
+
+**Environment: the two prerequisites, and the disk again.** `CARGO_NET_GIT_FETCH_WITH_CLI=true`
+and `libasound2-dev` were both needed as usual; 10-01's `libxkbcommon-dev` and friends were not,
+because nothing this night built the crates that want them. 10-02's note about the writable
+allowance was right and the remedy it suggested was not quite enough. The session gets a fixed
+allowance, `target/debug` reached 24GB across a night of edit-and-compile rounds, and the gate
+ran out of it part way through `agent_ui` — `No space left on device` while archiving
+`libterminal_view`, with the other four crates already green. **What works is one phase per
+clean slate rather than a prune between phases**: `cargo test` for the remaining crate,
+`script/clippy` (which is the release profile and so a second target directory entirely), and the
+workspace check each ran on their own with the previous phase's directory deleted first. Pruning
+inside a live `target` buys a gigabyte or two and risks deleting something the build in flight is
+reading; deleting the whole directory between phases buys all of it and risks nothing. The one
+prune worth doing mid-build is the test *binaries* of crates whose suites have already run —
+nothing links against those, and they were 1.5GB of the four.
+
+**The gate, five crates, and it caught two things in my own new code.** `cargo test` over the
+fork's three core crates plus the two others tonight touched: **acp_thread 347, agent_ui 542 (34
+`#[ignore]`d — the same 34 as 10-02, so nothing new had to be silenced), sidebar 194, gh_status
+59, ui 41. 1,183 passed, 0 failed.** `sidebar` is 194 again, the fourth night at exactly that
+number, which is the useful reading: nothing moved under it. `gh_status` went from 43 to 59 —
+sixteen new, ten of them on the query and the answer and six on the scheduling — and
+`acp_thread` from 342 to 347, one of those tonight's Claude-subagent test and four upstream's.
+
+`./script/clippy -p acp_thread -p agent_ui -p sidebar -p gh_status -p ui` (`--release
+--all-targets --all-features -- --deny warnings`) **failed the first time, on two lints in code
+written tonight**: a `sort_by` in `graphql.rs` that wanted `sort_by_key`, and a `key.clone()` in
+`watch_key` that became redundant the moment that function stopped passing the key on to a fetch
+of its own. Both fixed and the gate re-run; `cargo-shear`, `typos` and `buf` are not installed
+here, so `script/clippy` stops after the lint as it has every night in this log. Worth noting for
+next time that clippy stopped at `gh_status` and so never reached `agent_ui` or `sidebar` — the
+same early-exit trap as the workspace check above, in a second tool.
+
+**Diff size.** `git diff --diff-algorithm=histogram --shortstat $(git merge-base HEAD
+upstream/main) HEAD -- . ':!QUIET_UI.md'` is **107 files, +44,775 / -11,324**, from 106 files and
++42,941 / -11,176 at the start of the night: **1,834 more added lines and 148 more deleted, and
+one more file.** That is the wrong direction for this section's rule and it is where the night's
+work went: `gh_status/src/graphql.rs` is 948 of those lines, the batched poll and its tests in
+`gh_status.rs` are most of the rest, and the activity pill cost 34. The whole of it is one
+fork-only crate answering a Work queue entry, so none of it is new seam against upstream — the
+rebase cost of `gh_status` is zero, because upstream has no such crate. Without this file and the
+sidebar test files it is 105 files, +39,903 / -9,403. The myers figure, which this file no longer
+reports, reads 47,232 / 13,781; see the note in **Upstream first** for why that number is not the
+one to read.
+
+**Next time, two things worth having in hand before the gate.** Both of tonight's gate failures
+were the same shape: a tool that stops at the first crate it cannot compile, read as if it had
+checked everything. The workspace check cost an hour that way and clippy cost three rounds.
+`cargo check --workspace --all-targets` should be run on a tree nothing else is editing, and
+`script/clippy` is worth running once early on the crates already written rather than only at the
+end — it is the release profile, so it is the one check nothing else in the night exercises.
