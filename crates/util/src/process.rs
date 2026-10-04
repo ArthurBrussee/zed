@@ -1,5 +1,34 @@
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use std::process::Stdio;
+
+/// A spawn failure that says why it failed, not just what it failed to run.
+///
+/// The reason is the OS error's own message ("Too many open files", "No such
+/// file or directory"), which is the whole answer and only prints under
+/// `{:#}` — and not every surface an error reaches shows it that way. Naming
+/// it in the message itself means the reason survives the trip.
+fn spawn_error(error: std::io::Error, command: &str) -> anyhow::Error {
+    let command = crate::redact::redact_command(command);
+    // Running out of file handles looks like the program being broken from
+    // every angle except this one, which is why it is worth naming.
+    let reason = if out_of_file_handles(&error) {
+        format!("out of file handles ({error})")
+    } else {
+        error.to_string()
+    };
+    anyhow::Error::new(error).context(format!("failed to spawn command {command}: {reason}"))
+}
+
+#[cfg(unix)]
+fn out_of_file_handles(error: &std::io::Error) -> bool {
+    // EMFILE: this process is at its own limit. ENFILE: the machine is.
+    matches!(error.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE))
+}
+
+#[cfg(not(unix))]
+fn out_of_file_handles(_error: &std::io::Error) -> bool {
+    false
+}
 
 /// A wrapper around `smol::process::Child` that ensures all subprocesses
 /// are killed when the process is terminated: on Unix by using process
@@ -44,12 +73,7 @@ impl Child {
             .stdout(stdout)
             .stderr(stderr)
             .spawn()
-            .with_context(|| {
-                format!(
-                    "failed to spawn command {}",
-                    crate::redact::redact_command(&format!("{command:?}"))
-                )
-            })?;
+            .map_err(|error| spawn_error(error, &format!("{command:?}")))?;
         Ok(Self { process })
     }
 
@@ -66,12 +90,7 @@ impl Child {
             .stdout(stdout)
             .stderr(stderr)
             .spawn()
-            .with_context(|| {
-                format!(
-                    "failed to spawn command {}",
-                    crate::redact::redact_command(&format!("{command:?}"))
-                )
-            })?;
+            .map_err(|error| spawn_error(error, &format!("{command:?}")))?;
 
         // Assign the child to a job object configured to kill the entire
         // process tree when the last job handle is closed, so descendants
@@ -292,5 +311,43 @@ mod windows_tests {
             grandchild_pid,
             "grandchild should be terminated after dropping the child",
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_spawn_failure_says_why_it_failed() {
+        let mut command = std::process::Command::new("/nonexistent/program");
+        command.arg("--version");
+        let error = match Child::spawn(command, Stdio::null(), Stdio::null(), Stdio::null()) {
+            Ok(_) => panic!("there is nothing at that path to run"),
+            Err(error) => error,
+        };
+
+        // The command, so the reader knows which launch failed, and the
+        // reason, which is the part that used to print only under `{:#}`.
+        let message = error.to_string();
+        assert!(message.contains("/nonexistent/program"), "{message}");
+        assert!(
+            message.contains(&std::io::Error::from_raw_os_error(libc::ENOENT).to_string()),
+            "{message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn running_out_of_file_handles_is_named() {
+        assert!(out_of_file_handles(&std::io::Error::from_raw_os_error(
+            libc::EMFILE
+        )));
+        assert!(out_of_file_handles(&std::io::Error::from_raw_os_error(
+            libc::ENFILE
+        )));
+        assert!(!out_of_file_handles(&std::io::Error::from_raw_os_error(
+            libc::ENOENT
+        )));
     }
 }

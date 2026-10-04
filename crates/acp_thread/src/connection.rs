@@ -1,6 +1,6 @@
 use crate::{AcpThread, ElicitationStore};
 use agent_client_protocol::schema::{v1 as acp_v1, v2 as acp_v2};
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use collections::{HashMap, HashSet, IndexMap};
 use gpui::{Entity, SharedString, Task};
@@ -121,6 +121,24 @@ pub trait AgentConnection {
         Task::ready(Err(anyhow::Error::msg("Loading sessions is not supported")))
     }
 
+    /// The thread an in-flight [`Self::load_session`] or
+    /// [`Self::resume_session`] is filling, if the connection has created it
+    /// already.
+    ///
+    /// A long session's history replays over the wire entry by entry, and the
+    /// connection registers the thread before it asks for the replay so those
+    /// updates have somewhere to land. The task the load returns only resolves
+    /// once the last entry has arrived, so without this the reader waits out
+    /// the whole replay looking at nothing; with it they can watch the
+    /// conversation fill up.
+    fn loading_thread(
+        &self,
+        _session_id: &acp_v1::SessionId,
+        _cx: &App,
+    ) -> Option<Entity<AcpThread>> {
+        None
+    }
+
     /// Whether this agent supports closing existing sessions.
     fn supports_close_session(&self) -> bool {
         false
@@ -215,6 +233,22 @@ pub trait AgentConnection {
     }
 
     fn cancel(&self, session_id: &acp_v1::SessionId, cx: &mut App);
+
+    /// Stops one task the agent detached, leaving the turn alone.
+    ///
+    /// A backgrounded command has no process of ours to kill — the agent owns
+    /// it — so stopping it is a request rather than a signal. Agents that never
+    /// report detached work never get asked.
+    fn stop_async_task(
+        &self,
+        _session_id: &acp_v1::SessionId,
+        _async_task_id: SharedString,
+        _cx: &mut App,
+    ) -> Task<Result<()>> {
+        Task::ready(Err(anyhow!(
+            "this agent does not support stopping background tasks"
+        )))
+    }
 
     /// Request-scoped elicitations are connection-level because they can arrive before a session
     /// thread exists. Session-scoped elicitations stay in the thread timeline, but use

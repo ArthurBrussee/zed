@@ -16,7 +16,6 @@ use anyhow::{Context as _, Result, anyhow};
 use derive_more::{Deref, DerefMut};
 use futures::{Future, FutureExt, channel::oneshot, future::LocalBoxFuture};
 use itertools::Itertools;
-use parking_lot::RwLock;
 use slotmap::SlotMap;
 
 pub use async_context::*;
@@ -851,7 +850,7 @@ pub struct App {
     // We need to ensure the leak detector drops last, after all tasks, callbacks and things have been dropped.
     // Otherwise it may report false positives.
     #[cfg(any(test, gpui_leak_detection))]
-    _ref_counts: Arc<RwLock<EntityRefCounts>>,
+    _ref_counts: Arc<parking_lot::RwLock<EntityRefCounts>>,
 }
 
 impl App {
@@ -907,7 +906,7 @@ impl App {
                 windows: SlotMap::with_key(),
                 window_update_stack: Vec::new(),
                 window_handles: FxHashMap::default(),
-                focus_handles: Arc::new(RwLock::new(SlotMap::with_key())),
+                focus_handles: Arc::new(FocusMap::default()),
                 keymap: Rc::new(RefCell::new(Keymap::default())),
                 keyboard_layout,
                 keyboard_mapper,
@@ -1967,6 +1966,9 @@ impl App {
 
     /// Repeatedly called during `flush_effects` to handle a focused handle being dropped.
     fn release_dropped_focus_handles(&mut self) {
+        if !self.focus_handles.take_dropped() {
+            return;
+        }
         self.focus_handles
             .clone()
             .write()
@@ -2921,6 +2923,41 @@ impl App {
             .expect("asset cache entries are keyed by their asset type")
     }
 
+    /// What gpui is holding callbacks and handles for, right now.
+    ///
+    /// Every observer and every event listener is walked when the entity it
+    /// watches notifies or emits, and every focus handle is walked when one
+    /// is released, so these counts are what a flush costs. They should sit
+    /// still while the app does: one that climbs is a subscription or a
+    /// handle nobody dropped, and the freezes get longer with it.
+    ///
+    /// Walks the sets, so ask on a timer rather than on a frame.
+    pub fn callback_counts(&self) -> CallbackCounts {
+        let (observers, observed_entities) = self.observers.counts();
+        let (event_listeners, emitting_entities) = self.event_listeners.counts();
+        let (release_listeners, _) = self.release_listeners.counts();
+        let (global_observers, _) = self.global_observers.counts();
+        CallbackCounts {
+            observers,
+            observed_entities,
+            event_listeners,
+            emitting_entities,
+            release_listeners,
+            global_observers,
+            focus_handles: self.focus_handles.read().len(),
+        }
+    }
+
+    /// How many live entities there are of each concrete type, largest first.
+    ///
+    /// The counts above say how much a flush costs; this says what is holding
+    /// the handles, which is the only way to name a type that is leaking.
+    ///
+    /// Walks the entity map, so ask on a timer rather than on a frame.
+    pub fn entity_counts_by_type(&self) -> Vec<(&'static str, usize)> {
+        self.entities.counts_by_type()
+    }
+
     /// Obtain a new [`FocusHandle`], which allows you to track and manipulate the keyboard focus
     /// for elements rendered within this window.
     #[track_caller]
@@ -3099,6 +3136,26 @@ impl App {
         };
         self.to_async()
     }
+}
+
+/// How many callbacks and focus handles gpui is holding, by kind. See
+/// [`App::callback_counts`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CallbackCounts {
+    /// Live `observe` callbacks.
+    pub observers: usize,
+    /// How many entities those observers are spread over.
+    pub observed_entities: usize,
+    /// Live `subscribe` callbacks.
+    pub event_listeners: usize,
+    /// How many entities those listeners are spread over.
+    pub emitting_entities: usize,
+    /// Live `observe_release` callbacks.
+    pub release_listeners: usize,
+    /// Live `observe_global` callbacks.
+    pub global_observers: usize,
+    /// Live focus handles, which are swept whenever one is let go.
+    pub focus_handles: usize,
 }
 
 impl AppContext for App {
