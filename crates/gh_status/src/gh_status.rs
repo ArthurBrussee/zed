@@ -569,7 +569,6 @@ impl GhStatusStore {
         }
         self.record_request();
         let known_repos = self.repo_ids.clone();
-        let now = Instant::now();
         let unresolvable = self
             .unresolvable_repos
             .iter()
@@ -1392,7 +1391,11 @@ async fn fetch_batch(
 ) -> BatchOutcome {
     let mut repos = known_repos;
     let mut resolved_repos = Vec::new();
-    let mut unresolvable_repos = Vec::new();
+    // Checkouts this batch has already failed to name. Without it, every
+    // subject sharing one unnameable checkout spends its own request
+    // rediscovering that — which is the per-subject cost this is all here to
+    // remove.
+    let mut unresolvable_repos: Vec<PathBuf> = Vec::new();
     let mut answers = Vec::new();
     let mut asks: Vec<(RepoId, String, Ask)> = Vec::new();
     let mut alias_keys: Vec<(String, WatchKey)> = Vec::new();
@@ -1415,7 +1418,9 @@ async fn fetch_batch(
                 // Asked about recently and not named then either. Its
                 // subjects go the old way, which resolves the repository from
                 // the directory and so works where this does not.
-                None if unresolvable.contains(&key.repo_path) => {
+                None if unresolvable.contains(&key.repo_path)
+                    || unresolvable_repos.contains(&key.repo_path) =>
+                {
                     answers.push((
                         key.clone(),
                         Answer::Unanswered(format!(
