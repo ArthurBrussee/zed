@@ -7577,7 +7577,7 @@ impl ThreadView {
         if thread.status() == ThreadStatus::Idle && work.is_empty() {
             return None;
         }
-        Some(ui::agent_activity_pill("input-activity", work))
+        Some(ui::agent_activity_pill("input-activity", work, cx))
     }
 
     /// The right end of the input status bar: the loading spinner while added

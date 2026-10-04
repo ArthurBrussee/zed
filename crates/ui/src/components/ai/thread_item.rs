@@ -453,12 +453,24 @@ fn running_work_count(
 /// the commands still running and the subagents still out. Zero is silent — a
 /// thread with neither shows the spinner alone — so the pill only ever says
 /// something it knows.
-pub fn agent_activity_pill(id: impl Into<SharedString>, work: RunningWorkCounts) -> AnyElement {
+///
+/// Drawn as a pill: a fully rounded container with a solid fill of its own, so
+/// what the thread is doing reads as one object sitting on the row rather than
+/// as loose glyphs on whatever happens to be behind them.
+pub fn agent_activity_pill(
+    id: impl Into<SharedString>,
+    work: RunningWorkCounts,
+    cx: &App,
+) -> AnyElement {
     let id = id.into();
     let RunningWorkCounts { subagents, .. } = work;
     let commands = work.commands();
     h_flex()
+        .h_4()
+        .px_1p5()
         .gap_1()
+        .rounded_full()
+        .bg(cx.theme().colors().element_background)
         .child(agent_running_indicator())
         .when(commands > 0, |this| {
             this.child(running_work_count(
@@ -806,9 +818,14 @@ impl RenderOnce for ThreadItem {
         let hover_bg = apparent_bg.blend(color.ghost_element_hover);
         let active_bg = apparent_bg.blend(color.ghost_element_active);
 
+        // Sized and placed to dissolve the end of the title inside the
+        // title's own box. It used to be a sibling of the status slot,
+        // overhanging to the right of the row, which put the fade underneath
+        // the activity pill — a visible horizontal gradient behind the
+        // spinner and its counts.
         let gradient_overlay = GradientFade::new(base_bg, hover_bg, active_bg)
             .width(px(64.0))
-            .right(px(-10.0))
+            .right(px(0.0))
             .gradient_stop(0.7)
             .group_name("thread-item");
 
@@ -893,6 +910,7 @@ impl RenderOnce for ThreadItem {
             Some(agent_activity_pill(
                 format!("status-{}", self.id),
                 running_work,
+                cx,
             ))
         } else {
             status_icon.map(|icon| icon.into_any_element())
@@ -1023,14 +1041,18 @@ impl RenderOnce for ThreadItem {
                                 let id = format!("title-{}", self.id);
                                 move || id
                             })
+                            .relative()
+                            // Definite, so the fade below is as tall as the
+                            // row rather than as tall as the label.
+                            .h_full()
                             .min_w_0()
                             .flex_1()
                             .gap_1p5()
-                            .child(title_label),
+                            .child(title_label)
+                            .when(self.is_truncated && opaque_window, |this| {
+                                this.child(gradient_overlay)
+                            }),
                     )
-                    .when(self.is_truncated && opaque_window, |this| {
-                        this.child(gradient_overlay)
-                    })
                     .child(status_slot)
                     // The slot holds the row's buttons, hover-gated by whoever
                     // fills it. The PR chips are not in here: the title row

@@ -92,6 +92,31 @@ pub fn meta_with_tool_name(tool_name: &str) -> acp_v1::Meta {
     acp_v1::Meta::from_iter([(TOOL_NAME_META_KEY.into(), tool_name.into())])
 }
 
+/// The namespace the Claude adapter puts its own metadata under.
+pub const CLAUDE_CODE_META_KEY: &str = "claudeCode";
+
+/// The tool name the Claude adapter reports.
+///
+/// It names its tools in its own namespace rather than in ACP's `name` field
+/// or the legacy flat key, so a call from Claude carries a name nothing else
+/// here would find. Read only where the name itself is the question — what a
+/// call is labelled remains ACP's answer to give.
+pub fn claude_tool_name_from_meta(meta: &Option<acp_v1::Meta>) -> Option<SharedString> {
+    meta.as_ref()
+        .and_then(|meta| meta.get(CLAUDE_CODE_META_KEY))
+        .and_then(|claude| claude.get("toolName"))
+        .and_then(|name| name.as_str())
+        .map(|name| SharedString::from(name.to_owned()))
+}
+
+/// Whether a tool of this name is an agent handing work to a subagent.
+///
+/// `spawn_agent` is Codex's. `Agent` and `Task` are Claude's: `Task` is the
+/// older spelling and still what some versions report, so both count.
+fn is_subagent_tool_name(name: &str) -> bool {
+    matches!(name, "spawn_agent" | "Agent" | "Task")
+}
+
 /// Key used in ACP `AvailableCommand` meta to record which source produced a
 /// slash command, so the completion popup can group commands by category.
 pub const COMMAND_CATEGORY_META_KEY: &str = "command_category";
@@ -1698,8 +1723,18 @@ impl ToolCall {
             })
     }
 
+    /// Whether this call is an agent working through a subagent.
+    ///
+    /// Three ways to tell, because the agents disagree: the tool's own name,
+    /// the name the Claude adapter reports in its own namespace — which is the
+    /// only place a Claude subagent says so, and so the only reason one has
+    /// ever been counted — and Zed's own subagent-session metadata.
     pub fn is_subagent(&self) -> bool {
-        self.tool_name.as_ref().is_some_and(|s| s == "spawn_agent")
+        self.tool_name
+            .as_deref()
+            .is_some_and(is_subagent_tool_name)
+            || claude_tool_name_from_meta(&self.meta)
+                .is_some_and(|name| is_subagent_tool_name(&name))
             || self.subagent_session_info.is_some()
     }
 
@@ -11718,6 +11753,134 @@ mod tests {
             .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
             .expect("turn should still be running");
         request.await.expect("turn should complete");
+    }
+
+    /// Claude's subagents are its `Agent` and `Task` tool calls, and it names
+    /// its tools in its own metadata namespace rather than in ACP's `name`
+    /// field or the legacy flat key. Nothing read that namespace, so a running
+    /// Claude subagent was never counted — the pill said a thread was merely
+    /// spinning while two subagents worked under it.
+    #[gpui::test]
+    async fn test_claude_subagents_are_counted_while_they_work(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(
+                    project.clone(),
+                    PathList::new(&[Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        let claude_tool = |name: &str| {
+            acp_v1::Meta::from_iter([(
+                CLAUDE_CODE_META_KEY.into(),
+                serde_json::json!({ "toolName": name }),
+            )])
+        };
+        let subagent = |id: &'static str, title: &'static str, name: &str, status| {
+            acp_v1::SessionUpdate::ToolCall(
+                acp_v1::ToolCall::new(id, title)
+                    .status(status)
+                    .meta(claude_tool(name)),
+            )
+        };
+
+        // A call is only in flight while somebody is working on it.
+        let (complete, request) = start_test_turn(&thread, cx);
+        cx.run_until_parked();
+
+        // Both of Claude's spellings, running at once.
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    subagent(
+                        "agent-call",
+                        "Investigate the failing test",
+                        "Agent",
+                        acp_v1::ToolCallStatus::InProgress,
+                    ),
+                    cx,
+                )
+                .unwrap();
+            thread
+                .handle_session_update(
+                    subagent(
+                        "task-call",
+                        "Summarise the diff",
+                        "Task",
+                        acp_v1::ToolCallStatus::InProgress,
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(
+                thread.running_work(cx).subagents,
+                2,
+                "both of Claude's subagents are working, and the pill says two"
+            );
+        });
+
+        // And the count drops as each finishes.
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    subagent(
+                        "agent-call",
+                        "Investigate the failing test",
+                        "Agent",
+                        acp_v1::ToolCallStatus::Completed,
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(thread.running_work(cx).subagents, 1);
+        });
+
+        // A tool of Claude's that is not a subagent is not counted as one.
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    subagent(
+                        "bash-call",
+                        "cargo test",
+                        "Bash",
+                        acp_v1::ToolCallStatus::InProgress,
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(thread.running_work(cx).subagents, 1);
+        });
+
+        // Ending the turn settles the one left in flight: there is nobody left
+        // to finish it, so it is stuck rather than busy.
+        complete
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .expect("turn should still be running");
+        request.await.expect("turn should complete");
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(
+                thread.running_work(cx).subagents,
+                0,
+                "a subagent left in flight by a finished turn is not still working"
+            );
+        });
     }
 
     #[gpui::test]
