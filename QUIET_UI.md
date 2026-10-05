@@ -153,6 +153,46 @@ does is removed as it lands.
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**Images still paint over the chips and over each other. Fifth report; this time there is a code
+path for it.**
+
+Arthur's screenshot (2026-10-05): a run with a `python3 s…` chip and an expanded `…0.png` image
+chip. Two pictures from the same run overlap each other (two different grids of plots, the
+upper one cut off by the lower) and the chips are drawn on top of them. The pictures were PNGs a
+Python script wrote to `/tmp` (sizes seen there: 1500×900, 1500×950, 540×580, 620×420).
+
+The box is not the problem. `render_inline_image` gives every picture a definite
+`IMAGE_CHIP_WIDTH` × `image_box_height(..)` box with `size_full` + `ObjectFit::Contain`, so a
+picture can't paint outside its box. **The list item's measured height is what goes stale.** A
+whole run of actions is drawn by the run's *first* entry (`render_entry`: "The run's first entry
+draws the whole group; the rest draw nothing"). The fix for that was applied to `EntryUpdated`
+(`drawn_item_for_entry` in `conversation_view.rs`) and to chip toggles (`remeasure_chip`), but
+two paths still remeasure the wrong item or none:
+- `read_image_shape` (`chips.rs`) calls `list_state.remeasure_items(entry_ix..entry_ix + 1)`
+  with the picture's own entry. For any picture not in the run's first entry, that is an `Empty`
+  item, and the item that draws the picture keeps the height it measured with the placeholder.
+- `AcpThreadEvent::NewEntry` (`conversation_view.rs`) only splices the new index. A new tool
+  call that joins an existing run (the next command, the next picture) makes the run's
+  first item grow, and nothing remeasures it. With pictures, which are tall, the group overflows
+  its slot and paints into the items below. The next run's pictures then sit over this run's.
+
+Fix all of these through one function rather than at each site. Every remeasure of a thread entry
+goes through `drawn_item_for_entry`. `NewEntry` remeasures the drawn item of the new entry and,
+when the new entry changed which run the one before it belongs to, that one's too. Grep for every
+`remeasure_items` / `splice` on `list_state` and route each through it. Then add a guard, so a
+sixth report names itself: in debug builds and behind the `quiet-ui perf:` logging in release,
+log `quiet-ui layout: list item N painted Xpx, measured Ypx` whenever a thread list item paints
+taller than its measured height.
+
+The test is the scenario, not a unit of it. A `VisualTestContext` thread whose run is a
+`python3` command chip, then two tool calls that each produce a picture file on disk (use
+1500×900 and 540×580 PNGs written into the test's temp dir), arriving as separate `NewEntry`
+events after the first frame. Expand both picture chips. Run frames until the header reads land.
+Then assert that the run's item's measured height equals its painted height, and that the next
+item starts below the bottom of the lower picture. The four previous attempts each fixed a
+sizing rule and passed tests that never streamed a second entry into a run that was already
+measured.
+
 **The leak and the perf pass: the fixes are in, and the numbers that say whether they worked are not.**
 
 Everything those entries asked for was built on 2026-10-02 (see that night's rebase log
