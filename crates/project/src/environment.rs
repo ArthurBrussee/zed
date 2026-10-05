@@ -1,15 +1,16 @@
 use anyhow::{Context as _, bail};
+use async_lock::Semaphore;
 use futures::{FutureExt, StreamExt as _, channel::mpsc, future::Shared};
 use language::Buffer;
 use remote::RemoteClient;
 use rpc::proto::{self, REMOTE_SERVER_PROJECT_ID};
-use std::{collections::VecDeque, path::Path, sync::Arc};
+use std::{collections::VecDeque, path::Path, sync::Arc, sync::LazyLock, time::Instant};
 use task::{Shell, shell_to_proto};
 use util::{ResultExt, command::new_command};
 use worktree::Worktree;
 
 use collections::HashMap;
-use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Task, WeakEntity};
+use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Global, Task, WeakEntity};
 use settings::Settings as _;
 
 use crate::{
@@ -17,9 +18,55 @@ use crate::{
     worktree_store::WorktreeStore,
 };
 
+/// How long a directory's shell may take to print its environment before the
+/// capture gives up on it. The answer is cached for the life of the process,
+/// so a login shell that never returns is not one slow launch: it is every
+/// later one joining a task that will never finish, with nothing in the log to
+/// say so.
+const SHELL_ENVIRONMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// How many directories may have their shell environment captured at once,
+/// across the whole process.
+///
+/// A capture runs a login shell in the directory, and a direnv that evaluates
+/// a nix flake turns that into a full flake evaluation. Restoring fourteen
+/// worktree windows ran fourteen of those at once through the nix daemon: a
+/// load average of 188 on a 15-core machine, a `git fetch` to GitHub timing
+/// out, and an agent's own startup call failing because its process had
+/// starved. They were competing for the same cores either way, so taking
+/// turns costs them nothing between them and leaves the machine usable while
+/// they finish.
+///
+/// Process-wide rather than per project, because each window has its own
+/// [`ProjectEnvironment`]: a cap that each one kept for itself would bound
+/// nothing at all in the case that hurt.
+const CONCURRENT_SHELL_ENVIRONMENT_CAPTURES: usize = 2;
+
+static SHELL_ENVIRONMENT_CAPTURES: LazyLock<Semaphore> =
+    LazyLock::new(|| Semaphore::new(CONCURRENT_SHELL_ENVIRONMENT_CAPTURES));
+
+/// The local directory captures this app has already paid for, shared by every
+/// project in it rather than kept per project.
+///
+/// A directory's environment is a property of the directory, not of the window
+/// looking at it, and every window has a [`ProjectEnvironment`] of its own: two
+/// of them opening the same checkout captured it twice, at the same moment, and
+/// for a checkout whose shell takes seven seconds that is seven seconds twice
+/// over. The in-flight task is what is shared, so the second asker joins the
+/// first capture rather than starting another.
+///
+/// One consequence worth knowing: the capture reports a failure to whichever
+/// project started it, so a shell that fails to answer names its error in that
+/// project's window and not in the one that joined.
+#[derive(Default)]
+struct SharedLocalEnvironments(
+    HashMap<(Shell, Arc<Path>), Shared<Task<Option<HashMap<String, String>>>>>,
+);
+
+impl Global for SharedLocalEnvironments {}
+
 pub struct ProjectEnvironment {
     cli_environment: Option<HashMap<String, String>>,
-    local_environments: HashMap<(Shell, Arc<Path>), Shared<Task<Option<HashMap<String, String>>>>>,
     remote_environments: HashMap<(Shell, Arc<Path>), Shared<Task<Option<HashMap<String, String>>>>>,
     environment_error_messages: VecDeque<String>,
     environment_error_messages_tx: mpsc::UnboundedSender<String>,
@@ -55,7 +102,6 @@ impl ProjectEnvironment {
         });
         Self {
             cli_environment,
-            local_environments: Default::default(),
             remote_environments: Default::default(),
             environment_error_messages: Default::default(),
             environment_error_messages_tx: tx,
@@ -167,6 +213,36 @@ impl ProjectEnvironment {
         .unwrap_or_else(|| Task::ready(None).shared())
     }
 
+    /// The environment a directory inside the project should use, which is the
+    /// one its worktree root has.
+    ///
+    /// A submodule is its own git repository but not its own environment: it
+    /// sits inside the superproject's checkout and a shell started in it reads
+    /// the same `.envrc` and the same flake inputs. Capturing one per
+    /// repository meant a checkout with a submodule paid for two captures of
+    /// several seconds each, again for every worktree made from it. A path
+    /// outside every worktree keeps its own capture, since there is no
+    /// superproject to borrow from.
+    pub fn containing_worktree_environment(
+        &mut self,
+        abs_path: Arc<Path>,
+        cx: &mut App,
+    ) -> Shared<Task<Option<HashMap<String, String>>>> {
+        let worktree = self
+            .worktree_store
+            .read_with(cx, |worktree_store, cx| {
+                worktree_store
+                    .find_worktree(&abs_path, cx)
+                    .map(|(worktree, _)| worktree)
+            })
+            .ok()
+            .flatten();
+        match worktree {
+            Some(worktree) => self.worktree_environment(worktree, cx),
+            None => self.local_directory_environment(&Shell::System, abs_path, cx),
+        }
+    }
+
     /// Returns the project environment using the default worktree path.
     /// This ensures that project-specific environment variables (e.g. from `.envrc`)
     /// are loaded from the project directory rather than the home directory.
@@ -203,30 +279,74 @@ impl ProjectEnvironment {
             return Task::ready(Some(cli_environment)).shared();
         }
 
-        self.local_environments
-            .entry((shell.clone(), abs_path.clone()))
-            .or_insert_with(|| {
+        let key = (shell.clone(), abs_path.clone());
+        if let Some(shared) = cx
+            .try_global::<SharedLocalEnvironments>()
+            .and_then(|shared| shared.0.get(&key).cloned())
+        {
+            return shared;
+        }
+
+        let capture = {
                 let load_direnv = ProjectSettings::get_global(cx).load_direnv.clone();
                 let shell = shell.clone();
                 let tx = self.environment_error_messages_tx.clone();
                 cx.spawn(async move |cx| {
-                    let mut shell_env = match cx
-                        .background_spawn(load_directory_shell_environment(
-                            shell,
-                            abs_path.clone(),
-                            load_direnv,
-                            tx,
-                        ))
-                        .await
-                    {
-                        Ok(shell_env) => Some(shell_env),
-                        Err(e) => {
+                    // Take a turn before starting the clock: the timeout is
+                    // for a shell that will not answer, not for one that has
+                    // not been given a turn yet.
+                    let queued_at = Instant::now();
+                    let permit = SHELL_ENVIRONMENT_CAPTURES.acquire().await;
+                    let queued_for = queued_at.elapsed();
+                    let started_at = Instant::now();
+                    let mut capture = cx
+                        .background_spawn({
+                            let abs_path = abs_path.clone();
+                            async move {
+                                let _permit = permit;
+                                load_directory_shell_environment(
+                                    shell,
+                                    abs_path,
+                                    load_direnv,
+                                    tx,
+                                )
+                                .await
+                            }
+                        })
+                        .fuse();
+                    let mut timeout = cx
+                        .background_executor()
+                        .timer(SHELL_ENVIRONMENT_TIMEOUT)
+                        .fuse();
+                    let captured = futures::select_biased! {
+                        captured = capture => Some(captured),
+                        _ = timeout => None,
+                    };
+                    let mut shell_env = match captured {
+                        Some(Ok(shell_env)) => Some(shell_env),
+                        Some(Err(e)) => {
                             log::error!(
                                 "Failed to load shell environment for directory {abs_path:?}: {e:#}"
                             );
                             None
                         }
+                        None => {
+                            log::error!(
+                                "Gave up loading the shell environment for {abs_path:?} after {}s; \
+                                 continuing without it",
+                                SHELL_ENVIRONMENT_TIMEOUT.as_secs()
+                            );
+                            None
+                        }
                     };
+
+                    log::info!(
+                        "quiet-ui perf: shell environment for {:?} waited {:.0}ms for a turn, \
+                         then took {:.0}ms",
+                        abs_path,
+                        queued_for.as_secs_f64() * 1000.0,
+                        started_at.elapsed().as_secs_f64() * 1000.0,
+                    );
 
                     if let Some(shell_env) = shell_env.as_mut() {
                         let path = shell_env
@@ -245,8 +365,11 @@ impl ProjectEnvironment {
                     shell_env
                 })
                 .shared()
-            })
-            .clone()
+        };
+        cx.default_global::<SharedLocalEnvironments>()
+            .0
+            .insert(key, capture.clone());
+        capture
     }
 
     pub fn remote_directory_environment(
