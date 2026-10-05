@@ -13,7 +13,7 @@ names are the stable anchors; line numbers drift with every rebase and are not u
 ## Upstream first (from 2026-10-01)
 
 The fork stands at +45.3k / -11.4k lines across 108 files against upstream (+40.4k / -9.4k
-without this file and the sidebar test files). It was +44.8k / -11.3k across 107 files at the
+without this file and the sidebar test files; the exact figures on 10-05 were +45,318 / -11,354). It was +44.8k / -11.3k across 107 files at the
 start of 2026-10-05, +42.9k / -11.2k at the start of 2026-10-04, and +42.0k / -10.7k on
 2026-10-02. So it has gone **up** three nights running, by 0.5k on 10-05, and each time because a
 Work queue entry asked for the lines: 10-05's are three built items and their tests. The 108th
@@ -287,7 +287,12 @@ commit's own copy of the file wholesale.
 **Markerless drift.** Signature changes carry no conflict markers, so `cargo check --all-targets`
 right after the replay is the real check, not the conflict count. Past examples:
 `render_sandbox_not_applied_warning` becoming a data struct, `DiffStats::single_file` losing its
-buffer/cx arguments, `RelPath` moving to its own crate.
+buffer/cx arguments, `RelPath` moving to its own crate. **A workspace check that fails early has
+not checked the workspace**: cargo stops at the broken crate and nothing downstream of it is
+looked at, so the fix is followed by another *workspace* check, never just the crate that failed
+(learned on 10-04, repeated on 10-05). And not all of it is a signature: an attribute the replay
+drops — a fork `#[ignore]`, say — compiles perfectly and surfaces only as a test failure that
+reads like new work (10-05).
 
 **Adopt rather than defend.** When upstream replaces one of our helpers with a richer equivalent,
 take theirs (test-gated if we do not surface it) — e.g. `scroll_to_user_message_index` replacing
@@ -2238,6 +2243,49 @@ look half — making a subagent a chip in the run, where today it deliberately f
 full card rendering — is a second change in `chips.rs`, and the entry asks for both. Starting it
 with an hour left would have meant committing one half, which is the same as not doing it.
 
-**The gate.** `cargo test` and `./script/clippy` for `acp_thread`, `agent_ui`, `sidebar`, `ui` and
-`gpui` — the three core crates plus the two the night touched. The Verification queue was empty
-when the night started and is empty now.
+**The gate: green, and it found three things the checks had not.** `cargo test` and
+`./script/clippy` for `acp_thread`, `agent_ui`, `sidebar`, `ui` and `gpui` — the three core crates
+plus the two the night touched. 1,635 tests pass (acp_thread 350, agent_ui 545 with 35 ignored,
+sidebar 194, ui 91, gpui 454 plus its one integration target with 2 ignored) and clippy comes back
+**exit 0 with no warnings at all** under `--deny warnings`. The Verification queue was empty when
+the night started and is empty now.
+
+Everything the gate caught was the rebase's, not the night's work, and each was attributed by
+reverting the three built items and re-running the two failures against the bare replay — both
+still failed, which is what makes that claim worth anything.
+
+- **`sidebar`'s suite would not compile.** `draft_prompt_store::write` takes v2 blocks after the
+  night's drift fix and the fork's own tests handed it v1, in two places. **And this is the 10-04
+  lesson repeating itself in the same shape**: the first workspace check stopped at `agent_ui`, so
+  nothing downstream of `agent_ui` was compiled, and `sidebar` is downstream. After fixing
+  `agent_ui` the check that was re-run was `cargo check -p agent_ui`, not the workspace — so the
+  gate was the first thing to look at this crate, forty minutes later. **The rule is not "re-run
+  the failing crate"; it is "re-run the workspace", because a crate that fails to compile hides
+  everything that depends on it.** Run on a quiet tree at the end,
+  `cargo check --workspace --all-targets` came back exit 0 with zero errors and zero warnings.
+- **The `sidebar_tests.rs` union put back an import the fork had deliberately removed.**
+  Upstream's side of that region was two imports and only one of them was new;
+  `agent_settings::AgentSettings` has been there since before the merge base and serves
+  `set_max_idle_retained_threads`, a helper the fork dropped along with the nine tests that call
+  it (the fork's copy of that file is some 986 lines shorter than upstream's, and has been since
+  before tonight). A union is the right resolution for an append/append, but it takes *upstream's
+  new line*, not everything on upstream's side of the marker.
+- **A replayed `#[ignore]` went missing with no marker and no compile error.**
+  `test_external_file_drop_on_thread_does_not_paste_into_later_terminal` carried
+  `#[ignore = "pre-existing base-view degradation on the quiet-ui fork (threads live in tabs, not
+  the panel base view)"]`, the same note five other tests in that file carry, and the replay
+  dropped the attribute while keeping the test. It reads exactly like a new failure. **Worth
+  adding to the markerless-drift list above: a lost attribute is the quietest kind, because
+  `cargo check` cannot see it and the test it belongs to starts failing for a reason that looks
+  like tonight's work.** Restored.
+
+And one thing the gate turned into a decision rather than a fix.
+`test_unsupported_composer_draft_preserves_source_until_discard` is **new in upstream this round**
+and it tests a feature, not a detail: a draft whose resolution fails leaves the composer read-only,
+and the only way back out is an explicit "Discard draft" control, which upstream puts in the
+thread-controls row — the one surface this fork replaces wholesale. Deleting the stranded binding,
+which is what this log says to do with that seam, would have deleted a way out of a stuck composer
+and left the user with no way back. **Adopted instead**, into the status bar the fork draws in that
+row's place, keeping upstream's `discard-protected-draft` selector so upstream's test is the test.
+That is the seam rule's other half earning its place: take ours for the *surface*, but look at what
+upstream put in it before throwing the contents away.
