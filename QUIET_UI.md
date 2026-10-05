@@ -12,14 +12,16 @@ names are the stable anchors; line numbers drift with every rebase and are not u
 
 ## Upstream first (from 2026-10-01)
 
-The fork stands at +45.3k / -11.4k lines across 108 files against upstream (+40.4k / -9.4k
-without this file and the sidebar test files; the exact figures on 10-05 were +45,318 / -11,354). It was +44.8k / -11.3k across 107 files at the
+The fork stands at +45.8k / -11.4k lines across 109 files against upstream (+40.9k / -9.4k
+without this file and the sidebar test files; the exact figures on 10-05 were +45,792 / -11,354). It was +44.8k / -11.3k across 107 files at the
 start of 2026-10-05, +42.9k / -11.2k at the start of 2026-10-04, and +42.0k / -10.7k on
-2026-10-02. So it has gone **up** three nights running, by 0.5k on 10-05, and each time because a
-Work queue entry asked for the lines: 10-05's are three built items and their tests. The 108th
-file is the one new seam of the night — `gpui/src/elements/list.rs`, which now reports an item
-that lays out taller than the height the list remembered, because five reports of pictures
-painting over chips arrived with no line to grep for. Every line is still rebase cost and a place
+2026-10-02. So it has gone **up** three nights running, by 1.0k on 10-05, and each time because a
+Work queue entry asked for the lines: 10-05's are four built items and their tests. Two new seams
+this night, both asked for: `gpui/src/elements/list.rs`, which now reports an item that lays out
+taller than the height the list remembered (five reports of pictures painting over chips arrived
+with no line to grep for), and `README.md`, which carries the review banner `CLAUDE.md` requires
+of any session that touches source — that one is not the fork's idea and will conflict every
+rebase until it is removed by hand. Every line is still rebase cost and a place
 for bugs, and not all of it was asked for. Arthur's rule: **upstream wins by default, and the
 fork carries a change only with an explicit reason.** An explicit reason is that Arthur asked for it (a Work
 queue entry or a request recorded in this file), or that something he asked for needs it.
@@ -91,7 +93,11 @@ archived. The only worktree anything reclaims is a spare nobody was handed. A ru
 what it is running as one pill on its row — the spinner, the commands still going and the
 subagents still out, Claude's `Agent` and `Task` calls among them (2026-10-04) —
 `agent_activity_pill` in `ui/components/ai/thread_item.rs`, which the thread's own bottom bar
-draws too.
+draws too. A subagent Claude backgrounded is counted from its own lifecycle rather than from the
+call that launched it (2026-10-05): Zed advertises the AIR `nativeSubagentSessions` capability
+(`agent_servers/src/acp.rs`), `apply_subagent_update` there reads the reports back, and
+`AcpThread`'s `Subagent` records hold the state the pill counts and the chip spins on — which is
+what keeps three parallel reviews counted after the turn that launched them has ended.
 
 **Threads as tabs.** `agent_ui/thread_tab.rs` wraps a `ConversationView` as a pane item in the
 agent panel's own pane, `thread_tab_registry.rs` is the window-spanning ordered list the sidebar
@@ -104,7 +110,9 @@ close come from — all of it upstream's `Pane`, not fork code.
 
 **The thread view.** `agent_ui/conversation_view/thread_view.rs` with
 `thread_view/chips.rs`: a tool call reads as a quiet one-line chip saying what happened rather
-than that a tool ran. The command parser behind the labels is `acp_thread/command_parse.rs`
+than that a tool ran. A subagent is one of those chips too (2026-10-05), with the task it was
+given as its label and its status from its own reported lifecycle; it used to fall through to the
+full-width card that everything which is not a chip gets, which broke the run around it. The command parser behind the labels is `acp_thread/command_parse.rs`
 (what a shell line actually did: the acts in a pipeline, a devshell handover, a heredoc that is
 data and not shell) and `acp_thread/command_output.rs` reads results back out of what a command
 printed. `thread_view/bookmarks.rs` marks places in a long thread,
@@ -159,85 +167,48 @@ does is removed as it lands.
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
-**Claude's subagents: render them as chips, and count the ones still running after the turn.**
+**The two memory baselines: ~4,000 command terminals twice over, and ~17,925 `Markdown`. Read on
+2026-10-05; both need a design decision rather than a patch, and neither is where the entry
+thought.**
 
-Arthur's screenshot (2026-10-05): three Claude subagents ("Reuse review of flush cuts",
-"Simplification and altitude review", "Efficiency review of flush cuts"), launched together.
-Each is drawn as a full-width filled card with a check mark, indented and spaced apart, which
-breaks the chip run around it (`git add | git HEAD | wc …` above, `Read 1 file, searched 2
-places` below). And the activity pill never counted them. Two things to fix:
+The numbers and the session they came from are in the 10-05 rebase log entry. What that night
+established by reading the code, so this does not have to be rediscovered:
 
-1. **The look.** Subagents fall out of the chip run on purpose ("Permission prompts and subagents
-   are not chips and fall through to their full rendering"). Make a subagent a chip in the run
-   like any other action: the agent glyph, the subagent's task name, and its status (spinner
-   while running, check or cross when done). Clicking it expands the subagent's output or
-   transcript below the chips, the way other chips expand. Parallel subagents sit side by side in
-   the run's row.
+- **The terminals are real and the proposed fix is not small.** A thread loaded from history
+  carries `ToolCallContent::Terminal` for every command it ever ran, and
+  `AcpThread::ensure_tool_content_terminal` builds one for each as the content is prepared. It
+  already takes the cheap road — `TerminalBuilder::new_display_only`, so there is no PTY and no
+  process — but it still creates an alacritty grid and an `acp_thread::Terminal` to wrap it, which
+  is the `Terminal 4028, Terminal 4017` pair in the census. "Don't build `terminal::Terminal` for a
+  command whose exit is already known" means `acp_thread::Terminal::terminal` becomes an `Option`,
+  and `Terminal::terminal()` has **44 callers outside the terminal crate**, nearly all of them in
+  code the fork does not own. Making the creation lazy instead moves the same problem to
+  `ToolCall::terminals()`, which would hand back an id rather than an entity. Either way it is a
+  change to the shape of upstream's thread data, which wants a night and a decision about where a
+  finished command's text lives — not an evening's patch. The entry's own measurement is also
+  outside the sandbox: whether 8,000 entities actually go needs two `entities live` lines from a
+  real session.
+- **The sweep structurally cannot release the `Markdown`, so "release it with the views" is not the
+  fix.** The entry guesses the `Markdown` "may be owned by entry state that stays". It is not owned
+  by entry state at all: `EntryViewState` holds no `Markdown`, and every one of them hangs off the
+  *thread's* entries — `ToolCall::label`, `ToolCall::raw_input_markdown`, the error markdown,
+  `AssistantMessage`'s chunks, and `Terminal::command`. That is why the sweep took `TerminalView`
+  and `BlinkManager` out of the top ten and left `Markdown` at 17,925: it is a view-level mechanism
+  and this is thread data. Releasing it means thread entries dropping parsed markdown and
+  re-parsing from the source they already keep, which is the same kind of change as the terminals
+  above and runs into the same non-optional fields.
+- **`environment.rs:303` is not running twice for the same directory.** `local_directory_environment`
+  caches on `(shell, abs_path)` in a global, and the insert happens on the foreground thread
+  *before* the capture is awaited, so two callers for one key cannot both miss. Two 870ms hangs at
+  that line are two different directories, one shell each, already serialised behind
+  `SHELL_ENVIRONMENT_CAPTURES` and already timed out. Nothing to fix; the cost is one shell spawn
+  per distinct worktree at launch.
 
-2. **The count, and the check marks.** The checks are the `Agent` tool calls' own status, and
-   10-04's pill fix counts a subagent only while its call is in flight *and* a turn is running.
-   Claude launches background subagents the way it backgrounds commands: the `Agent` call
-   completes at once, the turn can end, and the subagents keep working. So they show as done and
-   count as zero. The Claude adapter (0.85.1, `dist/native-subagents.js`) reports their real
-   lifecycle only to clients that advertise subagent support: either ACP's `subagents` client
-   capability (see `clientSupportsSubagents` in `dist/acp-subagents.js`) or the AIR
-   `nativeSubagentSessions` capability, the same `_meta.jetbrains.air` mechanism as
-   `asyncTasks`. Zed advertises neither. With it, the adapter sends `subagent_spawned`
-   (`subagentSessionId`, `name`, `task`, `prompt`) and `subagent_state_update` (`state`) on the
-   parent session, and the subagent's work as its own session. `AcpThread::subagent_spawned`
-   already exists (upstream's), so start from what upstream does with it. Advertise the
-   capability, track each subagent's state from those updates, count live ones in
-   `running_work` whether or not a turn is running, drop them on a terminal state or when the
-   session closes, and drive the chip's status from that state rather than from the `Agent`
-   call's.
-
-Test: a Claude turn that launches three background subagents and ends. The pill shows 3 after
-the turn ends, the chips show spinners, and both drop as each subagent reports done.
-
-**The leak and the perf pass: the after-numbers are in. The leak is fixed; two baselines are left.**
-
-From Arthur's session on 2026-10-05, 12:58 to 14:09 local (build of 10-04):
-
-- **Entities level off now instead of climbing.** Startup loads to 47,361 by 13:26, then
-  47,365 at 13:39, 47,716 at 14:07 and 47,996 at 14:09, while he works: about 15 a minute,
-  mostly `Markdown` and terminals from new output. Before, it was 111k at 10:03 and 119k at
-  11:10, climbing all day. Latest line: `47996 entities live; largest: Markdown 17925, Buffer 4324,
-  Terminal 4028, Terminal 4017, DisplayMap 2168, MultiBuffer 2168, WrapMap 2168, BlinkManager
-  1869, Editor 1858, SharedScrollAnchor 1855`. `TerminalView` is out of the top ten
-  (`BlinkManager` went from 13,367 to 1,869).
-- `gpui holds 14988 observers over 14413 entities, 14859 listeners over 9227, 2289 release
-  observers, 18206 global observers, 28085 focus handles`, down from 46,684 observers and 81,694
-  focus handles.
-- Resident memory: 92MB at start, peaking at 602MB, 145MB at 14:04. Before, it swung from 204MB
-  to 1594MB.
-- The sweep runs: 98 `dropped the views of 1 off-screen threads` lines in 71 minutes.
-- Sidebar: `sidebar rebuilt 377 rows in 3ms, over 718 rebuilds nobody felt (607 of them built
-  the list that was already there) costing 1002ms in all; asked for by sidebar.rs:1287 610,
-  sidebar.rs:2496 50, sidebar.rs:972 44, sidebar.rs:1125 12`. That is about 1.4ms a rebuild,
-  and a line every 9 to 10 minutes, so roughly 0.2% of the foreground. `:1287`
-  (`AgentPanelEvent::EntryChanged`) is still 85% no-op. Cheap now, so it is only worth fixing if
-  the fix is small.
-- Hangs now name real call sites, no `executor.rs:143`. Most were at startup (12:58):
-  `project/src/environment.rs:303:26` twice, up to 870ms; `gpui_macos/src/window.rs:3190:10`
-  464ms; `extension_host/src/wasm_host.rs:584:18` 280ms; `session/src/session.rs:75:16` 222ms;
-  `project_panel/src/project_panel.rs:4554:39` 217ms; `workspace/src/workspace.rs:2187:12`
-  215ms. No foreground hangs.
-
-What is left, both baselines rather than leaks:
-1. **About 4,000 live command terminals after loading history**, twice over (`acp_thread`'s
-   `Terminal` and `terminal::Terminal`, a full alacritty grid each). The views are lazy now, but
-   every command restored from history still builds both models. A finished command needs its
-   captured output and exit status, not a terminal. Don't build `terminal::Terminal` for a
-   command whose exit is already known (anything replayed from history). Drop it once a live
-   command exits and its output is captured, and keep the captured text for the chip and
-   expansion.
-2. **17,925 `Markdown` at baseline**, one per rendered block of every loaded thread. Check
-   whether off-screen threads' sweep releases their `Markdown` too (it drops views; the
-   `Markdown` may be owned by entry state that stays), and release it with the views if not.
-3. Look at `environment.rs:303` (870ms in the background at startup) and see whether it is the
-   per-directory capture still running more than once at launch.
-
-Report the same lines before and after.
+So the thing both baselines share, and the thing worth deciding first: **the fork's remaining
+memory baseline is thread data, not view data.** The off-screen sweep got the view trees, which is
+what it is for and why the leak levelled off. Getting the rest means a thread entry being able to
+drop what it derived from its own source and rebuild it on demand, which is one mechanism that
+would serve the terminals and the markdown both, and is worth designing once rather than twice.
 
 ## Verification queue
 
@@ -2230,24 +2201,64 @@ and the wrong composition agree exactly, and the first version of this test pass
 formula. It now overrides those three with translucent values, as every real theme has them, and
 fails against the old formula on the first assertion.
 
-**What was not built: the subagent entry and the leak-and-perf entry, in that order, and the
-reason is the clock rather than either of them.** Both are still in the queue in Arthur's words.
-The subagent entry was read all the way through first, and it is correct about the mechanism and
-about where the work is: `client_capabilities_for_agent` in `agent_servers/src/acp.rs` already
-advertises the AIR extension with `asyncTasks` in its capability array, and
-`nativeSubagentSessions` goes in the same array; `handle_session_notification` already routes a
-raw `async_task_*` kind to `apply_async_task_update`, which is the template a `subagent_*` kind
-follows line for line; and `running_work` counts a subagent only while its `Agent` call is
-`InProgress`, which is why a backgrounded subagent counts zero. That is the lifecycle half. The
-look half — making a subagent a chip in the run, where today it deliberately falls through to its
-full card rendering — is a second change in `chips.rs`, and the entry asks for both. Starting it
-with an hour left would have meant committing one half, which is the same as not doing it.
+**Both remaining entries were then taken on after all, at Arthur's word.** The night had stopped
+at three items with the clock as the reason, and that reasoning was wrong in a way worth writing
+down: **the deadline is the gate, not the build.** A branch pushed after 00:45 is not a branch
+that misses — it is a branch the *next* build bundles, which costs a day of latency. A branch
+pushed ungated is the only thing that cannot be undone from the laptop. So "not enough time to
+gate it before the build" is a reason to push later, never a reason to leave an item unbuilt.
+
+*Claude's subagents, counted from their own lifecycle and drawn as chips.* The entry was right in
+every particular, including which mechanism to use. Zed now advertises
+`nativeSubagentSessions` beside `asyncTasks` in the AIR extension's capability array, which is
+what makes the adapter send anything at all, and `handle_session_notification` routes a raw
+`subagent_*` kind to a new `apply_subagent_update` exactly as it already routed `async_task_*`.
+`AcpThread` keeps a `Subagent` per reported session and counts the live ones whether or not a turn
+is running.
+
+Two decisions the entry did not have to make:
+
+- **The two ways of knowing about a subagent must not both count.** An agent that reports
+  lifecycles and a call that is still `InProgress` are the same subagent seen twice, and the pill
+  would have said two. A call whose subagent is reported on is counted from the report; a call
+  nobody reports on still has its own status read, which is all there was before and is what keeps
+  Codex's `spawn_agent` and Zed's own subagents counted. There is a test for exactly this, because
+  it is the kind of thing that reads correct and double-counts in practice.
+- **The chip's one icon slot carries the status, not an agent glyph.** The entry asks for "the agent
+  glyph, the subagent's task name, and its status". A chip has one icon slot, and which agent ran a
+  subagent is the same for every subagent in a run while whether it has finished is not — so the
+  slot spins while the subagent works and shows a check when it is done, and the glyph is the part
+  that went. Removing `!tool_call.is_subagent()` from `is_chip_entry` is the whole of the "stop
+  drawing them as full-width cards" half; the card was never chosen, it was what everything that is
+  not a chip falls through to.
+
+*The memory baselines: nothing built, and all three parts resolved by reading.* This is the one
+place the queue entry turned out to be wrong rather than merely hard, so the Work queue entry has
+been rewritten around what the code says instead of being left as Arthur wrote it. In short: the
+sweep **cannot** release the 17,925 `Markdown`, because `EntryViewState` holds none of them and
+every one hangs off the thread's own entries; `environment.rs:303` is **not** running twice for one
+directory, because the capture is cached on `(shell, path)` and inserted before it is awaited; and
+the terminals are real but the fix is not small — `acp_thread::Terminal::terminal()` has 44 callers
+outside the terminal crate, so making it optional is a change to the shape of upstream's thread
+data rather than a patch, and whether 8,000 entities actually go cannot be checked from here
+anyway. What the three share is the finding worth keeping: **the fork's remaining baseline is
+thread data, not view data**, and one mechanism for a thread entry to drop what it derived and
+rebuild it on demand would serve the terminals and the markdown both. That is a night with a design
+decision in it, which is what the rewritten entry now says.
+
+**One line of fork diff that is not the fork's idea.** `CLAUDE.md` carries a hard rule that any
+session touching source files must prepend a two-line review-confirmation banner to `README.md`,
+and it is explicit that the agent must never remove it — that is the human author's step. So
+`README.md` now carries those two lines on this branch. It is upstream-owned and it will conflict
+every rebase until Arthur removes it, which is worth knowing before wondering where it came from.
 
 **The gate: green, and it found three things the checks had not.** `cargo test` and
 `./script/clippy` for `acp_thread`, `agent_ui`, `sidebar`, `ui` and `gpui` — the three core crates
-plus the two the night touched. 1,635 tests pass (acp_thread 350, agent_ui 545 with 35 ignored,
-sidebar 194, ui 91, gpui 454 plus its one integration target with 2 ignored) and clippy comes back
-**exit 0 with no warnings at all** under `--deny warnings`. The Verification queue was empty when
+plus the three the night touched. 1,695 tests pass (acp_thread 352, agent_servers 58, agent_ui 545
+with 35 ignored, sidebar 194, ui 91, gpui 454 plus its one integration target with 2 ignored) and
+clippy comes back **exit 0 with no warnings at all** under `--deny warnings`. Those are the
+figures after the subagent work; the gate was run twice, the first time over the first three
+items. The Verification queue was empty when
 the night started and is empty now.
 
 Everything the gate caught was the rebase's, not the night's work, and each was attributed by
