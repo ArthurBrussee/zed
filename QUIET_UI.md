@@ -193,6 +193,30 @@ item starts below the bottom of the lower picture. The four previous attempts ea
 sizing rule and passed tests that never streamed a second entry into a run that was already
 measured.
 
+**The sidebar row still shows a gradient block next to the pill when the row is selected and
+running.**
+
+Arthur's screenshot (2026-10-05): the new pill is right, but on a selected, running row a
+rectangle of a slightly different blue sits just left of it. That is a `GradientFade` whose
+colours don't match what the row actually paints. In `ThreadItem::render`
+(`crates/ui/src/components/ai/thread_item.rs`), the fade colours are worked out as
+`apparent_bg` = `background.blend(raw_bg)`, plus `accent.opacity(0.08)` when running, plus
+`ghost_element_selected` when selected (`base_bg`), and the same running-tinted `apparent_bg`
+plus `ghost_element_hover` / `ghost_element_active` for `hover_bg` / `active_bg`. The row
+itself paints differently:
+- `.when(running && !self.selected, accent wash)` drops the running wash on a selected row, but
+  `base_bg` keeps it;
+- `.hover(...)` and `.active(...)` replace the row's background, wash included, but `hover_bg`
+  and `active_bg` keep the wash.
+
+So every selected-and-running, and every hovered-and-running, row draws its fades in a colour
+the row isn't. Compute one opaque colour per state (rest, hover, active) from exactly the layers
+the row paints in that state, and use those same values for the row's own background and for
+every `GradientFade` on it: the title fade and the action-slot fade. If the fades can't match
+cheaply, drop them and let the title truncate with an ellipsis. Test: for each combination of
+selected, running and state (rest, hover, active), the fade's colour equals the row's painted
+colour.
+
 **The leak and the perf pass: the fixes are in, and the numbers that say whether they worked are not.**
 
 Everything those entries asked for was built on 2026-10-02 (see that night's rebase log
