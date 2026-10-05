@@ -153,6 +153,36 @@ does is removed as it lands.
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**`+` opens the new worktree with no thread, showing "Worktree is open in another workspace".
+Broken core workflow; do this first.**
+
+Arthur, 2026-10-05 14:29: clicked `+`. The worktree was claimed from the spare (`dense-stoat`),
+the window was up in 369ms and the workspace opened in 2.6s, but the panel showed the
+`ForeignThreadTab` placeholder "Worktree is open in another workspace" instead of a thread. He
+clicked `+` again and got a second worktree (`stony-obsidian`) the same way.
+
+Cause: `AgentPanel::create_new_worktree_thread` only creates the worktree workspace
+(`create_worktree_workspace_foreground`). It never creates a thread. It relied on the new
+workspace's panel load path calling `ensure_pane_has_thread_tab` to make a draft, and the
+"no more drafts" change (fca3d9dcc6, 10-02) removed that, as the entry asked. Nothing replaced
+it on the `+` path. The new workspace's pane is left holding only the `ForeignThreadTab`
+proxies mirrored from other workspaces, and one of them is the active item. "Normally never
+visible" assumed activation would redirect, but nothing activates it.
+
+Fix:
+- `create_new_worktree_thread`, once the workspace task resolves, creates a thread in the *new*
+  workspace's panel: a real thread with a persisted row, the default agent (Claude, with its
+  configured mode), activated and with the message editor focused. Check the other "new thread in
+  this worktree" paths (the worktree header's `+`, the sidebar row's "New Thread in This
+  Worktree") for the same gap.
+- A pane must never show a `ForeignThreadTab` as its active item. If a proxy ends up active with
+  no local thread, activate a local thread if there is one, otherwise show upstream's empty
+  panel state, never the placeholder.
+- Test the whole flow: `+` from a workspace with other threads open, then assert the new
+  workspace's panel shows a local `ThreadTab` that is active and focused, its sidebar row
+  exists, and the agent is the default one. Do the same with the new workspace opened while its
+  pane already mirrors foreign proxies.
+
 **Images still paint over the chips and over each other. Fifth report; this time there is a code
 path for it.**
 
