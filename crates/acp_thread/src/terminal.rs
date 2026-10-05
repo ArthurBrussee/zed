@@ -1,12 +1,19 @@
 use agent_client_protocol::schema::{MaybeUndefined, v1 as acp_v1, v2 as acp_v2};
 use anyhow::{Result, bail};
 use collections::HashMap;
-use futures::{FutureExt as _, future::Shared};
-use gpui::{App, AppContext, AsyncApp, Context, Entity, Task};
+use futures::{FutureExt as _, StreamExt as _, future::Shared};
+use git::{
+    repository::RepoPath,
+    status::{DiffStat, FileStatus},
+};
+use gpui::{App, AppContext, AsyncApp, Context, Entity, Subscription, Task};
 use http_proxy::Allowlist;
 use language::LanguageRegistry;
 use markdown::Markdown;
-use project::Project;
+use project::{
+    Project, ProjectPath,
+    git_store::{Repository, RepositoryEvent},
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap as StdHashMap,
@@ -16,7 +23,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant, SystemTime},
 };
 use task::Shell;
 use util::get_default_system_shell_preferring_bash;
@@ -399,6 +406,244 @@ pub(crate) async fn prepare_sandbox_wrap(
     ))
 }
 
+/// How long to wait after a command exits for the repository's first status
+/// event: statuses arrive on debounced filesystem events.
+const FIRST_CHANGE_TIMEOUT: Duration = Duration::from_secs(6);
+/// How long the repository must stay quiet, once something was reported.
+const QUIET_AFTER_CHANGE: Duration = Duration::from_millis(750);
+const SETTLE_ROUNDS: usize = 30;
+/// Slack around the command's run for file timestamps.
+const WRITE_WINDOW_GRACE: Duration = Duration::from_secs(2);
+/// Caps on the before-text kept for already-dirty files, so a worktree full of
+/// large dirty files does not make every command cost megabytes to start.
+const MAX_PRE_COMMAND_FILES: usize = 16;
+const MAX_PRE_COMMAND_BYTES: usize = 512 * 1024;
+const MAX_OUTPUT_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
+
+/// A file a command changed, as the repository saw it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChangedFile {
+    pub path: ProjectPath,
+    pub added: u32,
+    pub deleted: u32,
+    /// Whether the file already had uncommitted changes when the command
+    /// started, so its diff against HEAD is not all the command's.
+    pub pre_command_dirty: bool,
+    /// What an already-dirty file held when the command started, unless it
+    /// was too large or unreadable to keep.
+    pub pre_command_text: Option<Arc<str>>,
+}
+
+/// The diff stat is included because an already-modified file keeps its
+/// status when changed again.
+type StatusSnapshot = HashMap<RepoPath, (FileStatus, Option<DiffStat>)>;
+
+fn status_snapshot(repository: &Entity<Repository>, cx: &App) -> StatusSnapshot {
+    repository
+        .read(cx)
+        .cached_status()
+        .map(|entry| (entry.repo_path, (entry.status, entry.unstaged_diff_stat)))
+        .collect()
+}
+
+struct RepositoryWatch {
+    repository: Entity<Repository>,
+    project: Entity<Project>,
+    fs: Arc<dyn project::Fs>,
+    baseline: StatusSnapshot,
+    pre_command_text: Shared<Task<Arc<HashMap<RepoPath, Arc<str>>>>>,
+    started_at: SystemTime,
+    candidates: Vec<(RepoPath, DiffStat)>,
+    reported: Vec<ChangedFile>,
+}
+
+/// Reads the already-dirty files before the command overwrites them; for a
+/// clean file HEAD is the before-text.
+fn capture_pre_command_text(
+    baseline: &StatusSnapshot,
+    repository: &Entity<Repository>,
+    project: &Entity<Project>,
+    fs: Arc<dyn project::Fs>,
+    cx: &App,
+) -> Task<Arc<HashMap<RepoPath, Arc<str>>>> {
+    let mut paths: Vec<(RepoPath, PathBuf)> = {
+        let repo = repository.read(cx);
+        baseline
+            .keys()
+            .filter_map(|repo_path| {
+                let path = repo.repo_path_to_project_path(repo_path, cx)?;
+                let worktree = project.read(cx).worktree_for_id(path.worktree_id, cx)?;
+                Some((repo_path.clone(), worktree.read(cx).absolutize(&path.path)))
+            })
+            .collect()
+    };
+    // Sorted so the cap keeps a deterministic set.
+    paths.sort_by(|(left, _), (right, _)| left.cmp(right));
+    paths.truncate(MAX_PRE_COMMAND_FILES);
+
+    cx.background_spawn(async move {
+        let mut captured: HashMap<RepoPath, Arc<str>> = HashMap::default();
+        for (repo_path, abs_path) in paths {
+            if let Ok(text) = fs.load(&abs_path).await
+                && text.len() <= MAX_PRE_COMMAND_BYTES
+            {
+                captured.insert(repo_path, text.as_str().into());
+            }
+        }
+        Arc::new(captured)
+    })
+}
+
+impl RepositoryWatch {
+    /// `ended_at` is `None` while the command is still running.
+    async fn refresh(
+        &mut self,
+        ended_at: Option<SystemTime>,
+        terminal: &gpui::WeakEntity<Terminal>,
+        cx: &mut AsyncApp,
+    ) {
+        let repository = self.repository.clone();
+        let baseline = &self.baseline;
+        let mut changed: Vec<(RepoPath, DiffStat)> = cx.update(|cx| {
+            status_snapshot(&repository, cx)
+                .iter()
+                .filter(|(path, state)| baseline.get(*path) != Some(state))
+                .map(|(path, (_, stat))| {
+                    let before = baseline.get(path).and_then(|(_, stat)| *stat);
+                    (path.clone(), stat_delta(before, *stat))
+                })
+                .collect()
+        });
+        changed.sort_by(|(left, _), (right, _)| left.cmp(right));
+        if changed == self.candidates {
+            return;
+        }
+        self.candidates = changed;
+
+        let pre_command_text = self.pre_command_text.clone().await;
+
+        let project = self.project.clone();
+        let candidates: Vec<(ChangedFile, PathBuf)> = cx.update(|cx| {
+            let repository = repository.read(cx);
+            self.candidates
+                .iter()
+                .filter_map(|(repo_path, delta)| {
+                    let path = repository.repo_path_to_project_path(repo_path, cx)?;
+                    let worktree = project.read(cx).worktree_for_id(path.worktree_id, cx)?;
+                    let abs_path = worktree.read(cx).absolutize(&path.path);
+                    let pre_command_dirty = baseline
+                        .get(repo_path)
+                        .and_then(|(_, stat)| *stat)
+                        .is_some_and(|stat| stat.added + stat.deleted > 0);
+                    Some((
+                        ChangedFile {
+                            path,
+                            added: delta.added,
+                            deleted: delta.deleted,
+                            pre_command_dirty,
+                            pre_command_text: pre_command_dirty
+                                .then(|| pre_command_text.get(repo_path).cloned())
+                                .flatten(),
+                        },
+                        abs_path,
+                    ))
+                })
+                .collect()
+        });
+
+        // Status events lag the filesystem, so edits from just before or after
+        // the command still arrive during the watch. A file's mtime tells them
+        // apart.
+        let ended_at = ended_at.unwrap_or_else(SystemTime::now);
+        let window = self
+            .started_at
+            .checked_sub(WRITE_WINDOW_GRACE)
+            .unwrap_or(self.started_at)
+            ..=ended_at.checked_add(WRITE_WINDOW_GRACE).unwrap_or(ended_at);
+        let fs = self.fs.clone();
+        let confirmed = cx
+            .background_spawn(async move {
+                let mut confirmed = Vec::new();
+                for (file, abs_path) in candidates {
+                    // No metadata: deleted, which is worth reporting.
+                    let within = match fs.metadata(&abs_path).await {
+                        Ok(Some(metadata)) => window.contains(&metadata.mtime.timestamp_for_user()),
+                        _ => true,
+                    };
+                    if within {
+                        confirmed.push(file);
+                    }
+                }
+                confirmed
+            })
+            .await;
+        if confirmed == self.reported {
+            return;
+        }
+        self.reported = confirmed.clone();
+
+        terminal
+            .update(cx, |terminal, cx| {
+                terminal.changed_files = confirmed;
+                cx.notify();
+            })
+            .ok();
+    }
+}
+
+/// The growth of a file's unstaged diff stat while the command ran.
+fn stat_delta(before: Option<DiffStat>, after: Option<DiffStat>) -> DiffStat {
+    let before = before.unwrap_or_default();
+    let after = after.unwrap_or_default();
+    DiffStat {
+        added: after.added.saturating_sub(before.added),
+        deleted: after.deleted.saturating_sub(before.deleted),
+    }
+}
+
+/// Tagged `bash` so every command gets shell syntax highlighting.
+fn command_markdown(command: &str) -> String {
+    format!("```bash\n{command}\n```")
+}
+
+/// Whether it is worth watching the repository around this command. A line
+/// that moves the branch or discards the worktree wholesale is not: its
+/// changes cannot be told apart from the rest of the line's.
+fn command_may_write(command: &str) -> bool {
+    use crate::command_parse::{DestructiveOperation, GitOperation, SegmentKind};
+
+    let mut may_write = false;
+    for segment in &crate::command_parse::parse_command(command).segments {
+        match &segment.kind {
+            SegmentKind::Git {
+                operation: GitOperation::Modify,
+                ..
+            } => return false,
+            SegmentKind::Destructive {
+                operation: DestructiveOperation::DiscardChanges,
+                paths,
+            } if paths.is_empty() => return false,
+
+            SegmentKind::Noop
+            | SegmentKind::Read { .. }
+            | SegmentKind::Search { .. }
+            | SegmentKind::ListDirectory { .. }
+            | SegmentKind::Lookup { .. }
+            | SegmentKind::CountLines { .. }
+            | SegmentKind::Wait { .. }
+            | SegmentKind::Git { .. } => {}
+
+            SegmentKind::WriteFile { .. }
+            | SegmentKind::EditInPlace { .. }
+            | SegmentKind::Destructive { .. }
+            | SegmentKind::InlineScript { .. }
+            | SegmentKind::GitHub { .. }
+            | SegmentKind::Run { .. } => may_write = true,
+        }
+    }
+    may_write
+}
+
 pub struct Terminal {
     id: acp_v1::TerminalId,
     command: Entity<Markdown>,
@@ -417,6 +662,14 @@ pub struct Terminal {
     /// sandboxed or after it finishes. Dropping it tears down the proxy on a
     /// background thread (see `sandbox::Sandbox`'s `Drop`).
     _sandbox: Option<SandboxConfigHandle>,
+    may_write: bool,
+    _repository_events: Option<Subscription>,
+    changed_files: Vec<ChangedFile>,
+    _changed_paths_task: Option<Task<()>>,
+    output_images: Vec<PathBuf>,
+    _output_images_task: Option<Task<()>>,
+    /// Comparable with file mtimes, unlike `started_at`.
+    started_at_wall: SystemTime,
 }
 
 enum TerminalExecution {
@@ -476,6 +729,14 @@ pub struct TerminalOutput {
     pub content_line_count: usize,
 }
 
+impl TerminalOutput {
+    /// A status with neither a code nor a signal is not a failure.
+    pub fn failed(&self) -> bool {
+        self.exit_status.exit_code.is_some_and(|code| code != 0)
+            || self.exit_status.signal.is_some()
+    }
+}
+
 impl Terminal {
     pub fn new(
         id: acp_v1::TerminalId,
@@ -506,7 +767,7 @@ impl Terminal {
             _sandbox: sandbox,
             command: cx.new(|cx| {
                 Markdown::new(
-                    format!("```\n{}\n```", command_label).into(),
+                    command_markdown(command_label).into(),
                     Some(language_registry.clone()),
                     None,
                     cx,
@@ -518,6 +779,13 @@ impl Terminal {
             output: None,
             output_byte_limit,
             user_stopped: Arc::new(AtomicBool::new(false)),
+            may_write: command_may_write(command_label),
+            _repository_events: None,
+            changed_files: Vec::new(),
+            _changed_paths_task: None,
+            output_images: Vec::new(),
+            _output_images_task: None,
+            started_at_wall: SystemTime::now(),
             execution: TerminalExecution::Process(
                 cx.spawn(async move |this, cx| {
                     let exit_status = command_task.await.map(Self::transform_exit_status);
@@ -533,6 +801,9 @@ impl Terminal {
                         );
                         this.terminal.update(cx, |terminal, _cx| {
                             terminal.release_pty_resources();
+                            // Otherwise each finished command keeps its whole
+                            // scrollback reservation while the thread is open.
+                            terminal.shrink_to_used();
                         });
                         // Free the sandbox (and its network proxy) as soon as
                         // the command finishes, rather than holding it until
@@ -567,7 +838,7 @@ impl Terminal {
             id,
             command: cx.new(|cx| {
                 Markdown::new(
-                    format!("```\n{}\n```", command_label.unwrap_or("Terminal")).into(),
+                    command_markdown(command_label.unwrap_or("Terminal")).into(),
                     Some(language_registry),
                     None,
                     cx,
@@ -586,6 +857,14 @@ impl Terminal {
             }),
             user_stopped: Arc::new(AtomicBool::new(false)),
             _sandbox: None,
+            // An unlabelled command might write; the label arrives too late.
+            may_write: command_label.is_none_or(command_may_write),
+            _repository_events: None,
+            changed_files: Vec::new(),
+            _changed_paths_task: None,
+            output_images: Vec::new(),
+            _output_images_task: None,
+            started_at_wall: SystemTime::now(),
         }
     }
 
@@ -605,6 +884,177 @@ impl Terminal {
                 bail!("Agent-provided terminals have no client-owned process to wait for")
             }
         }
+    }
+
+    /// Files this command changed, as the repository saw them.
+    pub fn changed_files(&self) -> &[ChangedFile] {
+        &self.changed_files
+    }
+
+    pub fn output_images(&self) -> &[PathBuf] {
+        &self.output_images
+    }
+
+    /// Pictures the command's output named that were written while it ran.
+    fn watch_output_images(&mut self, fs: Arc<dyn project::Fs>, cx: &mut Context<Self>) {
+        let Ok(exited) = self.wait_for_exit() else {
+            return;
+        };
+        let working_dir = self.working_dir.clone();
+        let started_at = self.started_at_wall;
+        self._output_images_task = Some(cx.spawn(async move |this, cx| {
+            exited.await;
+            let named = this
+                .read_with(cx, |this, _cx| {
+                    this.output
+                        .as_ref()
+                        .map(|output| crate::command_output::image_paths_in_output(&output.content))
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+            if named.is_empty() {
+                return;
+            }
+
+            let window = started_at
+                .checked_sub(WRITE_WINDOW_GRACE)
+                .unwrap_or(started_at)
+                ..=SystemTime::now()
+                    .checked_add(WRITE_WINDOW_GRACE)
+                    .unwrap_or_else(SystemTime::now);
+            let found = cx
+                .background_spawn(async move {
+                    let mut found = Vec::new();
+                    for name in named {
+                        let path = PathBuf::from(&name);
+                        let path = if path.is_absolute() {
+                            path
+                        } else if let Some(working_dir) = working_dir.as_ref() {
+                            working_dir.join(path)
+                        } else {
+                            continue;
+                        };
+                        let Ok(Some(metadata)) = fs.metadata(&path).await else {
+                            continue;
+                        };
+                        if metadata.is_dir
+                            || metadata.is_fifo
+                            || metadata.len > MAX_OUTPUT_IMAGE_BYTES
+                            || !window.contains(&metadata.mtime.timestamp_for_user())
+                        {
+                            continue;
+                        }
+                        found.push(path);
+                    }
+                    found
+                })
+                .await;
+            if found.is_empty() {
+                return;
+            }
+            this.update(cx, |this, cx| {
+                this.output_images = found;
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Records what the command changed, as whatever the repository status
+    /// says changed while it ran, rather than by reading the command. Cannot
+    /// see ignored files, files outside the repository, or another process
+    /// writing to the same worktree at the same time.
+    pub fn watch_repository(&mut self, project: Entity<Project>, cx: &mut Context<Self>) {
+        if !self.may_write {
+            return;
+        }
+
+        self.watch_output_images(project.read(cx).fs().clone(), cx);
+
+        // The innermost repository containing the working directory, so a
+        // command in a submodule is watched by the one it changes.
+        let git_store = project.read(cx).git_store().clone();
+        let containing = self.working_dir.as_ref().and_then(|working_dir| {
+            git_store
+                .read(cx)
+                .repositories()
+                .values()
+                .filter(|repository| {
+                    repository
+                        .read(cx)
+                        .abs_path_to_repo_path(working_dir)
+                        .is_some()
+                })
+                .max_by_key(|repository| repository.read(cx).work_directory_abs_path.clone())
+                .cloned()
+        });
+        let Some(repository) = containing.or_else(|| project.read(cx).active_repository(cx)) else {
+            return;
+        };
+        let Ok(exited) = self.wait_for_exit() else {
+            return;
+        };
+        let fs = project.read(cx).fs().clone();
+        let baseline = status_snapshot(&repository, cx);
+        let pre_command_text =
+            capture_pre_command_text(&baseline, &repository, &project, fs.clone(), cx).shared();
+        let mut watch = RepositoryWatch {
+            baseline,
+            pre_command_text,
+            fs,
+            repository: repository.clone(),
+            project,
+            started_at: SystemTime::now(),
+            candidates: Vec::new(),
+            reported: Vec::new(),
+        };
+
+        let (mut moved_tx, mut moved_rx) = futures::channel::mpsc::channel(1);
+        self._repository_events = Some(cx.subscribe(&repository, move |_, _, event, _| {
+            if matches!(event, RepositoryEvent::StatusesChanged) {
+                // A full channel already says the repository moved.
+                moved_tx.try_send(()).ok();
+            }
+        }));
+
+        self._changed_paths_task = Some(cx.spawn(async move |this, cx| {
+            let mut exited = exited.fuse();
+            let mut ended_at = None;
+
+            loop {
+                let listening = futures::select_biased! {
+                    _ = exited => {
+                        ended_at = Some(SystemTime::now());
+                        true
+                    }
+                    moved = moved_rx.next() => moved.is_some(),
+                };
+                watch.refresh(ended_at, &this, cx).await;
+                if ended_at.is_some() || !listening {
+                    break;
+                }
+            }
+            if ended_at.is_none() {
+                return;
+            }
+
+            // The last writes' status events land after the command ends.
+            for _ in 0..SETTLE_ROUNDS {
+                let quiet = if watch.reported.is_empty() {
+                    FIRST_CHANGE_TIMEOUT
+                } else {
+                    QUIET_AFTER_CHANGE
+                };
+                let moved = futures::select_biased! {
+                    moved = moved_rx.next() => moved.is_some(),
+                    _ = cx.background_executor().timer(quiet).fuse() => false,
+                };
+                if !moved {
+                    break;
+                }
+                watch.refresh(ended_at, &this, cx).await;
+            }
+        }));
     }
 
     pub fn kill(&mut self, cx: &mut App) {
@@ -771,10 +1221,7 @@ impl Terminal {
             if !command.is_undefined() {
                 state.command = DisplayCommand::Reported(command.take());
                 self.command.update(cx, |markdown, cx| {
-                    markdown.replace(
-                        format!("```\n{}\n```", state.command().unwrap_or("Terminal")),
-                        cx,
-                    );
+                    markdown.replace(command_markdown(state.command().unwrap_or("Terminal")), cx);
                 });
             }
             if !meta.is_undefined() {
@@ -861,7 +1308,7 @@ impl Terminal {
             state.command = DisplayCommand::LegacyCaption(label.to_owned());
         }
         self.command.update(cx, |command, cx| {
-            command.replace(format!("```\n{}\n```", label), cx);
+            command.replace(command_markdown(label), cx);
         });
     }
 
@@ -978,6 +1425,94 @@ pub(crate) fn disable_pagers_through_env(env: &mut collections::HashMap<String, 
     env.insert("PAGER".into(), "".into());
     // Override user core.pager (e.g. delta) which Git prefers over PAGER
     env.insert("GIT_PAGER".into(), "cat".into());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+    use serde_json::json;
+    use settings::SettingsStore;
+    use util::path;
+
+    #[gpui::test]
+    async fn a_dirty_file_keeps_what_the_command_found(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+        let fs = project::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "dirty.rs": "what the command found\n",
+                "clean.rs": "committed\n",
+            }),
+        )
+        .await;
+        fs.set_status_for_repo(
+            path!("/project/.git").as_ref(),
+            &[("dirty.rs", git::status::StatusCode::Modified.worktree())],
+        );
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        cx.run_until_parked();
+
+        let repository = project
+            .read_with(cx, |project, cx| project.active_repository(cx))
+            .expect("the project has a repository");
+        let baseline = cx.update(|cx| status_snapshot(&repository, cx));
+        let captured = cx
+            .update(|cx| capture_pre_command_text(&baseline, &repository, &project, fs.clone(), cx))
+            .await;
+
+        let dirty = RepoPath::new("dirty.rs").unwrap();
+        assert_eq!(
+            captured.get(&dirty).map(|text| text.to_string()),
+            Some("what the command found\n".to_string())
+        );
+        assert_eq!(captured.len(), 1, "a clean file needs nothing kept");
+    }
+
+    #[test]
+    fn a_line_that_moves_the_branch_is_not_watched() {
+        assert!(!command_may_write(
+            "git rebase --onto upstream/main HEAD~3 && cargo check -p acp_thread"
+        ));
+        assert!(!command_may_write("git stash && cargo test"));
+        assert!(!command_may_write(
+            "git reset --hard origin/main && cargo build"
+        ));
+        assert!(!command_may_write("git clean -fd"));
+        assert!(!command_may_write("git status --short"));
+
+        assert!(command_may_write("git checkout -- src/main.rs"));
+        assert!(command_may_write("cargo fmt --all"));
+        assert!(command_may_write("sed -i '' 's/a/b/' src/main.rs"));
+    }
+
+    #[test]
+    fn a_change_is_measured_from_where_the_file_already_was() {
+        let stat = |added, deleted| Some(DiffStat { added, deleted });
+
+        assert_eq!(
+            stat_delta(None, stat(7, 2)),
+            DiffStat {
+                added: 7,
+                deleted: 2
+            }
+        );
+
+        assert_eq!(
+            stat_delta(stat(10, 4), stat(13, 4)),
+            DiffStat {
+                added: 3,
+                deleted: 0
+            }
+        );
+
+        assert_eq!(stat_delta(stat(10, 4), stat(6, 4)), DiffStat::default());
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

@@ -13,7 +13,7 @@ use editor::{
 use futures::{AsyncReadExt as _, FutureExt as _, future::Shared};
 use gpui::{
     AppContext, ClipboardEntry, Context, Empty, Entity, EntityId, Image, ImageFormat, Img,
-    SharedString, Task, WeakEntity,
+    ObjectFit, SharedString, Task, WeakEntity,
 };
 use http_client::{AsyncBody, HttpClientWithUrl};
 use itertools::Either;
@@ -1433,7 +1433,16 @@ impl Render for ImageHover {
             div()
                 .p_1p5()
                 .elevation_2(cx)
-                .child(gpui::img(image).h_auto().max_w_96().rounded_sm())
+                // A definite box: `h_auto` let a tall image grow the card over
+                // what sat under it.
+                .child(
+                    div().w(rems(24.)).h(rems(18.)).child(
+                        gpui::img(image)
+                            .size_full()
+                            .object_fit(ObjectFit::Contain)
+                            .rounded_sm(),
+                    ),
+                )
                 .into_any_element()
         } else {
             gpui::Empty.into_any_element()

@@ -37,7 +37,7 @@ use gpui_util::post_inc;
 use gpui_util::{ResultExt, measure};
 use itertools::FoldWhile::{Continue, Done};
 use itertools::Itertools;
-use parking_lot::RwLock;
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use raw_window_handle::{HandleError, HasDisplayHandle, HasWindowHandle};
 use refineable::Refineable;
 use scheduler::Instant;
@@ -495,7 +495,27 @@ impl ArenaClearNeeded {
     }
 }
 
-pub(crate) type FocusMap = RwLock<SlotMap<FocusId, FocusRef>>;
+/// `dropped` lets [`App::release_dropped_focus_handles`], which runs once per effect, skip walking
+/// every handle when none was released.
+#[derive(Default)]
+pub(crate) struct FocusMap {
+    handles: RwLock<SlotMap<FocusId, FocusRef>>,
+    dropped: AtomicBool,
+}
+
+impl FocusMap {
+    pub(crate) fn read(&self) -> RwLockReadGuard<'_, SlotMap<FocusId, FocusRef>> {
+        self.handles.read()
+    }
+
+    pub(crate) fn write(&self) -> RwLockWriteGuard<'_, SlotMap<FocusId, FocusRef>> {
+        self.handles.write()
+    }
+
+    pub(crate) fn take_dropped(&self) -> bool {
+        self.dropped.swap(false, SeqCst)
+    }
+}
 pub(crate) struct FocusRef {
     pub(crate) ref_count: AtomicUsize,
     pub(crate) tab_index: isize,
@@ -661,12 +681,16 @@ impl Eq for FocusHandle {}
 
 impl Drop for FocusHandle {
     fn drop(&mut self) {
-        self.handles
+        let remaining = self
+            .handles
             .read()
             .get(self.id)
             .unwrap()
             .ref_count
             .fetch_sub(1, SeqCst);
+        if remaining == 1 {
+            self.handles.dropped.store(true, SeqCst);
+        }
     }
 }
 
@@ -7954,6 +7978,43 @@ mod tests {
                 .expect("inspect presented frame");
             assert!(callback_ran.get());
         }
+    }
+
+    #[gpui::test]
+    fn test_dropped_focus_handles_are_swept_and_held_ones_are_not(cx: &mut TestAppContext) {
+        let _window = cx.add_window(|_, _| EmptyView);
+
+        let before = cx.update(|cx| cx.callback_counts().focus_handles);
+        let held: Vec<FocusHandle> = cx.update(|cx| (0..4).map(|_| cx.focus_handle()).collect());
+        let dropped: Vec<FocusHandle> = cx.update(|cx| (0..4).map(|_| cx.focus_handle()).collect());
+        cx.update(|cx| {
+            assert_eq!(
+                cx.callback_counts().focus_handles,
+                before + 8,
+                "every handle should be in the map while it is held"
+            );
+        });
+
+        drop(dropped);
+        cx.update(|cx| cx.refresh_windows());
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            assert_eq!(
+                cx.callback_counts().focus_handles,
+                before + 4,
+                "the handles nobody holds should have left the map"
+            );
+        });
+        cx.update(|cx| {
+            assert!(
+                !cx.focus_handles.take_dropped(),
+                "a flush that dropped nothing should not arm the sweep"
+            );
+        });
+
+        assert_eq!(held.len(), 4, "the held handles are still held");
+        drop(held);
     }
 
     /// Visibility transitions reach observers exactly once each, with the new

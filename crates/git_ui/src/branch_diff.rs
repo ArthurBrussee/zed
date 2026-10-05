@@ -66,6 +66,24 @@ impl Addon for BranchDiffAddon {
             .read(cx)
             .status_for_buffer_id(buffer_id, cx)
     }
+
+    fn render_buffer_header_controls(
+        &self,
+        _: &multi_buffer::ExcerptBoundaryInfo,
+        buffer: &language::BufferSnapshot,
+        _: &Window,
+        _: &App,
+    ) -> Option<AnyElement> {
+        if !crate::generated_file::buffer_is_generated(buffer) {
+            return None;
+        }
+        Some(
+            Label::new("generated")
+                .size(LabelSize::XSmall)
+                .color(Color::Muted)
+                .into_any_element(),
+        )
+    }
 }
 
 impl BranchDiff {

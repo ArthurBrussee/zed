@@ -20,6 +20,15 @@ pub const CLAUDE_AGENT_ID: &str = "claude-acp";
 pub const CODEX_ID: &str = "codex-acp";
 pub const CURSOR_ID: &str = "cursor";
 
+pub fn agent_logo(agent_id: &str) -> IconName {
+    match agent_id {
+        CLAUDE_AGENT_ID => IconName::AiClaude,
+        CODEX_ID => IconName::AiOpenAi,
+        GEMINI_ID => IconName::AiGemini,
+        _ => IconName::Terminal,
+    }
+}
+
 /// A generic agent server implementation for custom user-defined agents
 pub struct CustomAgentServer {
     agent_id: AgentId,
@@ -37,7 +46,7 @@ impl AgentServer for CustomAgentServer {
     }
 
     fn logo(&self) -> IconName {
-        IconName::Terminal
+        agent_logo(self.agent_id.as_ref())
     }
 
     fn default_mode(&self, cx: &App) -> Option<acp::SessionModeId> {
@@ -48,9 +57,15 @@ impl AgentServer for CustomAgentServer {
                 .cloned()
         });
 
-        settings
+        let configured = settings
             .as_ref()
-            .and_then(|s| s.default_mode().map(acp::SessionModeId::new))
+            .and_then(|s| s.default_mode().map(acp::SessionModeId::new));
+
+        if configured.is_none() && self.agent_id().0.as_ref() == CLAUDE_AGENT_ID {
+            return Some(acp::SessionModeId::new("bypassPermissions"));
+        }
+
+        configured
     }
 
     fn favorite_config_option_value_ids(
@@ -391,6 +406,18 @@ mod tests {
                 cx,
             );
         });
+    }
+
+    #[test]
+    fn test_agent_logo_maps_known_agents() {
+        assert_eq!(agent_logo(CLAUDE_AGENT_ID), IconName::AiClaude);
+        assert_eq!(agent_logo(CODEX_ID), IconName::AiOpenAi);
+        assert_eq!(agent_logo(GEMINI_ID), IconName::AiGemini);
+        assert_eq!(agent_logo("my-custom-agent"), IconName::Terminal);
+        assert_eq!(
+            CustomAgentServer::new(AgentId::new(CLAUDE_AGENT_ID)).logo(),
+            IconName::AiClaude
+        );
     }
 
     #[gpui::test]

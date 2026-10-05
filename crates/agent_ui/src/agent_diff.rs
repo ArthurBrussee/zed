@@ -2351,4 +2351,86 @@ mod tests {
         });
         cx.run_until_parked();
     }
+
+    // A review comment left in a plain file editor reaches the workspace's
+    // pending-review pipeline, ready to attach to the next message.
+    #[gpui::test]
+    async fn test_pending_review_blocks_attach_from_workspace(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            prompt_store::init(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            language_model::init(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/test"), json!({"file1": "abc\ndef\nghi\njkl"}))
+            .await;
+        let project = Project::test(fs, [path!("/test").as_ref()], cx).await;
+        let buffer_path = project
+            .read_with(cx, |project, cx| {
+                project.find_project_path("test/file1", cx)
+            })
+            .unwrap();
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(buffer_path, cx))
+            .await
+            .unwrap();
+
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        let editor = cx.new_window_entity(|window, cx| {
+            Editor::for_buffer(buffer.clone(), Some(project.clone()), window, cx)
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(editor.clone()), None, true, window, cx);
+        });
+        cx.run_until_parked();
+
+        editor.update_in(cx, |editor, window, cx| {
+            editor.show_diff_review_overlay(
+                editor::display_map::DisplayRow(1)..editor::display_map::DisplayRow(2),
+                window,
+                cx,
+            );
+        });
+        editor.update_in(cx, |editor, window, cx| {
+            let prompt = editor
+                .diff_review_prompt_editor()
+                .expect("overlay opens a prompt editor")
+                .clone();
+            prompt.update(cx, |prompt, cx| {
+                prompt.set_text("Prefer uppercase here", window, cx)
+            });
+            prompt.focus_handle(cx).focus(window, cx);
+            editor.submit_diff_review_comment(window, cx);
+        });
+
+        assert_eq!(
+            cx.update(|_, cx| crate::diff_review::pending_review_comment_count(&workspace, cx)),
+            1,
+            "the workspace scan should find the pending comment"
+        );
+
+        let blocks =
+            cx.update(|_, cx| crate::diff_review::take_pending_review_blocks(&workspace, cx));
+        assert_eq!(blocks.len(), 1, "one editor with comments yields one block");
+        let parsed = crate::diff_review::review_comment_blocks(&blocks);
+        assert_eq!(parsed.len(), 1, "the block is detected as a review");
+        assert_eq!(parsed[0].comments.len(), 1);
+        let comment = &parsed[0].comments[0];
+        assert_eq!(comment.path.as_ref(), "file1");
+        assert_eq!(comment.line_range, Some((2, 3)));
+        assert_eq!(comment.quoted_code.as_ref(), "def\nghi");
+        assert_eq!(comment.comment.as_ref(), "Prefer uppercase here");
+
+        assert_eq!(
+            cx.update(|_, cx| crate::diff_review::pending_review_comment_count(&workspace, cx)),
+            0,
+            "taken comments should be cleared from the editor"
+        );
+    }
 }

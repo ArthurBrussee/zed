@@ -11,6 +11,7 @@ mod context;
 mod context_server_configuration;
 pub(crate) mod conversation_view;
 mod diagnostics;
+mod diff_review;
 pub mod draft_prompt_store;
 mod entry_view_state;
 mod external_source_prompt;
@@ -31,10 +32,14 @@ pub mod terminal_thread_metadata_store;
 pub mod test_support;
 mod thread_import;
 pub mod thread_metadata_store;
+pub mod thread_read_state;
+pub mod thread_tab;
+pub mod thread_tab_registry;
 pub mod thread_worktree_archive;
+mod tool_call_diff;
 
 pub mod threads_archive_view;
-mod ui;
+pub mod ui;
 mod unicode_confusables;
 
 use std::rc::Rc;
@@ -82,6 +87,8 @@ use crate::agent_registry_ui::AgentRegistryPage;
 pub use crate::inline_assistant::InlineAssistant;
 pub use crate::message_editor::MessageEditorEvent;
 pub use crate::thread_metadata_store::ThreadId;
+pub use crate::thread_read_state::ThreadReadState;
+pub use crate::thread_tab_registry::{ThreadTabsEntry, ThreadTabsRegistry};
 pub use agent_diff::{AgentDiffPane, AgentDiffToolbar};
 pub use conversation_view::open_markdown_in_workspace;
 pub use conversation_view::{ConversationView, StateChange};
@@ -95,6 +102,20 @@ pub use thread_import::{
 };
 use zed_actions;
 pub use zed_actions::{CreateWorktree, NewWorktreeBranchTarget, SwitchWorktree};
+
+/// A subtle brand tint per agent; `None` keeps the theme's neutral icon color.
+pub fn agent_brand_color(agent_id: &project::AgentId) -> Option<gpui::Hsla> {
+    let id = agent_id.as_ref().to_ascii_lowercase();
+    if id.contains("claude") {
+        Some(gpui::hsla(0.055, 0.42, 0.56, 0.85))
+    } else if id.contains("codex") || id.contains("openai") {
+        Some(gpui::hsla(0.47, 0.22, 0.52, 0.85))
+    } else if id.contains("gemini") {
+        Some(gpui::hsla(0.58, 0.38, 0.60, 0.85))
+    } else {
+        None
+    }
+}
 
 pub(crate) fn resolve_agent_image(
     dest_url: &str,
@@ -199,6 +220,18 @@ pub(crate) fn open_abs_path_at_point(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    // Agents produce HTML report pages to be looked at, not edited.
+    let is_html = abs_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm")
+        });
+    if is_html && let Ok(url) = url::Url::from_file_path(&abs_path) {
+        cx.open_url(url.as_str());
+        return;
+    }
+
     let project_path = workspace.project().read_with(cx, |project, cx| {
         project_path_for_file_link(project, &abs_path, cx)
     });
@@ -263,7 +296,7 @@ pub(crate) fn open_abs_path_at_point(
         .detach_and_log_err(cx);
 }
 
-pub const DEFAULT_THREAD_TITLE: &str = "New Agent Thread";
+pub const DEFAULT_THREAD_TITLE: &str = "New Thread";
 const PARALLEL_AGENT_LAYOUT_BACKFILL_KEY: &str = "parallel_agent_layout_backfilled";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -353,6 +386,8 @@ actions!(
         RejectOnce,
         /// Follows the agent's suggestions.
         Follow,
+        /// Toggles between an agent-focused and a review-focused layout.
+        ToggleReviewLayout,
         /// Resets the trial upsell notification.
         ResetTrialUpsell,
         /// Resets the trial end upsell notification.
@@ -396,16 +431,22 @@ actions!(
         ScrollOutputToTop,
         /// Scroll the output to the bottom.
         ScrollOutputToBottom,
-        /// Scroll the output to the previous user message.
+        /// Scroll the output to the previous waypoint: a bookmark, or the
+        /// user message that started a turn.
         ScrollOutputToPreviousMessage,
-        /// Scroll the output to the next user message.
+        /// Scroll the output to the next waypoint: a bookmark, or the user
+        /// message that started a turn.
         ScrollOutputToNextMessage,
+        /// Toggles a bookmark on the entry at the top of the viewport.
+        ToggleBookmark,
         /// Toggles in-thread search over the current agent thread's contents.
         ToggleSearch,
         /// Import agent threads from other Zed release channels (e.g. Preview, Nightly).
         ImportThreadsFromOtherChannels,
         /// Starts a new terminal thread.
         NewTerminalThread,
+        /// Starts another agent in this worktree.
+        NewAdditionalThread,
     ]
 );
 
@@ -575,6 +616,16 @@ impl Agent {
         }
     }
 
+    /// The same icon the agent's `AgentServer` reports.
+    pub fn logo(&self) -> IconName {
+        match self {
+            Self::NativeAgent => IconName::ZedAgent,
+            Self::Custom { id } => agent_servers::agent_logo(id.as_ref()),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Stub => IconName::ZedAgent,
+        }
+    }
+
     pub fn server(
         &self,
         fs: Arc<dyn fs::Fs>,
@@ -589,6 +640,53 @@ impl Agent {
             Self::Stub => Rc::new(crate::test_support::StubAgentServer::default_response()),
         }
     }
+}
+
+/// Display metadata for an agent offered in a new-thread menu.
+pub struct AgentMenuEntry {
+    pub agent: Agent,
+    pub display_name: SharedString,
+    /// Path to the agent's custom SVG icon, when it provides one.
+    pub icon_path: Option<SharedString>,
+}
+
+/// Enumerates the external agents available for new threads in `project`,
+/// sorted by display name. The native Zed agent is not included.
+pub fn external_agent_menu_entries(
+    project: &Entity<project::Project>,
+    cx: &App,
+) -> Vec<AgentMenuEntry> {
+    let agent_server_store = project.read(cx).agent_server_store().clone();
+    let agent_server_store = agent_server_store.read(cx);
+    let registry_store = project::AgentRegistryStore::try_global(cx);
+    let registry_store_ref = registry_store.as_ref().map(|store| store.read(cx));
+
+    let mut entries = agent_server_store
+        .external_agents()
+        .map(|agent_id| {
+            let registry_agent = registry_store_ref
+                .as_ref()
+                .and_then(|store| store.agent(agent_id));
+            let display_name = agent_server_store
+                .agent_display_name(agent_id)
+                .or_else(|| registry_agent.as_ref().map(|agent| agent.name().clone()))
+                .unwrap_or_else(|| agent_id.0.clone());
+            let icon_path = agent_server_store.agent_icon(agent_id).or_else(|| {
+                registry_agent
+                    .as_ref()
+                    .and_then(|agent| agent.icon_path().cloned())
+            });
+            AgentMenuEntry {
+                agent: Agent::Custom {
+                    id: agent_id.clone(),
+                },
+                display_name,
+                icon_path,
+            }
+        })
+        .collect::<Vec<_>>();
+    entries.sort_unstable_by_key(|entry| entry.display_name.to_lowercase());
+    entries
 }
 
 /// Content to initialize new external agent with.

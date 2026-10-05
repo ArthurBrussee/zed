@@ -53,7 +53,8 @@ use ui::{
 use update_version::UpdateVersion;
 use util::ResultExt;
 use workspace::{
-    AccessibleMode, MultiWorkspace, ToggleWorktreeSecurity, Workspace,
+    AccessibleMode, MultiWorkspace, SidebarSide, ToggleWorkspaceSidebar, ToggleWorktreeSecurity,
+    Workspace,
     notifications::{NotifyResultExt, NotifyTaskExt as _},
 };
 
@@ -311,6 +312,7 @@ impl Render for TitleBar {
             h_flex()
                 .h_full()
                 .gap_0p5()
+                .children(self.render_collapsed_sidebar_toggle(cx))
                 .map(|title_bar| {
                     let mut render_project_items = title_bar_settings.show_branch_name
                         || title_bar_settings.show_project_items;
@@ -745,6 +747,46 @@ impl TitleBar {
         }
     }
 
+    /// While the sidebar is open, its own header carries the toggle instead.
+    fn render_collapsed_sidebar_toggle(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let multi_workspace = self.multi_workspace.clone()?.upgrade()?;
+        let multi_workspace = multi_workspace.read(cx);
+        if !multi_workspace.multi_workspace_enabled(cx) || multi_workspace.sidebar_open() {
+            return None;
+        }
+
+        let icon = match multi_workspace.sidebar_side(cx) {
+            SidebarSide::Left => IconName::ThreadsSidebarLeftClosed,
+            SidebarSide::Right => IconName::ThreadsSidebarRightClosed,
+        };
+        let has_notifications = multi_workspace.sidebar_has_notifications(cx);
+
+        Some(
+            h_flex()
+                .gap_0p5()
+                .child(
+                    IconButton::new("toggle-workspace-sidebar", icon)
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Muted)
+                        .when(has_notifications, |this| {
+                            this.indicator(Indicator::dot().color(Color::Accent))
+                        })
+                        .tooltip(|_window, cx| {
+                            Tooltip::for_action(
+                                "Open Threads Sidebar",
+                                &ToggleWorkspaceSidebar,
+                                cx,
+                            )
+                        })
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(ToggleWorkspaceSidebar.boxed_clone(), cx);
+                        }),
+                )
+                .child(ui::Divider::vertical().color(ui::DividerColor::Border))
+                .into_any_element(),
+        )
+    }
+
     pub fn render_project_host(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if self.project.read(cx).is_via_remote_server() {
             return self.render_remote_project_connection(cx);
@@ -837,18 +879,12 @@ impl TitleBar {
             .map(|w| w.read(cx).focus_handle(cx))
             .unwrap_or_else(|| cx.focus_handle());
 
-        let window_project_groups: Vec<_> = self
-            .multi_workspace
-            .as_ref()
-            .and_then(|mw| mw.upgrade())
-            .map(|mw| mw.read(cx).project_group_keys())
-            .unwrap_or_default();
-
         PopoverMenu::new("recent-projects-menu")
             .menu(move |window, cx| {
+                // The sidebar is the workspace switcher.
                 Some(recent_projects::RecentProjects::popover(
                     workspace.clone(),
-                    window_project_groups.clone(),
+                    Vec::new(),
                     None,
                     focus_handle.clone(),
                     window,
@@ -889,18 +925,12 @@ impl TitleBar {
             .map(|w| w.read(cx).focus_handle(cx))
             .unwrap_or_else(|| cx.focus_handle());
 
-        let window_project_groups: Vec<_> = self
-            .multi_workspace
-            .as_ref()
-            .and_then(|mw| mw.upgrade())
-            .map(|mw| mw.read(cx).project_group_keys())
-            .unwrap_or_default();
-
         PopoverMenu::new("sidebar-title-recent-projects-menu")
             .menu(move |window, cx| {
+                // The sidebar is the workspace switcher.
                 Some(recent_projects::RecentProjects::popover(
                     workspace.clone(),
-                    window_project_groups.clone(),
+                    Vec::new(),
                     None,
                     focus_handle.clone(),
                     window,

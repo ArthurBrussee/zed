@@ -83,6 +83,8 @@ pub struct FakeGitRepositoryState {
     pub stash_entries: GitStash,
     pub commit_template: Option<GitCommitTemplate>,
     pub blob_read_gate: Option<FakeBlobReadGate>,
+    pub fetched_remotes: Vec<String>,
+    pub simulated_fetch_error: Option<String>,
 }
 
 impl FakeGitRepositoryState {
@@ -111,6 +113,8 @@ impl FakeGitRepositoryState {
             commit_history: Vec::new(),
             stash_entries: Default::default(),
             commit_template: None,
+            fetched_remotes: Vec::new(),
+            simulated_fetch_error: None,
         }
     }
 }
@@ -1281,12 +1285,24 @@ impl GitRepository for FakeGitRepository {
 
     fn fetch(
         &self,
-        _fetch_options: FetchOptions,
+        fetch_options: FetchOptions,
         _askpass: AskPassDelegate,
         _env: Arc<HashMap<String, String>>,
         _cx: AsyncApp,
     ) -> BoxFuture<'_, Result<git::repository::RemoteCommandOutput>> {
-        unimplemented!()
+        let remote = fetch_options
+            .to_proto()
+            .unwrap_or_else(|| "<all>".to_string());
+        self.with_state_async(true, move |state| {
+            state.fetched_remotes.push(remote);
+            if let Some(message) = state.simulated_fetch_error.clone() {
+                bail!("{message}");
+            }
+            Ok(git::repository::RemoteCommandOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        })
     }
 
     fn get_all_remotes(&self) -> BoxFuture<'_, Result<Vec<Remote>>> {

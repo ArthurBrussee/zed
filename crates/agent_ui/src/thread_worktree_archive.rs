@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, anyhow};
+use fs::{Fs, RemoveOptions, RenameOptions};
 use gpui::{App, AsyncApp, Entity, Task};
 use project::{
     LocalProjectFlags, Project, WorktreeId,
@@ -16,7 +17,9 @@ use settings::Settings;
 use util::{ResultExt, paths::PathStyle};
 use workspace::{AppState, MultiWorkspace, Workspace};
 
-use crate::thread_metadata_store::{ArchivedGitWorktree, ThreadId, ThreadMetadataStore};
+use crate::thread_metadata_store::{
+    ArchivedGitWorktree, ArchivedSubmodule, ThreadId, ThreadMetadataStore,
+};
 
 /// The plan for archiving a single git worktree root.
 ///
@@ -481,6 +484,267 @@ async fn rollback_root(root: &RootPlan, cx: &mut AsyncApp) {
     }
 }
 
+/// A linked worktree's own git admin directory (`…/.git/worktrees/<name>`)
+/// and the repository's common one (`…/.git`), read off its `.git` file.
+async fn worktree_git_dirs(fs: &dyn Fs, worktree_path: &Path) -> Option<(PathBuf, PathBuf)> {
+    let dot_git = worktree_path.join(".git");
+    let metadata = fs.metadata(&dot_git).await.ok()??;
+    if metadata.is_dir {
+        return None;
+    }
+    let gitdir_rel = fs.load(&dot_git).await.ok()?;
+    let gitdir_rel = gitdir_rel.strip_prefix("gitdir:")?.trim();
+    let admin_dir = fs
+        .canonicalize(&worktree_path.join(gitdir_rel))
+        .await
+        .ok()?;
+    let common_rel = fs.load(&admin_dir.join("commondir")).await.ok()?;
+    let common_dir = fs
+        .canonicalize(&admin_dir.join(common_rel.trim()))
+        .await
+        .ok()?;
+    Some((admin_dir, common_dir))
+}
+
+/// The parts of a worktree's admin directory that `git worktree remove` would
+/// take with it and nothing else records: the submodules' git directories
+/// (where their commits live) and the sparse-checkout patterns.
+const KEPT_ADMIN_ENTRIES: [&str; 2] = ["modules", "info"];
+
+/// Keyed by the archived-worktree row, so the record says where they are.
+fn archived_admin_path(common_git_dir: &Path, archived_worktree_id: i64) -> PathBuf {
+    common_git_dir
+        .join("zed-archived-worktrees")
+        .join(archived_worktree_id.to_string())
+}
+
+/// The `.gitmodules` paths whose directory carries a `.git` file, paired with
+/// that file's contents. Empty unless the user initialised submodules by hand.
+async fn initialized_submodules(
+    fs: &dyn Fs,
+    worktree_path: &Path,
+) -> Result<Vec<(String, String)>> {
+    let Ok(gitmodules) = fs.load(&worktree_path.join(".gitmodules")).await else {
+        return Ok(Vec::new());
+    };
+
+    let mut found = Vec::new();
+    for path in declared_submodule_paths(&gitmodules) {
+        let dot_git = worktree_path.join(&path).join(".git");
+        let Ok(Some(metadata)) = fs.metadata(&dot_git).await else {
+            continue;
+        };
+        // A `.git` directory is an independent clone whose history nothing
+        // else references, so deleting the worktree would lose it.
+        if metadata.is_dir {
+            return Err(anyhow!(
+                "refusing to delete worktree at {}: {path} holds its own git \
+                 repository rather than an initialized submodule, and nothing \
+                 else has a copy of it",
+                worktree_path.display()
+            ));
+        }
+        let Ok(git_file) = fs.load(&dot_git).await else {
+            continue;
+        };
+        found.push((path, git_file));
+    }
+    Ok(found)
+}
+
+fn declared_submodule_paths(gitmodules: &str) -> Vec<String> {
+    gitmodules
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            (key.trim() == "path")
+                .then(|| value.trim())
+                .filter(|path| !path.is_empty())
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+/// Gives each initialised submodule the same two WIP commits the worktree
+/// gets, saving the edits and unpushed commits its gitlink alone would drop.
+async fn checkpoint_submodules(
+    root: &RootPlan,
+    cx: &mut AsyncApp,
+) -> Result<Vec<ArchivedSubmodule>> {
+    if root.remote_connection.is_some() {
+        return Ok(Vec::new());
+    }
+    let Some(fs) = current_app_state(cx).map(|state| state.fs.clone()) else {
+        return Ok(Vec::new());
+    };
+
+    let mut archived = Vec::new();
+    for (path, git_file) in initialized_submodules(fs.as_ref(), &root.root_path).await? {
+        let submodule_path = root.root_path.join(&path);
+        let (repo, _temp_project) = find_or_create_repository(&submodule_path, None, cx)
+            .await
+            .with_context(|| {
+                format!(
+                    "refusing to archive worktree at {}: could not open its submodule at {path}",
+                    root.root_path.display()
+                )
+            })?;
+
+        let original_commit_hash = repo
+            .update(cx, |repo, _cx| repo.head_sha())
+            .await
+            .map_err(|_| anyhow!("head_sha canceled"))?
+            .with_context(|| format!("failed to read HEAD of submodule {path}"))?
+            .with_context(|| format!("submodule {path} has no HEAD"))?;
+
+        let (staged_commit_hash, unstaged_commit_hash) = repo
+            .update(cx, |repo, _cx| repo.create_archive_checkpoint())
+            .await
+            .map_err(|_| anyhow!("create_archive_checkpoint canceled"))?
+            .with_context(|| {
+                format!(
+                    "refusing to archive worktree at {}: could not check point its submodule at {path}",
+                    root.root_path.display()
+                )
+            })?;
+        drop(_temp_project);
+
+        archived.push(ArchivedSubmodule {
+            path,
+            git_file,
+            staged_commit_hash,
+            unstaged_commit_hash,
+            original_commit_hash,
+        });
+    }
+    Ok(archived)
+}
+
+async fn move_kept_admin_entries(from: &Path, to: &Path, fs: &dyn Fs) -> Result<()> {
+    for entry in KEPT_ADMIN_ENTRIES {
+        let source = from.join(entry);
+        if fs.metadata(&source).await?.is_none() {
+            continue;
+        }
+        fs.rename(
+            &source,
+            &to.join(entry),
+            RenameOptions {
+                overwrite: true,
+                ignore_if_exists: false,
+                create_parents: true,
+            },
+        )
+        .await
+        .with_context(|| format!("could not move the worktree's git directory's {entry}"))?;
+    }
+    Ok(())
+}
+
+/// Sets the kept admin entries aside before `git worktree remove` deletes
+/// them. Failing fails the archive, since carrying on would delete the work.
+async fn preserve_submodule_git_dirs(
+    worktree_path: &Path,
+    archived_worktree_id: i64,
+    fs: &dyn Fs,
+) -> Result<()> {
+    let Some((admin_dir, common_dir)) = worktree_git_dirs(fs, worktree_path).await else {
+        return Ok(());
+    };
+    let kept = archived_admin_path(&common_dir, archived_worktree_id);
+    move_kept_admin_entries(&admin_dir, &kept, fs)
+        .await
+        .with_context(|| {
+            format!(
+                "refusing to archive worktree at {}",
+                worktree_path.display()
+            )
+        })
+}
+
+/// Moves the set-aside entries back, on restore and on a rolled-back archive.
+async fn return_submodule_git_dirs(
+    worktree_path: &Path,
+    archived_worktree_id: i64,
+    fs: &dyn Fs,
+) -> Result<()> {
+    let Some((admin_dir, common_dir)) = worktree_git_dirs(fs, worktree_path).await else {
+        return Ok(());
+    };
+    let kept = archived_admin_path(&common_dir, archived_worktree_id);
+    move_kept_admin_entries(&kept, &admin_dir, fs).await?;
+    forget_archived_admin_entries(fs, &common_dir, archived_worktree_id).await;
+    Ok(())
+}
+
+/// Puts the submodules' git directories back and recreates each submodule's
+/// `.git` file verbatim from the record.
+async fn restore_submodule_git_dirs(row: &ArchivedGitWorktree, fs: &dyn Fs) -> Result<()> {
+    if row.submodules.is_empty() {
+        return Ok(());
+    }
+    return_submodule_git_dirs(&row.worktree_path, row.id, fs).await?;
+
+    for submodule in &row.submodules {
+        let submodule_path = row.worktree_path.join(&submodule.path);
+        fs.create_dir(&submodule_path).await?;
+        fs.atomic_write(submodule_path.join(".git"), submodule.git_file.clone())
+            .await
+            .with_context(|| format!("failed to reattach submodule {}", submodule.path))?;
+    }
+    Ok(())
+}
+
+/// Every submodule is attempted even when one fails: they are independent.
+async fn replay_submodule_checkpoints(row: &ArchivedGitWorktree, cx: &mut AsyncApp) -> Result<()> {
+    let mut failures = Vec::new();
+    for submodule in &row.submodules {
+        let submodule_path = row.worktree_path.join(&submodule.path);
+        let restored = async {
+            let (repo, _temp_project) = find_or_create_repository(&submodule_path, None, cx)
+                .await
+                .with_context(|| format!("could not open submodule {}", submodule.path))?;
+            let restored = repo
+                .update(cx, |repo, _cx| {
+                    repo.restore_archive_checkpoint(
+                        submodule.staged_commit_hash.clone(),
+                        submodule.unstaged_commit_hash.clone(),
+                    )
+                })
+                .await
+                .map_err(|_| anyhow!("restore_archive_checkpoint canceled"))
+                .and_then(|result| result);
+            drop(_temp_project);
+            restored
+        }
+        .await;
+        if let Err(error) = restored {
+            failures.push(format!("{}: {error:#}", submodule.path));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!("{}", failures.join("; ")))
+    }
+}
+
+async fn forget_archived_admin_entries(
+    fs: &dyn Fs,
+    common_git_dir: &Path,
+    archived_worktree_id: i64,
+) {
+    fs.remove_dir(
+        &archived_admin_path(common_git_dir, archived_worktree_id),
+        RemoveOptions {
+            recursive: true,
+            ignore_if_not_exists: true,
+        },
+    )
+    .await
+    .log_err();
+}
+
 /// Saves the worktree's full git state so it can be restored later.
 ///
 /// This creates two detached commits (via [`create_archive_checkpoint`] on
@@ -513,6 +777,8 @@ pub async fn persist_worktree_state(root: &RootPlan, cx: &mut AsyncApp) -> Resul
         .map_err(|_| anyhow!("create_archive_checkpoint canceled"))?
         .context("failed to create archive checkpoint")?;
 
+    let submodules = checkpoint_submodules(root, cx).await?;
+
     // Create DB record
     let store = cx.update(|cx| ThreadMetadataStore::global(cx));
     let worktree_path_str = root.root_path.to_string_lossy().to_string();
@@ -535,6 +801,7 @@ pub async fn persist_worktree_state(root: &RootPlan, cx: &mut AsyncApp) -> Resul
                 staged_commit_hash.clone(),
                 unstaged_commit_hash.clone(),
                 original_commit_hash.clone(),
+                submodules.clone(),
                 cx,
             )
         })
@@ -603,6 +870,15 @@ pub async fn persist_worktree_state(root: &RootPlan, cx: &mut AsyncApp) -> Resul
     // or temporary project; dropping only matters in the temporary case.
     drop(_temp_project);
 
+    if root.remote_connection.is_none()
+        && let Some(fs) = current_app_state(cx).map(|state| state.fs.clone())
+        && let Err(error) =
+            preserve_submodule_git_dirs(&root.root_path, archived_worktree_id, fs.as_ref()).await
+    {
+        rollback_persist(archived_worktree_id, root, cx).await;
+        return Err(error);
+    }
+
     Ok(archived_worktree_id)
 }
 
@@ -611,6 +887,12 @@ pub async fn persist_worktree_state(root: &RootPlan, cx: &mut AsyncApp) -> Resul
 /// detached (they don't move any branch), no git reset is needed — the
 /// commits will be garbage-collected once the ref is removed.
 pub async fn rollback_persist(archived_worktree_id: i64, root: &RootPlan, cx: &mut AsyncApp) {
+    if let Some(fs) = current_app_state(cx).map(|state| state.fs.clone()) {
+        return_submodule_git_dirs(&root.root_path, archived_worktree_id, fs.as_ref())
+            .await
+            .log_err();
+    }
+
     // Delete the git ref on main repo
     if let Ok((main_repo, _temp_project)) =
         find_or_create_repository(&root.main_repo_path, root.remote_connection.as_ref(), cx).await
@@ -789,6 +1071,21 @@ pub async fn restore_worktree_via_git(
         return Err(error.context("failed to restore archive checkpoint"));
     }
 
+    // A submodule that cannot be reattached is not worth failing the restore.
+    if remote_connection.is_none() && !row.submodules.is_empty() {
+        let restored = async {
+            restore_submodule_git_dirs(row, app_state.fs.as_ref()).await?;
+            replay_submodule_checkpoints(row, cx).await
+        }
+        .await;
+        if let Err(error) = restored {
+            log::error!(
+                "Restored worktree at {} but could not restore its submodules: {error:#}",
+                worktree_path.display()
+            );
+        }
+    }
+
     if created_new_worktree {
         // Re-register the restored worktree as Zed-created so it can be
         // archived again later.
@@ -796,6 +1093,7 @@ pub async fn restore_worktree_via_git(
             &wt_repo,
             worktree_path,
             remote_connection,
+            false,
             cx,
         )
         .await;
@@ -842,12 +1140,30 @@ pub async fn cleanup_archived_worktree_record(
         drop(_temp_project);
     }
 
+    if remote_connection.is_none()
+        && let Some(fs) = current_app_state(cx).map(|state| state.fs.clone())
+        && let Some(common_dir) = main_repo_git_dir(fs.as_ref(), &row.main_repo_path).await
+    {
+        forget_archived_admin_entries(fs.as_ref(), &common_dir, row.id).await;
+    }
+
     // Delete the DB records
     let store = cx.update(|cx| ThreadMetadataStore::global(cx));
     store
         .read_with(cx, |store, cx| store.delete_archived_worktree(row.id, cx))
         .await
         .log_err();
+}
+
+/// Usually `<repo>/.git`, unless the repository is itself a linked worktree.
+async fn main_repo_git_dir(fs: &dyn Fs, main_repo_path: &Path) -> Option<PathBuf> {
+    let dot_git = main_repo_path.join(".git");
+    let metadata = fs.metadata(&dot_git).await.ok()??;
+    if metadata.is_dir {
+        return Some(dot_git);
+    }
+    let (_, common_dir) = worktree_git_dirs(fs, main_repo_path).await?;
+    Some(common_dir)
 }
 
 /// Cleans up all archived worktree data associated with a thread being deleted.
@@ -957,7 +1273,7 @@ fn current_app_state(cx: &mut AsyncApp) -> Option<Arc<AppState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fs::{FakeFs, Fs as _};
+    use fs::FakeFs;
     use git::repository::Worktree as GitWorktree;
     use gpui::{BorrowAppContext, TestAppContext};
     use project::Project;
@@ -1369,6 +1685,219 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_submodule_git_dirs_survive_archive_and_come_back(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/project",
+            json!({
+                ".git": {},
+                "src": { "main.rs": "fn main() {}" }
+            }),
+        )
+        .await;
+
+        let worktree_path = PathBuf::from("/worktrees/project/feature/project");
+        fs.add_linked_worktree_for_repo(
+            Path::new("/project/.git"),
+            true,
+            GitWorktree {
+                path: worktree_path.clone(),
+                ref_name: Some("refs/heads/feature".into()),
+                sha: "abc123".into(),
+                is_main: false,
+                is_bare: false,
+            },
+        )
+        .await;
+
+        let admin_dir = PathBuf::from("/project/.git/worktrees/feature");
+        let git_file = "gitdir: ../../../../../project/.git/worktrees/feature/modules/vendor/lib";
+        fs.insert_tree(
+            worktree_path.join("vendor/lib"),
+            json!({ ".git": git_file }),
+        )
+        .await;
+        fs.insert_tree(
+            admin_dir.join("modules/vendor/lib"),
+            json!({ "objects": { "unpushed-commit": "" } }),
+        )
+        .await;
+        fs.atomic_write(
+            worktree_path.join(".gitmodules"),
+            "[submodule \"lib\"]\n\tpath = vendor/lib\n\turl = https://example.com/lib\n"
+                .to_owned(),
+        )
+        .await
+        .unwrap();
+
+        let submodules = initialized_submodules(fs.as_ref(), &worktree_path)
+            .await
+            .expect("an initialised submodule is not a refusal");
+        assert_eq!(
+            submodules,
+            vec![("vendor/lib".to_owned(), git_file.to_owned())],
+            "an initialised submodule is found by its .gitmodules path and its .git pointer"
+        );
+
+        preserve_submodule_git_dirs(&worktree_path, 7, fs.as_ref())
+            .await
+            .expect("setting the modules tree aside");
+
+        assert!(
+            !fs.is_dir(&admin_dir.join("modules")).await,
+            "the modules tree is out of the admin directory before it is deleted"
+        );
+        assert!(
+            fs.is_dir(Path::new(
+                "/project/.git/zed-archived-worktrees/7/modules/vendor/lib/objects"
+            ))
+            .await,
+            "and is kept under the archived-worktree record that owns it"
+        );
+
+        // Archiving deletes the checkout and the admin directory.
+        fs.remove_worktree_for_repo(Path::new("/project/.git"), true, "refs/heads/feature")
+            .await;
+        assert!(!fs.is_dir(&worktree_path).await);
+        assert!(
+            fs.is_dir(Path::new(
+                "/project/.git/zed-archived-worktrees/7/modules/vendor/lib/objects"
+            ))
+            .await,
+            "the submodule's objects outlive the worktree they were inside"
+        );
+
+        // Restoring recreates the worktree and its admin directory.
+        fs.add_linked_worktree_for_repo(
+            Path::new("/project/.git"),
+            true,
+            GitWorktree {
+                path: worktree_path.clone(),
+                ref_name: Some("refs/heads/feature".into()),
+                sha: "abc123".into(),
+                is_main: false,
+                is_bare: false,
+            },
+        )
+        .await;
+
+        let row = ArchivedGitWorktree {
+            id: 7,
+            worktree_path: worktree_path.clone(),
+            main_repo_path: PathBuf::from("/project"),
+            branch_name: Some("feature".to_owned()),
+            staged_commit_hash: "staged".to_owned(),
+            unstaged_commit_hash: "unstaged".to_owned(),
+            original_commit_hash: "abc123".to_owned(),
+            submodules: vec![ArchivedSubmodule {
+                path: "vendor/lib".to_owned(),
+                git_file: git_file.to_owned(),
+                staged_commit_hash: "sub-staged".to_owned(),
+                unstaged_commit_hash: "sub-unstaged".to_owned(),
+                original_commit_hash: "sub-head".to_owned(),
+            }],
+        };
+        restore_submodule_git_dirs(&row, fs.as_ref())
+            .await
+            .expect("putting the modules tree back");
+
+        assert!(
+            fs.is_dir(&admin_dir.join("modules/vendor/lib/objects"))
+                .await,
+            "the submodule's objects are back where its .git file points"
+        );
+        assert_eq!(
+            fs.load(&worktree_path.join("vendor/lib/.git"))
+                .await
+                .expect("the submodule is a repository again"),
+            git_file,
+            "recreated verbatim, so nothing has to guess the name it is filed under"
+        );
+        assert!(
+            !fs.is_dir(Path::new("/project/.git/zed-archived-worktrees/7"))
+                .await,
+            "and nothing is left behind under the record"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_a_nested_clone_where_a_submodule_should_be_refuses_the_archive(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let worktree_path = PathBuf::from("/worktrees/project/feature/project");
+        fs.insert_tree(
+            worktree_path.join("vendor/lib"),
+            json!({ ".git": { "HEAD": "ref: refs/heads/main" } }),
+        )
+        .await;
+        fs.atomic_write(
+            worktree_path.join(".gitmodules"),
+            "[submodule \"lib\"]\n\tpath = vendor/lib\n".to_owned(),
+        )
+        .await
+        .unwrap();
+
+        let error = initialized_submodules(fs.as_ref(), &worktree_path)
+            .await
+            .expect_err("a nested clone is refused rather than archived");
+        assert!(
+            error.to_string().contains("holds its own git repository"),
+            "the refusal says what it found: {error}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_sparse_checkout_patterns_survive_archive(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ ".git": {} })).await;
+        let worktree_path = PathBuf::from("/worktrees/project/feature/project");
+        fs.add_linked_worktree_for_repo(
+            Path::new("/project/.git"),
+            true,
+            GitWorktree {
+                path: worktree_path.clone(),
+                ref_name: Some("refs/heads/feature".into()),
+                sha: "abc123".into(),
+                is_main: false,
+                is_bare: false,
+            },
+        )
+        .await;
+        let admin_dir = PathBuf::from("/project/.git/worktrees/feature");
+        fs.insert_tree(
+            admin_dir.join("info"),
+            json!({ "sparse-checkout": "/*\n!/vendor/\n" }),
+        )
+        .await;
+
+        preserve_submodule_git_dirs(&worktree_path, 11, fs.as_ref())
+            .await
+            .expect("setting the sparse patterns aside");
+        assert!(!fs.is_dir(&admin_dir.join("info")).await);
+
+        return_submodule_git_dirs(&worktree_path, 11, fs.as_ref())
+            .await
+            .expect("putting them back");
+        assert_eq!(
+            fs.load(&admin_dir.join("info/sparse-checkout"))
+                .await
+                .expect("the patterns are back"),
+            "/*\n!/vendor/\n"
+        );
+        assert!(
+            !fs.is_dir(Path::new("/project/.git/zed-archived-worktrees/11"))
+                .await
+        );
+    }
+
+    #[gpui::test]
     async fn test_remove_root_deletes_directory_and_git_metadata(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -1577,6 +2106,7 @@ mod tests {
                 worktree_path,
                 None,
                 actual_created_at + Duration::from_secs(1),
+                false,
                 cx,
             )
         })

@@ -22,6 +22,7 @@ pub mod telemetry_snapshot;
 pub mod terminals;
 pub mod toolchain_store;
 pub mod trusted_worktrees;
+pub mod worktree_language_servers;
 pub mod worktree_store;
 
 mod environment;

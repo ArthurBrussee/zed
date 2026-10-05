@@ -1,4 +1,6 @@
 pub mod auth_methods;
+mod command_output;
+mod command_parse;
 pub mod commands;
 pub mod config_options;
 mod connection;
@@ -7,6 +9,7 @@ mod diff;
 pub mod elicitation;
 mod mention;
 pub mod notices;
+mod pr_mentions;
 pub mod prompt_capabilities;
 mod submission;
 mod terminal;
@@ -16,6 +19,8 @@ use agent_client_protocol::schema::{MaybeUndefined, v1 as acp_v1, v2 as acp_v2};
 use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result, anyhow};
 use collections::{HashSet, IndexMap};
+pub use command_output::*;
+pub use command_parse::*;
 pub use connection::*;
 pub use diff::*;
 use feature_flags::{AcpBetaFeatureFlag, FeatureFlagAppExt as _};
@@ -33,6 +38,7 @@ use language::{
 };
 use markdown::{Markdown, MarkdownOptions};
 pub use mention::*;
+pub use pr_mentions::*;
 use project::lsp_store::{FormatTrigger, LspFormatTarget};
 use project::{
     AgentLocation, Project,
@@ -89,6 +95,22 @@ pub fn tool_name_from_meta(meta: &Option<acp_v1::Meta>) -> Option<SharedString> 
 /// Creates ACP metadata containing the legacy tool-name field.
 pub fn meta_with_tool_name(tool_name: &str) -> acp_v1::Meta {
     acp_v1::Meta::from_iter([(TOOL_NAME_META_KEY.into(), tool_name.into())])
+}
+
+const CLAUDE_CODE_META_KEY: &str = "claudeCode";
+
+/// The Claude adapter reports tool names only in its own meta namespace.
+fn claude_tool_name_from_meta(meta: &Option<acp_v1::Meta>) -> Option<SharedString> {
+    meta.as_ref()
+        .and_then(|meta| meta.get(CLAUDE_CODE_META_KEY))
+        .and_then(|claude| claude.get("toolName"))
+        .and_then(|name| name.as_str())
+        .map(|name| SharedString::from(name.to_owned()))
+}
+
+/// `spawn_agent` is Codex's; `Agent` and `Task` (older versions) are Claude's.
+fn is_subagent_tool_name(name: &str) -> bool {
+    matches!(name, "spawn_agent" | "Agent" | "Task")
 }
 
 /// Key used in ACP `AvailableCommand` meta to record which source produced a
@@ -1211,6 +1233,13 @@ impl ToolCallPatch {
     }
 }
 
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
 impl ToolCall {
     fn from_acp(
         tool_call: acp_v1::ToolCall,
@@ -1266,10 +1295,12 @@ impl ToolCall {
         let sandbox_fallback_authorization_details =
             sandbox_fallback_authorization_details_from_meta(&meta);
         let sandbox_not_applied = sandbox_not_applied_from_meta(&meta);
+        let locations = patch.locations.take().unwrap_or_default();
         let label = Self::new_label(
             title.as_ref().filter(|title| !title.trim().is_empty()),
             tool_name.as_ref(),
             kind.as_ref().unwrap_or(&acp_v2::ToolKind::Other),
+            &locations,
             language_registry.clone(),
             cx,
         );
@@ -1283,7 +1314,7 @@ impl ToolCall {
             reported_status: patch.status.take(),
             meta,
             structured_content: content,
-            locations: patch.locations.take().unwrap_or_default(),
+            locations,
             resolved_locations: Vec::default(),
             local_status: None,
             authorization: None,
@@ -1351,6 +1382,7 @@ impl ToolCall {
         title: Option<&SharedString>,
         tool_name: Option<&SharedString>,
         kind: &acp_v2::ToolKind,
+        locations: &[acp_v1::ToolCallLocation],
     ) -> SharedString {
         let Some(title) = title else {
             return tool_name
@@ -1360,9 +1392,9 @@ impl ToolCall {
         };
 
         if kind == &acp_v2::ToolKind::Execute {
-            title.clone()
+            execute_command_label_source(title).into()
         } else if kind == &acp_v2::ToolKind::Edit {
-            MarkdownEscaped(title).to_string().into()
+            edit_label_source(title, locations).into()
         } else if let Some((first_line, _)) = title.split_once('\n') {
             (first_line.to_owned() + "…").into()
         } else {
@@ -1374,12 +1406,13 @@ impl ToolCall {
         title: Option<&SharedString>,
         tool_name: Option<&SharedString>,
         kind: &acp_v2::ToolKind,
+        locations: &[acp_v1::ToolCallLocation],
         language_registry: Arc<LanguageRegistry>,
         cx: &mut App,
     ) -> Entity<Markdown> {
-        let text = Self::label_text(title, tool_name, kind);
+        let text = Self::label_text(title, tool_name, kind, locations);
         cx.new(|cx| {
-            if title.is_none() || kind == &acp_v2::ToolKind::Execute {
+            if title.is_none() {
                 Markdown::new_text(text, cx)
             } else {
                 Markdown::new(text, Some(language_registry), None, cx)
@@ -1433,9 +1466,10 @@ impl ToolCall {
             MaybeUndefined::Null => Some(Vec::new()),
             MaybeUndefined::Value(content) => Some(content.prepare(terminals)?),
         };
-        let was_plain_text =
-            self.effective_title().is_none() || self.kind() == &acp_v2::ToolKind::Execute;
-        let mut label_changed = !title.is_undefined() || !kind.is_undefined();
+        let was_plain_text = self.effective_title().is_none();
+        // An edit's label is derived from its locations.
+        let mut label_changed =
+            !title.is_undefined() || !kind.is_undefined() || !locations.is_undefined();
         if !kind.is_undefined() {
             self.reported_kind = kind.take();
         }
@@ -1504,20 +1538,32 @@ impl ToolCall {
                 }
             }
         }
+        if !locations.is_undefined() {
+            let locations = locations.take().unwrap_or_default();
+            if self.locations != locations {
+                self.locations = locations;
+                self.resolved_locations.clear();
+            }
+        }
+
         if label_changed {
-            let is_plain_text =
-                self.effective_title().is_none() || self.kind() == &acp_v2::ToolKind::Execute;
+            let is_plain_text = self.effective_title().is_none();
             if was_plain_text != is_plain_text {
                 self.label = Self::new_label(
                     self.effective_title(),
                     self.tool_name.as_ref(),
                     self.kind(),
+                    &self.locations,
                     language_registry.clone(),
                     cx,
                 );
             } else {
-                let text =
-                    Self::label_text(self.effective_title(), self.tool_name.as_ref(), self.kind());
+                let text = Self::label_text(
+                    self.effective_title(),
+                    self.tool_name.as_ref(),
+                    self.kind(),
+                    &self.locations,
+                );
                 if self.label.read(cx).source() != &text {
                     self.label.update(cx, |label, cx| label.replace(text, cx));
                 }
@@ -1539,14 +1585,6 @@ impl ToolCall {
                 ));
             }
             self.structured_content.truncate(new_content_len);
-        }
-
-        if !locations.is_undefined() {
-            let locations = locations.take().unwrap_or_default();
-            if self.locations != locations {
-                self.locations = locations;
-                self.resolved_locations.clear();
-            }
         }
 
         if !raw_input.is_undefined() {
@@ -1675,8 +1713,53 @@ impl ToolCall {
     }
 
     pub fn is_subagent(&self) -> bool {
-        self.tool_name.as_ref().is_some_and(|s| s == "spawn_agent")
+        self.tool_name.as_deref().is_some_and(is_subagent_tool_name)
+            || claude_tool_name_from_meta(&self.meta)
+                .is_some_and(|name| is_subagent_tool_name(&name))
             || self.subagent_session_info.is_some()
+    }
+
+    /// Polling or sleeping rather than doing work.
+    pub fn is_wait(&self, cx: &App) -> bool {
+        is_wait_call(
+            self.tool_name.as_deref(),
+            &self.label.read(cx).source(),
+            self.kind(),
+        )
+    }
+
+    /// The agent looking up its own tools, not working on the project.
+    pub fn is_tool_lookup(&self, cx: &App) -> bool {
+        is_tool_lookup_call(self.tool_name.as_deref(), &self.label.read(cx).source())
+    }
+
+    /// An empty stdin write: an agent poking an interactive command.
+    pub fn is_empty_stdin_write(&self, cx: &App) -> bool {
+        is_empty_stdin_write_call(
+            self.tool_name.as_deref(),
+            &self.label.read(cx).source(),
+            self.raw_input.as_ref(),
+        )
+    }
+
+    /// Some agents report compaction as an ordinary tool call.
+    pub fn is_compaction(&self, cx: &App) -> bool {
+        if self
+            .tool_name
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case("compact"))
+        {
+            return true;
+        }
+        // Asked of every entry on every frame, so no lowercased copy of what
+        // may be a whole command.
+        let label = self.label.read(cx).source();
+        let first_line = label.lines().next().unwrap_or("");
+        if !contains_ignore_ascii_case(first_line, "compact") {
+            return false;
+        }
+        contains_ignore_ascii_case(first_line, "context")
+            || contains_ignore_ascii_case(first_line, "conversation")
     }
 
     pub fn to_markdown(&self, cx: &App) -> String {
@@ -1726,6 +1809,33 @@ impl ToolCall {
         });
 
         Some(ResolvedLocation { buffer, position })
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_test(
+        tool_call: acp_v1::ToolCall,
+        status: ToolCallStatus,
+        language_registry: Arc<LanguageRegistry>,
+        cx: &mut App,
+    ) -> Self {
+        Self::from_acp(
+            tool_call,
+            Some(status),
+            language_registry,
+            &HashMap::default(),
+            cx,
+        )
+        .expect("a tool call with no terminal content to resolve")
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_content_for_test(&mut self, content: Vec<ToolCallContent>) {
+        self.structured_content = content;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_status_for_test(&mut self, status: ToolCallStatus) {
+        self.set_legacy_status(status);
     }
 
     fn resolve_locations(
@@ -2333,7 +2443,7 @@ impl ContentBlock {
         }
     }
 
-    fn plain_markdown(&self) -> Option<&Entity<Markdown>> {
+    pub fn plain_markdown(&self) -> Option<&Entity<Markdown>> {
         match &self.render {
             RenderBlock::Markdown { markdown } => Some(markdown),
             _ => None,
@@ -2544,7 +2654,7 @@ impl ContentBlock {
         Some((Arc::new(gpui::Image::from_bytes(format, bytes)), dimensions))
     }
 
-    fn image_dimensions(bytes: &[u8], format: gpui::ImageFormat) -> Option<gpui::Size<u32>> {
+    pub fn image_dimensions(bytes: &[u8], format: gpui::ImageFormat) -> Option<gpui::Size<u32>> {
         let format = match format {
             gpui::ImageFormat::Png => image::ImageFormat::Png,
             gpui::ImageFormat::Jpeg => image::ImageFormat::Jpeg,
@@ -3406,6 +3516,12 @@ pub struct AcpThread {
     /// reveal text gradually without changing the authoritative message.
     streaming_text_buffer: Option<StreamingTextBuffer>,
     idle_sleep_prevention: IdleSleepPrevention,
+    async_tasks: Vec<AsyncTask>,
+    /// Only populated for an agent that reports subagent lifecycles.
+    subagents: Vec<Subagent>,
+    /// The task carrying a command's lifecycle can name its call late or
+    /// never, so the call's own backgrounded marker is kept as well.
+    backgrounded_tool_calls: HashSet<acp_v1::ToolCallId>,
 }
 
 enum IdleSleepPrevention {
@@ -3584,6 +3700,73 @@ pub enum ThreadStatus {
     Generating,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RunningWork {
+    pub terminals: usize,
+    pub subagents: usize,
+    pub async_tasks: usize,
+}
+
+impl RunningWork {
+    pub fn is_empty(&self) -> bool {
+        self.terminals == 0 && self.subagents == 0 && self.async_tasks == 0
+    }
+}
+
+/// An unknown state is treated as running: a task counted too long is better
+/// than one that vanishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsyncTaskState {
+    Running,
+    Paused,
+    Completed,
+    Failed,
+    Stopped,
+}
+
+impl AsyncTaskState {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Stopped)
+    }
+
+    pub fn from_wire(state: &str) -> Self {
+        match state {
+            "completed" => Self::Completed,
+            "failed" => Self::Failed,
+            "stopped" => Self::Stopped,
+            "paused" => Self::Paused,
+            _ => Self::Running,
+        }
+    }
+}
+
+/// Work the agent runs outside its turn, such as Claude's `run_in_background`
+/// commands. The tool call that started it completes on hand-off, so the
+/// lifecycle arrives separately.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AsyncTask {
+    pub id: SharedString,
+    pub name: SharedString,
+    pub description: Option<SharedString>,
+    pub state: AsyncTaskState,
+    pub summary: Option<SharedString>,
+    /// Can arrive after the task itself.
+    pub tool_call_id: Option<acp_v1::ToolCallId>,
+    pub output_file_path: Option<SharedString>,
+    pub can_stop: bool,
+}
+
+/// A subagent as the adapter reports its lifecycle. Claude's `Agent` call
+/// completes on hand-off, so the call's status says nothing about whether the
+/// subagent is still working.
+#[derive(Debug, Clone)]
+pub struct Subagent {
+    pub session_id: acp_v1::SessionId,
+    pub name: Option<SharedString>,
+    pub task: Option<SharedString>,
+    pub state: AsyncTaskState,
+}
+
 #[derive(Debug, Clone)]
 pub enum LoadError {
     Unsupported {
@@ -3739,6 +3922,9 @@ impl AcpThread {
             ui_scroll_position: None,
             streaming_text_buffer: None,
             idle_sleep_prevention: IdleSleepPrevention::Inactive,
+            async_tasks: Vec::new(),
+            subagents: Vec::new(),
+            backgrounded_tool_calls: HashSet::default(),
         }
     }
 
@@ -3948,6 +4134,197 @@ impl AcpThread {
 
     pub fn had_error(&self) -> bool {
         self.had_error
+    }
+
+    /// What this thread is running right now. Only work with evidence it is
+    /// alive counts; replayed history counts for nothing.
+    pub fn running_work(&self, cx: &App) -> RunningWork {
+        let mut work = RunningWork::default();
+        // Replayed and cancelled terminals never get output, and calls can be
+        // left `InProgress` by a dead agent or a cancel. Outside a turn nobody
+        // is left to finish them, so only detached work counts then.
+        let turn_is_running = !matches!(self.foreground_activity(), ForegroundActivity::Idle);
+        for entry in &self.entries {
+            let AgentThreadEntry::ToolCall(call) = entry else {
+                continue;
+            };
+            let in_flight = matches!(
+                call.status(),
+                ToolCallStatus::Pending
+                    | ToolCallStatus::InProgress
+                    | ToolCallStatus::WaitingForConfirmation
+            );
+            if !(in_flight && turn_is_running) && !self.tool_call_is_backgrounded(&call.id) {
+                continue;
+            }
+            work.terminals += call
+                .terminals()
+                .filter(|terminal| terminal.read(cx).output().is_none())
+                .count();
+            if call.is_subagent()
+                && matches!(call.status(), ToolCallStatus::InProgress)
+                && !self.subagent_is_reported(call)
+            {
+                work.subagents += 1;
+            }
+        }
+        // Reported subagents count whether or not a turn is running.
+        work.subagents += self
+            .subagents
+            .iter()
+            .filter(|subagent| !subagent.state.is_terminal())
+            .count();
+        work.async_tasks = self
+            .async_tasks
+            .iter()
+            .filter(|task| !task.state.is_terminal())
+            .count();
+        work
+    }
+
+    pub fn async_tasks(&self) -> &[AsyncTask] {
+        &self.async_tasks
+    }
+
+    pub fn subagents(&self) -> &[Subagent] {
+        &self.subagents
+    }
+
+    pub fn subagent_state_for_tool_call(&self, call: &ToolCall) -> Option<AsyncTaskState> {
+        let session_id = &call.subagent_session_info.as_ref()?.session_id;
+        self.subagents
+            .iter()
+            .find(|subagent| &subagent.session_id == session_id)
+            .map(|subagent| subagent.state)
+    }
+
+    fn subagent_is_reported(&self, call: &ToolCall) -> bool {
+        call.subagent_session_info.as_ref().is_some_and(|info| {
+            self.subagents
+                .iter()
+                .any(|subagent| subagent.session_id == info.session_id)
+        })
+    }
+
+    pub fn async_task_for_tool_call(
+        &self,
+        tool_call_id: &acp_v1::ToolCallId,
+    ) -> Option<&AsyncTask> {
+        self.async_tasks.iter().find(|task| {
+            !task.state.is_terminal() && task.tool_call_id.as_ref() == Some(tool_call_id)
+        })
+    }
+
+    /// A backgrounded call reads `completed` while its command runs on.
+    pub fn tool_call_is_backgrounded(&self, tool_call_id: &acp_v1::ToolCallId) -> bool {
+        self.backgrounded_tool_calls.contains(tool_call_id)
+            || self.async_task_for_tool_call(tool_call_id).is_some()
+    }
+
+    pub fn mark_tool_call_backgrounded(
+        &mut self,
+        tool_call_id: acp_v1::ToolCallId,
+        cx: &mut Context<Self>,
+    ) {
+        if self.backgrounded_tool_calls.insert(tool_call_id) {
+            cx.notify();
+        }
+    }
+
+    pub fn async_task_spawned(&mut self, task: AsyncTask, cx: &mut Context<Self>) {
+        match self
+            .async_tasks
+            .iter_mut()
+            .find(|existing| existing.id == task.id)
+        {
+            // A task can be announced after its own terminal state.
+            Some(existing) => {
+                let state = existing.state;
+                let summary = existing.summary.take();
+                *existing = task;
+                if state.is_terminal() {
+                    existing.state = state;
+                    existing.summary = summary;
+                }
+            }
+            None => self.async_tasks.push(task),
+        }
+        self.settle_backgrounded_tool_calls();
+        cx.notify();
+    }
+
+    pub fn async_task_progress(
+        &mut self,
+        id: &str,
+        description: Option<SharedString>,
+        summary: Option<SharedString>,
+        tool_call_id: Option<acp_v1::ToolCallId>,
+        output_file_path: Option<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(task) = self.async_tasks.iter_mut().find(|task| task.id == id) else {
+            return;
+        };
+        if description.is_some() {
+            task.description = description;
+        }
+        if summary.is_some() {
+            task.summary = summary;
+        }
+        if tool_call_id.is_some() {
+            task.tool_call_id = tool_call_id;
+        }
+        if output_file_path.is_some() {
+            task.output_file_path = output_file_path;
+        }
+        self.settle_backgrounded_tool_calls();
+        cx.notify();
+    }
+
+    pub fn async_task_state_updated(
+        &mut self,
+        id: &str,
+        state: AsyncTaskState,
+        summary: Option<SharedString>,
+        tool_call_id: Option<acp_v1::ToolCallId>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(task) = self.async_tasks.iter_mut().find(|task| task.id == id) else {
+            return;
+        };
+        task.state = state;
+        if summary.is_some() {
+            task.summary = summary;
+        }
+        if tool_call_id.is_some() {
+            task.tool_call_id = tool_call_id;
+        }
+        self.settle_backgrounded_tool_calls();
+        cx.notify();
+    }
+
+    fn clear_async_tasks(&mut self, cx: &mut Context<Self>) {
+        if self.async_tasks.is_empty() && self.backgrounded_tool_calls.is_empty() {
+            return;
+        }
+        self.async_tasks.clear();
+        self.backgrounded_tool_calls.clear();
+        cx.notify();
+    }
+
+    /// The marker never updates, so a task's terminal state releases it.
+    fn settle_backgrounded_tool_calls(&mut self) {
+        let finished: Vec<acp_v1::ToolCallId> = self
+            .async_tasks
+            .iter()
+            .filter(|task| task.state.is_terminal())
+            .filter_map(|task| task.tool_call_id.clone())
+            .collect();
+        for tool_call_id in finished {
+            if self.async_task_for_tool_call(&tool_call_id).is_none() {
+                self.backgrounded_tool_calls.remove(&tool_call_id);
+            }
+        }
     }
 
     pub fn is_waiting_for_confirmation(&self) -> bool {
@@ -4764,6 +5141,24 @@ impl AcpThread {
     ) {
         let path_style = self.project.read(cx).path_style(cx);
 
+        // External agents announce native compaction as an assistant message.
+        if let acp_v2::ContentBlock::Text(text_content) = &chunk
+            && !is_thought
+            && is_context_compaction_notice(&text_content.text)
+        {
+            let id = ContextCompactionId(format!("agent-notice-{}", self.entries.len()).into());
+            self.push_context_compaction(
+                ContextCompaction {
+                    id,
+                    status: ContextCompactionStatus::Completed,
+                    error: None,
+                    summary: Vec::new(),
+                },
+                cx,
+            );
+            return;
+        }
+
         // For text chunks going to an existing Markdown block, buffer for smooth
         // streaming instead of appending all at once which may feel more choppy.
         let chunk = match chunk {
@@ -5195,6 +5590,56 @@ impl AcpThread {
         cx.emit(AcpThreadEvent::SubagentSpawned(session_id));
     }
 
+    /// Like [`Self::subagent_spawned`], but also tracks the lifecycle.
+    pub fn subagent_reported(&mut self, subagent: Subagent, cx: &mut Context<Self>) {
+        let session_id = subagent.session_id.clone();
+        match self
+            .subagents
+            .iter_mut()
+            .find(|existing| existing.session_id == subagent.session_id)
+        {
+            // A spawn can arrive after its own terminal state.
+            Some(existing) => {
+                let state = existing.state;
+                *existing = subagent;
+                if state.is_terminal() {
+                    existing.state = state;
+                }
+            }
+            None => self.subagents.push(subagent),
+        }
+        cx.emit(AcpThreadEvent::SubagentSpawned(session_id));
+        cx.notify();
+    }
+
+    pub fn subagent_state_updated(
+        &mut self,
+        session_id: &acp_v1::SessionId,
+        state: AsyncTaskState,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(subagent) = self
+            .subagents
+            .iter_mut()
+            .find(|subagent| &subagent.session_id == session_id)
+        else {
+            return;
+        };
+        if subagent.state == state {
+            return;
+        }
+        subagent.state = state;
+        cx.notify();
+    }
+
+    fn clear_subagents(&mut self, cx: &mut Context<Self>) {
+        if self.subagents.is_empty() {
+            return;
+        }
+        self.subagents.clear();
+        cx.notify();
+    }
+
     pub fn update_token_usage(&mut self, usage: Option<TokenUsage>, cx: &mut Context<Self>) {
         if usage.is_none() {
             self.cost = None;
@@ -5218,18 +5663,8 @@ impl AcpThread {
         let ix = match self.index_for_tool_call(update.id()) {
             Some(ix) => ix,
             None => {
-                // Tool call not found - create a failed tool call entry
-                let failed_tool_call = ToolCall::from_acp(
-                    acp_v1::ToolCall::new(update.id().clone(), "Tool call not found")
-                        .kind(acp_v1::ToolKind::Fetch)
-                        .status(acp_v1::ToolCallStatus::Failed)
-                        .content(vec!["Tool call not found".into()]),
-                    Some(ToolCallStatus::Failed),
-                    languages,
-                    &self.terminals,
-                    cx,
-                )?;
-                self.push_entry(AgentThreadEntry::ToolCall(failed_tool_call), cx);
+                // A placeholder entry would render as a useless chip.
+                log::warn!("ignoring update for unknown tool call {:?}", update.id());
                 return Ok(());
             }
         };
@@ -6524,6 +6959,15 @@ impl AcpThread {
         permission_outcome: RequestPermissionOutcome,
         cx: &mut Context<Self>,
     ) {
+        // The agent stopped, so it will not correct an in-progress entry itself.
+        for plan in self.plans.values_mut() {
+            for entry in &mut plan.entries {
+                if entry.source.status == acp_v2::PlanEntryStatus::InProgress {
+                    entry.source.status = acp_v2::PlanEntryStatus::Pending;
+                }
+            }
+        }
+
         let mut canceled_requests = Vec::new();
         for (ix, entry) in self.entries.iter_mut().enumerate() {
             match entry {
@@ -7123,7 +7567,10 @@ impl AcpThread {
 
         cx.spawn(async move |this, cx| {
             let terminal = terminal_task.await?;
-            this.update(cx, |this, _cx| {
+            this.update(cx, |this, cx| {
+                terminal.update(cx, |terminal, cx| {
+                    terminal.watch_repository(this.project.clone(), cx)
+                });
                 this.terminals.insert(terminal_id, terminal.clone());
                 terminal
             })
@@ -7184,6 +7631,8 @@ impl AcpThread {
     }
 
     pub fn emit_load_error(&mut self, error: LoadError, cx: &mut Context<Self>) {
+        self.clear_async_tasks(cx);
+        self.clear_subagents(cx);
         cx.emit(AcpThreadEvent::LoadError(error));
     }
 
@@ -7211,6 +7660,9 @@ impl AcpThread {
                 None,
                 cx,
             )
+        });
+        entity.update(cx, |terminal, cx| {
+            terminal.watch_repository(self.project.clone(), cx)
         });
         self.terminals.insert(terminal_id.clone(), entity.clone());
         entity
@@ -7391,6 +7843,330 @@ impl AcpThread {
     }
 }
 
+/// Edit labels that name no file (Codex sends these).
+const GENERIC_EDIT_LABELS: &[&str] = &[
+    "edit",
+    "edits",
+    "edit file",
+    "edit files",
+    "editing",
+    "editing file",
+    "editing files",
+    "file edit",
+    "file edits",
+    "apply patch",
+    "applying patch",
+    "patch",
+    "write",
+    "writing",
+    "writing file",
+    "writing files",
+    "update file",
+    "update files",
+    "updating file",
+    "updating files",
+];
+
+fn is_generic_edit_label(title: &str) -> bool {
+    let normalized = title
+        .trim()
+        .trim_end_matches(['.', '…', '"', '\''])
+        .to_lowercase();
+    normalized.is_empty() || GENERIC_EDIT_LABELS.contains(&normalized.as_str())
+}
+
+/// A label that names no file is replaced by the files the call touches.
+fn edit_label_source(title: &str, locations: &[acp_v1::ToolCallLocation]) -> String {
+    if !is_generic_edit_label(title) {
+        return MarkdownEscaped(title).to_string();
+    }
+
+    let mut file_names: Vec<String> = Vec::new();
+    for location in locations {
+        let Some(name) = location.path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !file_names.iter().any(|existing| existing == name) {
+            file_names.push(name.to_string());
+        }
+    }
+
+    match file_names.as_slice() {
+        [] => MarkdownEscaped(title).to_string(),
+        [name] => MarkdownEscaped(name).to_string(),
+        names => format!("{} files", names.len()),
+    }
+}
+
+fn is_tool_lookup_call(tool_name: Option<&str>, title: &str) -> bool {
+    let names_lookup = |name: &str| {
+        let name = name.trim().to_lowercase().replace(['-', ' '], "_");
+        name == "toolsearch" || name.starts_with("tool_search") || name.starts_with("search_tools")
+    };
+    match tool_name {
+        Some(tool_name) => names_lookup(tool_name),
+        None => names_lookup(title),
+    }
+}
+
+fn is_empty_stdin_write_call(
+    tool_name: Option<&str>,
+    title: &str,
+    raw_input: Option<&serde_json::Value>,
+) -> bool {
+    let names_stdin = |name: &str| name.trim().to_lowercase().contains("stdin");
+    let writes_stdin = match tool_name {
+        Some(tool_name) => names_stdin(tool_name),
+        None => names_stdin(title),
+    };
+    if !writes_stdin {
+        return false;
+    }
+    // An unreadable payload is not an empty one.
+    match raw_input {
+        Some(input) => input
+            .get("chars")
+            .is_some_and(|chars| chars.as_str().is_some_and(|chars| chars.is_empty())),
+        None => true,
+    }
+}
+
+/// Recognized by a reported name (`wait`, `wait_for_task`), else by a title
+/// that only says it is waiting. Calls that run or touch files never are.
+fn is_wait_call(tool_name: Option<&str>, title: &str, kind: &acp_v2::ToolKind) -> bool {
+    if matches!(
+        kind,
+        acp_v2::ToolKind::Execute
+            | acp_v2::ToolKind::Edit
+            | acp_v2::ToolKind::Delete
+            | acp_v2::ToolKind::Move
+    ) {
+        return false;
+    }
+
+    if let Some(tool_name) = tool_name {
+        let name = tool_name.trim().to_lowercase();
+        return name == "wait" || name.starts_with("wait_") || name.starts_with("wait-");
+    }
+
+    let title = title
+        .trim()
+        .trim_matches('`')
+        .trim_end_matches(['.', '…', '!'])
+        .to_lowercase();
+    let Some(rest) = title
+        .strip_prefix("waiting")
+        .or_else(|| title.strip_prefix("wait"))
+    else {
+        return false;
+    };
+    // Not "Waitlist".
+    rest.is_empty() || rest.starts_with(' ')
+}
+
+/// A bash-tagged fence for shell highlighting, reusing the body of any fence
+/// the agent already sent.
+fn execute_command_label_source(title: &str) -> String {
+    let command = title
+        .strip_prefix("```")
+        .and_then(|after_fence| after_fence.split_once('\n'))
+        .map(|(_tag, body)| body.strip_suffix("\n```").unwrap_or(body))
+        .unwrap_or(title);
+    let command = unquote_command(command);
+    format!("```bash\n{command}\n```")
+}
+
+/// Strips a JSON string literal or single quotes wrapped around a whole
+/// command, which would otherwise highlight as one string.
+fn unquote_command(command: &str) -> Cow<'_, str> {
+    let trimmed = command.trim();
+    if trimmed.len() < 2 {
+        return Cow::Borrowed(command);
+    }
+
+    if trimmed.starts_with('"') && trimmed.ends_with('"') {
+        // serde rejects `"a" && "b"` and unescapes `\"`.
+        if let Ok(unquoted) = serde_json::from_str::<String>(trimmed)
+            && !unquoted.trim().is_empty()
+        {
+            return Cow::Owned(unquoted);
+        }
+        return Cow::Borrowed(command);
+    }
+
+    if trimmed.starts_with('\'')
+        && trimmed.ends_with('\'')
+        && let Some(inner) = trimmed
+            .strip_prefix('\'')
+            .and_then(|rest| rest.strip_suffix('\''))
+        && !inner.contains('\'')
+        && !inner.trim().is_empty()
+    {
+        return Cow::Owned(inner.to_string());
+    }
+
+    Cow::Borrowed(command)
+}
+
+/// A verbatim one-line prefix of the command, with an ellipsis when anything
+/// is omitted.
+pub fn command_display_prefix(command: &str, max_chars: usize) -> String {
+    let trimmed = command.trim();
+    let first_line = trimmed.lines().next().unwrap_or("").trim_end();
+    let more_lines = trimmed.lines().nth(1).is_some();
+    let mut prefix: String = first_line.chars().take(max_chars).collect();
+    if more_lines || first_line.chars().count() > max_chars {
+        prefix.truncate(prefix.trim_end().len());
+        prefix.push('…');
+    }
+    prefix
+}
+
+/// "Context compacted to fit the model's context window." The length cap keeps
+/// prose about compaction from matching.
+fn is_context_compaction_notice(text: &str) -> bool {
+    const MAX_NOTICE_LEN: usize = 200;
+
+    let text = text.trim();
+    if text.is_empty() || text.len() > MAX_NOTICE_LEN {
+        return false;
+    }
+
+    let text = text.to_lowercase();
+    text.starts_with("context compacted")
+        || (text.contains("compacted") && text.contains("context window"))
+}
+
+/// Agents report usage failures as a JSON blob, often behind a prefix:
+/// `Internal error: { "message": "…", "codexErrorInfo": "usageLimitExceeded" }`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentErrorPayload {
+    pub message: String,
+    pub code: Option<String>,
+}
+
+pub fn parse_agent_error_payload(raw: &str) -> Option<AgentErrorPayload> {
+    payload_from_json(&extract_json_value(raw)?)
+}
+
+fn extract_json_value(raw: &str) -> Option<serde_json::Value> {
+    let trimmed = raw.trim();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        return Some(value);
+    }
+
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    if end < start {
+        return None;
+    }
+    serde_json::from_str(trimmed.get(start..=end)?).ok()
+}
+
+fn payload_from_json(value: &serde_json::Value) -> Option<AgentErrorPayload> {
+    const MESSAGE_KEYS: [&str; 5] = [
+        "message",
+        "error_message",
+        "errorMessage",
+        "detail",
+        "description",
+    ];
+    const CODE_KEYS: [&str; 7] = [
+        "codexErrorInfo",
+        "error_code",
+        "errorCode",
+        "code",
+        "kind",
+        "type",
+        "status",
+    ];
+    const NESTED_KEYS: [&str; 4] = ["error", "data", "body", "payload"];
+
+    let object = value.as_object()?;
+
+    let code = CODE_KEYS
+        .iter()
+        .find_map(|key| object.get(*key).and_then(json_scalar_to_string));
+
+    let message = MESSAGE_KEYS
+        .iter()
+        .find_map(|key| object.get(*key).and_then(|value| value.as_str()));
+
+    let Some(message) = message else {
+        // Shapes like `{"error": {"message": …}}` carry the message one level down.
+        return NESTED_KEYS.iter().find_map(|key| {
+            let mut nested = payload_from_json(object.get(*key)?)?;
+            nested.code = nested.code.or_else(|| code.clone());
+            Some(nested)
+        });
+    };
+
+    // Double-encoded payloads.
+    if let Some(mut nested) = parse_agent_error_payload(message) {
+        nested.code = nested.code.or(code);
+        return Some(nested);
+    }
+
+    Some(AgentErrorPayload {
+        message: message.trim().to_string(),
+        code,
+    })
+}
+
+fn json_scalar_to_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(value) => {
+            let value = value.trim();
+            (!value.is_empty()).then(|| value.to_string())
+        }
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+/// Wraps bare `http(s)` URLs in markdown links, leaving existing links alone.
+pub fn linkify_urls(text: &str) -> String {
+    const SCHEMES: [&str; 2] = ["https://", "http://"];
+
+    let mut linkified = String::with_capacity(text.len());
+    let mut rest = text;
+
+    while let Some(index) = rest.find("http") {
+        let (before, from) = rest.split_at(index);
+        linkified.push_str(before);
+
+        let Some(scheme) = SCHEMES
+            .iter()
+            .find(|scheme| from.starts_with(**scheme))
+            .copied()
+        else {
+            linkified.push_str("http");
+            rest = &from["http".len()..];
+            continue;
+        };
+
+        let end = from.find(char::is_whitespace).unwrap_or(from.len());
+        let (candidate, remainder) = from.split_at(end);
+        rest = remainder;
+
+        if before.ends_with("](") || before.ends_with('<') {
+            linkified.push_str(candidate);
+            continue;
+        }
+
+        let url = candidate.trim_end_matches([',', '.', ';', ':', '!', '?', ')', ']', '}', '\'']);
+        if url.len() > scheme.len() {
+            linkified.push_str(&format!("[{url}]({url})"));
+        } else {
+            linkified.push_str(url);
+        }
+        linkified.push_str(&candidate[url.len()..]);
+    }
+
+    linkified.push_str(rest);
+    linkified
+}
+
 fn markdown_for_raw_output(
     raw_output: &serde_json::Value,
     language_registry: &Arc<LanguageRegistry>,
@@ -7554,6 +8330,155 @@ mod tests {
     }
 
     #[test]
+    fn quoted_commands_are_unquoted_so_they_highlight_as_bash() {
+        assert_eq!(
+            execute_command_label_source("\"cargo test --workspace\""),
+            "```bash\ncargo test --workspace\n```"
+        );
+        assert_eq!(
+            execute_command_label_source("'ls -la'"),
+            "```bash\nls -la\n```"
+        );
+        assert_eq!(
+            execute_command_label_source(r#""git commit -m \"fix: thing\"""#),
+            "```bash\ngit commit -m \"fix: thing\"\n```"
+        );
+
+        for command in [
+            "echo \"hi\"",
+            "git commit -m \"wip\" && echo \"done\"",
+            "\"my program\" --flag \"x\"",
+            "echo 'a' && echo 'b'",
+            "cargo test",
+        ] {
+            assert_eq!(
+                execute_command_label_source(command),
+                format!("```bash\n{command}\n```"),
+                "{command} is not a quoted command"
+            );
+        }
+
+        assert_eq!(
+            execute_command_label_source("```sh\n\"cargo test\"\n```"),
+            "```bash\ncargo test\n```"
+        );
+    }
+
+    #[test]
+    fn command_display_prefixes() {
+        assert_eq!(command_display_prefix("cargo build", 60), "cargo build");
+        assert_eq!(
+            command_display_prefix("echo abcdefghijklmnop", 9),
+            "echo abcd…"
+        );
+        assert_eq!(
+            command_display_prefix("cargo build\ncargo test", 60),
+            "cargo build…"
+        );
+        assert_eq!(command_display_prefix("  spaced  ", 60), "spaced");
+    }
+
+    #[test]
+    fn json_error_payloads_are_parsed_into_message_and_code() {
+        let raw = r#"Internal error: { "message": "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Jul 20th, 2026 11:23 PM.", "codexErrorInfo": "usageLimitExceeded" }"#;
+        let payload = parse_agent_error_payload(raw).expect("the payload is JSON behind a prefix");
+        assert_eq!(payload.code.as_deref(), Some("usageLimitExceeded"));
+        assert!(payload.message.starts_with("You've hit your usage limit."));
+        assert!(!payload.message.contains("codexErrorInfo"));
+
+        assert_eq!(
+            parse_agent_error_payload(r#"{"message": "boom", "code": 429}"#),
+            Some(AgentErrorPayload {
+                message: "boom".to_string(),
+                code: Some("429".to_string()),
+            })
+        );
+
+        assert_eq!(
+            parse_agent_error_payload(r#"{"error": {"message": "nope", "type": "overloaded"}}"#),
+            Some(AgentErrorPayload {
+                message: "nope".to_string(),
+                code: Some("overloaded".to_string()),
+            })
+        );
+
+        assert_eq!(
+            parse_agent_error_payload(
+                r#"{"message": "{\"message\": \"inner\", \"code\": \"x\"}"}"#
+            ),
+            Some(AgentErrorPayload {
+                message: "inner".to_string(),
+                code: Some("x".to_string()),
+            })
+        );
+
+        for raw in [
+            r#"{"code": "boom"}"#,
+            "Something went wrong",
+            r#"["a", "b"]"#,
+            "Internal error: {oops",
+            "",
+        ] {
+            assert_eq!(parse_agent_error_payload(raw), None, "{raw}");
+        }
+    }
+
+    #[test]
+    fn urls_in_error_messages_become_links() {
+        assert_eq!(
+            linkify_urls(
+                "Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://x.dev/u to buy."
+            ),
+            "Upgrade to Pro ([https://chatgpt.com/explore/pro](https://chatgpt.com/explore/pro)), \
+             visit [https://x.dev/u](https://x.dev/u) to buy."
+        );
+
+        for unchanged in [
+            "see [docs](https://zed.dev/docs) and <https://zed.dev>",
+            "http is a protocol",
+        ] {
+            assert_eq!(linkify_urls(unchanged), unchanged);
+        }
+    }
+
+    #[test]
+    fn generic_edit_labels_are_derived_from_the_edited_files() {
+        let location = |path: &str| acp_v1::ToolCallLocation::new(PathBuf::from(path));
+
+        for title in ["editing files", "Editing Files.", ""] {
+            assert_eq!(
+                edit_label_source(title, &[location("/project/src/main.rs")]),
+                "main.rs"
+            );
+        }
+        assert_eq!(
+            edit_label_source(
+                "editing files",
+                &[
+                    location("/project/a.rs"),
+                    location("/project/b.rs"),
+                    location("/project/c.rs"),
+                ]
+            ),
+            "3 files"
+        );
+        assert_eq!(
+            edit_label_source(
+                "editing files",
+                &[location("/project/a.rs"), location("/project/a.rs")]
+            ),
+            "a.rs"
+        );
+
+        assert_eq!(edit_label_source("editing files", &[]), "editing files");
+        // Labels that name the file are kept, escaped.
+        assert_eq!(
+            edit_label_source("Create foo_bar.rs", &[location("/project/foo_bar.rs")]),
+            "Create foo\\_bar.rs"
+        );
+    }
+
+    #[test]
     fn command_category_meta_round_trips() {
         // Exhaustive list of variants. The match below has no wildcard arm, so
         // adding a `CommandCategory` variant fails to compile here until it's
@@ -7589,6 +8514,27 @@ mod tests {
             serde_json::to_value(deserialized).expect("serialize client message id"),
             json!("client-id")
         );
+    }
+
+    #[gpui::test]
+    async fn assistant_markdown_renders_diagrams(cx: &mut TestAppContext) {
+        init_test(cx);
+        let language_registry = Arc::new(LanguageRegistry::test(cx.executor()));
+        let markdown = cx.update(|cx| {
+            let block = ContentBlock::new_output(
+                acp_v2::ContentBlock::Text(acp_v2::TextContent::new(String::from("Some prose."))),
+                &language_registry,
+                cx,
+            );
+            block
+                .plain_markdown()
+                .cloned()
+                .unwrap_or_else(|| panic!("expected markdown, got {block:?}"))
+        });
+        cx.run_until_parked();
+        markdown.read_with(cx, |markdown, _| {
+            assert!(markdown.renders_mermaid_diagrams());
+        });
     }
 
     fn init_test(cx: &mut TestAppContext) {
@@ -8714,6 +9660,56 @@ mod tests {
     }
 
     #[test]
+    fn wait_calls_are_recognized_by_name_then_title() {
+        use acp_v2::ToolKind as Kind;
+        for (name, title, kind, expected) in [
+            (Some("wait"), "Polling", Kind::Other, true),
+            (Some("wait_for_task"), "Polling", Kind::Other, true),
+            (Some("read_file"), "Waiting", Kind::Read, false),
+            (None, "Wait", Kind::Other, true),
+            (None, "Waiting…", Kind::Other, true),
+            (None, "Waiting for the build", Kind::Other, true),
+            (None, "Waitlist the user", Kind::Other, false),
+            (None, "Read foo.rs", Kind::Read, false),
+            (Some("wait"), "wait 5", Kind::Execute, false),
+            (Some("wait"), "wait", Kind::Edit, false),
+        ] {
+            assert_eq!(is_wait_call(name, title, &kind), expected, "{title}");
+        }
+    }
+
+    #[test]
+    fn tool_lookups_are_not_actions() {
+        assert!(is_tool_lookup_call(Some("ToolSearch"), "ToolSearch"));
+        assert!(is_tool_lookup_call(Some("tool_search"), "tool_search"));
+        assert!(is_tool_lookup_call(Some("search_tools"), "search_tools"));
+        assert!(is_tool_lookup_call(None, "ToolSearch"));
+        assert!(!is_tool_lookup_call(Some("grep"), "Search for `foo`"));
+        assert!(!is_tool_lookup_call(None, "Searched the codebase"));
+    }
+
+    #[test]
+    fn empty_stdin_writes_are_not_actions() {
+        let empty = json!({ "chars": "" });
+        let keystrokes = json!({ "chars": "y\n" });
+        let unreadable = json!({ "data": [3] });
+        for (name, title, input, expected) in [
+            (Some("write_stdin"), "write_stdin", Some(&empty), true),
+            (Some("write_stdin"), "write_stdin", None, true),
+            (None, "write_stdin", Some(&empty), true),
+            (Some("write_stdin"), "write_stdin", Some(&keystrokes), false),
+            (Some("write_stdin"), "write_stdin", Some(&unreadable), false),
+            (Some("read_file"), "Read foo.rs", None, false),
+        ] {
+            assert_eq!(
+                is_empty_stdin_write_call(name, title, input),
+                expected,
+                "{name:?} {input:?}"
+            );
+        }
+    }
+
+    #[test]
     fn text_resource_markdown_uses_mime_type_for_code_blocks() {
         let shell =
             acp_v2::TextResourceContents::new("echo 'hello from exec test'", "tool://preview")
@@ -9612,11 +10608,11 @@ mod tests {
                 assert_eq!(reused.read(cx).inner().entity_id(), lower.entity_id());
                 assert_eq!(
                     reused.read(cx).command().read(cx).source(),
-                    "```\nactual command\n```"
+                    "```bash\nactual command\n```"
                 );
                 assert!(lower.read(cx).get_content().contains("early"));
                 let (_, tool) = thread.tool_call(&tool_id).expect("tool");
-                assert_eq!(tool.label.read(cx).source(), "New caption");
+                assert_eq!(tool.label.read(cx).source(), "```bash\nNew caption\n```");
                 assert_eq!(tool.terminals().next(), Some(&terminal));
             });
             thread
@@ -9633,7 +10629,7 @@ mod tests {
             terminal.read_with(cx, |terminal, cx| {
                 assert_eq!(
                     terminal.command().read(cx).source(),
-                    "```\nactual command\n```"
+                    "```bash\nactual command\n```"
                 );
             });
             thread
@@ -9656,7 +10652,10 @@ mod tests {
                 })
                 .expect("explicit command clear remains authoritative");
             terminal.read_with(cx, |terminal, cx| {
-                assert_eq!(terminal.command().read(cx).source(), "```\nTerminal\n```");
+                assert_eq!(
+                    terminal.command().read(cx).source(),
+                    "```bash\nTerminal\n```"
+                );
             });
             thread
                 .update(cx, |thread, cx| {
@@ -9976,7 +10975,7 @@ mod tests {
             assert!(terminal.inner().read(cx).get_content().contains("fresh"));
             assert_eq!(
                 terminal.command().read(cx).source(),
-                "```\nfirst command\n```"
+                "```bash\nfirst command\n```"
             );
         });
         thread
@@ -10075,7 +11074,7 @@ mod tests {
             assert!(terminal.display_state().is_none());
             assert_eq!(
                 terminal.command().read(cx).source(),
-                "```\nnative command\n```"
+                "```bash\nnative command\n```"
             );
             assert!(terminal.output().is_none());
             assert_eq!(lower.read(cx).get_content(), before);
@@ -10179,6 +11178,595 @@ mod tests {
         assert!(
             content.contains("pre-exit data"),
             "expected pre-exit data to render, got: {content}"
+        );
+    }
+
+    fn create_display_terminal(
+        thread: &mut AcpThread,
+        terminal_id: &acp_v1::TerminalId,
+        cx: &mut Context<AcpThread>,
+    ) {
+        let builder = ::terminal::TerminalBuilder::new_display_only(
+            ::terminal::terminal_settings::CursorShape::default(),
+            ::terminal::terminal_settings::AlternateScroll::On,
+            None,
+            0,
+            cx.background_executor(),
+            thread.project().read(cx).path_style(cx),
+        );
+        let lower = cx.new(|cx| builder.subscribe(cx));
+        thread.on_terminal_provider_event(
+            TerminalProviderEvent::Created {
+                terminal_id: terminal_id.clone(),
+                label: "cargo test".to_string(),
+                cwd: None,
+                output_byte_limit: None,
+                terminal: lower,
+            },
+            cx,
+        );
+    }
+
+    fn execute_call_with_terminal(
+        id: &'static str,
+        status: acp_v1::ToolCallStatus,
+        terminal_id: &acp_v1::TerminalId,
+    ) -> acp_v1::SessionUpdate {
+        acp_v1::SessionUpdate::ToolCall(
+            acp_v1::ToolCall::new(id, "cargo test")
+                .kind(acp_v1::ToolKind::Execute)
+                .status(status)
+                .content(vec![acp_v1::ToolCallContent::Terminal(
+                    acp_v1::Terminal::new(terminal_id.clone()),
+                )]),
+        )
+    }
+
+    fn claude_subagent_meta(session_id: Option<&str>) -> acp_v1::Meta {
+        let mut meta = acp_v1::Meta::from_iter([(
+            CLAUDE_CODE_META_KEY.into(),
+            serde_json::json!({ "toolName": "Agent" }),
+        )]);
+        if let Some(session_id) = session_id {
+            meta.insert(
+                SUBAGENT_SESSION_INFO_META_KEY.into(),
+                serde_json::json!({ "session_id": session_id, "message_start_index": 0 }),
+            );
+        }
+        meta
+    }
+
+    #[gpui::test]
+    async fn test_display_only_terminal_reports_its_own_exit(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let thread = new_test_thread(cx).await;
+
+        let terminal_id = acp_v1::TerminalId::new("display-only");
+        thread.update(cx, |thread, cx| {
+            create_display_terminal(thread, &terminal_id, cx);
+        });
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            assert!(thread.terminals[&terminal_id].read(cx).output().is_none());
+        });
+
+        let still_running_at = Instant::now();
+        thread.update(cx, |thread, cx| {
+            thread.on_terminal_provider_event(
+                TerminalProviderEvent::Exit {
+                    terminal_id: terminal_id.clone(),
+                    status: acp_v1::TerminalExitStatus::new().exit_code(1),
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, cx| {
+            let terminal = thread.terminals[&terminal_id].read(cx);
+            let output = terminal
+                .output()
+                .expect("the reported exit ends the command");
+            assert_eq!(output.exit_status.exit_code, Some(1));
+            assert!(output.ended_at >= still_running_at);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_detached_work_keeps_a_thread_and_its_card_working(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let thread = new_test_thread(cx).await;
+
+        let tool_call_id = acp_v1::ToolCallId::new("bash-call");
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::ToolCall(
+                        acp_v1::ToolCall::new(tool_call_id.clone(), "cargo test")
+                            .kind(acp_v1::ToolKind::Execute)
+                            .status(acp_v1::ToolCallStatus::Completed),
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            assert!(thread.running_work(cx).is_empty());
+            assert!(!thread.tool_call_is_backgrounded(&tool_call_id));
+        });
+
+        // The marker can arrive before the task that names the call.
+        thread.update(cx, |thread, cx| {
+            thread.mark_tool_call_backgrounded(tool_call_id.clone(), cx);
+        });
+        thread.read_with(cx, |thread, cx| {
+            assert!(thread.tool_call_is_backgrounded(&tool_call_id));
+            assert!(thread.running_work(cx).is_empty());
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.async_task_spawned(
+                AsyncTask {
+                    id: "task-1".into(),
+                    name: "cargo test".into(),
+                    description: Some("running the suite".into()),
+                    state: AsyncTaskState::Running,
+                    summary: None,
+                    tool_call_id: Some(tool_call_id.clone()),
+                    output_file_path: Some("/tmp/task-1.log".into()),
+                    can_stop: true,
+                },
+                cx,
+            );
+        });
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(
+                thread.running_work(cx),
+                RunningWork {
+                    terminals: 0,
+                    subagents: 0,
+                    async_tasks: 1,
+                },
+            );
+            assert_eq!(
+                thread
+                    .async_task_for_tool_call(&tool_call_id)
+                    .map(|task| task.id.clone()),
+                Some("task-1".into()),
+            );
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.async_task_progress(
+                "task-1",
+                None,
+                Some("42 passed".into()),
+                None,
+                Some("/tmp/task-1-final.log".into()),
+                cx,
+            );
+        });
+        thread.read_with(cx, |thread, _| {
+            let task = &thread.async_tasks()[0];
+            assert_eq!(task.summary.as_deref(), Some("42 passed"));
+            assert_eq!(
+                task.output_file_path.as_deref(),
+                Some("/tmp/task-1-final.log")
+            );
+            assert_eq!(task.description.as_deref(), Some("running the suite"));
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.async_task_state_updated(
+                "task-1",
+                AsyncTaskState::Completed,
+                Some("done".into()),
+                None,
+                cx,
+            );
+        });
+        thread.read_with(cx, |thread, cx| {
+            assert!(thread.running_work(cx).is_empty());
+            assert!(!thread.tool_call_is_backgrounded(&tool_call_id));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_a_detached_task_announced_late_keeps_the_state_it_reached(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let thread = new_test_thread(cx).await;
+
+        let task = AsyncTask {
+            id: "task-1".into(),
+            name: "sleep 300".into(),
+            description: None,
+            state: AsyncTaskState::Running,
+            summary: None,
+            tool_call_id: None,
+            output_file_path: None,
+            can_stop: true,
+        };
+        thread.update(cx, |thread, cx| {
+            thread.async_task_spawned(task.clone(), cx);
+            thread.async_task_state_updated("task-1", AsyncTaskState::Stopped, None, None, cx);
+            thread.async_task_spawned(task, cx);
+        });
+        thread.read_with(cx, |thread, cx| {
+            assert!(thread.running_work(cx).is_empty());
+            assert_eq!(thread.async_tasks().len(), 1);
+        });
+    }
+
+    /// Terminals with no output are left behind by replayed history and by
+    /// cancelled turns; counting them marked idle sidebar rows as busy.
+    #[gpui::test]
+    async fn test_running_work_counts_only_what_is_still_in_flight(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let thread = new_test_thread(cx).await;
+        thread.read_with(cx, |thread, cx| {
+            assert!(thread.running_work(cx).is_empty());
+        });
+
+        // A replayed call whose terminal never reported an exit.
+        let replayed = acp_v1::TerminalId::new("replayed-command");
+        thread.update(cx, |thread, cx| {
+            create_display_terminal(thread, &replayed, cx);
+            thread
+                .handle_session_update(
+                    execute_call_with_terminal(
+                        "replayed-call",
+                        acp_v1::ToolCallStatus::Completed,
+                        &replayed,
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            assert!(thread.running_work(cx).is_empty());
+        });
+
+        let in_flight = |thread: &mut AcpThread,
+                         call: &'static str,
+                         subagent: &'static str,
+                         terminal_id: &acp_v1::TerminalId,
+                         cx: &mut Context<AcpThread>| {
+            create_display_terminal(thread, terminal_id, cx);
+            thread
+                .handle_session_update(
+                    execute_call_with_terminal(
+                        call,
+                        acp_v1::ToolCallStatus::InProgress,
+                        terminal_id,
+                    ),
+                    cx,
+                )
+                .unwrap();
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::ToolCall(
+                        acp_v1::ToolCall::new(subagent, "Investigate the failure")
+                            .status(acp_v1::ToolCallStatus::InProgress)
+                            .meta(meta_with_tool_name("spawn_agent")),
+                    ),
+                    cx,
+                )
+                .unwrap();
+        };
+        let busy = RunningWork {
+            terminals: 1,
+            subagents: 1,
+            async_tasks: 0,
+        };
+
+        // Work that finishes on its own.
+        let (complete, request) = start_test_turn(&thread, cx);
+        cx.run_until_parked();
+        let finished = acp_v1::TerminalId::new("finished-command");
+        thread.update(cx, |thread, cx| {
+            in_flight(thread, "terminal-call", "subagent-call", &finished, cx);
+        });
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| assert_eq!(thread.running_work(cx), busy));
+        thread.update(cx, |thread, cx| {
+            thread.on_terminal_provider_event(
+                TerminalProviderEvent::Exit {
+                    terminal_id: finished.clone(),
+                    status: acp_v1::TerminalExitStatus::new().exit_code(0),
+                },
+                cx,
+            );
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::ToolCallUpdate(acp_v1::ToolCallUpdate::new(
+                        acp_v1::ToolCallId::new("subagent-call"),
+                        acp_v1::ToolCallUpdateFields::new()
+                            .status(acp_v1::ToolCallStatus::Completed),
+                    )),
+                    cx,
+                )
+                .unwrap();
+        });
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            assert!(thread.running_work(cx).is_empty());
+        });
+        complete
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .expect("turn should still be running");
+        request.await.expect("turn should complete");
+
+        // Work a cancelled turn leaves behind.
+        let (complete, request) = start_test_turn(&thread, cx);
+        cx.run_until_parked();
+        let cancelled = acp_v1::TerminalId::new("cancelled-command");
+        thread.update(cx, |thread, cx| {
+            in_flight(
+                thread,
+                "cancelled-call",
+                "cancelled-subagent",
+                &cancelled,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| assert_eq!(thread.running_work(cx), busy));
+
+        // `cancel` waits for the turn's send task, which this test holds.
+        let cancelled_turn = thread.update(cx, |thread, cx| thread.cancel(cx));
+        drop(complete);
+        cancelled_turn.await;
+        request.await.ok();
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            assert!(thread.running_work(cx).is_empty());
+        });
+    }
+
+    /// Claude names its tools only in its own meta namespace.
+    #[gpui::test]
+    async fn test_claude_subagents_are_counted_while_they_work(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let thread = new_test_thread(cx).await;
+
+        let claude_tool = |name: &str| {
+            acp_v1::Meta::from_iter([(
+                CLAUDE_CODE_META_KEY.into(),
+                serde_json::json!({ "toolName": name }),
+            )])
+        };
+        let call = |id: &'static str, name: &str, status| {
+            acp_v1::SessionUpdate::ToolCall(
+                acp_v1::ToolCall::new(id, id)
+                    .status(status)
+                    .meta(claude_tool(name)),
+            )
+        };
+
+        let (complete, request) = start_test_turn(&thread, cx);
+        cx.run_until_parked();
+
+        thread.update(cx, |thread, cx| {
+            for (id, name) in [
+                ("agent-call", "Agent"),
+                ("task-call", "Task"),
+                ("bash-call", "Bash"),
+            ] {
+                thread
+                    .handle_session_update(call(id, name, acp_v1::ToolCallStatus::InProgress), cx)
+                    .unwrap();
+            }
+        });
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(thread.running_work(cx).subagents, 2);
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    call("agent-call", "Agent", acp_v1::ToolCallStatus::Completed),
+                    cx,
+                )
+                .unwrap();
+        });
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(thread.running_work(cx).subagents, 1);
+        });
+
+        // Nobody is left to finish a call once the turn ends.
+        complete
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .expect("turn should still be running");
+        request.await.expect("turn should complete");
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(thread.running_work(cx).subagents, 0);
+        });
+    }
+
+    /// Claude's `Agent` call completes when the subagent is handed off, so only
+    /// the adapter's lifecycle reports say it is still running.
+    #[gpui::test]
+    async fn test_reported_subagents_outlive_the_turn_that_launched_them(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let thread = new_test_thread(cx).await;
+
+        let reviews = [
+            ("subagent-1", "Reuse review of flush cuts"),
+            ("subagent-2", "Simplification and altitude review"),
+            ("subagent-3", "Efficiency review of flush cuts"),
+        ];
+
+        let (complete, request) = start_test_turn(&thread, cx);
+        cx.run_until_parked();
+
+        thread.update(cx, |thread, cx| {
+            for (session, task) in reviews {
+                thread.subagent_reported(
+                    Subagent {
+                        session_id: acp_v1::SessionId::new(session),
+                        name: Some("code-reviewer".into()),
+                        task: Some(task.into()),
+                        state: AsyncTaskState::Running,
+                    },
+                    cx,
+                );
+                thread
+                    .handle_session_update(
+                        acp_v1::SessionUpdate::ToolCall(
+                            acp_v1::ToolCall::new(session, task)
+                                // Reported and still in flight: counted once.
+                                .status(if session == "subagent-1" {
+                                    acp_v1::ToolCallStatus::InProgress
+                                } else {
+                                    acp_v1::ToolCallStatus::Completed
+                                })
+                                .meta(claude_subagent_meta(Some(session))),
+                        ),
+                        cx,
+                    )
+                    .unwrap();
+            }
+            // One nobody reports on, which only its call speaks for.
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::ToolCall(
+                        acp_v1::ToolCall::new("unreported", "Summarise the diff")
+                            .status(acp_v1::ToolCallStatus::InProgress)
+                            .meta(claude_subagent_meta(None)),
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(thread.running_work(cx).subagents, 4);
+            for (session, _) in reviews {
+                let call = thread
+                    .tool_call(&acp_v1::ToolCallId::new(session))
+                    .expect("subagent call")
+                    .1;
+                assert_eq!(
+                    thread.subagent_state_for_tool_call(call),
+                    Some(AsyncTaskState::Running),
+                );
+            }
+        });
+
+        complete
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .expect("turn should still be running");
+        request.await.expect("turn should complete");
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(thread.running_work(cx).subagents, 3);
+        });
+
+        for (session, state, remaining) in [
+            ("subagent-1", AsyncTaskState::Completed, 2),
+            ("subagent-2", AsyncTaskState::Failed, 1),
+            ("subagent-3", AsyncTaskState::Stopped, 0),
+        ] {
+            thread.update(cx, |thread, cx| {
+                thread.subagent_state_updated(&acp_v1::SessionId::new(session), state, cx);
+            });
+            cx.run_until_parked();
+            thread.read_with(cx, |thread, cx| {
+                assert_eq!(thread.running_work(cx).subagents, remaining, "{session}");
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn test_terminal_output_records_how_long_the_command_ran(cx: &mut gpui::TestAppContext) {
+        use std::collections::HashMap;
+        use task::Shell;
+        use util::shell_builder::ShellBuilder;
+
+        init_test(cx);
+        cx.executor().allow_parking();
+        let thread = new_test_thread(cx).await;
+
+        let terminal_id = acp_v1::TerminalId::new(uuid::Uuid::new_v4().to_string());
+        let (program, args) =
+            ShellBuilder::new(&Shell::System, false).build(Some("sleep 1".to_owned()), &[]);
+        let terminal_mode = ::terminal::TerminalMode::task(task::SpawnInTerminal {
+            command: Some(program.clone()),
+            args: args.clone(),
+            ..Default::default()
+        });
+        let builder = cx
+            .update(|cx| {
+                ::terminal::TerminalBuilder::new(
+                    None,
+                    terminal_mode,
+                    task::Shell::WithArguments {
+                        program,
+                        args,
+                        title_override: None,
+                    },
+                    HashMap::default(),
+                    ::terminal::terminal_settings::CursorShape::default(),
+                    ::terminal::terminal_settings::AlternateScroll::On,
+                    None,
+                    vec![],
+                    Duration::ZERO,
+                    false,
+                    0,
+                    cx,
+                    vec![],
+                    PathStyle::local(),
+                )
+            })
+            .await
+            .unwrap();
+        let lower_terminal = cx.new(|cx| builder.subscribe(cx));
+
+        thread.update(cx, |thread, cx| {
+            thread.on_terminal_provider_event(
+                TerminalProviderEvent::Created {
+                    terminal_id: terminal_id.clone(),
+                    label: "sleep 1".to_string(),
+                    cwd: None,
+                    output_byte_limit: None,
+                    terminal: lower_terminal.clone(),
+                },
+                cx,
+            );
+        });
+
+        // Wait for the real process first, so the duration is the command's.
+        let ran = cx.update(|cx| lower_terminal.read(cx).wait_for_completed_task(cx));
+        ran.await;
+        thread.update(cx, |thread, cx| {
+            thread.on_terminal_provider_event(
+                TerminalProviderEvent::Exit {
+                    terminal_id: terminal_id.clone(),
+                    status: acp_v1::TerminalExitStatus::new().exit_code(Some(0)),
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let (started_at, ended_at) = thread.read_with(cx, |thread, cx| {
+            let terminal = thread.terminals[&terminal_id].read(cx);
+            let output = terminal.output().expect("the command finished");
+            (terminal.started_at(), output.ended_at)
+        });
+        let ran_for = ended_at.duration_since(started_at);
+        assert!(
+            ran_for >= Duration::from_millis(500),
+            "a command that slept for a second reported {ran_for:?}"
         );
     }
 
@@ -10360,6 +11948,54 @@ mod tests {
                 inner_content
             );
         }
+    }
+
+    #[gpui::test]
+    async fn test_compaction_notice_becomes_a_compaction_entry(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        thread.update(cx, |thread, cx| {
+            thread.push_assistant_content_block(
+                "Context compacted to fit the model's context window.".into(),
+                false,
+                cx,
+            );
+        });
+        thread.update(cx, |thread, _cx| {
+            assert!(matches!(
+                thread.entries.as_slice(),
+                [AgentThreadEntry::ContextCompaction(compaction)]
+                    if compaction.status == ContextCompactionStatus::Completed
+            ));
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.push_assistant_content_block(
+                "I could compact the context window here, but let me first explain what \
+                 compaction does and why the model's context window fills up: every tool \
+                 call, every file I read, and every message we exchange accumulates in it."
+                    .into(),
+                false,
+                cx,
+            );
+        });
+        thread.update(cx, |thread, _cx| {
+            assert_eq!(thread.entries.len(), 2);
+            assert!(matches!(
+                thread.entries[1],
+                AgentThreadEntry::AssistantMessage(_)
+            ));
+        });
     }
 
     #[gpui::test]
@@ -13072,7 +14708,7 @@ mod tests {
             );
             assert_eq!(call.status(), ToolCallStatus::Completed);
             assert_eq!(call.local_status, None);
-            assert_eq!(call.label.read(cx).source(), "updated title");
+            assert_eq!(call.label.read(cx).source(), "```bash\nupdated title\n```");
             thread
                 .update_tool_call(
                     acp_v1::ToolCallUpdate::new(
@@ -13906,7 +15542,7 @@ mod tests {
             ),
             (
                 acp_v1::ToolCallUpdateFields::new().kind(acp_v1::ToolKind::Execute),
-                "**Readable title**",
+                "```bash\n**Readable title**\n```",
                 false,
             ),
             (
@@ -14509,9 +16145,9 @@ mod tests {
                     )
                     .is_err()
             );
-            assert_eq!(command.read(cx).source(), "```\noriginal command\n```");
+            assert_eq!(command.read(cx).source(), "```bash\noriginal command\n```");
             let (_, call) = thread.tool_call(&id).expect("unchanged tool");
-            assert_eq!(call.label.read(cx).source(), "Tool caption");
+            assert_eq!(call.label.read(cx).source(), "```bash\nTool caption\n```");
             assert_eq!(call.terminals().next(), Some(&terminal));
             assert_eq!(call.content().len(), 1);
             thread
@@ -14527,7 +16163,7 @@ mod tests {
                     cx,
                 )
                 .expect("valid terminal update");
-            assert_eq!(command.read(cx).source(), "```\nchanged command\n```");
+            assert_eq!(command.read(cx).source(), "```bash\nchanged command\n```");
             assert_eq!(
                 thread.tool_call(&id).expect("tool").1.terminals().next(),
                 Some(&terminal)
@@ -14725,7 +16361,10 @@ mod tests {
             let (_, tool_call) = thread
                 .tool_call(&tool_call_id)
                 .expect("tool call should exist");
-            assert_eq!(tool_call.label.read(cx).source(), "Updated title");
+            assert_eq!(
+                tool_call.label.read(cx).source(),
+                "```bash\nUpdated title\n```"
+            );
             assert!(matches!(
                 tool_call.status(),
                 ToolCallStatus::WaitingForConfirmation
@@ -14753,7 +16392,10 @@ mod tests {
             let (_, tool_call) = thread
                 .tool_call(&tool_call_id)
                 .expect("tool call should exist");
-            assert_eq!(tool_call.label.read(cx).source(), "Updated again");
+            assert_eq!(
+                tool_call.label.read(cx).source(),
+                "```bash\nUpdated again\n```"
+            );
             assert!(matches!(
                 tool_call.status(),
                 ToolCallStatus::WaitingForConfirmation
@@ -14807,7 +16449,7 @@ mod tests {
             let (_, tool_call) = thread
                 .tool_call(&tool_call_id)
                 .expect("tool call should exist");
-            assert_eq!(tool_call.label.read(cx).source(), "Completed");
+            assert_eq!(tool_call.label.read(cx).source(), "```bash\nCompleted\n```");
             assert!(matches!(tool_call.status(), ToolCallStatus::Completed));
             assert_eq!(tool_call.content().len(), 1);
             assert_eq!(tool_call.content()[0].to_markdown(cx), "done");
@@ -14953,7 +16595,10 @@ mod tests {
             let (_, tool_call) = thread
                 .tool_call(&tool_call_id)
                 .expect("tool call should exist");
-            assert_eq!(tool_call.label.read(cx).source(), "Needs permission");
+            assert_eq!(
+                tool_call.label.read(cx).source(),
+                "```bash\nNeeds permission\n```"
+            );
             assert_eq!(tool_call.status(), ToolCallStatus::WaitingForConfirmation);
             assert_eq!(
                 tool_call.permission_status(),
@@ -15682,6 +17327,68 @@ mod tests {
                     HELLO
 
                 "}
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_cancel_stops_the_in_progress_plan_entry(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new().on_user_message(
+            move |_, thread, mut cx| {
+                async move {
+                    thread
+                        .update(&mut cx, |thread, cx| {
+                            thread.handle_session_update(
+                                acp_v1::SessionUpdate::Plan(acp_v1::Plan::new(vec![
+                                    acp_v1::PlanEntry::new(
+                                        "First",
+                                        acp_v1::PlanEntryPriority::Medium,
+                                        acp_v1::PlanEntryStatus::InProgress,
+                                    ),
+                                    acp_v1::PlanEntry::new(
+                                        "Second",
+                                        acp_v1::PlanEntryPriority::Medium,
+                                        acp_v1::PlanEntryStatus::Pending,
+                                    ),
+                                ])),
+                                cx,
+                            )
+                        })
+                        .unwrap()
+                        .unwrap();
+                    Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::Cancelled))
+                }
+                .boxed_local()
+            },
+        ));
+
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Do the thing", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, _| {
+            let plan = thread.plan().expect("the turn reported a plan");
+            assert!(
+                plan.stats().in_progress_entry.is_none(),
+                "a cancelled turn leaves nothing in progress"
+            );
+            assert_eq!(plan.entries.len(), 2);
+            assert_eq!(
+                plan.entries[0].source.status,
+                acp_v2::PlanEntryStatus::Pending
             );
         });
     }
@@ -17411,31 +19118,7 @@ mod tests {
 
             // The update should succeed (not return an error)
             assert!(result.is_ok());
-
-            // There should now be exactly one entry in the thread
-            assert_eq!(thread.entries.len(), 1);
-
-            // The entry should be a failed tool call
-            if let AgentThreadEntry::ToolCall(tool_call) = &thread.entries[0] {
-                assert_eq!(tool_call.id, nonexistent_id);
-                assert!(matches!(tool_call.status(), ToolCallStatus::Failed));
-                assert_eq!(tool_call.kind(), &acp_v2::ToolKind::Fetch);
-
-                // Check that the content contains the error message
-                assert_eq!(tool_call.content().len(), 1);
-                if let ToolCallContent::ContentBlock {
-                    block: content_block,
-                    ..
-                } = &tool_call.content()[0]
-                {
-                    let markdown = content_block.plain_markdown().expect("expected markdown");
-                    assert!(markdown.read(cx).source().contains("Tool call not found"));
-                } else {
-                    panic!("Expected ContentBlock, got: {:?}", tool_call.content()[0]);
-                }
-            } else {
-                panic!("Expected ToolCall entry, got: {:?}", thread.entries[0]);
-            }
+            assert_eq!(thread.entries.len(), 0);
         });
     }
 

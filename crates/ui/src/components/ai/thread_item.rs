@@ -1,11 +1,12 @@
 use crate::{CommonAnimationExt, DiffStat, GradientFade, HighlightedLabel, Tooltip, prelude::*};
 
 use gpui::{
-    Animation, AnimationExt, ClickEvent, Hsla, MouseButton, SharedString,
+    Animation, AnimationExt, ClickEvent, FontWeight, Hsla, MouseButton, SharedString,
     WindowBackgroundAppearance, pulsating_between,
 };
 use itertools::Itertools as _;
 use std::{path::PathBuf, sync::Arc, time::Duration};
+use theme::ThemeColors;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AgentThreadStatus {
@@ -16,6 +17,15 @@ pub enum AgentThreadStatus {
     Error,
 }
 
+/// The one "agent running" glyph, shared by every surface.
+pub fn agent_running_indicator() -> AnyElement {
+    Icon::new(IconName::LoadCircle)
+        .size(IconSize::Small)
+        .color(Color::Accent)
+        .with_rotate_animation(2)
+        .into_any_element()
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WorktreeKind {
     #[default]
@@ -23,13 +33,428 @@ pub enum WorktreeKind {
     Linked,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq)]
 pub struct ThreadItemWorktreeInfo {
     pub worktree_name: Option<SharedString>,
     pub branch_name: Option<SharedString>,
     pub full_path: SharedString,
     pub highlight_positions: Vec<usize>,
     pub kind: WorktreeKind,
+}
+
+/// A pull request's CI glyph. Only a run still going turns: a still one read
+/// as a refresh button.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ChecksGlyph {
+    pub icon: IconName,
+    pub color: Color,
+    pub spinning: bool,
+}
+
+impl ChecksGlyph {
+    pub fn settled(icon: IconName, color: Color) -> Self {
+        Self {
+            icon,
+            color,
+            spinning: false,
+        }
+    }
+
+    pub fn running(icon: IconName, color: Color) -> Self {
+        Self {
+            icon,
+            color,
+            spinning: true,
+        }
+    }
+
+    /// `id` names the surface: the pill and its hover card draw the same glyph.
+    fn render(self, id: &'static str, size: IconSize) -> AnyElement {
+        let icon = Icon::new(self.icon).size(size).color(self.color);
+        if self.spinning {
+            icon.with_keyed_rotate_animation(id, 2).into_any_element()
+        } else {
+            icon.into_any_element()
+        }
+    }
+}
+
+/// A pull-request badge. Without a `url` (the "no PR" indicator) it is inert
+/// and muted.
+#[derive(Clone)]
+pub struct ThreadItemPrChip {
+    pub label: SharedString,
+    pub state_icon: IconName,
+    pub state_color: Color,
+    pub checks: Option<ChecksGlyph>,
+    pub url: Option<SharedString>,
+    pub tooltip: SharedString,
+    /// Without it the badge falls back to the plain `tooltip` text.
+    pub detail: Option<PrChipDetail>,
+}
+
+#[derive(Clone)]
+pub struct PrChipDetail {
+    pub title: SharedString,
+    pub number: u64,
+    pub state: SharedString,
+    pub state_color: Color,
+    pub checks: SharedString,
+    pub checks_icon: Option<ChecksGlyph>,
+    pub review: SharedString,
+    /// Capped by the producer.
+    pub failing_checks: Vec<SharedString>,
+    /// Failing checks not listed, for an "and N more" line.
+    pub extra_failing_checks: usize,
+    /// Why GitHub will not merge this pull request, when known.
+    pub merge_blocker: Option<SharedString>,
+}
+
+#[derive(IntoElement)]
+pub struct PrChip {
+    id: ElementId,
+    chip: ThreadItemPrChip,
+    large: bool,
+    surface: Option<Hsla>,
+    remove: Option<PrChipRemove>,
+}
+
+struct PrChipRemove {
+    group: SharedString,
+    tooltip: SharedString,
+    handler: Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>,
+}
+
+impl PrChip {
+    pub fn new(id: impl Into<ElementId>, chip: ThreadItemPrChip) -> Self {
+        Self {
+            id: id.into(),
+            chip,
+            large: false,
+            surface: None,
+            remove: None,
+        }
+    }
+
+    /// On hover the X stands where the state icon does, so it costs no width.
+    /// `group` is the hover group the chip draws itself into.
+    pub fn on_remove(
+        mut self,
+        group: impl Into<SharedString>,
+        tooltip: impl Into<SharedString>,
+        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.remove = Some(PrChipRemove {
+            group: group.into(),
+            tooltip: tooltip.into(),
+            handler: Box::new(handler),
+        });
+        self
+    }
+
+    pub fn large(mut self, large: bool) -> Self {
+        self.large = large;
+        self
+    }
+
+    /// The opaque colour the pill sits on. Defaults to the panel background.
+    pub fn surface(mut self, surface: Hsla) -> Self {
+        self.surface = Some(surface);
+        self
+    }
+}
+
+impl RenderOnce for PrChip {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let chip = self.chip;
+        let clickable = chip.url.is_some();
+        // A translucent theme fill would let a long title read through the pill.
+        let surface = self
+            .surface
+            .unwrap_or_else(|| cx.theme().colors().panel_background);
+        // The inert pill keeps the same geometry so a row does not change shape
+        // when a PR lands.
+        let (label_color, label_weight, border_color, fill) = if clickable {
+            (
+                Color::Default,
+                FontWeight::MEDIUM,
+                cx.theme().colors().border,
+                cx.theme().colors().element_background,
+            )
+        } else {
+            (
+                Color::Muted,
+                FontWeight::NORMAL,
+                cx.theme().colors().border.opacity(0.5),
+                cx.theme().colors().element_background.opacity(0.5),
+            )
+        };
+        let background = surface.blend(fill);
+        let label_size = if self.large {
+            LabelSize::Default
+        } else {
+            LabelSize::Small
+        };
+
+        h_flex()
+            .id(self.id)
+            .min_w_0()
+            .flex_shrink_0()
+            .h(rems_from_px(24_f32))
+            .px_1p5()
+            .gap_1()
+            .rounded_md()
+            .border_1()
+            .border_color(border_color)
+            .bg(background)
+            .when(clickable, |this| {
+                this.hover(|s| s.bg(cx.theme().colors().element_hover))
+            })
+            .when_some(self.remove.as_ref(), |this, remove| {
+                this.group(remove.group.clone())
+            })
+            .map(|this| {
+                let state_icon = Icon::new(chip.state_icon)
+                    .size(IconSize::Small)
+                    .color(chip.state_color);
+                let Some(remove) = self.remove else {
+                    return this.child(state_icon);
+                };
+                let PrChipRemove {
+                    group,
+                    tooltip,
+                    handler,
+                } = remove;
+                this.child(
+                    div()
+                        .relative()
+                        .flex_none()
+                        .child(
+                            div()
+                                .group_hover(group.clone(), |style| style.invisible())
+                                .child(state_icon),
+                        )
+                        .child(
+                            div()
+                                .id("pr-chip-remove")
+                                .absolute()
+                                .inset_0()
+                                .invisible()
+                                .group_hover(group, |style| style.visible())
+                                .cursor_pointer()
+                                .tooltip(Tooltip::text(tooltip))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(move |event, window, cx| {
+                                    cx.stop_propagation();
+                                    handler(event, window, cx);
+                                })
+                                .child(
+                                    Icon::new(IconName::Close)
+                                        .size(IconSize::Small)
+                                        .color(Color::Muted),
+                                ),
+                        ),
+                )
+            })
+            .child(
+                Label::new(chip.label)
+                    .size(label_size)
+                    .weight(label_weight)
+                    .color(label_color),
+            )
+            .when_some(chip.checks, |this, glyph| {
+                this.child(glyph.render("pr-chip-checks", IconSize::Small))
+            })
+            .map(|this| match chip.detail {
+                Some(detail) => this.tooltip(Tooltip::element(move |_, _| {
+                    let detail = detail.clone();
+                    v_flex()
+                        .gap_1()
+                        .w_96()
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .min_w_0()
+                                .gap_1()
+                                .items_start()
+                                .child(div().min_w_0().flex_1().child(Label::new(detail.title)))
+                                .child(
+                                    Label::new(format!("#{}", detail.number)).color(Color::Muted),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_1p5()
+                                .child(
+                                    h_flex()
+                                        .gap_0p5()
+                                        .child(
+                                            Icon::new(IconName::PullRequest)
+                                                .size(IconSize::XSmall)
+                                                .color(detail.state_color),
+                                        )
+                                        .child(
+                                            Label::new(detail.state)
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
+                                        ),
+                                )
+                                .when(!detail.checks.is_empty(), |this| {
+                                    this.child(
+                                        h_flex()
+                                            .gap_0p5()
+                                            .when_some(detail.checks_icon, |this, glyph| {
+                                                this.child(
+                                                    glyph
+                                                        .render("pr-card-checks", IconSize::XSmall),
+                                                )
+                                            })
+                                            .child(
+                                                Label::new(detail.checks)
+                                                    .size(LabelSize::Small)
+                                                    .color(Color::Muted),
+                                            ),
+                                    )
+                                })
+                                .child(
+                                    Label::new(detail.review)
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                ),
+                        )
+                        .when_some(detail.merge_blocker, |this, reason| {
+                            this.child(
+                                h_flex()
+                                    .gap_0p5()
+                                    .child(
+                                        Icon::new(IconName::Warning)
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Warning),
+                                    )
+                                    .child(
+                                        Label::new(reason)
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
+                                    ),
+                            )
+                        })
+                        .when(!detail.failing_checks.is_empty(), |this| {
+                            let extra = detail.extra_failing_checks;
+                            this.child(
+                                v_flex()
+                                    .gap_0p5()
+                                    .children(detail.failing_checks.into_iter().map(|name| {
+                                        Label::new(name)
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted)
+                                            .truncate()
+                                    }))
+                                    .when(extra > 0, |this| {
+                                        this.child(
+                                            Label::new(format!("and {extra} more"))
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
+                                        )
+                                    }),
+                            )
+                        })
+                        .into_any_element()
+                })),
+                None => this.tooltip(Tooltip::text(chip.tooltip)),
+            })
+            .when_some(chip.url, |this, url| {
+                this.cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        cx.open_url(&url);
+                    })
+            })
+    }
+}
+
+/// The number sits in a fixed-width slot so a changing count does not shuffle
+/// what it sits in.
+fn running_work_count(
+    id: impl Into<ElementId>,
+    icon: IconName,
+    count: usize,
+    tooltip: String,
+) -> impl IntoElement {
+    h_flex()
+        .id(id)
+        .gap_0p5()
+        .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Accent))
+        .child(
+            h_flex().min_w(rems_from_px(10_f32)).justify_center().child(
+                Label::new(count.to_string())
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            ),
+        )
+        .tooltip(Tooltip::text(tooltip))
+}
+
+/// The spinner plus the commands still running and the subagents still out;
+/// a zero count is not drawn.
+pub fn agent_activity_pill(
+    id: impl Into<SharedString>,
+    work: RunningWorkCounts,
+    cx: &App,
+) -> AnyElement {
+    let id = id.into();
+    let RunningWorkCounts { subagents, .. } = work;
+    let commands = work.commands();
+    h_flex()
+        .h_4()
+        .px_1p5()
+        .gap_1()
+        .rounded_full()
+        .bg(cx.theme().colors().element_background)
+        .child(agent_running_indicator())
+        .when(commands > 0, |this| {
+            this.child(running_work_count(
+                SharedString::from(format!("{id}-terminals")),
+                IconName::ToolTerminal,
+                commands,
+                if commands == 1 {
+                    "1 command running".into()
+                } else {
+                    format!("{commands} commands running")
+                },
+            ))
+        })
+        .when(subagents > 0, |this| {
+            this.child(running_work_count(
+                SharedString::from(format!("{id}-subagents")),
+                IconName::ZedAgent,
+                subagents,
+                if subagents == 1 {
+                    "1 subagent working".into()
+                } else {
+                    format!("{subagents} subagents working")
+                },
+            ))
+        })
+        .into_any_element()
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RunningWorkCounts {
+    pub terminals: usize,
+    pub subagents: usize,
+    /// Commands the agent detached and is still running.
+    pub async_tasks: usize,
+}
+
+impl RunningWorkCounts {
+    pub fn is_empty(&self) -> bool {
+        self.commands() == 0 && self.subagents == 0
+    }
+
+    fn commands(&self) -> usize {
+        self.terminals + self.async_tasks
+    }
 }
 
 #[derive(IntoElement, RegisterComponent)]
@@ -46,6 +471,7 @@ pub struct ThreadItem {
     title_generating: bool,
     highlight_positions: Vec<usize>,
     timestamp: SharedString,
+    size: SharedString,
     notified: bool,
     status: AgentThreadStatus,
     selected: bool,
@@ -55,9 +481,13 @@ pub struct ThreadItem {
     is_truncated: bool,
     added: Option<usize>,
     removed: Option<usize>,
+    running_terminals: usize,
+    running_async_tasks: usize,
+    running_subagents: usize,
     project_paths: Option<Arc<[PathBuf]>>,
     project_name: Option<SharedString>,
     worktrees: Vec<ThreadItemWorktreeInfo>,
+    pr_chips: Vec<ThreadItemPrChip>,
     is_remote: bool,
     archived: bool,
     on_click: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
@@ -81,6 +511,7 @@ impl ThreadItem {
             title_generating: false,
             highlight_positions: Vec::new(),
             timestamp: "".into(),
+            size: "".into(),
             notified: false,
             status: AgentThreadStatus::default(),
             selected: false,
@@ -90,9 +521,13 @@ impl ThreadItem {
             is_truncated: true,
             added: None,
             removed: None,
+            running_terminals: 0,
+            running_async_tasks: 0,
+            running_subagents: 0,
             project_paths: None,
             project_name: None,
             worktrees: Vec::new(),
+            pr_chips: Vec::new(),
             is_remote: false,
             archived: false,
             on_click: None,
@@ -100,6 +535,11 @@ impl ThreadItem {
             action_slot: None,
             base_bg: None,
         }
+    }
+
+    pub fn size(mut self, size: impl Into<SharedString>) -> Self {
+        self.size = size.into();
+        self
     }
 
     pub fn timestamp(mut self, timestamp: impl Into<SharedString>) -> Self {
@@ -184,6 +624,21 @@ impl ThreadItem {
         self
     }
 
+    pub fn running_terminals(mut self, count: usize) -> Self {
+        self.running_terminals = count;
+        self
+    }
+
+    pub fn running_async_tasks(mut self, count: usize) -> Self {
+        self.running_async_tasks = count;
+        self
+    }
+
+    pub fn running_subagents(mut self, count: usize) -> Self {
+        self.running_subagents = count;
+        self
+    }
+
     pub fn project_paths(mut self, paths: Arc<[PathBuf]>) -> Self {
         self.project_paths = Some(paths);
         self
@@ -196,6 +651,11 @@ impl ThreadItem {
 
     pub fn worktrees(mut self, worktrees: Vec<ThreadItemWorktreeInfo>) -> Self {
         self.worktrees = worktrees;
+        self
+    }
+
+    pub fn pr_chips(mut self, pr_chips: Vec<ThreadItemPrChip>) -> Self {
+        self.pr_chips = pr_chips;
         self
     }
 
@@ -248,6 +708,36 @@ impl ThreadItem {
     }
 }
 
+/// The opaque colour a row paints in each state, which the title's
+/// `GradientFade` has to match exactly.
+struct RowBackgrounds {
+    rest: Hsla,
+    hover: Hsla,
+    active: Hsla,
+}
+
+/// The row sets one background per state rather than stacking them.
+fn row_backgrounds(
+    color: &ThemeColors,
+    raw_bg: Hsla,
+    selected: bool,
+    running: bool,
+) -> RowBackgrounds {
+    let surface = color.background.blend(raw_bg);
+    let rest = if selected {
+        surface.blend(color.ghost_element_selected)
+    } else if running {
+        surface.blend(color.text_accent.opacity(0.08))
+    } else {
+        surface
+    };
+    RowBackgrounds {
+        rest,
+        hover: surface.blend(color.ghost_element_hover),
+        active: surface.blend(color.ghost_element_active),
+    }
+}
+
 impl RenderOnce for ThreadItem {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let color = cx.theme().colors();
@@ -258,20 +748,23 @@ impl RenderOnce for ThreadItem {
         let opaque_window = cx.theme().window_background_appearance()
             == WindowBackgroundAppearance::Opaque
             && raw_bg.a >= 1.0;
-        let apparent_bg = color.background.blend(raw_bg);
-
-        let base_bg = if self.selected {
-            apparent_bg.blend(color.ghost_element_selected)
-        } else {
-            apparent_bg
+        let running_work = RunningWorkCounts {
+            terminals: self.running_terminals,
+            subagents: self.running_subagents,
+            async_tasks: self.running_async_tasks,
         };
-
-        let hover_bg = apparent_bg.blend(color.ghost_element_hover);
-        let active_bg = apparent_bg.blend(color.ghost_element_active);
+        // A turn can end with detached commands still running.
+        let running = self.status == AgentThreadStatus::Running || !running_work.is_empty();
+        let accent = color.text_accent;
+        let RowBackgrounds {
+            rest: base_bg,
+            hover: hover_bg,
+            active: active_bg,
+        } = row_backgrounds(color, raw_bg, self.selected, running);
 
         let gradient_overlay = GradientFade::new(base_bg, hover_bg, active_bg)
             .width(px(64.0))
-            .right(px(-10.0))
+            .right(px(0.0))
             .gradient_stop(0.7)
             .group_name("thread-item");
 
@@ -287,13 +780,22 @@ impl RenderOnce for ThreadItem {
         let icon_container = || {
             h_flex()
                 .id(icon_id.clone())
+                .debug_selector({
+                    let icon_id = icon_id.clone();
+                    move || icon_id
+                })
                 .size_4()
                 .flex_none()
                 .justify_center()
                 .when(!icon_visible, |this| this.invisible())
         };
         let icon_color = self.icon_color.unwrap_or(Color::Muted);
-        let agent_icon = if let Some(icon_char) = self.icon_char {
+        let agent_icon = if self.archived {
+            Icon::new(IconName::Archive)
+                .color(icon_color)
+                .size(IconSize::Small)
+                .into_any_element()
+        } else if let Some(icon_char) = self.icon_char {
             Label::new(icon_char)
                 .size(LabelSize::Small)
                 .color(icon_color)
@@ -310,42 +812,44 @@ impl RenderOnce for ThreadItem {
                 .into_any_element()
         };
 
-        let status_icon = if self.status == AgentThreadStatus::Error {
+        let status_icon = if matches!(
+            self.status,
+            AgentThreadStatus::Error | AgentThreadStatus::WaitingForConfirmation
+        ) {
             Some(
-                Icon::new(IconName::Close)
+                Icon::new(IconName::Circle)
                     .size(IconSize::Small)
-                    .color(Color::Error),
-            )
-        } else if self.status == AgentThreadStatus::WaitingForConfirmation {
-            Some(
-                Icon::new(IconName::Warning)
-                    .size(IconSize::XSmall)
                     .color(Color::Warning),
             )
         } else if self.notified {
             Some(
                 Icon::new(IconName::Circle)
-                    .size(IconSize::Small)
+                    .size(IconSize::XSmall)
                     .color(Color::Accent),
             )
         } else {
             None
         };
 
-        let icon = if self.status == AgentThreadStatus::Running {
-            icon_container()
-                .child(
-                    Icon::new(IconName::LoadCircle)
-                        .size(IconSize::Small)
-                        .color(Color::Muted)
-                        .with_rotate_animation(2),
-                )
-                .into_any_element()
-        } else if let Some(status_icon) = status_icon {
-            icon_container().child(status_icon).into_any_element()
+        let icon = icon_container().child(agent_icon).into_any_element();
+
+        // Always drawn so the row does not change shape when a thread starts.
+        let status_indicator = if running {
+            Some(agent_activity_pill(
+                format!("status-{}", self.id),
+                running_work,
+                cx,
+            ))
         } else {
-            icon_container().child(agent_icon).into_any_element()
+            status_icon.map(|icon| icon.into_any_element())
         };
+        let status_slot = h_flex()
+            .id(SharedString::from(format!("status-{}", self.id)))
+            .h_4()
+            .min_w_4()
+            .flex_none()
+            .justify_center()
+            .children(status_indicator);
 
         let title = self.title;
         let highlight_positions = self.highlight_positions;
@@ -399,6 +903,8 @@ impl RenderOnce for ThreadItem {
         let has_project_paths = project_paths.is_some();
         let has_timestamp = !self.timestamp.is_empty();
         let timestamp = self.timestamp;
+        let has_size = !self.size.is_empty();
+        let size = self.size;
 
         let show_tooltip = matches!(
             self.status,
@@ -409,16 +915,13 @@ impl RenderOnce for ThreadItem {
             .worktrees
             .into_iter()
             .filter(|wt| wt.kind == WorktreeKind::Linked)
-            .filter(|wt| wt.worktree_name.is_some() || wt.branch_name.is_some())
+            .filter(|wt| wt.worktree_name.is_some())
             .collect();
 
         let has_worktree = !linked_worktrees.is_empty();
 
-        let has_metadata = has_project_name
-            || has_project_paths
-            || has_worktree
-            || has_diff_stats
-            || has_timestamp;
+        let pr_chips = self.pr_chips;
+        let has_pr_chips = !pr_chips.is_empty();
 
         v_flex()
             .id(self.id.clone())
@@ -430,15 +933,26 @@ impl RenderOnce for ThreadItem {
             .w_full()
             .py_1()
             .px_1p5()
-            .when(self.selected, |s| s.bg(color.ghost_element_selected))
+            .bg(base_bg)
             .border_1()
             .border_r_2()
             .border_color(gpui::transparent_black())
             .when(self.focused, |s| s.border_color(color.panel_focused_border))
             .when(self.rounded, |s| s.rounded_sm())
-            .hover(|s| s.bg(color.ghost_element_hover))
-            .active(|s| s.bg(color.ghost_element_active))
+            .hover(|s| s.bg(hover_bg))
+            .active(|s| s.bg(active_bg))
             .on_hover(self.on_hover)
+            .when(running, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top_0()
+                        .bottom_0()
+                        .w(px(2.))
+                        .bg(accent.opacity(0.8)),
+                )
+            })
             .child(
                 h_flex()
                     .min_w_0()
@@ -449,164 +963,152 @@ impl RenderOnce for ThreadItem {
                     .child(
                         h_flex()
                             .id("content")
+                            .debug_selector({
+                                let id = format!("title-{}", self.id);
+                                move || id
+                            })
+                            .relative()
+                            .h_full()
                             .min_w_0()
                             .flex_1()
                             .gap_1p5()
-                            .child(icon)
-                            .child(title_label),
+                            .child(title_label)
+                            .when(self.is_truncated && opaque_window, |this| {
+                                this.child(gradient_overlay)
+                            }),
                     )
-                    .when(self.is_truncated && opaque_window, |this| {
-                        this.child(gradient_overlay)
-                    })
-                    .when(self.hovered, |this| {
-                        this.when_some(self.action_slot, |this, slot| {
-                            this.child(
-                                h_flex()
-                                    .relative()
-                                    .when(opaque_window, |this| {
-                                        this.child(
-                                            GradientFade::new(base_bg, hover_bg, active_bg)
-                                                .width(px(120.0))
-                                                .right(px(8.))
-                                                .gradient_stop(0.90)
-                                                .group_name("thread-item"),
-                                        )
-                                    })
-                                    .child(
-                                        h_flex()
-                                            .pr_1p5()
-                                            .child(slot)
-                                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                                cx.stop_propagation()
-                                            }),
-                                    ),
-                            )
-                        })
+                    .child(status_slot)
+                    .when_some(self.action_slot, |this, slot| {
+                        this.child(
+                            h_flex()
+                                .relative()
+                                .when(opaque_window, |this| {
+                                    this.child(
+                                        GradientFade::new(base_bg, hover_bg, active_bg)
+                                            .width(px(120.0))
+                                            .right(px(8.))
+                                            .gradient_stop(0.90)
+                                            .group_name("thread-item"),
+                                    )
+                                })
+                                .child(
+                                    h_flex()
+                                        .pr_1p5()
+                                        .child(slot)
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation()
+                                        }),
+                                ),
+                        )
                     }),
             )
-            .when(has_metadata, |this| {
-                this.child(
-                    h_flex()
-                        .gap_1p5()
-                        .child(icon_container()) // Icon Spacing
-                        .when(self.archived, |this| {
-                            this.child(
-                                Icon::new(IconName::Archive).size(IconSize::XSmall).color(
-                                    Color::Custom(cx.theme().colors().icon_muted.opacity(0.5)),
-                                ),
+            // Always drawn so every row is the same height; the zero-width
+            // label holds the line to the metadata text's height.
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .child(
+                        h_flex()
+                            .child(
+                                div()
+                                    .w_0()
+                                    .overflow_hidden()
+                                    .child(Label::new("\u{a0}").size(LabelSize::Small)),
                             )
-                        })
-                        .when(
-                            has_project_name || has_project_paths || has_worktree,
-                            |this| {
-                                this.when_some(self.project_name, |this, name| {
-                                    this.child(
-                                        Label::new(name).size(LabelSize::Small).color(Color::Muted),
-                                    )
-                                })
-                                .when(
-                                    has_project_name && (has_project_paths || has_worktree),
-                                    |this| this.child(dot_separator()),
+                            .child(icon),
+                    )
+                    .when(
+                        has_project_name || has_project_paths || has_worktree,
+                        |this| {
+                            this.when_some(self.project_name, |this, name| {
+                                this.child(
+                                    Label::new(name).size(LabelSize::Small).color(Color::Muted),
                                 )
-                                .when_some(project_paths, |this, paths| {
-                                    this.child(
-                                        Label::new(paths)
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted),
-                                    )
-                                })
-                                .when(has_project_paths && has_worktree, |this| {
-                                    this.child(dot_separator())
-                                })
-                                .children(
-                                    linked_worktrees.into_iter().map(|wt| {
-                                        let worktree_label = wt.worktree_name.clone().map(|name| {
-                                            if wt.highlight_positions.is_empty() {
-                                                Label::new(name)
-                                                    .size(LabelSize::Small)
-                                                    .color(Color::Muted)
-                                                    .truncate()
-                                                    .into_any_element()
-                                            } else {
-                                                HighlightedLabel::new(
-                                                    name,
-                                                    wt.highlight_positions.clone(),
-                                                )
+                            })
+                            .when(
+                                has_project_name && (has_project_paths || has_worktree),
+                                |this| this.child(dot_separator()),
+                            )
+                            .when_some(project_paths, |this, paths| {
+                                this.child(
+                                    Label::new(paths).size(LabelSize::Small).color(Color::Muted),
+                                )
+                            })
+                            .when(has_project_paths && has_worktree, |this| {
+                                this.child(dot_separator())
+                            })
+                            .children(
+                                linked_worktrees.into_iter().map(|wt| {
+                                    let worktree_label = wt.worktree_name.map(|name| {
+                                        if wt.highlight_positions.is_empty() {
+                                            Label::new(name)
                                                 .size(LabelSize::Small)
                                                 .color(Color::Muted)
                                                 .truncate()
                                                 .into_any_element()
-                                            }
-                                        });
-
-                                        // When only the branch is shown, lead with a branch icon;
-                                        // otherwise keep the worktree icon (which "covers" both the
-                                        // worktree and any accompanying branch).
-                                        let chip_icon = if wt.worktree_name.is_none()
-                                            && wt.branch_name.is_some()
-                                        {
-                                            IconName::GitBranch
                                         } else {
-                                            IconName::GitWorktree
-                                        };
-
-                                        let branch_label = wt.branch_name.map(|branch| {
-                                            Label::new(branch)
-                                                .size(LabelSize::Small)
-                                                .color(Color::Muted)
-                                                .truncate()
-                                                .into_any_element()
-                                        });
-
-                                        let show_separator =
-                                            worktree_label.is_some() && branch_label.is_some();
-
-                                        h_flex()
-                                            .min_w_0()
-                                            .gap_0p5()
-                                            .child(
-                                                Icon::new(chip_icon)
-                                                    .size(IconSize::XSmall)
-                                                    .color(Color::Muted),
+                                            HighlightedLabel::new(
+                                                name,
+                                                wt.highlight_positions.clone(),
                                             )
-                                            .when_some(worktree_label, |this, label| {
-                                                this.child(label)
-                                            })
-                                            .when(show_separator, |this| {
-                                                this.child(
-                                                    Label::new("/")
-                                                        .size(LabelSize::Small)
-                                                        .color(separator_color)
-                                                        .flex_shrink_0(),
-                                                )
-                                            })
-                                            .when_some(branch_label, |this, label| {
-                                                this.child(label)
-                                            })
-                                    }),
-                                )
-                            },
-                        )
-                        .when(
-                            (has_project_name || has_project_paths || has_worktree)
-                                && (has_diff_stats || has_timestamp),
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted)
+                                            .truncate()
+                                            .into_any_element()
+                                        }
+                                    });
+
+                                    h_flex()
+                                        .min_w_0()
+                                        .gap_0p5()
+                                        .child(
+                                            Icon::new(IconName::GitWorktree)
+                                                .size(IconSize::XSmall)
+                                                .color(Color::Muted),
+                                        )
+                                        .when_some(worktree_label, |this, label| this.child(label))
+                                }),
+                            )
+                        },
+                    )
+                    .when(has_pr_chips, |this| {
+                        this.when(
+                            has_project_name || has_project_paths || has_worktree,
                             |this| this.child(dot_separator()),
                         )
-                        .when(has_diff_stats, |this| {
-                            this.child(DiffStat::new(diff_stat_id, added_count, removed_count))
-                        })
-                        .when(has_diff_stats && has_timestamp, |this| {
-                            this.child(dot_separator())
-                        })
-                        .when(has_timestamp, |this| {
-                            this.child(
-                                Label::new(timestamp.clone())
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            )
-                        }),
-                )
-            })
+                        .children(pr_chips.into_iter().enumerate().map(|(chip_ix, chip)| {
+                            PrChip::new(("pr-chip", chip_ix), chip).surface(base_bg)
+                        }))
+                    })
+                    .when(
+                        (has_project_name || has_project_paths || has_worktree || has_pr_chips)
+                            && (has_diff_stats || has_size || has_timestamp),
+                        |this| this.child(dot_separator()),
+                    )
+                    .when(has_diff_stats, |this| {
+                        this.child(DiffStat::new(diff_stat_id, added_count, removed_count))
+                    })
+                    .when(has_diff_stats && (has_size || has_timestamp), |this| {
+                        this.child(dot_separator())
+                    })
+                    .when(has_size, |this| {
+                        this.child(
+                            Label::new(size.clone())
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                    })
+                    .when(has_size && has_timestamp, |this| {
+                        this.child(dot_separator())
+                    })
+                    .when(has_timestamp, |this| {
+                        this.child(
+                            Label::new(timestamp.clone())
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                    }),
+            )
             .when(show_tooltip, |this| {
                 let status = self.status;
                 this.tooltip(Tooltip::element(move |_, _| match status {
@@ -617,7 +1119,7 @@ impl RenderOnce for ThreadItem {
                                 .size(IconSize::Small)
                                 .color(Color::Error),
                         )
-                        .child(Label::new("Thread has an Error"))
+                        .child(Label::new("Agent Hit an Error"))
                         .into_any_element(),
                     AgentThreadStatus::WaitingForConfirmation => h_flex()
                         .gap_1()
@@ -642,7 +1144,7 @@ impl Component for ThreadItem {
 
     fn description() -> &'static str {
         "A row representing an agent thread in a list, showing its title, status, \
-        timestamp, and contextual metadata such as worktree and branch information."
+        timestamp, and contextual metadata such as worktree and pull request information."
     }
 
     fn preview(_window: &mut Window, cx: &mut App) -> AnyElement {
@@ -989,7 +1491,7 @@ impl Component for ThreadItem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{Background, Modifiers, TestAppContext, VisualTestContext, point};
+    use gpui::{Background, Modifiers, TestAppContext, VisualTestContext, hsla, point};
 
     #[gpui::test]
     fn test_thread_action_padding_preserves_row_background(cx: &mut TestAppContext) {
@@ -1017,6 +1519,67 @@ mod tests {
         assert_eq!(view.read_with(cx, |view, _| view.clicks), 1);
     }
 
+    #[gpui::test]
+    fn test_agent_icon_leads_the_second_line(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let (_view, cx) = cx.add_window_view(|_, _| ThreadItemLayoutTestView);
+
+        let title = cx.debug_bounds("title-with-meta").expect("title bounds");
+        let icon = cx.debug_bounds("icon-with-meta").expect("icon bounds");
+        assert!(
+            icon.top() >= title.bottom(),
+            "the icon sits on the line below the title, got icon {icon:?} title {title:?}"
+        );
+        assert_eq!(
+            icon.left(),
+            title.left(),
+            "the title starts where the icon used to, and the icon lines up under it"
+        );
+
+        let bare_icon = cx
+            .debug_bounds("icon-without-meta")
+            .expect("a row with no metadata still draws its icon");
+        assert_eq!(
+            bare_icon.left(),
+            icon.left(),
+            "the icons of both rows are in one column"
+        );
+        let with_meta = cx.debug_bounds("ROW_WITH_META").expect("row bounds");
+        let without_meta = cx
+            .debug_bounds("ROW_WITHOUT_META")
+            .expect("bare row bounds");
+        assert_eq!(
+            with_meta.size.height, without_meta.size.height,
+            "both rows are the same height"
+        );
+    }
+
+    struct ThreadItemLayoutTestView;
+
+    impl Render for ThreadItemLayoutTestView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            v_flex().size_full().p(px(20.)).child(
+                v_flex()
+                    .w(px(300.))
+                    .child(
+                        div().debug_selector(|| "ROW_WITH_META".to_owned()).child(
+                            ThreadItem::new("with-meta", "A thread with a long title")
+                                .timestamp("2h ago"),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "ROW_WITHOUT_META".to_owned())
+                            .child(ThreadItem::new("without-meta", "Nothing else to say")),
+                    ),
+            )
+        }
+    }
+
     struct ThreadItemTestView {
         clicks: usize,
     }
@@ -1039,6 +1602,71 @@ mod tests {
                         .on_click(cx.listener(|view, _, _, _| view.clicks += 1)),
                 ),
             )
+        }
+    }
+
+    /// The ghost colours are translucent on purpose: the test theme's are
+    /// opaque, which would hide a wrong composition.
+    #[gpui::test]
+    fn test_row_fade_colours_are_the_colours_the_row_paints(cx: &mut TestAppContext) {
+        let color = cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            let mut color = cx.theme().colors().clone();
+            color.background = hsla(0.6, 0.12, 0.15, 1.0);
+            color.surface_background = hsla(0.6, 0.12, 0.15, 1.0);
+            color.text_accent = hsla(0.62, 0.78, 0.65, 1.0);
+            color.ghost_element_selected = hsla(0.62, 0.11, 0.26, 0.14);
+            color.ghost_element_hover = hsla(0.62, 0.12, 0.27, 0.10);
+            color.ghost_element_active = hsla(0.61, 0.12, 0.20, 0.18);
+            color
+        });
+        let surface = color.background.blend(color.surface_background);
+        let for_row = |selected, running| {
+            row_backgrounds(&color, color.surface_background, selected, running)
+        };
+        let idle = for_row(false, false);
+        let running = for_row(false, true);
+        let selected_idle = for_row(true, false);
+        let selected_running = for_row(true, true);
+
+        assert_eq!(
+            selected_running.rest, selected_idle.rest,
+            "a selected row paints no running wash, so neither does its fade"
+        );
+        assert_eq!(
+            selected_idle.rest,
+            surface.blend(color.ghost_element_selected),
+            "a selected row is the surface plus one selection layer"
+        );
+        assert_eq!(
+            running.rest,
+            surface.blend(color.text_accent.opacity(0.08)),
+            "an unselected running row is the surface plus the accent wash"
+        );
+        assert_ne!(
+            running.rest, idle.rest,
+            "and so it differs from the same row at rest"
+        );
+        assert_eq!(idle.rest, surface, "a plain row is just the surface");
+
+        for (name, state) in [
+            ("idle", &idle),
+            ("running", &running),
+            ("selected idle", &selected_idle),
+            ("selected running", &selected_running),
+        ] {
+            assert_eq!(
+                state.hover,
+                surface.blend(color.ghost_element_hover),
+                "the hovered colour is one hover layer over the surface ({name})"
+            );
+            assert_eq!(
+                state.active,
+                surface.blend(color.ghost_element_active),
+                "the active colour is one active layer over the surface ({name})"
+            );
         }
     }
 
