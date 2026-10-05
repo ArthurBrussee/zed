@@ -2374,6 +2374,21 @@ impl AgentPanel {
             {
                 pane.activate_item(index, false, false, window, cx);
             }
+            // A panel that is new has no previous tab to restore, so the
+            // sync can leave a proxy as the active item with no activation
+            // event to re-route it. A proxy must never be what the pane
+            // shows, so put a local tab in front whenever there is one.
+            let proxy_is_active = pane
+                .active_item()
+                .is_some_and(|item| item.downcast::<ForeignThreadTab>().is_some());
+            let first_local = pane
+                .items()
+                .position(|item| item.downcast::<ThreadTab>().is_some());
+            if let Some(local_index) = first_local
+                && proxy_is_active
+            {
+                pane.activate_item(local_index, false, false, window, cx);
+            }
         });
         self.syncing_foreign_tabs = false;
         cx.notify();
@@ -3992,8 +4007,32 @@ impl AgentPanel {
                     cx,
                 )
             });
-            if let Ok(task) = task {
-                task.await.log_err();
+            if let Ok(task) = task
+                && let Some(created) = task.await.log_err()
+            {
+                // The new workspace opens with no thread in it and nothing
+                // else will make one: the panel's load path stopped creating
+                // drafts, and the pane is left holding only the proxies of
+                // other workspaces' threads. `open_worktree_workspace` has
+                // already awaited the new workspace's panels, so its agent
+                // panel is registered by the time this resolves.
+                created
+                    .workspace
+                    .update_in(cx, |workspace, window, cx| {
+                        let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
+                            return;
+                        };
+                        panel.update(cx, |panel, cx| {
+                            panel.activate_new_thread(
+                                true,
+                                AgentThreadSource::AgentPanel,
+                                window,
+                                cx,
+                            );
+                        });
+                        workspace.focus_panel::<AgentPanel>(window, cx);
+                    })
+                    .log_err();
             }
         })
         .detach();
@@ -5330,9 +5369,19 @@ impl AgentPanel {
 
     /// Whether the panel should show its thread pane: threads are open as
     /// tabs and no terminal has claimed the base view.
+    ///
+    /// A pane holding only [`ForeignThreadTab`](crate::thread_tab::ForeignThreadTab)
+    /// proxies has nothing to show — a proxy renders a placeholder, never a
+    /// conversation — so a workspace with no thread of its own falls through
+    /// to the empty panel state rather than drawing that placeholder.
     fn thread_pane_is_visible(&self, cx: &App) -> bool {
         matches!(self.base_view, BaseView::Uninitialized)
-            && self.thread_pane.read(cx).items_len() > 0
+            && self
+                .thread_pane
+                .read(cx)
+                .items_of_type::<crate::thread_tab::ThreadTab>()
+                .next()
+                .is_some()
     }
 
     fn visible_font_size(&self) -> WhichFontSize {
@@ -16583,6 +16632,170 @@ mod tests {
     /// panel holds the pending draft, and the freshly opened worktree
     /// workspace whose panel has already created (and connected) its own
     /// thread tab.
+    /// `+` makes a worktree and a thread in it. The thread was the half that
+    /// went missing: `create_new_worktree_thread` opened the workspace and
+    /// relied on the panel's load path making a draft, which the "no more
+    /// drafts" change removed. The new workspace's pane was then left holding
+    /// only the proxies of other workspaces' threads, one of them active, so
+    /// the panel drew "Worktree is open in another workspace".
+    ///
+    /// The worktree `+` opens gets its agent panel from `initialize_workspace`,
+    /// which lives in the `zed` crate, so a workspace created here never has
+    /// one. What this covers is both halves of the fix on a panel that does:
+    /// a pane holding nothing but proxies is not shown, and the thread `+` now
+    /// asks for lands as this workspace's own active tab.
+    #[gpui::test]
+    async fn test_a_worktree_workspace_shows_its_own_thread_not_a_proxy(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+        fs.insert_tree("/repo", json!({ ".git": {}, "src": { "main.rs": "" } }))
+            .await;
+        fs.insert_tree("/worktree", json!({ ".git": {}, "src": { "main.rs": "" } }))
+            .await;
+        // The base `+` asks for is already in the clone, so nothing waits on a
+        // fetch.
+        fs.insert_branches(&PathBuf::from("/repo/.git"), &["main", "origin/main"]);
+
+        let project = Project::test(fs.clone(), [Path::new("/repo")], cx).await;
+        let worktree_project = Project::test(fs.clone(), [Path::new("/worktree")], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let multi_workspace_entity = multi_workspace.root(cx).unwrap();
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+        workspace.update(cx, |workspace, _cx| {
+            workspace.set_random_database_id();
+        });
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+        multi_workspace_entity.update(cx, |multi_workspace, cx| {
+            multi_workspace.retain_active_workspace(cx);
+        });
+
+        let _stub_connection =
+            crate::test_support::set_stub_agent_connection(StubAgentConnection::new());
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.selected_agent = Agent::Stub;
+            panel.activate_new_thread(true, AgentThreadSource::AgentPanel, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            panel.read_with(cx, |panel, cx| panel.open_thread_tab_ids(cx).len()),
+            1,
+            "the workspace `+` is pressed from has a thread of its own"
+        );
+
+        // `+` does open the worktree's workspace; what it never did was put a
+        // thread in it.
+        panel.update_in(cx, |panel, window, cx| {
+            panel.create_new_worktree_thread(window, cx);
+        });
+        for _ in 0..16 {
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            multi_workspace_entity
+                .read_with(cx, |multi_workspace, _cx| multi_workspace
+                    .workspaces()
+                    .count()),
+            2,
+            "`+` opens the worktree's workspace"
+        );
+
+        // That workspace, with the panel the app gives it: its pane mirrors
+        // the thread above as a `ForeignThreadTab` and owns nothing.
+        let worktree_workspace = multi_workspace_entity.update_in(cx, |multi_workspace, window, cx| {
+            multi_workspace.test_add_workspace(worktree_project.clone(), window, cx)
+        });
+        worktree_workspace.update(cx, |workspace, _cx| {
+            workspace.set_random_database_id();
+        });
+        let worktree_panel = worktree_workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+        cx.run_until_parked();
+
+        worktree_panel.read_with(cx, |panel, cx| {
+            assert!(
+                panel.open_thread_tab_ids(cx).is_empty(),
+                "this workspace owns no thread yet"
+            );
+            assert!(
+                panel
+                    .thread_pane
+                    .read(cx)
+                    .items_of_type::<crate::thread_tab::ForeignThreadTab>()
+                    .next()
+                    .is_some(),
+                "its pane mirrors the other workspace's thread as a proxy"
+            );
+            assert!(
+                !panel.thread_pane_is_visible(cx),
+                "a pane holding nothing but proxies is not shown, so the panel \
+                 falls through to the empty state instead of drawing a \
+                 ForeignThreadTab's placeholder"
+            );
+        });
+
+        // The thread `+` now asks for, in the new workspace's own panel.
+        worktree_panel.update_in(cx, |panel, window, cx| {
+            panel.selected_agent = Agent::Stub;
+            panel.activate_new_thread(true, AgentThreadSource::AgentPanel, window, cx);
+        });
+        cx.run_until_parked();
+
+        worktree_panel.read_with(cx, |panel, cx| {
+            let local = panel.open_thread_tab_ids(cx);
+            assert_eq!(local.len(), 1, "the worktree has a thread of its own");
+            assert!(
+                panel.thread_pane_is_visible(cx),
+                "the pane shows that thread"
+            );
+            let active = panel
+                .thread_pane
+                .read(cx)
+                .active_item()
+                .expect("the pane has an active item");
+            assert!(
+                active
+                    .downcast::<crate::thread_tab::ThreadTab>()
+                    .is_some_and(|tab| tab.read(cx).thread_id(cx) == local[0]),
+                "the active item is this workspace's own thread, never a proxy"
+            );
+            assert_eq!(
+                panel.active_thread_id(cx),
+                Some(local[0]),
+                "and the panel reports it as the active thread"
+            );
+            assert!(
+                ThreadMetadataStore::global(cx)
+                    .read(cx)
+                    .entry(local[0])
+                    .is_some(),
+                "the thread has a persisted row, so the sidebar lists it"
+            );
+        });
+    }
+
     async fn setup_worktree_draft_migration(
         cx: &mut TestAppContext,
     ) -> (
