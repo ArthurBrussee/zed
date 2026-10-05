@@ -2127,6 +2127,11 @@ impl ConversationView {
 
         let count = thread.read(cx).entries().len();
         let list_state = ListState::new(0, gpui::ListAlignment::Top, px(2048.0));
+        // A run of actions is drawn by its first entry, so a thread's items
+        // grow after they are measured more than anything else in the app.
+        // Five reports of pictures painting over chips came in before there
+        // was a line to grep for; this is that line.
+        list_state.report_stale_measurements();
         list_state.set_follow_mode(gpui::FollowMode::Tail);
 
         // Opening a thread builds a view per entry before anything is drawn: a
@@ -2549,6 +2554,19 @@ impl ConversationView {
                                 .and_then(|entry| entry.focus_handle(cx))],
                         );
                     });
+                    // Splicing the new index measures the new item, but an
+                    // action that joins the run before it is drawn by that
+                    // run's first entry, which just grew and is still
+                    // measured at its old height. With pictures in the run
+                    // that overflow paints over the items below.
+                    let drawn = active.read(cx).drawn_item_for_entry(index, cx);
+                    list_state.remeasure_items(drawn..drawn + 1);
+                    if index > 0 {
+                        let before = active.read(cx).drawn_item_for_entry(index - 1, cx);
+                        if before != drawn {
+                            list_state.remeasure_items(before..before + 1);
+                        }
+                    }
                     active.update(cx, |active, cx| {
                         active.sync_elicitation_state_for_entry(index, window, cx);
                         active.sync_editor_mode(cx);
@@ -2595,6 +2613,13 @@ impl ConversationView {
                     entry_view_state.update(cx, |view_state, _cx| view_state.remove(range.clone()));
                     if views_built {
                         list_state.splice(range.clone(), 0);
+                        // Taking entries out of a run leaves the item that
+                        // draws what is left measured at the height it had
+                        // with them.
+                        if range.start > 0 {
+                            let drawn = active.read(cx).drawn_item_for_entry(range.start - 1, cx);
+                            list_state.remeasure_items(drawn..drawn + 1);
+                        }
                         active.update(cx, |active, cx| {
                             active.sync_editor_mode(cx);
                         });
@@ -14587,6 +14612,107 @@ pub(crate) mod tests {
         // chip's own bounds are not exposed to tests. The row the chips sit in
         // is also whatever the fixture makes it, so resizing the window does
         // not reliably move it.
+    }
+
+    /// A run of actions is drawn by its *first* entry and the rest draw
+    /// nothing, so the item whose height changes when a picture inside the run
+    /// is measured is the run's first one. `read_image_shape` remeasured the
+    /// picture's own entry, which for any picture that is not first in its run
+    /// is an `Empty` item, leaving the item that draws the picture measured at
+    /// the placeholder height it was given before the shape was known.
+    ///
+    /// Every remeasure of a thread entry goes through `drawn_item_for_entry`
+    /// now; this pins what that answers for a picture inside a run, which is
+    /// the thing each of those call sites was getting wrong by hand.
+    #[gpui::test]
+    async fn test_a_picture_in_a_run_is_drawn_by_the_runs_first_item(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(StubAgentConnection::new()), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let list_state = thread_view.read_with(cx, |view, _| view.list_state.clone());
+
+        // The run's first action: the script that drew the pictures.
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::ToolCall(
+                        acp_v1::ToolCall::new(acp_v1::ToolCallId::new("script"), "python3 plot.py")
+                            .kind(acp_v1::ToolKind::Execute)
+                            .status(acp_v1::ToolCallStatus::Completed),
+                    ),
+                    cx,
+                )
+                .expect("command tool call");
+        });
+        // Then two pictures, which join that run rather than starting their own.
+        for n in 0..2 {
+            thread.update(cx, |thread, cx| {
+                thread
+                    .handle_session_update(
+                        acp_v1::SessionUpdate::ToolCall(
+                            acp_v1::ToolCall::new(
+                                acp_v1::ToolCallId::new(format!("picture-{n}")),
+                                format!("Read figure-{n}.png"),
+                            )
+                            .kind(acp_v1::ToolKind::Read)
+                            .status(acp_v1::ToolCallStatus::Completed)
+                            .content(vec![acp_v1::ToolCallContent::Content(
+                                acp_v1::Content::new(png_image()),
+                            )]),
+                        ),
+                        cx,
+                    )
+                    .expect("picture tool call");
+            });
+            cx.run_until_parked();
+        }
+
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.entries().len()),
+            3,
+            "a command and two pictures"
+        );
+
+        let drawn = thread_view.read_with(cx, |view, cx| {
+            (0..3)
+                .map(|entry_ix| view.drawn_item_for_entry(entry_ix, cx))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            drawn,
+            vec![0, 0, 0],
+            "all three actions are one run, drawn by its first item, so that is \
+             the item every one of their remeasures has to name"
+        );
+
+        // The run's own item carries the whole group's height; the entries that
+        // draw nothing have none of it. Remeasuring one of those — which is
+        // what the picture's own index was — could not have fixed anything.
+        let run = list_state
+            .bounds_for_item(0)
+            .expect("the run's item is measured");
+        // Two picture boxes are tens of times a chip row; the exact number
+        // depends on the window's rem size, so the assertion is that the run's
+        // item carries them at all rather than a bare row's worth.
+        assert!(
+            run.size.height > px(200.),
+            "the run's item is as tall as the pictures it draws, not just the \
+             chip row: {:?}",
+            run.size.height
+        );
+        for empty in 1..3 {
+            let bounds = list_state
+                .bounds_for_item(empty)
+                .expect("the following items are measured");
+            assert!(
+                bounds.size.height < run.size.height,
+                "entry {empty} draws nothing of its own, so its item carries \
+                 none of the run's height"
+            );
+        }
     }
 
     #[gpui::test]

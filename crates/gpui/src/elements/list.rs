@@ -73,6 +73,7 @@ struct StateInner {
     measuring_behavior: ListMeasuringBehavior,
     pending_scroll: Option<PendingScroll>,
     follow_state: FollowState,
+    report_stale_measurements: bool,
 }
 
 /// Deferred scroll adjustment applied after the scroll-top item has been remeasured.
@@ -325,9 +326,19 @@ impl ListState {
             measuring_behavior: ListMeasuringBehavior::default(),
             pending_scroll: None,
             follow_state: FollowState::default(),
+            report_stale_measurements: false,
         })));
         this.splice(0..0, item_count);
         this
+    }
+
+    /// Report, at info level, any item that lays out taller than the height
+    /// this list had remembered for it. That gap is the shape of every
+    /// overlap in a list whose items grow: the slot was sized from the stale
+    /// height and the element paints past it, over whatever is below. Off by
+    /// default, so no other list in the app says anything.
+    pub fn report_stale_measurements(&self) {
+        self.0.borrow_mut().report_stale_measurements = true;
     }
 
     /// Set the list to measure all items in the list in the first layout phase.
@@ -1024,6 +1035,33 @@ impl StateInner {
         self.items = SumTree::from_iter(measured_items, ());
     }
 
+    /// Says when an item laid out taller than the height the list had
+    /// remembered for it, which is what leaves a grown item painting over
+    /// its neighbours. Silent unless the list asked for it with
+    /// [`ListState::report_stale_measurements`].
+    fn report_stale_measurement(
+        &self,
+        item_index: usize,
+        remembered_height: Option<Pixels>,
+        painted_height: Pixels,
+    ) {
+        if !self.report_stale_measurements {
+            return;
+        }
+        let Some(remembered) = remembered_height else {
+            return;
+        };
+        // A fraction of a pixel is rounding, not a stale measurement.
+        if painted_height <= remembered + px(0.5) {
+            return;
+        }
+        log::info!(
+            "quiet-ui layout: list item {item_index} painted {:.0}px, measured {:.0}px",
+            painted_height.0,
+            remembered.0,
+        );
+    }
+
     fn layout_items(
         &mut self,
         available_width: Option<Pixels>,
@@ -1069,6 +1107,7 @@ impl StateInner {
 
             // Use the previously cached height and focus handle if available
             let mut size = item.size();
+            let remembered_height = size.map(|size| size.height);
 
             // If we're within the visible area or the height wasn't cached, render and measure the item's element
             if visible_height < available_height || size.is_none() {
@@ -1076,6 +1115,7 @@ impl StateInner {
                 let mut element = render_item(item_index, window, cx);
                 let element_size = element.layout_as_root(available_item_space, window, cx);
                 size = Some(element_size);
+                self.report_stale_measurement(item_index, remembered_height, element_size.height);
 
                 // If there's a pending scroll adjustment for the scroll-top
                 // item, apply it.

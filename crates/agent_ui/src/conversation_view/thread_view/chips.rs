@@ -2910,7 +2910,12 @@ impl ThreadView {
             let shape = image_shape_of_file(&fs, &path).await;
             this.update(cx, |this, cx| {
                 this.chip_cache.image_shapes.borrow_mut().insert(path, shape);
-                this.list_state.remeasure_items(entry_ix..entry_ix + 1);
+                // Not this entry: the one that draws it. A picture inside a
+                // run is drawn by the run's first entry, and remeasuring an
+                // entry that renders nothing leaves the block that grew
+                // still measured at its placeholder height.
+                let item = this.drawn_item_for_entry(entry_ix, cx);
+                this.list_state.remeasure_items(item..item + 1);
                 cx.notify();
             })
             .ok();

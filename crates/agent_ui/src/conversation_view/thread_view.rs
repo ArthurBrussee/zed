@@ -5950,7 +5950,8 @@ impl ThreadView {
         self.entry_view_state.update(cx, |state, _cx| {
             state.toggle_compaction_expansion(entry_ix);
         });
-        self.list_state.remeasure_items(entry_ix..entry_ix + 1);
+        let item = self.drawn_item_for_entry(entry_ix, cx);
+        self.list_state.remeasure_items(item..item + 1);
         self.refresh_thread_search(window, cx);
         cx.notify();
     }
