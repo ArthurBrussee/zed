@@ -5,8 +5,8 @@ use gpui::{
     WindowBackgroundAppearance, pulsating_between,
 };
 use itertools::Itertools as _;
-use theme::ThemeColors;
 use std::{path::PathBuf, sync::Arc, time::Duration};
+use theme::ThemeColors;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AgentThreadStatus {

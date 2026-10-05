@@ -7315,6 +7315,7 @@ impl ThreadView {
                             .children(self.render_thread_pr_controls(cx))
                     })
                     .children(self.render_pending_review_comments(cx))
+                    .children(self.render_discard_protected_draft_button(cx))
                     .children(self.render_input_activity_pill(cx))
                     .child(self.render_input_run_indicator(cx))
                     .when(is_generating, |this| {
@@ -7322,6 +7323,37 @@ impl ThreadView {
                     }),
             )
             .into_any()
+    }
+
+    /// Upstream's way out of a draft its composer has locked: a draft that
+    /// could not be resolved keeps the composer read-only until it is
+    /// explicitly thrown away, and without a control for that there is no way
+    /// back. Upstream draws it in the thread-controls row, which this fork
+    /// replaces with the status bar, so it lives here instead.
+    fn render_discard_protected_draft_button(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.message_editor.read(cx).editor().read(cx).read_only(cx) {
+            return None;
+        }
+        Some(
+            div()
+                .debug_selector(|| "discard-protected-draft".into())
+                .child(
+                    Button::new("discard-protected-draft", "Discard draft")
+                        .label_size(LabelSize::Small)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this._draft_resolve_task.take();
+                            this.message_editor.update(cx, |editor, cx| {
+                                editor.set_read_only(false, cx);
+                                editor.set_message(Vec::new(), window, cx);
+                            });
+                            this.clear_thread_error(cx);
+                        })),
+                )
+                .into_any_element(),
+        )
     }
 
     /// The thread's pull requests, and the controls for saying which they

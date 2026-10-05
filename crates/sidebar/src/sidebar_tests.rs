@@ -2,7 +2,6 @@ use super::*;
 use acp_thread::{AcpThread, PermissionOptions, StubAgentConnection};
 use agent::ThreadStore;
 use agent_client_protocol::schema::v2 as acp_v2;
-use agent_settings::AgentSettings;
 
 /// What an empty draft's row reads as. Every workspace keeps one open and it
 /// has had a row of its own since the tab bar went, so the tests that count

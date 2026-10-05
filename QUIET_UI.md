@@ -12,13 +12,16 @@ names are the stable anchors; line numbers drift with every rebase and are not u
 
 ## Upstream first (from 2026-10-01)
 
-The fork stands at +44.8k / -11.3k lines across 107 files against upstream (+39.9k / -9.4k
-without this file and the sidebar test files). It was +42.9k / -11.2k at the start of 2026-10-04,
-and +42.0k / -10.7k on 2026-10-02 before that night's work. So it went **up** by 1.8k on 10-04,
-which is the exception this rule allows for rather than a breach of it: nearly all of that is one
-new fork-only file and its tests, written because a Work queue entry asked for it. Every line is
-still rebase cost and a place for bugs, and not all of it was asked for. Arthur's rule: **upstream wins by default, and the fork carries a
-change only with an explicit reason.** An explicit reason is that Arthur asked for it (a Work
+The fork stands at +45.3k / -11.4k lines across 108 files against upstream (+40.4k / -9.4k
+without this file and the sidebar test files). It was +44.8k / -11.3k across 107 files at the
+start of 2026-10-05, +42.9k / -11.2k at the start of 2026-10-04, and +42.0k / -10.7k on
+2026-10-02. So it has gone **up** three nights running, by 0.5k on 10-05, and each time because a
+Work queue entry asked for the lines: 10-05's are three built items and their tests. The 108th
+file is the one new seam of the night — `gpui/src/elements/list.rs`, which now reports an item
+that lays out taller than the height the list remembered, because five reports of pictures
+painting over chips arrived with no line to grep for. Every line is still rebase cost and a place
+for bugs, and not all of it was asked for. Arthur's rule: **upstream wins by default, and the
+fork carries a change only with an explicit reason.** An explicit reason is that Arthur asked for it (a Work
 queue entry or a request recorded in this file), or that something he asked for needs it.
 Routine-invented restyles, refactors of upstream code that change its shape without changing
 what it does, and code left behind by removed features have no reason and go back.
@@ -135,7 +138,10 @@ fd-limit spawn error in `util/src/process.rs`, capped environment capture in
 `subscription.rs`) plus focus-handle sweeping (`gpui/src/window.rs`). A thread tab off screen for
 thirty seconds drops its whole per-entry view tree and rebuilds it on return
 (`agent_ui/entry_view_state.rs`), which is what reclaims the view trees of threads left open all
-day.
+day. In gpui, `ListState::report_stale_measurements` (`gpui/src/elements/list.rs`) logs
+`quiet-ui layout: list item N painted Xpx, measured Ypx` for any item that lays out taller than
+the height the list had remembered; the thread's list is the only one that asks for it
+(2026-10-05).
 
 ## Work queue
 
@@ -152,100 +158,6 @@ does is removed as it lands.
 
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
-
-**`+` opens the new worktree with no thread, showing "Worktree is open in another workspace".
-Broken core workflow; do this first.**
-
-Arthur, 2026-10-05 14:29: clicked `+`. The worktree was claimed from the spare (`dense-stoat`),
-the window was up in 369ms and the workspace opened in 2.6s, but the panel showed the
-`ForeignThreadTab` placeholder "Worktree is open in another workspace" instead of a thread. He
-clicked `+` again and got a second worktree (`stony-obsidian`) the same way.
-
-Cause: `AgentPanel::create_new_worktree_thread` only creates the worktree workspace
-(`create_worktree_workspace_foreground`). It never creates a thread. It relied on the new
-workspace's panel load path calling `ensure_pane_has_thread_tab` to make a draft, and the
-"no more drafts" change (fca3d9dcc6, 10-02) removed that, as the entry asked. Nothing replaced
-it on the `+` path. The new workspace's pane is left holding only the `ForeignThreadTab`
-proxies mirrored from other workspaces, and one of them is the active item. "Normally never
-visible" assumed activation would redirect, but nothing activates it.
-
-Fix:
-- `create_new_worktree_thread`, once the workspace task resolves, creates a thread in the *new*
-  workspace's panel: a real thread with a persisted row, the default agent (Claude, with its
-  configured mode), activated and with the message editor focused. Check the other "new thread in
-  this worktree" paths (the worktree header's `+`, the sidebar row's "New Thread in This
-  Worktree") for the same gap.
-- A pane must never show a `ForeignThreadTab` as its active item. If a proxy ends up active with
-  no local thread, activate a local thread if there is one, otherwise show upstream's empty
-  panel state, never the placeholder.
-- Test the whole flow: `+` from a workspace with other threads open, then assert the new
-  workspace's panel shows a local `ThreadTab` that is active and focused, its sidebar row
-  exists, and the agent is the default one. Do the same with the new workspace opened while its
-  pane already mirrors foreign proxies.
-
-**Images still paint over the chips and over each other. Fifth report; this time there is a code
-path for it.**
-
-Arthur's screenshot (2026-10-05): a run with a `python3 s…` chip and an expanded `…0.png` image
-chip. Two pictures from the same run overlap each other (two different grids of plots, the
-upper one cut off by the lower) and the chips are drawn on top of them. The pictures were PNGs a
-Python script wrote to `/tmp` (sizes seen there: 1500×900, 1500×950, 540×580, 620×420).
-
-The box is not the problem. `render_inline_image` gives every picture a definite
-`IMAGE_CHIP_WIDTH` × `image_box_height(..)` box with `size_full` + `ObjectFit::Contain`, so a
-picture can't paint outside its box. **The list item's measured height is what goes stale.** A
-whole run of actions is drawn by the run's *first* entry (`render_entry`: "The run's first entry
-draws the whole group; the rest draw nothing"). The fix for that was applied to `EntryUpdated`
-(`drawn_item_for_entry` in `conversation_view.rs`) and to chip toggles (`remeasure_chip`), but
-two paths still remeasure the wrong item or none:
-- `read_image_shape` (`chips.rs`) calls `list_state.remeasure_items(entry_ix..entry_ix + 1)`
-  with the picture's own entry. For any picture not in the run's first entry, that is an `Empty`
-  item, and the item that draws the picture keeps the height it measured with the placeholder.
-- `AcpThreadEvent::NewEntry` (`conversation_view.rs`) only splices the new index. A new tool
-  call that joins an existing run (the next command, the next picture) makes the run's
-  first item grow, and nothing remeasures it. With pictures, which are tall, the group overflows
-  its slot and paints into the items below. The next run's pictures then sit over this run's.
-
-Fix all of these through one function rather than at each site. Every remeasure of a thread entry
-goes through `drawn_item_for_entry`. `NewEntry` remeasures the drawn item of the new entry and,
-when the new entry changed which run the one before it belongs to, that one's too. Grep for every
-`remeasure_items` / `splice` on `list_state` and route each through it. Then add a guard, so a
-sixth report names itself: in debug builds and behind the `quiet-ui perf:` logging in release,
-log `quiet-ui layout: list item N painted Xpx, measured Ypx` whenever a thread list item paints
-taller than its measured height.
-
-The test is the scenario, not a unit of it. A `VisualTestContext` thread whose run is a
-`python3` command chip, then two tool calls that each produce a picture file on disk (use
-1500×900 and 540×580 PNGs written into the test's temp dir), arriving as separate `NewEntry`
-events after the first frame. Expand both picture chips. Run frames until the header reads land.
-Then assert that the run's item's measured height equals its painted height, and that the next
-item starts below the bottom of the lower picture. The four previous attempts each fixed a
-sizing rule and passed tests that never streamed a second entry into a run that was already
-measured.
-
-**The sidebar row still shows a gradient block next to the pill when the row is selected and
-running.**
-
-Arthur's screenshot (2026-10-05): the new pill is right, but on a selected, running row a
-rectangle of a slightly different blue sits just left of it. That is a `GradientFade` whose
-colours don't match what the row actually paints. In `ThreadItem::render`
-(`crates/ui/src/components/ai/thread_item.rs`), the fade colours are worked out as
-`apparent_bg` = `background.blend(raw_bg)`, plus `accent.opacity(0.08)` when running, plus
-`ghost_element_selected` when selected (`base_bg`), and the same running-tinted `apparent_bg`
-plus `ghost_element_hover` / `ghost_element_active` for `hover_bg` / `active_bg`. The row
-itself paints differently:
-- `.when(running && !self.selected, accent wash)` drops the running wash on a selected row, but
-  `base_bg` keeps it;
-- `.hover(...)` and `.active(...)` replace the row's background, wash included, but `hover_bg`
-  and `active_bg` keep the wash.
-
-So every selected-and-running, and every hovered-and-running, row draws its fades in a colour
-the row isn't. Compute one opaque colour per state (rest, hover, active) from exactly the layers
-the row paints in that state, and use those same values for the row's own background and for
-every `GradientFade` on it: the title fade and the action-slot fade. If the fades can't match
-cheaply, drop them and let the title truncate with an ellipsis. Test: for each combination of
-selected, running and state (rest, hover, active), the fade's colour equals the row's painted
-colour.
 
 **Claude's subagents: render them as chips, and count the ones still running after the turn.**
 
@@ -2174,3 +2086,158 @@ checked everything. The workspace check cost an hour that way and clippy cost th
 `cargo check --workspace --all-targets` should be run on a tree nothing else is editing, and
 `script/clippy` is worth running once early on the crates already written rather than only at the
 end — it is the release profile, so it is the one check nothing else in the night exercises.
+
+**2026-10-05**: onto main cac9d17a6 (34 upstream commits). Squash-then-rebase folded twelve fork
+commits into one, tree-identical to the old tip (`015dfde93`) before rebasing. Seven of those
+twelve were Arthur's own queue entries written during the day, so the night's starting point was
+five plans and no unverified edits. **Five conflicts, and `thread_view.rs` is back in them after
+three quiet nights** — but once again the conflict count was the wrong thing to read: the night's
+real cost was upstream continuing the SDK's v1-to-v2 migration into `ContentBlock`, which
+conflicted nowhere and broke ten things.
+
+- `crates/acp_thread/src/acp_thread.rs`, one region, append/append in the module list: upstream's
+  new `pub mod commands;` landed where the fork adds `command_output` and `command_parse`.
+  **Union**, in the list's existing sorted order. Worth saying what that module is, because the
+  name invites a wrong conclusion: `commands.rs` is the *slash*-command v1-to-v2 adaptation, a
+  sibling of 10-04's `config_options.rs`, and has nothing to do with the fork's shell-line
+  parser. Nothing to delete.
+- `crates/sidebar/src/sidebar_tests.rs`, one region, append/append: upstream added two imports
+  where the fork declares `EMPTY_DRAFT_PLACEHOLDER`. **Union.**
+- `crates/agent_ui/src/draft_prompt_store.rs`, one region at the imports, and the clearest
+  small example of the rule this file opens with. Upstream's change to the file is a mechanical
+  v1-to-v2 migration; the fork's is that an empty draft's row reads neutral instead of naming an
+  agent. **Both**: upstream's migration taken whole (the body merged to v2 clean on its own), the
+  fork's neutral label kept, and `ZED_AGENT_ID` dropped because the fork had already removed its
+  only user.
+- `crates/agent_ui/src/agent_panel.rs`, three regions. In `draft_prompt_blocks_if_in_memory`
+  upstream's only change is the v2 type, and the merge base already held the inlined lookup the
+  fork replaced with `conversation_view_for_id` plus its `unstarted_message_editor` early
+  return — so **upstream's type on the fork's body**, which is the smallest change that keeps
+  "the composer is the single source of truth for an unstarted draft" (2026-10-02). The other two
+  regions are upstream seeding a stale prompt onto an `AcpThread` in a test whose own comment
+  says an unstarted draft has none; the fork had removed the binding, so upstream's blocks would
+  not have compiled. **Took ours.**
+- `crates/agent_ui/src/conversation_view/thread_view.rs`, three regions, and the recurring seam is
+  one of them. (1) The empty-input send path: upstream added a queue-validation guard where the
+  fork sends pending review comments as the message. **Union**, review comments first — pressing
+  send with comments pending is a send of those comments, which should win over draining the
+  queue. (2) The thread-controls row, which is the seam exactly as this log describes it: upstream
+  added a `discard_draft_button` to a row this fork does not draw at all, the status bar above the
+  message box being that surface. **Took ours**, and then deleted the two stranded upstream
+  bindings (`discard_draft_button`, `composer_is_read_only`) that `cargo check` named as unused —
+  the `render_send_button` the fork deleted long ago came back with the replay and went again with
+  the row. (3) A thousand-line append/append in the test module, where upstream migrated
+  `native_command` to v2 and the fork appends its own tests ahead of it. **Union**: the fork's
+  tests, then upstream's signature.
+
+**Markerless drift: the v1-to-v2 migration reached the fork's review-comment path, and the review
+path alone.** `cargo check --workspace --all-targets` came back with ten errors in eleven minutes,
+all in `agent_ui`, none carrying a marker. Upstream moved `ContentBlock` to v2 across the send and
+queue path (`send`, `add_to_queue`, `send_content`, `MessageEditor::set_message`), and the fork
+composes review comments into blocks of its own:
+
+- `agent_ui/src/diff_review.rs` composed them as v1 — three sites, now v2. The file's own
+  `ReviewBlockText` trait, which existed precisely because "a message the user has sent carries v2
+  blocks; the queue still composes v1 ones", has had that straddle collapse out from under it:
+  both impls are still there, and the v1 one is now the unused half to watch.
+- `thread_view.rs`'s `take_pending_review_blocks` followed, and
+  `conversation_view.rs`'s two `set_message` calls for an external-source prompt.
+- `agent_diff.rs`'s two test modules read review blocks back and aliased v1.
+- `conversation_view.rs`'s `ReplayingConnection::prompt` is the one to remember: the trait now
+  takes a **v2 request** and still answers with a **v1 response**. Migrating both, which is the
+  obvious thing to do, fails; the signature is genuinely mixed.
+
+Re-run on a quiet tree, `cargo check -p agent_ui --all-targets` came back clean, and the workspace
+check had already passed everything else on the first run.
+
+**Nothing to delete this round.** Upstream's `commands.rs` is an adaptation the fork consumes
+rather than duplicates (above), and the other thirty-three commits are git-tag and git-graph UI,
+`PathStyle`, hosting providers and the v2 migration itself.
+
+**What was built: the Work queue's first three entries, each its own commit.**
+
+*The `+` that opened a worktree with no thread in it.* The entry's diagnosis was right to the
+line: `create_new_worktree_thread` creates the workspace and nothing else, having relied on the
+panel load path making a draft, which fca3d9dcc6 removed. It now creates the thread in the new
+workspace's own panel once the creation task resolves — the panel is registered by then, because
+`open_worktree_workspace` awaits `take_panels_task`, which is the same assumption the
+`create_thread` tool's worktree path already documents. **The other paths the entry asked about
+are fine and were left alone**: the worktree header's `+` and the sidebar row's menu both go
+through `Sidebar::create_new_thread`, which already parks the request in
+`pending_new_thread_workspace` and fulfils it from `PanelAdded` when the panel loads late. The
+second half of the entry — "a pane must never show a `ForeignThreadTab` as its active item" —
+turned out to have a smaller answer than the activation handling it points at. `ForeignThreadTab`
+activations were already re-routed; what was missing is that a pane of *only* proxies counted as
+visible, so `thread_pane_is_visible` now requires one local `ThreadTab` and a workspace with no
+thread of its own falls through to upstream's empty panel state. Syncing the proxies also puts a
+local tab in front when nothing restored the active item.
+
+**The one thing the test cannot reach, and why.** The entry asks the test to press `+` and then
+assert on the new workspace's panel. A worktree workspace gets its agent panel from
+`initialize_workspace`, which lives in the `zed` crate, so a workspace created inside `agent_ui`'s
+tests never has one — the test confirms `+` opens the second workspace, and then asserts both
+halves of the fix against a panel it adds itself: a pane holding only proxies is not shown, and
+the thread `+` asks for lands as that workspace's own active tab with a persisted row. The
+end-to-end press belongs in `cargo test -p zed --bin zed`, which 09-22 established needs
+`libxkbcommon-dev` and friends to link.
+
+*Every thread remeasure now goes through `drawn_item_for_entry`.* Three sites still named a list
+index by hand. `read_image_shape` is the one that was provably wrong: it remeasured the picture's
+own entry, which for a picture that is not first in its run is an item that draws nothing, so the
+item that *does* draw the picture kept the placeholder height it was measured at. `NewEntry` and
+`EntriesRemoved` named nothing at all, and the compaction toggle named its own entry. All four go
+through the one function now, as the entry asked, and the guard it asked for exists: the list
+reports `quiet-ui layout: list item N painted Xpx, measured Ypx` when an item lays out taller than
+the height it remembered, opt-in per list so nothing else in the app says anything.
+
+**But the sixth report is not forestalled, and this is the important line in this entry.** Two
+tests were written for this item and *both passed against the unfixed code* before being thrown
+away — which is the same trap the entry says the four previous attempts fell into, caught this
+time only because each new test was run against a reverted fix on purpose. The first streamed
+pictures into an already-measured run, exactly the scenario the entry specifies, and passed with
+the `NewEntry` remeasure deleted. The reason is in `StateInner::layout_items`: an item inside the
+visible region is re-rendered and re-measured **every frame** regardless of what the sum tree
+holds, and `item_layouts` positions from those fresh sizes. So for a visible item a stale
+remembered height does not cause the overlap, and a test window in which everything is visible
+cannot reproduce it. **The entry's diagnosis is accurate about the code and does not explain the
+screenshot.** What is committed is correct and small — `read_image_shape` was remeasuring an empty
+item — but it should not be taken as the cause being found. The mechanism is still open, and the
+places left to suspect are the ones where a tree height is used instead of a fresh one: a run
+whose first entry has scrolled above the viewport, the `overdraw` region, and the scroll-top
+arithmetic that accumulates `rendered_height` from remembered heights. The committed test pins
+what the fix actually establishes: all three actions of a run report item 0 as the item that draws
+them, and the entries that draw nothing carry none of the run's height, so remeasuring one of them
+could never have fixed anything.
+
+*The sidebar row's fades are painted in the colour the row is painted in.* The entry's diagnosis
+was right in full. The row sets one background per state rather than stacking them —
+`.when(running && !self.selected, ..)` drops the running wash once a row is selected, and the
+`.hover()` and `.active()` styles replace the base outright, wash and selection included — while
+the fades were handed a blend of every layer at once. One function now works out the opaque colour
+for each of rest, hover and active from exactly the layers the row paints in that state, and the
+row's own background and every `GradientFade` on it are given those same three values, so they
+cannot disagree.
+
+**Worth recording for any future test in `ui`: the test theme's ghost colours are fully opaque.**
+`ghost_element_selected`, `_hover` and `_active` all come back with `a: 1.0` under
+`LoadThemes::JustBase`, and an opaque layer discards whatever it is blended onto — so the right
+and the wrong composition agree exactly, and the first version of this test passed against the old
+formula. It now overrides those three with translucent values, as every real theme has them, and
+fails against the old formula on the first assertion.
+
+**What was not built: the subagent entry and the leak-and-perf entry, in that order, and the
+reason is the clock rather than either of them.** Both are still in the queue in Arthur's words.
+The subagent entry was read all the way through first, and it is correct about the mechanism and
+about where the work is: `client_capabilities_for_agent` in `agent_servers/src/acp.rs` already
+advertises the AIR extension with `asyncTasks` in its capability array, and
+`nativeSubagentSessions` goes in the same array; `handle_session_notification` already routes a
+raw `async_task_*` kind to `apply_async_task_update`, which is the template a `subagent_*` kind
+follows line for line; and `running_work` counts a subagent only while its `Agent` call is
+`InProgress`, which is why a backgrounded subagent counts zero. That is the lifecycle half. The
+look half — making a subagent a chip in the run, where today it deliberately falls through to its
+full card rendering — is a second change in `chips.rs`, and the entry asks for both. Starting it
+with an hour left would have meant committing one half, which is the same as not doing it.
+
+**The gate.** `cargo test` and `./script/clippy` for `acp_thread`, `agent_ui`, `sidebar`, `ui` and
+`gpui` — the three core crates plus the two the night touched. The Verification queue was empty
+when the night started and is empty now.

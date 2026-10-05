@@ -1854,7 +1854,7 @@ async fn test_every_thread_row_offers_a_way_out(cx: &mut TestAppContext) {
     cx.update(|cx| {
         agent_ui::draft_prompt_store::write(
             typed_draft,
-            &[acp::ContentBlock::from("half a thought".to_string())],
+            &[acp_v2::ContentBlock::from("half a thought".to_string())],
             cx,
         )
     })
@@ -2054,7 +2054,7 @@ async fn test_an_unsent_thread_keeps_its_row_and_survives_a_restart(cx: &mut Tes
     cx.update(|cx| {
         agent_ui::draft_prompt_store::write(
             typed,
-            &[acp::ContentBlock::from("half a thought".to_string())],
+            &[acp_v2::ContentBlock::from("half a thought".to_string())],
             cx,
         )
     })
