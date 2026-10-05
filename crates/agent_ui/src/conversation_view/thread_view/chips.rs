@@ -1996,11 +1996,22 @@ impl ThreadView {
         // agent marks the call and reports the command's own lifecycle
         // separately; the card reads as running for as long as that lasts.
         let backgrounded = self.thread.read(cx).tool_call_is_backgrounded(&tool_call.id);
-        let running = backgrounded
-            || matches!(
-                tool_call.status(),
-                ToolCallStatus::InProgress | ToolCallStatus::Pending
-            );
+        // A subagent is backgrounded the same way: the `Agent` call completes
+        // the moment the subagent is handed off, so the call reads `completed`
+        // while the subagent works on. Where the adapter reports the
+        // subagent's own lifecycle, that is what the chip says; where it does
+        // not, there is nothing better than the call's status.
+        let subagent_state = self.thread.read(cx).subagent_state_for_tool_call(tool_call);
+        let running = match subagent_state {
+            Some(state) => !state.is_terminal(),
+            None => {
+                backgrounded
+                    || matches!(
+                        tool_call.status(),
+                        ToolCallStatus::InProgress | ToolCallStatus::Pending
+                    )
+            }
+        };
         // A command the user killed exits non-zero like any other, so without
         // asking the terminal whether the kill was deliberate, a stopped
         // server would read as a command that broke.
@@ -2009,10 +2020,15 @@ impl ThreadView {
             .next()
             .is_some_and(|terminal| terminal.read(cx).was_stopped_by_user());
         let failed = !user_stopped
-            && (matches!(
-                tool_call.status(),
-                ToolCallStatus::Rejected | ToolCallStatus::Canceled | ToolCallStatus::Failed
-            ) || terminal_output.is_some_and(|output| output.failed()));
+            && match subagent_state {
+                Some(state) => matches!(state, acp_thread::AsyncTaskState::Failed),
+                None => {
+                    matches!(
+                        tool_call.status(),
+                        ToolCallStatus::Rejected | ToolCallStatus::Canceled | ToolCallStatus::Failed
+                    ) || terminal_output.is_some_and(|output| output.failed())
+                }
+            };
 
         let icon_color = if failed || outcome_failed {
             Color::Error
@@ -2049,6 +2065,16 @@ impl ThreadView {
                             .size(IconSize::Small)
                             .color(Color::Error),
                     )
+                    .into_any_element(),
+            )
+        } else if subagent_state.is_some_and(|state| state.is_terminal()) {
+            // A subagent that is done. The one icon slot carries its status
+            // rather than an agent glyph: which agent ran it is the same for
+            // every subagent in the run, while whether it finished is not.
+            Some(
+                Icon::new(IconName::Check)
+                    .size(IconSize::Small)
+                    .color(Color::Muted)
                     .into_any_element(),
             )
         } else if command_pieces.is_some() {

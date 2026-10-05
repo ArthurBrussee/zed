@@ -689,7 +689,10 @@ fn client_capabilities_for_agent(
             serde_json::json!({
                 AIR_EXTENSION_KEY: {
                     "version": AIR_EXTENSION_VERSION,
-                    "capabilities": [AIR_ASYNC_TASKS_CAPABILITY],
+                    "capabilities": [
+                        AIR_ASYNC_TASKS_CAPABILITY,
+                        AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
+                    ],
                 }
             }),
         ),
@@ -3610,7 +3613,10 @@ mod tests {
         );
         assert_eq!(
             air.get("capabilities"),
-            Some(&serde_json::json!([AIR_ASYNC_TASKS_CAPABILITY])),
+            Some(&serde_json::json!([
+                AIR_ASYNC_TASKS_CAPABILITY,
+                AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY
+            ])),
             "only the capabilities Zed actually handles are claimed"
         );
     }
@@ -6416,6 +6422,11 @@ const AIR_META_KEY: &str = "jetbrains";
 const AIR_EXTENSION_KEY: &str = "air";
 const AIR_EXTENSION_VERSION: u64 = 1;
 const AIR_ASYNC_TASKS_CAPABILITY: &str = "asyncTasks";
+/// The AIR capability that makes the adapter report its subagents' own
+/// lifecycle. Without it a backgrounded subagent is invisible: the `Agent`
+/// call completes the moment the subagent is handed off, so the call says
+/// "done" while the subagent works on.
+const AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY: &str = "nativeSubagentSessions";
 const ASYNC_TASK_STOP_METHOD: &str = "_session/async_task/stop";
 
 /// The AIR extension's `asyncTasks` payload on a message's `_meta`, if it
@@ -6505,6 +6516,57 @@ fn apply_async_task_update(
     }
 }
 
+/// The AIR extension's subagent reports on a parent session. Only sent to a
+/// client that advertised [`AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY`], and
+/// read off the raw payload because v1 has no variant for an extension kind.
+fn apply_subagent_update(
+    update: &serde_json::Value,
+    thread: &WeakEntity<AcpThread>,
+    cx: &mut AsyncApp,
+) {
+    let field = |name: &str| {
+        update
+            .get(name)
+            .and_then(|value| value.as_str())
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(SharedString::from)
+    };
+    let Some(session_id) = field("subagentSessionId") else {
+        return;
+    };
+    let session_id = acp::SessionId::new(session_id.as_ref());
+
+    match update.get("sessionUpdate").and_then(|kind| kind.as_str()) {
+        Some("subagent_spawned") => {
+            let subagent = acp_thread::Subagent {
+                session_id,
+                name: field("name"),
+                // The adapter sends the task it was given, and the prompt it
+                // was given when there is no shorter description of it.
+                task: field("task").or_else(|| field("prompt")),
+                state: acp_thread::AsyncTaskState::Running,
+            };
+            thread
+                .update(cx, |thread, cx| thread.subagent_reported(subagent, cx))
+                .log_err();
+        }
+        Some("subagent_state_update") => {
+            let state = update
+                .get("state")
+                .and_then(|value| value.as_str())
+                .map(acp_thread::AsyncTaskState::from_wire)
+                .unwrap_or(acp_thread::AsyncTaskState::Running);
+            thread
+                .update(cx, |thread, cx| {
+                    thread.subagent_state_updated(&session_id, state, cx);
+                })
+                .log_err();
+        }
+        _ => {}
+    }
+}
+
 fn handle_session_notification(
     raw: RawSessionNotification,
     cx: &mut AsyncApp,
@@ -6527,6 +6589,17 @@ fn handle_session_notification(
             session.thread.clone()
         };
         apply_async_task_update(&raw.update, &thread, cx);
+        return;
+    }
+    if session_update_kind.starts_with("subagent_") {
+        let thread = {
+            let sessions = ctx.sessions.borrow();
+            let Some(session) = sessions.get(&raw.session_id) else {
+                return;
+            };
+            session.thread.clone()
+        };
+        apply_subagent_update(&raw.update, &thread, cx);
         return;
     }
     let update = match serde_json::from_value::<acp::SessionUpdate>(raw.update) {

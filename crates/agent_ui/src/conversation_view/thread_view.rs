@@ -8716,8 +8716,8 @@ impl ThreadView {
                 // of headline chips (a group ends at the next assistant text
                 // message). The run's first entry draws the whole group; the
                 // rest draw nothing so the list index stays 1:1 with the thread
-                // entries. Permission prompts and subagents are not chips and
-                // fall through to their full rendering below.
+                // entries. Permission prompts are not chips and fall through
+                // to their full rendering below.
                 if let Some((run_start, run_len)) = self.action_run_bounds(entry_ix, cx) {
                     if entry_ix != run_start {
                         return Empty.into_any();
@@ -10357,7 +10357,7 @@ impl ThreadView {
                 !matches!(
                     tool_call.status(),
                     ToolCallStatus::WaitingForConfirmation { .. }
-                ) && !tool_call.is_subagent()
+                )
                     // Compaction renders as the transcript-wide barrier, never
                     // as an action chip.
                     && !tool_call.is_compaction(cx)

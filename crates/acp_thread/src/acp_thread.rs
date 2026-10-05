@@ -3556,6 +3556,9 @@ pub struct AcpThread {
     idle_sleep_prevention: IdleSleepPrevention,
     /// Tasks the agent detached, in the order it announced them.
     async_tasks: Vec<AsyncTask>,
+    /// Subagents the adapter has reported, terminal ones dropped as they
+    /// report in. Only populated for an agent that reports their lifecycle.
+    subagents: Vec<Subagent>,
     /// Tool calls whose command detached into the background. The agent marks
     /// the call itself, which is the only thing that arrives in order with the
     /// call's own completion; the task carrying the command's lifecycle can
@@ -3814,6 +3817,39 @@ pub struct AsyncTask {
     pub can_stop: bool,
 }
 
+/// A subagent the agent is running, as the adapter reports it.
+///
+/// Claude backgrounds subagents the way it backgrounds commands: the `Agent`
+/// call completes the moment the subagent is handed off, the turn can end, and
+/// the subagent keeps working. So the call's own status says nothing about
+/// whether the work is still going, and the lifecycle has to come from the
+/// adapter's own `subagent_spawned` / `subagent_state_update` reports. Those
+/// only arrive at all for a client that advertises support for them.
+///
+/// The states are [`AsyncTaskState`]'s: the adapter uses the same vocabulary
+/// here as for detached commands (`running`, `completed`, `failed`,
+/// `stopped`), and the only thing done with a non-terminal one is count it.
+#[derive(Debug, Clone)]
+pub struct Subagent {
+    /// The subagent's own session, which is also how its updates are keyed.
+    pub session_id: acp_v1::SessionId,
+    /// What kind of subagent it is, when the adapter says.
+    pub name: Option<SharedString>,
+    /// What it was asked to do, which is what its chip reads as.
+    pub task: Option<SharedString>,
+    pub state: AsyncTaskState,
+}
+
+impl Subagent {
+    /// The label for a subagent with nothing better to say than its session.
+    pub fn display_label(&self) -> SharedString {
+        self.task
+            .clone()
+            .or_else(|| self.name.clone())
+            .unwrap_or_else(|| SharedString::from("Subagent"))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum LoadError {
     Unsupported {
@@ -3964,6 +4000,7 @@ impl AcpThread {
             streaming_text_buffer: None,
             idle_sleep_prevention: IdleSleepPrevention::Inactive,
             async_tasks: Vec::new(),
+            subagents: Vec::new(),
             backgrounded_tool_calls: HashSet::default(),
         }
     }
@@ -4171,10 +4208,25 @@ impl AcpThread {
                 .terminals()
                 .filter(|terminal| terminal.read(cx).output().is_none())
                 .count();
-            if call.is_subagent() && matches!(call.status(), ToolCallStatus::InProgress) {
+            // A call whose subagent the adapter is reporting on is counted
+            // from that report instead, below: the call completes at once for
+            // a backgrounded subagent, so its status would say zero while the
+            // work runs on.
+            if call.is_subagent()
+                && matches!(call.status(), ToolCallStatus::InProgress)
+                && !self.subagent_is_reported(call)
+            {
                 work.subagents += 1;
             }
         }
+        // Reported subagents count whether or not a turn is running, which is
+        // the whole point of asking for the reports: Claude's are backgrounded
+        // and outlive the turn that launched them.
+        work.subagents += self
+            .subagents
+            .iter()
+            .filter(|subagent| !subagent.state.is_terminal())
+            .count();
         work.async_tasks = self
             .async_tasks
             .iter()
@@ -4187,6 +4239,33 @@ impl AcpThread {
     /// session drops them.
     pub fn async_tasks(&self) -> &[AsyncTask] {
         &self.async_tasks
+    }
+
+    /// The subagents the adapter has reported on, in the order they spawned.
+    pub fn subagents(&self) -> &[Subagent] {
+        &self.subagents
+    }
+
+    /// The reported state of the subagent a tool call spawned, when the
+    /// adapter is reporting on it. This is what a subagent's chip reads its
+    /// status from: the call's own status reaches `completed` as soon as the
+    /// subagent is handed off.
+    pub fn subagent_state_for_tool_call(&self, call: &ToolCall) -> Option<AsyncTaskState> {
+        let session_id = &call.subagent_session_info.as_ref()?.session_id;
+        self.subagents
+            .iter()
+            .find(|subagent| &subagent.session_id == session_id)
+            .map(|subagent| subagent.state)
+    }
+
+    /// Whether this call's subagent is one the adapter reports on, in which
+    /// case the report rather than the call decides whether it is running.
+    fn subagent_is_reported(&self, call: &ToolCall) -> bool {
+        call.subagent_session_info.as_ref().is_some_and(|info| {
+            self.subagents
+                .iter()
+                .any(|subagent| subagent.session_id == info.session_id)
+        })
     }
 
     /// The live task a tool call's command detached into, if the agent has said
@@ -5582,6 +5661,63 @@ impl AcpThread {
 
     pub fn subagent_spawned(&mut self, session_id: acp_v1::SessionId, cx: &mut Context<Self>) {
         cx.emit(AcpThreadEvent::SubagentSpawned(session_id));
+    }
+
+    /// A subagent the adapter is reporting the lifecycle of. Emits the same
+    /// event as [`Self::subagent_spawned`], so the subagent's own session is
+    /// loaded exactly as before, and additionally remembers it so it can be
+    /// counted and drawn while it runs.
+    pub fn subagent_reported(&mut self, subagent: Subagent, cx: &mut Context<Self>) {
+        let session_id = subagent.session_id.clone();
+        match self
+            .subagents
+            .iter_mut()
+            .find(|existing| existing.session_id == subagent.session_id)
+        {
+            // A spawn can arrive after its own terminal edge; keep the state
+            // that was already reached, as detached tasks do.
+            Some(existing) => {
+                let state = existing.state;
+                *existing = subagent;
+                if state.is_terminal() {
+                    existing.state = state;
+                }
+            }
+            None => self.subagents.push(subagent),
+        }
+        cx.emit(AcpThreadEvent::SubagentSpawned(session_id));
+        cx.notify();
+    }
+
+    pub fn subagent_state_updated(
+        &mut self,
+        session_id: &acp_v1::SessionId,
+        state: AsyncTaskState,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(subagent) = self
+            .subagents
+            .iter_mut()
+            .find(|subagent| &subagent.session_id == session_id)
+        else {
+            return;
+        };
+        if subagent.state == state {
+            return;
+        }
+        subagent.state = state;
+        cx.notify();
+    }
+
+    /// Nothing the agent spawned can still be running: the session is closing,
+    /// or the agent is unusable. A subagent left counted here would keep the
+    /// thread reading as working for as long as it stayed open.
+    pub fn clear_subagents(&mut self, cx: &mut Context<Self>) {
+        if self.subagents.is_empty() {
+            return;
+        }
+        self.subagents.clear();
+        cx.notify();
     }
 
     pub fn update_token_usage(&mut self, usage: Option<TokenUsage>, cx: &mut Context<Self>) {
@@ -7582,6 +7718,7 @@ impl AcpThread {
         // is unusable, and a task left counted would keep the thread reading as
         // working for as long as it stayed open.
         self.clear_async_tasks(cx);
+        self.clear_subagents(cx);
         cx.emit(AcpThreadEvent::LoadError(error));
     }
 
@@ -11906,6 +12043,241 @@ mod tests {
                 thread.running_work(cx).subagents,
                 0,
                 "a subagent left in flight by a finished turn is not still working"
+            );
+        });
+    }
+
+    /// Claude backgrounds its subagents: the `Agent` call completes the moment
+    /// the subagent is handed off, the turn ends, and the subagents keep
+    /// working. Counting them from the call's status therefore reports zero for
+    /// exactly the minutes they are running, which is what the pill used to do.
+    /// With the adapter's own reports they are counted until each says it is
+    /// done, turn or no turn.
+    #[gpui::test]
+    async fn test_reported_subagents_outlive_the_turn_that_launched_them(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(
+                    project.clone(),
+                    PathList::new(&[Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        let reviews = [
+            ("subagent-1", "Reuse review of flush cuts"),
+            ("subagent-2", "Simplification and altitude review"),
+            ("subagent-3", "Efficiency review of flush cuts"),
+        ];
+
+        let (complete, request) = start_test_turn(&thread, cx);
+        cx.run_until_parked();
+
+        // Launched together, as the screenshot showed them.
+        thread.update(cx, |thread, cx| {
+            for (session, task) in reviews {
+                thread.subagent_reported(
+                    Subagent {
+                        session_id: acp_v1::SessionId::new(session),
+                        name: Some("code-reviewer".into()),
+                        task: Some(task.into()),
+                        state: AsyncTaskState::Running,
+                    },
+                    cx,
+                );
+            }
+        });
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(thread.running_work(cx).subagents, 3);
+        });
+
+        // The `Agent` calls complete at once, which is how Claude hands a
+        // background subagent off. That must not drop the count.
+        thread.update(cx, |thread, cx| {
+            for (session, task) in reviews {
+                thread
+                    .handle_session_update(
+                        acp_v1::SessionUpdate::ToolCall(
+                            acp_v1::ToolCall::new(session, task)
+                                .status(acp_v1::ToolCallStatus::Completed)
+                                .meta(acp_v1::Meta::from_iter([
+                                    (
+                                        CLAUDE_CODE_META_KEY.into(),
+                                        serde_json::json!({ "toolName": "Agent" }),
+                                    ),
+                                    (
+                                        SUBAGENT_SESSION_INFO_META_KEY.into(),
+                                        serde_json::json!({
+                                            "session_id": session,
+                                            "message_start_index": 0,
+                                        }),
+                                    ),
+                                ])),
+                        ),
+                        cx,
+                    )
+                    .unwrap();
+            }
+        });
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(
+                thread.running_work(cx).subagents,
+                3,
+                "the calls completing is the hand-off, not the work finishing"
+            );
+            for (session, task) in reviews {
+                let state = thread
+                    .subagents()
+                    .iter()
+                    .find(|subagent| subagent.session_id == acp_v1::SessionId::new(session))
+                    .map(|subagent| subagent.state);
+                assert_eq!(
+                    state,
+                    Some(AsyncTaskState::Running),
+                    "{task} is still running, so its chip spins"
+                );
+            }
+        });
+
+        // And the turn ends while they work, which is the case that reported
+        // zero before.
+        complete
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .expect("turn should still be running");
+        request.await.expect("turn should complete");
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(
+                thread.running_work(cx).subagents,
+                3,
+                "a backgrounded subagent outlives the turn that launched it"
+            );
+        });
+
+        // Each drops as it reports in, and a failure is still an ending.
+        let endings = [
+            ("subagent-1", AsyncTaskState::Completed, 2),
+            ("subagent-2", AsyncTaskState::Failed, 1),
+            ("subagent-3", AsyncTaskState::Stopped, 0),
+        ];
+        for (session, state, remaining) in endings {
+            thread.update(cx, |thread, cx| {
+                thread.subagent_state_updated(&acp_v1::SessionId::new(session), state, cx);
+            });
+            cx.run_until_parked();
+            thread.read_with(cx, |thread, cx| {
+                assert_eq!(
+                    thread.running_work(cx).subagents,
+                    remaining,
+                    "{session} reported {state:?}"
+                );
+            });
+        }
+    }
+
+    /// The two ways of knowing about a subagent must not both be counted. An
+    /// agent that reports lifecycles is believed; one that does not still has
+    /// its call's status read, which is all there was before.
+    #[gpui::test]
+    async fn test_a_reported_subagent_is_counted_once(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(
+                    project.clone(),
+                    PathList::new(&[Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        let (complete, request) = start_test_turn(&thread, cx);
+        cx.run_until_parked();
+
+        // One subagent, reported *and* with its call still in flight.
+        thread.update(cx, |thread, cx| {
+            thread.subagent_reported(
+                Subagent {
+                    session_id: acp_v1::SessionId::new("reported"),
+                    name: None,
+                    task: Some("Review the diff".into()),
+                    state: AsyncTaskState::Running,
+                },
+                cx,
+            );
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::ToolCall(
+                        acp_v1::ToolCall::new("reported", "Review the diff")
+                            .status(acp_v1::ToolCallStatus::InProgress)
+                            .meta(acp_v1::Meta::from_iter([
+                                (
+                                    CLAUDE_CODE_META_KEY.into(),
+                                    serde_json::json!({ "toolName": "Agent" }),
+                                ),
+                                (
+                                    SUBAGENT_SESSION_INFO_META_KEY.into(),
+                                    serde_json::json!({
+                                        "session_id": "reported",
+                                        "message_start_index": 0,
+                                    }),
+                                ),
+                            ])),
+                    ),
+                    cx,
+                )
+                .unwrap();
+            // And one nobody reports on, which only its call speaks for.
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::ToolCall(
+                        acp_v1::ToolCall::new("unreported", "Summarise the diff")
+                            .status(acp_v1::ToolCallStatus::InProgress)
+                            .meta(acp_v1::Meta::from_iter([(
+                                CLAUDE_CODE_META_KEY.into(),
+                                serde_json::json!({ "toolName": "Task" }),
+                            )])),
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(
+                thread.running_work(cx).subagents,
+                2,
+                "one reported and one not, counted once each"
+            );
+        });
+
+        // Ending the turn settles the unreported one, as it always did, and
+        // leaves the reported one alone.
+        complete
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .expect("turn should still be running");
+        request.await.expect("turn should complete");
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(
+                thread.running_work(cx).subagents,
+                1,
+                "the reported subagent survives the turn; the one only its \
+                 call spoke for does not"
             );
         });
     }
