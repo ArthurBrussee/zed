@@ -217,6 +217,41 @@ cheaply, drop them and let the title truncate with an ellipsis. Test: for each c
 selected, running and state (rest, hover, active), the fade's colour equals the row's painted
 colour.
 
+**Claude's subagents: render them as chips, and count the ones still running after the turn.**
+
+Arthur's screenshot (2026-10-05): three Claude subagents ("Reuse review of flush cuts",
+"Simplification and altitude review", "Efficiency review of flush cuts"), launched together.
+Each is drawn as a full-width filled card with a check mark, indented and spaced apart, which
+breaks the chip run around it (`git add | git HEAD | wc …` above, `Read 1 file, searched 2
+places` below). And the activity pill never counted them. Two things to fix:
+
+1. **The look.** Subagents fall out of the chip run on purpose ("Permission prompts and subagents
+   are not chips and fall through to their full rendering"). Make a subagent a chip in the run
+   like any other action: the agent glyph, the subagent's task name, and its status (spinner
+   while running, check or cross when done). Clicking it expands the subagent's output or
+   transcript below the chips, the way other chips expand. Parallel subagents sit side by side in
+   the run's row.
+
+2. **The count, and the check marks.** The checks are the `Agent` tool calls' own status, and
+   10-04's pill fix counts a subagent only while its call is in flight *and* a turn is running.
+   Claude launches background subagents the way it backgrounds commands: the `Agent` call
+   completes at once, the turn can end, and the subagents keep working. So they show as done and
+   count as zero. The Claude adapter (0.85.1, `dist/native-subagents.js`) reports their real
+   lifecycle only to clients that advertise subagent support: either ACP's `subagents` client
+   capability (see `clientSupportsSubagents` in `dist/acp-subagents.js`) or the AIR
+   `nativeSubagentSessions` capability, the same `_meta.jetbrains.air` mechanism as
+   `asyncTasks`. Zed advertises neither. With it, the adapter sends `subagent_spawned`
+   (`subagentSessionId`, `name`, `task`, `prompt`) and `subagent_state_update` (`state`) on the
+   parent session, and the subagent's work as its own session. `AcpThread::subagent_spawned`
+   already exists (upstream's), so start from what upstream does with it. Advertise the
+   capability, track each subagent's state from those updates, count live ones in
+   `running_work` whether or not a turn is running, drop them on a terminal state or when the
+   session closes, and drive the chip's status from that state rather than from the `Agent`
+   call's.
+
+Test: a Claude turn that launches three background subagents and ends. The pill shows 3 after
+the turn ends, the chips show spinners, and both drop as each subagent reports done.
+
 **The leak and the perf pass: the fixes are in, and the numbers that say whether they worked are not.**
 
 Everything those entries asked for was built on 2026-10-02 (see that night's rebase log
