@@ -252,31 +252,50 @@ places` below). And the activity pill never counted them. Two things to fix:
 Test: a Claude turn that launches three background subagents and ends. The pill shows 3 after
 the turn ends, the chips show spinners, and both drop as each subagent reports done.
 
-**The leak and the perf pass: the fixes are in, and the numbers that say whether they worked are not.**
+**The leak and the perf pass: the after-numbers are in. The leak is fixed; two baselines are left.**
 
-Everything those entries asked for was built on 2026-10-02 (see that night's rebase log
-entry for what each change was), and on 2026-10-04 every line below was checked to have a
-live emitter that can still fire — so a number that has not moved is the code's answer and
-not a missing log line. What cannot be produced in the sandbox is the other half of the
-entries: the "after" lines themselves. Bring from a session that has been up a while —
+From Arthur's session on 2026-10-05, 12:58 to 14:09 local (build of 10-04):
 
-- two consecutive `quiet-ui perf: N entities live; largest: …; grown since the last line: …`
-  lines, and the `gpui holds …` line under them. Before: 118,828 live, Markdown 47,251,
-  Terminal 11,276, TerminalView 11,276, BlinkManager 13,367, growing about ten a minute.
-  The terminals and their views should be gone; what is left of the Markdown count names
-  whatever is next.
-- the `memory usage` lines over an hour. Before: 204MB to 1594MB.
-- a `quiet-ui perf: dropped the views of N off-screen threads` line, which no log has ever
-  held. One should appear within a minute of a window going to the back.
-- a `quiet-ui perf: sidebar rebuilt … costing Xms in all; asked for by file:line N` line.
-  The trigger names and the total are both new; the names say which caller to fix next and
-  the total says whether the sidebar was ever the 100ms/second it looked like.
-- any `ran too long` line with a call site that is no longer `executor.rs:143`. The 13
-  background hangs of 115 to 310ms are expected to name `worktree.rs`, which is where the
-  only `scoped_priority` fan-out in the app is; the line will say.
+- **Entities level off now instead of climbing.** Startup loads to 47,361 by 13:26, then
+  47,365 at 13:39, 47,716 at 14:07 and 47,996 at 14:09, while he works: about 15 a minute,
+  mostly `Markdown` and terminals from new output. Before, it was 111k at 10:03 and 119k at
+  11:10, climbing all day. Latest line: `47996 entities live; largest: Markdown 17925, Buffer 4324,
+  Terminal 4028, Terminal 4017, DisplayMap 2168, MultiBuffer 2168, WrapMap 2168, BlinkManager
+  1869, Editor 1858, SharedScrollAnchor 1855`. `TerminalView` is out of the top ten
+  (`BlinkManager` went from 13,367 to 1,869).
+- `gpui holds 14988 observers over 14413 entities, 14859 listeners over 9227, 2289 release
+  observers, 18206 global observers, 28085 focus handles`, down from 46,684 observers and 81,694
+  focus handles.
+- Resident memory: 92MB at start, peaking at 602MB, 145MB at 14:04. Before, it swung from 204MB
+  to 1594MB.
+- The sweep runs: 98 `dropped the views of 1 off-screen threads` lines in 71 minutes.
+- Sidebar: `sidebar rebuilt 377 rows in 3ms, over 718 rebuilds nobody felt (607 of them built
+  the list that was already there) costing 1002ms in all; asked for by sidebar.rs:1287 610,
+  sidebar.rs:2496 50, sidebar.rs:972 44, sidebar.rs:1125 12`. That is about 1.4ms a rebuild,
+  and a line every 9 to 10 minutes, so roughly 0.2% of the foreground. `:1287`
+  (`AgentPanelEvent::EntryChanged`) is still 85% no-op. Cheap now, so it is only worth fixing if
+  the fix is small.
+- Hangs now name real call sites, no `executor.rs:143`. Most were at startup (12:58):
+  `project/src/environment.rs:303:26` twice, up to 870ms; `gpui_macos/src/window.rs:3190:10`
+  464ms; `extension_host/src/wasm_host.rs:584:18` 280ms; `session/src/session.rs:75:16` 222ms;
+  `project_panel/src/project_panel.rs:4554:39` 217ms; `workspace/src/workspace.rs:2187:12`
+  215ms. No foreground hangs.
 
-If a number has not moved, that is the finding, and the entry it belongs to comes back with
-it. If it has, there is nothing here to build.
+What is left, both baselines rather than leaks:
+1. **About 4,000 live command terminals after loading history**, twice over (`acp_thread`'s
+   `Terminal` and `terminal::Terminal`, a full alacritty grid each). The views are lazy now, but
+   every command restored from history still builds both models. A finished command needs its
+   captured output and exit status, not a terminal. Don't build `terminal::Terminal` for a
+   command whose exit is already known (anything replayed from history). Drop it once a live
+   command exits and its output is captured, and keep the captured text for the chip and
+   expansion.
+2. **17,925 `Markdown` at baseline**, one per rendered block of every loaded thread. Check
+   whether off-screen threads' sweep releases their `Markdown` too (it drops views; the
+   `Markdown` may be owned by entry state that stays), and release it with the views if not.
+3. Look at `environment.rs:303` (870ms in the background at startup) and see whether it is the
+   per-directory capture still running more than once at launch.
+
+Report the same lines before and after.
 
 ## Verification queue
 
