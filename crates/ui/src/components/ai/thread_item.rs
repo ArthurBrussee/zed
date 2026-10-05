@@ -5,6 +5,7 @@ use gpui::{
     WindowBackgroundAppearance, pulsating_between,
 };
 use itertools::Itertools as _;
+use theme::ThemeColors;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -775,6 +776,45 @@ impl ThreadItem {
     }
 }
 
+/// The opaque colour a row paints in each of its three states. A
+/// `GradientFade` dissolves the title into the row by painting the row's own
+/// colour over it, so it has to be given the colour the row actually paints:
+/// anything else reads as a rectangle of a slightly different shade.
+struct RowBackgrounds {
+    rest: Hsla,
+    hover: Hsla,
+    active: Hsla,
+}
+
+/// Works out those three colours from exactly the layers the row paints.
+/// The row sets one background per state rather than stacking them, so a
+/// selected row shows no running wash and a hovered row shows neither — a
+/// fade computed by blending all of them together is a colour the row is
+/// never painted in, which is what put a block of the wrong blue next to the
+/// activity pill.
+fn row_backgrounds(
+    color: &ThemeColors,
+    raw_bg: Hsla,
+    selected: bool,
+    running: bool,
+) -> RowBackgrounds {
+    // What lies under the row. Every state paints one translucent layer on
+    // top of this, never two.
+    let surface = color.background.blend(raw_bg);
+    let rest = if selected {
+        surface.blend(color.ghost_element_selected)
+    } else if running {
+        surface.blend(color.text_accent.opacity(0.08))
+    } else {
+        surface
+    };
+    RowBackgrounds {
+        rest,
+        hover: surface.blend(color.ghost_element_hover),
+        active: surface.blend(color.ghost_element_active),
+    }
+}
+
 impl RenderOnce for ThreadItem {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let color = cx.theme().colors();
@@ -802,21 +842,11 @@ impl RenderOnce for ThreadItem {
         // doing minutes of work reads as idle.
         let running = self.status == AgentThreadStatus::Running || !running_work.is_empty();
         let accent = color.text_accent;
-        let apparent_bg = color.background.blend(raw_bg);
-        let apparent_bg = if running {
-            apparent_bg.blend(accent.opacity(0.08))
-        } else {
-            apparent_bg
-        };
-
-        let base_bg = if self.selected {
-            apparent_bg.blend(color.ghost_element_selected)
-        } else {
-            apparent_bg
-        };
-
-        let hover_bg = apparent_bg.blend(color.ghost_element_hover);
-        let active_bg = apparent_bg.blend(color.ghost_element_active);
+        let RowBackgrounds {
+            rest: base_bg,
+            hover: hover_bg,
+            active: active_bg,
+        } = row_backgrounds(color, raw_bg, self.selected, running);
 
         // Sized and placed to dissolve the end of the title inside the
         // title's own box. It used to be a sibling of the status slot,
@@ -1006,15 +1036,14 @@ impl RenderOnce for ThreadItem {
             .w_full()
             .py_1()
             .px_1p5()
-            .when(running && !self.selected, |s| s.bg(accent.opacity(0.08)))
-            .when(self.selected, |s| s.bg(color.ghost_element_selected))
+            .bg(base_bg)
             .border_1()
             .border_r_2()
             .border_color(gpui::transparent_black())
             .when(self.focused, |s| s.border_color(color.panel_focused_border))
             .when(self.rounded, |s| s.rounded_sm())
-            .hover(|s| s.bg(color.ghost_element_hover))
-            .active(|s| s.bg(color.ghost_element_active))
+            .hover(|s| s.bg(hover_bg))
+            .active(|s| s.bg(active_bg))
             .on_hover(self.on_hover)
             .when(running, |this| {
                 this.child(
@@ -1653,7 +1682,7 @@ impl Component for ThreadItem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{Background, Modifiers, TestAppContext, VisualTestContext, point};
+    use gpui::{Background, Modifiers, TestAppContext, VisualTestContext, hsla, point};
 
     #[gpui::test]
     fn test_thread_action_padding_preserves_row_background(cx: &mut TestAppContext) {
@@ -1768,6 +1797,89 @@ mod tests {
                         .on_click(cx.listener(|view, _, _, _| view.clicks += 1)),
                 ),
             )
+        }
+    }
+
+    /// Every `GradientFade` on a row paints the row's own colour over the end
+    /// of the title, so it has to be handed the colour the row actually paints.
+    /// The row sets one background per state rather than stacking them: a
+    /// selected row shows no running wash, and a hovered or active row shows
+    /// neither, because `.bg()` in those styles replaces the base. The fades
+    /// were computed by blending all of the layers together, which is a colour
+    /// the row is never painted in — the block of a slightly different blue
+    /// beside the activity pill.
+    ///
+    /// The ghost colours are given translucent here on purpose. Every real
+    /// theme has them so, but the test theme's are fully opaque, and an opaque
+    /// layer discards whatever it is blended onto — which makes both the right
+    /// and the wrong composition agree and the bug invisible.
+    #[gpui::test]
+    fn test_row_fade_colours_are_the_colours_the_row_paints(cx: &mut TestAppContext) {
+        let color = cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            let mut color = cx.theme().colors().clone();
+            color.background = hsla(0.6, 0.12, 0.15, 1.0);
+            color.surface_background = hsla(0.6, 0.12, 0.15, 1.0);
+            color.text_accent = hsla(0.62, 0.78, 0.65, 1.0);
+            color.ghost_element_selected = hsla(0.62, 0.11, 0.26, 0.14);
+            color.ghost_element_hover = hsla(0.62, 0.12, 0.27, 0.10);
+            color.ghost_element_active = hsla(0.61, 0.12, 0.20, 0.18);
+            color
+        });
+        let surface = color.background.blend(color.surface_background);
+        let for_row = |selected, running| {
+            row_backgrounds(&color, color.surface_background, selected, running)
+        };
+        let idle = for_row(false, false);
+        let running = for_row(false, true);
+        let selected_idle = for_row(true, false);
+        let selected_running = for_row(true, true);
+
+        // `.when(running && !self.selected, ..)` means a selected row paints no
+        // running wash, so its fade carries none either and a selected row
+        // reads the same whether or not it is working.
+        assert_eq!(
+            selected_running.rest, selected_idle.rest,
+            "a selected row paints no running wash, so neither does its fade"
+        );
+        assert_eq!(
+            selected_idle.rest,
+            surface.blend(color.ghost_element_selected),
+            "a selected row is the surface plus one selection layer"
+        );
+        // The wash is matched rather than dropped: an unselected running row
+        // still carries it.
+        assert_eq!(
+            running.rest,
+            surface.blend(color.text_accent.opacity(0.08)),
+            "an unselected running row is the surface plus the accent wash"
+        );
+        assert_ne!(
+            running.rest, idle.rest,
+            "and so it differs from the same row at rest"
+        );
+        assert_eq!(idle.rest, surface, "a plain row is just the surface");
+
+        // Hover and active replace the row's background outright, wash and
+        // selection included, so neither depends on either.
+        for (name, state) in [
+            ("idle", &idle),
+            ("running", &running),
+            ("selected idle", &selected_idle),
+            ("selected running", &selected_running),
+        ] {
+            assert_eq!(
+                state.hover,
+                surface.blend(color.ghost_element_hover),
+                "the hovered colour is one hover layer over the surface ({name})"
+            );
+            assert_eq!(
+                state.active,
+                surface.blend(color.ghost_element_active),
+                "the active colour is one active layer over the surface ({name})"
+            );
         }
     }
 
