@@ -9,7 +9,21 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use collections::HashMap;
 use gpui::{App, Global};
 
+#[cfg(not(test))]
 static CREATIONS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+// Per test thread, so tests running in parallel don't see each other's creations.
+#[cfg(test)]
+thread_local! {
+    static CREATIONS_IN_FLIGHT: AtomicUsize = const { AtomicUsize::new(0) };
+}
+
+fn creations_in_flight<R>(f: impl FnOnce(&AtomicUsize) -> R) -> R {
+    #[cfg(not(test))]
+    return f(&CREATIONS_IN_FLIGHT);
+    #[cfg(test)]
+    return CREATIONS_IN_FLIGHT.with(f);
+}
 
 /// Held while a `+` opens its window, since a spare's checkout racing that open made it take
 /// 12-14s. A static rather than a [`Global`] so the guard can release without an `App`.
@@ -17,18 +31,18 @@ pub struct CreationInFlight;
 
 impl CreationInFlight {
     pub fn begin() -> Self {
-        CREATIONS_IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+        creations_in_flight(|count| count.fetch_add(1, Ordering::SeqCst));
         Self
     }
 
     pub fn any() -> bool {
-        CREATIONS_IN_FLIGHT.load(Ordering::SeqCst) > 0
+        creations_in_flight(|count| count.load(Ordering::SeqCst)) > 0
     }
 }
 
 impl Drop for CreationInFlight {
     fn drop(&mut self) {
-        CREATIONS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+        creations_in_flight(|count| count.fetch_sub(1, Ordering::SeqCst));
     }
 }
 
