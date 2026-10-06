@@ -11,7 +11,6 @@ use ui::{Divider, PopoverMenu, PopoverMenuHandle, Tooltip, prelude::*};
 use crate::ui::ModelSelectorTooltip;
 use crate::{ModelSelector, model_selector::acp_model_selector};
 
-/// One selectable thinking-effort level in the merged model/effort popover.
 #[derive(Clone)]
 pub struct EffortOption {
     pub name: SharedString,
@@ -19,28 +18,21 @@ pub struct EffortOption {
     pub selected: bool,
 }
 
-/// The thinking/effort content merged into the model popover's second section.
-/// Built by the thread view (which owns the thread and settings writes) and
-/// handed to the popover each render.
+/// Built by the thread view, which owns the thread and settings writes.
 #[derive(Clone)]
 pub struct EffortMenuSection {
-    /// A thinking on/off toggle, when the model allows disabling thinking:
-    /// `(enabled, toggle)`.
+    /// `(enabled, toggle)`, when the model allows disabling thinking.
     pub thinking_toggle: Option<(bool, Rc<dyn Fn(&mut Window, &mut App)>)>,
     pub effort_options: Vec<EffortOption>,
     pub on_select_effort: Rc<dyn Fn(SharedString, &mut Window, &mut App)>,
-    /// Short label of the active effort, appended to the trigger as `model/effort`.
     pub selected_label: Option<SharedString>,
 }
 
-/// The fast-mode content merged into the model popover's third section. Built
-/// by the thread view; absent for models that do not support fast mode.
 #[derive(Clone)]
 pub struct FastModeSection {
     pub enabled: bool,
     pub toggle: Rc<dyn Fn(&mut Window, &mut App)>,
-    /// The provider's warning, shown inline before enabling fast mode. The
-    /// second handler enables it and stops showing the warning.
+    /// The provider's warning, shown inline before enabling fast mode.
     pub confirmation: Option<FastModeConfirmationRows>,
 }
 
@@ -55,8 +47,7 @@ pub struct ModelSelectorPopover {
     selector: Entity<ModelSelector>,
     menu: Entity<ModelEffortMenu>,
     menu_handle: PopoverMenuHandle<ModelEffortMenu>,
-    /// Whether the thread this selector belongs to is generating. The trigger
-    /// doubles as the activity light: it glimmers while work is happening.
+    /// The trigger glimmers while the thread is generating.
     working: bool,
 }
 
@@ -101,15 +92,12 @@ impl ModelSelectorPopover {
         });
     }
 
-    /// Update the effort section shown under the model list. Called each render
-    /// by the thread view so the effort state (and its handlers) stay fresh.
     pub fn set_effort_section(&self, effort: Option<EffortMenuSection>, cx: &mut Context<Self>) {
         self.menu.update(cx, |menu, _cx| {
             menu.effort = effort;
         });
     }
 
-    /// Update the fast-mode section shown under the effort section.
     pub fn set_fast_mode_section(
         &self,
         fast_mode: Option<FastModeSection>,
@@ -150,8 +138,6 @@ impl Render for ModelSelectorPopover {
             .as_ref()
             .is_some_and(|fast_mode| fast_mode.enabled);
 
-        let show_cycle_row = selector.delegate.favorites_count() > 1;
-
         let (color, icon) = if self.menu_handle.is_deployed() {
             (Color::Accent, IconName::ChevronUp)
         } else if self.working {
@@ -159,6 +145,8 @@ impl Render for ModelSelectorPopover {
         } else {
             (Color::Muted, IconName::ChevronDown)
         };
+
+        let show_cycle_row = selector.delegate.favorites_count() > 1;
 
         let tooltip = Tooltip::element({
             move |_, _cx| {
@@ -168,8 +156,7 @@ impl Render for ModelSelectorPopover {
             }
         });
 
-        // Fast mode takes over the leading icon slot (the button has only one),
-        // so an enabled fast mode is visible without opening the popover.
+        // Fast mode takes over the only leading icon slot.
         let start_icon = if fast_mode_on {
             Some(
                 Icon::new(IconName::FastForward)
@@ -204,8 +191,6 @@ impl Render for ModelSelectorPopover {
                 y: px(-2.0),
             });
 
-        // While the thread works, the model control is the activity light:
-        // a clearly visible accent glimmer breathing over the whole control.
         if self.working {
             let glow = cx.theme().colors().text_accent;
             return div()
@@ -224,7 +209,6 @@ impl Render for ModelSelectorPopover {
     }
 }
 
-/// The popover body: the model picker on top, then a thinking-effort section.
 pub struct ModelEffortMenu {
     picker: Entity<ModelSelector>,
     effort: Option<EffortMenuSection>,
@@ -234,8 +218,6 @@ pub struct ModelEffortMenu {
 
 impl ModelEffortMenu {
     fn new(picker: Entity<ModelSelector>, cx: &mut Context<Self>) -> Self {
-        // Confirming a model dismisses the picker; propagate that so the whole
-        // popover closes.
         let subscription = cx.subscribe(&picker, |_this, _picker, &DismissEvent, cx| {
             cx.emit(DismissEvent);
         });
@@ -261,9 +243,8 @@ impl Render for ModelEffortMenu {
         let hover_bg = cx.theme().colors().element_hover;
         v_flex()
             .min_w(rems(14.))
-            // The popover machinery renders this view bare; the elevated
-            // surface chrome that PickerPopoverMenu used to provide has to be
-            // drawn here or the menu floats transparent over the thread.
+            // PopoverMenu renders this view bare, without PickerPopoverMenu's
+            // surface chrome.
             .bg(cx.theme().colors().elevated_surface_background)
             .border_1()
             .border_color(cx.theme().colors().border_variant)
@@ -346,8 +327,6 @@ impl Render for ModelEffortMenu {
                                 })
                             },
                         ))
-                        // The provider's warning is shown inline rather than in
-                        // its own popover: enabling from here accepts it.
                         .when_some(fast_mode.confirmation, |this, confirmation| {
                             this.child(
                                 v_flex()

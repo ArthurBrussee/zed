@@ -1,10 +1,6 @@
-//! What a chip is made of: the glyph it wears, the label it carries, and the
-//! popover it opens.
-//!
-//! This is the fork's own vocabulary rather than an edit to Zed's, and it lives
-//! beside the thread view instead of inside it so that upstream's file stays
-//! close to upstream's. Everything here is presentation; what a command *did*
-//! is decided in `acp_thread::command_parse`.
+//! The thread view's action chips, kept out of `thread_view.rs` so that file
+//! stays close to upstream's. What a command did is decided in
+//! `acp_thread::command_parse`.
 
 use std::sync::Arc;
 
@@ -14,32 +10,16 @@ use project::project_settings::DiagnosticSeverity;
 use super::*;
 use crate::entry_view_state::diff_editor_text_style_refinement;
 
-/// A hover card is a fixed-width window onto something longer, and the command
-/// card is two of them stacked (the command, then what it printed), so both
-/// halves share one width rather than each sizing to its own content.
+/// Shared by the command card's two stacked halves so they line up.
 const CARD_WIDTH: Rems = Rems(30.);
 
-/// A diff wants width more than height: wrapping is what makes a hunk hard to
-/// read, and a card that could be half again as wide spends its life scrolling
-/// instead. Kept together with `DIFF_CARD_HEIGHT` and `DIFF_CARD_MAX_W` so a
-/// declared edit and a command-changed file open at the same size.
 const DIFF_CARD_WIDTH: Rems = Rems(48.);
-/// A diff card's scroll region cannot be taller than this. Bigger than the
-/// text cards get, because there is more to read at once and the enterable
-/// card scrolls for what still doesn't fit.
 const DIFF_CARD_HEIGHT: Rems = Rems(30.);
-/// The container ceiling has to move with the scroll region or the region
-/// won't get it. Sized to hold `DIFF_CARD_WIDTH` plus the card's own padding
-/// without cropping.
+/// `DIFF_CARD_WIDTH` plus the card's padding; must move with it.
 const DIFF_CARD_MAX_W: Rems = Rems(56.);
 
-/// How much of a command's output the card carries. The end is where a command
-/// says how it went; the whole thing is one click away in the chip itself.
 const OUTPUT_TAIL_LINES: usize = 200;
 
-/// Puts a chip's picture on the clipboard. Data the agent sent is already in
-/// hand; a file is read first, off the foreground, since the point of copying a
-/// screenshot is not to stall the window while it happens.
 fn copy_chip_image(image: ChipImage, cx: &mut App) {
     match image {
         ChipImage::Data { image, .. } => cx.write_to_clipboard(ClipboardItem::new_image(&image)),
@@ -68,12 +48,10 @@ fn copy_chip_image(image: ChipImage, cx: &mut App) {
     }
 }
 
-/// A picture's shape, taken from the header of the file it lives in.
-///
-/// The whole file is read, because that is the read `Fs` offers, but only the
-/// few bytes at the front of it are parsed. A name that is not a raster format
-/// answers without touching the disk at all.
-pub(super) async fn image_shape_of_file(fs: &Arc<dyn fs::Fs>, path: &std::path::Path) -> ImageShape {
+pub(super) async fn image_shape_of_file(
+    fs: &Arc<dyn fs::Fs>,
+    path: &std::path::Path,
+) -> ImageShape {
     let Some(format) = path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -88,7 +66,6 @@ pub(super) async fn image_shape_of_file(fs: &Arc<dyn fs::Fs>, path: &std::path::
         .map_or(ImageShape::Unknown, ImageShape::Known)
 }
 
-/// The format a file's name claims, for the formats an image chip can show.
 fn image_format_from_extension(extension: &str) -> Option<gpui::ImageFormat> {
     match extension.to_ascii_lowercase().as_str() {
         "png" => Some(gpui::ImageFormat::Png),
@@ -101,8 +78,6 @@ fn image_format_from_extension(extension: &str) -> Option<gpui::ImageFormat> {
     }
 }
 
-/// A diff stat, when there is anything to say: a chip with `+0 -0` on it says
-/// only that the file is in a list it is already in.
 fn diff_stats(added: u32, deleted: u32) -> Option<action_log::DiffStats> {
     (added > 0 || deleted > 0).then_some(action_log::DiffStats {
         lines_added: added,
@@ -110,9 +85,6 @@ fn diff_stats(added: u32, deleted: u32) -> Option<action_log::DiffStats> {
     })
 }
 
-/// A read-only diff editor for a hover card: the same stripped-down editor a
-/// declared edit is shown in, over a file's own buffer and the repository's
-/// diff for it.
 fn command_file_diff_editor(
     multibuffer: Entity<MultiBuffer>,
     window: &mut Window,
@@ -152,8 +124,6 @@ fn command_file_diff_editor(
     })
 }
 
-/// The shared container for chip hover cards: styled like a popover (an
-/// elevated, bordered surface) rather than a plain tooltip bubble.
 pub(super) struct ChipHoverCard {
     pub(super) build: std::rc::Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>,
 }
@@ -161,16 +131,13 @@ pub(super) struct ChipHoverCard {
 impl Render for ChipHoverCard {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui_font = theme::theme_settings(cx).ui_font(cx).clone();
-        // The padding is part of the card, not a gap: with a hoverable
-        // tooltip the pointer crosses it on the way in, and a real gap would
-        // dismiss the card before it arrives.
+        // Padding, not a gap: a gap would dismiss the hoverable card as the
+        // pointer crosses it.
         div().pl_2().pt_2p5().child(
             v_flex()
                 .font(ui_font)
                 .text_ui(cx)
                 .text_color(cx.theme().colors().text)
-                // One surface, said once: this was the same background,
-                // border, radius and shadow that `elevation_2` carries.
                 .elevation_2(cx)
                 .p_2p5()
                 .child((self.build)(window, cx)),
@@ -178,12 +145,7 @@ impl Render for ChipHoverCard {
     }
 }
 
-/// One phrasing for every search, whatever performed it: `Searched "query"`.
-///
-/// Agents word this differently, one saying `Search for x`, another `grep x`,
-/// another just the pattern, and the shell's own searches arrive as a bare
-/// query. A chip that reads differently for the same act is what this avoids;
-/// the magnifying glass says it was a search, and the label says for what.
+/// One phrasing, `Searched "query"`, however the agent worded its search.
 pub(super) fn search_chip_label(source: &str) -> Option<SharedString> {
     const VERBS: &[&str] = &[
         "searched for ",
@@ -203,8 +165,7 @@ pub(super) fn search_chip_label(source: &str) -> Option<SharedString> {
     let query = VERBS
         .iter()
         .find_map(|verb| lowercase.strip_prefix(verb))
-        // The prefix is matched against the lowercase copy, so the tail is cut
-        // from the original by length rather than by the match itself.
+        // Matched on the lowercase copy, so cut the original by length.
         .map(|rest| &text[text.len() - rest.len()..])
         .unwrap_or(text)
         .trim()
@@ -212,14 +173,9 @@ pub(super) fn search_chip_label(source: &str) -> Option<SharedString> {
     (!query.is_empty()).then(|| format!("Searched {query:?}").into())
 }
 
-/// A scrollable region inside a hover card.
-///
-/// Tooltips are laid out with min-content available space, and a scrolling
-/// element's automatic minimum size is zero rather than content based, so a
-/// region like this collapses to a sliver unless it carries a width of its
-/// own. That is the only reason the width is fixed here. `occlude` keeps the
-/// wheel from reaching the transcript underneath, which would otherwise
-/// scroll the thread out from under the pointer.
+/// Tooltips lay out at min-content and a scroller's minimum size is zero, so
+/// the region needs its own width or it collapses. `occlude` keeps the wheel
+/// off the transcript underneath.
 pub(super) fn card_scroll_region(
     id: &'static str,
     width: gpui::Rems,
@@ -233,8 +189,6 @@ pub(super) fn card_scroll_region(
         .occlude()
 }
 
-/// Wraps a card body in the shared popover-style container, in the shape the
-/// `.tooltip(...)` API expects.
 pub(super) fn chip_hover_card(
     build: impl Fn(&mut Window, &mut App) -> AnyElement + 'static,
 ) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView {
@@ -245,11 +199,8 @@ pub(super) fn chip_hover_card(
     }
 }
 
-/// A chip hover card whose body loads asynchronously: the card observes an
-/// entity and re-renders when it notifies, so a body that returns `None` while
-/// something loads gets a real chance to fill in once the load completes. A
-/// plain `chip_hover_card` re-renders only when the card itself notifies, so
-/// an `entity.notify()` on the thread cannot reach it.
+/// For a body that loads asynchronously: a plain card never sees the observed
+/// entity's notify, so it would stay empty until hovered again.
 pub(super) fn chip_hover_card_observing<T: 'static>(
     observed: WeakEntity<T>,
     build: impl Fn(&mut Window, &mut App) -> AnyElement + 'static,
@@ -268,24 +219,18 @@ pub(super) fn chip_hover_card_observing<T: 'static>(
     }
 }
 
-/// A chip built from several clipped commands is not a shell line, so parsing
-/// the whole label highlights neither command correctly. Keeping the pieces
-/// lets each one be highlighted on its own, with the separators and any prose
-/// left plain.
+/// Command ranges are kept so each is highlighted on its own: a label joined
+/// from several clipped commands is not one shell line.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct CommandChipLabel {
     pub(super) text: String,
-    /// Byte ranges of `text` that are commands.
     pub(super) commands: Vec<Range<usize>>,
 }
 
 impl CommandChipLabel {
-    /// Joins a chain's acts where only text will do, as in a tooltip. The
-    /// chip itself draws a rule instead; a bar character reads as one of the
-    /// pipes in `a|b|c`, which is what half these labels contain.
+    /// For text-only joins; the chip draws a rule, since a bar reads as a pipe.
     pub(super) const SEPARATOR: &'static str = " · ";
 
-    /// A label that is a description rather than a command.
     pub(super) fn prose(text: String) -> Self {
         Self {
             text,
@@ -300,8 +245,6 @@ impl CommandChipLabel {
         }
     }
 
-    /// Highlight runs for the whole label: each command parsed by itself,
-    /// everything between them left in the base style.
     pub(super) fn runs(
         &self,
         language: Option<&Arc<Language>>,
@@ -329,14 +272,10 @@ impl CommandChipLabel {
     }
 }
 
-/// The glyph on a command chip, or on one piece of a chained one. A program
-/// that belongs to a language wears that language's own icon, which is how a
-/// wall of chips reads at a glance: the Rust one is a build, the Python one is
-/// a script.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum ChipGlyph {
     Icon(IconName),
-    /// An icon-theme file type, as named by [`acp_thread::program_language`].
+    /// An icon-theme file type from [`acp_thread::program_language`].
     Language(&'static str),
 }
 
@@ -377,7 +316,7 @@ impl ChipGlyph {
             Self::Language(language) => FileIcons::get(cx).get_icon_for_type(language, cx),
         };
         match path {
-            // A language icon is the real logo, so it keeps its own colors.
+            // A language logo keeps its own colors.
             Some(path) => Icon::from_path(path)
                 .size(IconSize::Small)
                 .into_any_element(),
@@ -389,74 +328,38 @@ impl ChipGlyph {
     }
 }
 
-/// One act of a chained command line, as it appears on a collapsed chip: what
-/// it was for, and what it was called.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct CommandChipPiece {
     pub(super) glyph: ChipGlyph,
     pub(super) label: CommandChipLabel,
-    /// Whether this act ran in the line's devshell, on a line where only some
-    /// of them did. The badge names the devshell once; this marks which acts it
-    /// covered, which is the whole reason a mixed line is worth reading.
+    /// Set only on a line where some acts ran outside the devshell.
     pub(super) in_environment: bool,
 }
 
-/// The devshell a command line's work ran in, and whether it covered all of it.
 pub(super) struct CommandEnvironment {
     pub(super) name: String,
     pub(super) partial: bool,
 }
 
-/// A collapsed command chip's contents. A line that did one thing is one
-/// label; a chain is a piece per act, each with its own glyph, so the shape of
-/// the line survives being shrunk to a chip.
 pub(super) enum CollapsedCommand {
     Label(CommandChipLabel),
     Pieces(Vec<CommandChipPiece>),
 }
 
-pub(super) fn highlight_code_runs(
-    code: &str,
-    language: Option<&Arc<Language>>,
-    code_text_style: TextStyle,
-    markdown_style: &MarkdownStyle,
-) -> Vec<TextRun> {
-    if code.is_empty() {
-        return Vec::new();
-    }
-
-    let Some(language) = language else {
-        return vec![code_text_style.to_run(code.len())];
-    };
-
-    let mut runs = Vec::new();
-    let mut offset = 0;
-    for (range, highlight_id) in language.highlight_text(&Rope::from(code), 0..code.len()) {
-        if range.start > offset {
-            runs.push(code_text_style.to_run(range.start - offset));
+fn command_class_icon(class: acp_thread::CommandClass) -> IconName {
+    match class {
+        acp_thread::CommandClass::Search => IconName::MagnifyingGlass,
+        acp_thread::CommandClass::Read => IconName::FileCode,
+        acp_thread::CommandClass::ReadDiff => IconName::Diff,
+        acp_thread::CommandClass::GitInfo => IconName::GitBranch,
+        acp_thread::CommandClass::GitHub => IconName::PullRequest,
+        acp_thread::CommandClass::Inspect | acp_thread::CommandClass::Other => {
+            IconName::ToolTerminal
         }
-
-        let mut run_style = code_text_style.clone();
-        if let Some(highlight) = markdown_style.syntax.get(highlight_id).cloned() {
-            run_style = run_style.highlight(highlight);
-        }
-        runs.push(run_style.to_run(range.len()));
-        offset = range.end;
     }
-
-    if offset < code.len() {
-        runs.push(code_text_style.to_run(code.len() - offset));
-    }
-
-    runs
 }
 
-/// The chip surface of a thread view. These are methods on `ThreadView`
-/// rather than free functions because they read its expansion state, its
-/// caches, and its workspace; keeping them in a child module leaves the
-/// call sites in `thread_view.rs` untouched while the bulk lives here.
 impl ThreadView {
-    /// The machine a terminal call ran on, when it ran somewhere else.
     pub(super) fn command_host_for(&self, tool_call: &ToolCall, cx: &App) -> Option<String> {
         if tool_call.terminals().next().is_none() {
             return None;
@@ -464,10 +367,8 @@ impl ThreadView {
         self.chip_cache.command(tool_call, cx).host.clone()
     }
 
-    /// The devshell a command ran in, when one wrapped it. The wrapper is
-    /// stripped from the label (`nix develop … --command ruff check` is a ruff
-    /// run), so this is the only thing that still says where it ran. A line
-    /// only half inside the devshell says so rather than claiming all of it.
+    /// The devshell wrapper is stripped from the label, so this is what still
+    /// says where the command ran.
     pub(super) fn command_environment_for(
         &self,
         tool_call: &ToolCall,
@@ -509,7 +410,6 @@ impl ThreadView {
         }
     }
 
-    /// Chip grouping without a cache, for callers that have no view (tests).
     #[cfg(test)]
     pub(super) fn action_chips_in(
         entries: &[AgentThreadEntry],
@@ -529,9 +429,7 @@ impl ThreadView {
     ) -> Vec<ActionChip> {
         let mut chips: Vec<ActionChip> = Vec::new();
 
-        // Consecutive reads/searches (waits between them are invisible and do
-        // not break the stretch) fold into one summary chip; a lone one keeps
-        // its own chip. A stretch ends at any other visible chip.
+        // Consecutive reads/searches fold into one summary chip.
         let mut pending_low_value: Vec<usize> = Vec::new();
         fn flush(chips: &mut Vec<ActionChip>, pending: &mut Vec<usize>) {
             match pending.len() {
@@ -553,24 +451,16 @@ impl ThreadView {
                         || tool_call.is_empty_stdin_write(cx)
                         || tool_call.is_tool_lookup(cx)
                     {
-                        // Waiting, prodding a process with no keystrokes, and
-                        // looking up its own tools are not actions worth
-                        // reporting: agents emit long stretches of them. They
-                        // stay in the run so the chips around them keep one
-                        // group.
+                        // Hidden, but kept in the run so neighbours stay grouped.
                         continue;
                     }
-                    // A picture is never noise: an image read keeps its own
-                    // chip rather than folding into "read 4 files", where the
-                    // image would have nowhere to appear.
+                    // An image read keeps its own chip so the image can show.
                     if Self::tool_call_has_image(tool_call, cx) {
                         flush(&mut chips, &mut pending_low_value);
                         chips.push(ActionChip::ToolCall { entry_ix });
                         continue;
                     }
-                    // A command that changed files is never quiet noise, however
-                    // much it reads like a look-around: `sed -n` folds away,
-                    // `sed -i` does not.
+                    // `sed -n` folds away, `sed -i` does not.
                     if Self::low_value_class(tool_call, cache, cx).is_some()
                         && Self::command_changed_files(tool_call, cx).is_empty()
                     {
@@ -579,11 +469,8 @@ impl ThreadView {
                     }
                     flush(&mut chips, &mut pending_low_value);
 
-                    // An edit is one chip per file it touched, each naming
-                    // the file and carrying its own diff stat. This is also
-                    // what keeps a generic title ("editing files") off the
-                    // chip: the file names come from the call's own files,
-                    // never from its label.
+                    // One chip per edited file, named from the call's files
+                    // rather than its generic label.
                     let files = Self::edited_files(tool_call, cx);
                     let is_edit = matches!(tool_call.kind(), acp_v2::ToolKind::Edit);
                     let failed = matches!(
@@ -593,9 +480,6 @@ impl ThreadView {
                             | ToolCallStatus::Failed
                     );
                     if files.is_empty() {
-                        // An edit call with no files yet says nothing worth a
-                        // chip ("editing files"); its per-file chips appear as
-                        // the diffs arrive. Failures stay visible.
                         if !is_edit || failed {
                             chips.push(ActionChip::ToolCall { entry_ix });
                         }
@@ -605,10 +489,6 @@ impl ThreadView {
                         }
                     }
 
-                    // What a command changed is known only after it ran, and
-                    // only by the repository. The command keeps its own chip;
-                    // these sit beside it, until there are so many that naming
-                    // them says less than counting them.
                     let changed = Self::command_changed_files(tool_call, cx).len();
                     if changed > MOST_NAMED_COMMAND_FILES {
                         chips.push(ActionChip::CommandFiles { entry_ix });
@@ -626,15 +506,10 @@ impl ThreadView {
         chips
     }
 
-    /// Whether a chip renders expanded. Chips expand only by being clicked; a
-    /// thought never expands (its full text is a hover card), so it has no
-    /// expansion state at all.
     pub(super) fn action_chip_expanded(&self, id: &ActionChipId, cx: &App) -> bool {
         if self.expanded_action_chip.as_ref() == Some(id) {
             return true;
         }
-        // A call expanded through the tool call's own state (an auto-expanded
-        // failure, or a caller reaching for it directly) shows its body too.
         match id {
             ActionChipId::ToolCall(tool_call_id) => self
                 .entry_view_state
@@ -644,9 +519,7 @@ impl ThreadView {
         }
     }
 
-    /// Whether a tool call's chip renders expanded. A chip about an image
-    /// starts expanded (the picture is what the chip is about) and stays so
-    /// until collapsed; every other chip expands only by being clicked.
+    /// An image chip starts expanded; every other chip expands on click.
     pub(super) fn tool_call_chip_expanded(
         &self,
         tool_call: &ToolCall,
@@ -667,11 +540,8 @@ impl ThreadView {
         cx.notify();
     }
 
-    /// Tells the list that an entry's height has changed. The list measures an
-    /// entry once and remembers it, and a chip's body is drawn by the first
-    /// entry of its run, so an expansion that nobody reports paints over
-    /// whatever is below it. An image, being the tallest thing a chip opens, is
-    /// where this shows worst.
+    /// The list keeps measured heights, so an unreported expansion paints over
+    /// whatever is below it.
     pub(super) fn remeasure_chip(&mut self, id: &ActionChipId, cx: &App) {
         let Some(entry_ix) = self.entry_ix_for_chip(id, cx) else {
             return;
@@ -680,29 +550,18 @@ impl ThreadView {
         self.list_state.remeasure_items(item..item + 1);
     }
 
-    /// The list item that draws an entry. A run of actions is drawn by its
-    /// first entry as one block and the rest draw nothing, so an entry whose
-    /// content grew changed the height of the item that draws it, not of its
-    /// own. Remeasuring the wrong one leaves the block overlapping whatever is
-    /// below it.
+    /// A run of actions is drawn as one block by its first entry, so that is
+    /// the item to remeasure when any entry in it grows.
     pub(crate) fn drawn_item_for_entry(&self, entry_ix: usize, cx: &App) -> usize {
-        // Called between frames, when an entry has just changed: the frame's
-        // memos of which entries are chips, and of the runs they form, were
-        // both built before that change.
+        // The frame memos predate the change that prompted this call.
         self.chip_cache.frame_chip_entries.borrow_mut().clear();
         self.chip_cache.frame_runs.borrow_mut().clear();
         self.action_run_bounds(entry_ix, cx)
             .map_or(entry_ix, |(run_start, _)| run_start)
     }
 
-    /// Which entry a chip belongs to, by the tool call it stands for.
     fn entry_ix_for_chip(&self, id: &ActionChipId, cx: &App) -> Option<usize> {
-        let wanted = match id {
-            ActionChipId::ToolCall(tool_call_id) | ActionChipId::Collapsed(tool_call_id) => {
-                tool_call_id
-            }
-            ActionChipId::EditFile { tool_call_id, .. } => tool_call_id,
-        };
+        let (ActionChipId::ToolCall(wanted) | ActionChipId::Collapsed(wanted)) = id;
         self.thread
             .read(cx)
             .entries()
@@ -719,8 +578,7 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Single expand across the whole group: collapse whichever chip the user
-        // had open, then open this one.
+        // One expanded chip at a time.
         if let Some(previous) = self.expanded_action_chip.take() {
             let toggled_same = previous == id;
             self.collapse_action_chip(&previous, cx);
@@ -732,24 +590,18 @@ impl ThreadView {
         }
 
         match &id {
-            // Drive the tool call's own expansion state so its expanded body
-            // (diff, output, content) shows directly.
             ActionChipId::ToolCall(tool_call_id) => {
                 self.entry_view_state.update(cx, |state, _cx| {
                     state.set_tool_call_expanded(tool_call_id, true)
                 });
                 let tool_call_id = tool_call_id.clone();
                 self.prepare_command_scripts(&tool_call_id, cx);
-                // The body about to be drawn may need views that are only
-                // built for a call somebody opened.
+                // Some body views are only built for an opened call.
                 if let Some(entry_ix) = self.entry_ix_for_chip(&id, cx) {
                     self.sync_entry_views(entry_ix, window, cx);
                 }
             }
-            // A per-file chip shows only its own file's diff, so it does not
-            // touch the tool call's overall expansion state. The collapsed
-            // summary only reveals its constituent chips.
-            ActionChipId::EditFile { .. } | ActionChipId::Collapsed(_) => {}
+            ActionChipId::Collapsed(_) => {}
         }
         self.remeasure_chip(&id, cx);
         self.expanded_action_chip = Some(id);
@@ -763,12 +615,10 @@ impl ThreadView {
                     state.set_tool_call_expanded(tool_call_id, false)
                 });
             }
-            ActionChipId::EditFile { .. } | ActionChipId::Collapsed(_) => {}
+            ActionChipId::Collapsed(_) => {}
         }
     }
 
-    /// The added/removed line stats for one edited file of a tool call,
-    /// identified by its distinct-file index, matched to its diff by path.
     pub(super) fn edit_file_stats(
         &self,
         tool_call: &ToolCall,
@@ -781,10 +631,8 @@ impl ThreadView {
         (stats.lines_added > 0 || stats.lines_removed > 0).then_some(stats)
     }
 
-    /// The diff entity of a tool call whose file matches `location`, matched by
-    /// file name (the diff's path may be absolute where the location's is not).
-    /// The diff for one of an edit call's files, matched by file name whether
-    /// the file came from a reported location or from the diff itself.
+    /// Matched by file name: the diff's path may be absolute where the
+    /// location's is not.
     pub(super) fn diff_for_edited_file<'a>(
         &self,
         tool_call: &'a ToolCall,
@@ -802,8 +650,6 @@ impl ThreadView {
         })
     }
 
-    /// Sum of the added/removed line counts across an edit tool call's diffs,
-    /// for the chip's quiet +/- stat.
     pub(super) fn chip_edit_stats(
         &self,
         tool_call: &ToolCall,
@@ -820,8 +666,6 @@ impl ThreadView {
         (stats.lines_added > 0 || stats.lines_removed > 0).then_some(stats)
     }
 
-    /// Strips the leading verb from an edit tool call's headline: the pencil
-    /// icon already says it is an edit, so the chip shows just the path.
     pub(super) fn strip_edit_verb(headline: &str) -> &str {
         for verb in [
             "Edited ", "Edit ", "Editing ", "Wrote ", "Write ", "Writing ", "Created ", "Create ",
@@ -833,10 +677,7 @@ impl ThreadView {
         headline
     }
 
-    /// A thought's chip label: what the agent was thinking, not the word
-    /// "Thinking". The first sentence (or line) of the thought, with markdown
-    /// decoration stripped and truncated to what fits a chip. Empty thoughts
-    /// fall back to a generic label.
+    /// The thought's first sentence, markdown stripped, truncated to fit a chip.
     pub(super) fn thought_summary(source: &str) -> SharedString {
         const MAX_CHARS: usize = 64;
 
@@ -856,8 +697,6 @@ impl ThreadView {
             return "Thinking".into();
         };
 
-        // Cut at the first sentence end, so a chip reads as one thought rather
-        // than a fragment of a paragraph.
         let mut summary = line;
         if let Some(end) = line
             .char_indices()
@@ -889,20 +728,8 @@ impl ThreadView {
         summary.to_string().into()
     }
 
-    /// The hover card for a terminal command chip: the full command rendered
-    /// like a shell prompt (monospace, bash-highlighted through the same path
-    /// the chip label uses), plus the working directory and, once the command
-    /// has finished, its exit status and how long it took. `None` for tool calls
-    /// that run no terminal.
-    /// A read's hover card: the file's name and full path, plus the code the
-    /// agent actually read, highlighted. The chip itself only has room for the
-    /// file name.
-    /// An expanded search chip: the files it matched, one clickable row each.
-    ///
-    /// The tool's own output is prose the agent wrote for itself, and reading
-    /// it to find out which files matched is work the chip can do instead.
-    /// `None` for a search that matched nothing the thread recorded, which
-    /// falls back to showing that output.
+    /// An expanded search chip lists the files it matched. `None` falls back to
+    /// the tool's own output.
     pub(super) fn render_search_matches(
         &self,
         entry_ix: usize,
@@ -951,29 +778,20 @@ impl ThreadView {
         )
     }
 
-    /// A picture's hover card is the picture. A collapsed image chip says only
-    /// that an image was read, which is the one kind of chip whose contents
-    /// cannot be described in a line.
     pub(super) fn image_hover_card(
         &self,
         tool_call: &ToolCall,
         cx: &Context<Self>,
     ) -> Option<impl Fn(&mut Window, &mut App) -> gpui::AnyView + use<>> {
         let image = self.tool_call_image(tool_call, cx)?;
-        // Whatever the inline chip's read already learned about the file. The
-        // card does not start one of its own: a popover that has not opened yet
-        // is not a reason to touch the disk, and a card is not measured once
-        // and kept the way a list entry is.
+        // Only what the inline chip already read; the card never reads the disk.
         let dimensions = self.chip_image_dimensions(&image);
         Some(chip_hover_card(move |_window, _cx| {
             let picture = match image.clone() {
                 ChipImage::File(path) => img(path),
                 ChipImage::Data { image, .. } => img(image),
             };
-            // A definite box for the same reason the inline one has one: an
-            // image contributes no size until it has loaded, and a card that
-            // resizes under the pointer is a card that gets away. The card is
-            // wider than the chip, so its height is computed at its own width.
+            // A definite box, or the card resizes under the pointer as it loads.
             const HOVER_CARD_WIDTH: Rems = Rems(28.);
             div()
                 .w(HOVER_CARD_WIDTH)
@@ -997,13 +815,16 @@ impl ThreadView {
             .into();
         let path: SharedString = location.path.to_string_lossy().into_owned().into();
 
-        // Only the handle is taken here. Every chip on screen builds its card's
-        // closure on every frame, and a card that is not hovered is never
-        // called, so reading the content out belongs inside.
-        let content = tool_call.content().iter().find_map(|content| match content {
-            acp_thread::ToolCallContent::ContentBlock { block, .. } => block.plain_markdown().cloned(),
-            _ => None,
-        });
+        // Built per chip per frame, so only take handles; read inside the card.
+        let content = tool_call
+            .content()
+            .iter()
+            .find_map(|content| match content {
+                acp_thread::ToolCallContent::ContentBlock { block, .. } => {
+                    block.plain_markdown().cloned()
+                }
+                _ => None,
+            });
 
         Some(chip_hover_card(move |window, cx| {
             let code: Option<SharedString> = content.as_ref().and_then(|markdown| {
@@ -1048,15 +869,12 @@ impl ThreadView {
         }))
     }
 
-    /// What a search chip searched, and where: the call's own label, which
-    /// the chip itself no longer shows.
     pub(super) fn search_hover_card(
         &self,
         tool_call: &ToolCall,
         cx: &Context<Self>,
     ) -> Option<impl Fn(&mut Window, &mut App) -> gpui::AnyView + use<>> {
         let query = search_chip_label(&tool_call.label.read(cx).source())?;
-        // What the search found, which is the part a chip has no room for.
         let locations: Vec<SharedString> = tool_call
             .locations
             .iter()
@@ -1102,9 +920,7 @@ impl ThreadView {
         tool_call: &ToolCall,
         _cx: &Context<Self>,
     ) -> Option<impl Fn(&mut Window, &mut App) -> gpui::AnyView + use<>> {
-        // Handles only: this runs for every command chip on screen on every
-        // frame, while the card itself is built only for the one under the
-        // pointer. Reading the command out, and highlighting it, belong there.
+        // Built per chip per frame, so only take handles; read inside the card.
         let terminal = tool_call.terminals().next()?.clone();
         let label = tool_call.label.clone();
 
@@ -1115,12 +931,9 @@ impl ThreadView {
                 .to_string()
                 .into();
             let language = label.read(cx).first_code_block_language();
-            // Only a command tall enough to need scrolling pays the fixed width
-            // a scroll region costs (see `card_scroll_region`); a short one
-            // keeps sizing to its own text.
+            // A scroll region needs a fixed width, so only long commands get one.
             let scrolls = command.lines().count() > 12 || command.len() > 600;
 
-            // (text, is_error) for the meta line under the command.
             let mut meta: Vec<(SharedString, bool)> = Vec::new();
             if let Some(working_dir) = terminal.working_dir() {
                 meta.push((working_dir.display().to_string().into(), false));
@@ -1148,9 +961,6 @@ impl ThreadView {
                 ));
             }
 
-            // What it printed. A card is a window onto a long run, so it
-            // carries the end of the output, which is where a command says how
-            // it went; the whole thing is in the chip's own expansion.
             let printed: Option<SharedString> = terminal.output().and_then(|output| {
                 let content = output.content.trim_end();
                 if content.is_empty() {
@@ -1238,15 +1048,11 @@ impl ThreadView {
                             .border_t_1()
                             .border_color(cx.theme().colors().border_variant)
                             .child(
-                                card_scroll_region(
-                                    "command-hover-output",
-                                    CARD_WIDTH,
-                                    rems(18.),
-                                )
-                                .text_xs()
-                                .font_buffer(cx)
-                                .text_color(cx.theme().colors().text_muted)
-                                .child(printed),
+                                card_scroll_region("command-hover-output", CARD_WIDTH, rems(18.))
+                                    .text_xs()
+                                    .font_buffer(cx)
+                                    .text_color(cx.theme().colors().text_muted)
+                                    .child(printed),
                             ),
                     )
                 })
@@ -1254,12 +1060,8 @@ impl ThreadView {
         }))
     }
 
-    /// Renders a run of agent actions as chips that wrap: a chip is only as wide
-    /// as its content needs, capped at a quarter of the row so a long label
-    /// truncates instead of crowding out its neighbours. Clicking a chip expands
-    /// exactly one at a time below the chips; the expanded body is that tool
-    /// call's own per-kind rendering (terminal command + output, edit diff with
-    /// go-to-file, read/other output), or the thought itself for a thinking chip.
+    /// A run of agent actions as wrapping chips; an expanded chip's body renders
+    /// below the row holding it.
     pub(super) fn render_action_group(
         &self,
         active_session_id: &acp_v1::SessionId,
@@ -1271,16 +1073,10 @@ impl ThreadView {
     ) -> AnyElement {
         let entries = self.thread.read(cx).entries();
 
-        // An expanded chip's body renders right below the row holding the
-        // chip; chips after it start a fresh row underneath. There is no
-        // single body slot at the end of the group.
         let mut segments: Vec<AnyElement> = Vec::new();
         let mut row: Vec<AnyElement> = Vec::new();
         let mut any_chip = false;
-        // A multi-file edit draws a chip per file, and working out which files
-        // a call touched reads every diff it carries and builds a path from
-        // each. Asked once per chip that is once per file per file, on every
-        // frame the run is on screen; a call's files cannot change within one.
+        // Computed once per call, not once per file chip.
         let mut edited_files: HashMap<usize, Vec<EditedFile>> = HashMap::default();
         let flush_row = |segments: &mut Vec<AnyElement>, row: &mut Vec<AnyElement>| {
             if !row.is_empty() {
@@ -1304,8 +1100,6 @@ impl ThreadView {
                     let id = ActionChipId::ToolCall(tool_call.id.clone());
                     let is_expanded = self.tool_call_chip_expanded(tool_call, &id, cx);
 
-                    // An expanded chip gets a row of its own: it grows to show
-                    // the full command, with the output directly beneath.
                     if is_expanded {
                         flush_row(&mut segments, &mut row);
                     }
@@ -1320,17 +1114,11 @@ impl ThreadView {
 
                     if is_expanded {
                         flush_row(&mut segments, &mut row);
-                        // A chip about an image shows the picture itself, not a
-                        // description of where it came from.
                         if let Some(image) = self.tool_call_image(tool_call, cx) {
                             segments.push(self.render_inline_image(entry_ix, 0, image, cx));
                         } else if let Some(matches) =
                             self.render_search_matches(entry_ix, tool_call, cx)
                         {
-                            // A search's results are the files it found, which
-                            // its own output states in whatever shape the agent
-                            // chose. The files are the answer, and each one
-                            // opens.
                             segments.push(matches);
                         } else {
                             segments.push(
@@ -1345,12 +1133,9 @@ impl ThreadView {
                                 )
                                 .into_any_element(),
                             );
-                            // A command that wrote a picture prints where it
-                            // put it and nothing else. The picture is the
-                            // result; showing it beats making the reader leave
-                            // the app to look.
-                            for (image_ix, path) in
-                                Self::command_output_images(tool_call, cx).into_iter().enumerate()
+                            for (image_ix, path) in Self::command_output_images(tool_call, cx)
+                                .into_iter()
+                                .enumerate()
                             {
                                 segments.push(self.render_inline_image(
                                     entry_ix,
@@ -1372,9 +1157,8 @@ impl ThreadView {
                     let Some(file) = files.get(file_ix).cloned() else {
                         continue;
                     };
-                    // Edit chips do not expand inline: hover shows the diff, a
-                    // click opens the real file with the change revealed. The
-                    // chip reads as selected while that file's diff is open.
+                    // Edit chips do not expand; they read as selected while
+                    // their diff tab is open.
                     let diff_open = crate::tool_call_diff::is_tool_call_diff_open(
                         &crate::tool_call_diff::ToolCallDiffKey {
                             tool_call_id: tool_call.id.clone(),
@@ -1430,8 +1214,6 @@ impl ThreadView {
         }
         flush_row(&mut segments, &mut row);
 
-        // A run of nothing but hidden calls (waits) draws nothing, rather than
-        // an empty row that still takes vertical space.
         if !any_chip {
             return Empty.into_any_element();
         }
@@ -1439,8 +1221,6 @@ impl ThreadView {
         v_flex().my_0p5().gap_1().children(segments).into_any()
     }
 
-    /// The reads-and-searches summary chip. Hover lists what was read and
-    /// searched; a click reveals (or refolds) the individual chips.
     pub(super) fn render_collapsed_chip(
         &self,
         entry_ixs: &[usize],
@@ -1483,50 +1263,24 @@ impl ThreadView {
             return Empty.into_any_element();
         };
 
-        // Reading changes is its own kind of looking around, so a run of
-        // `git diff`s says so rather than counting as files read.
-        let mut parts: Vec<String> = Vec::new();
-        if reads > 0 {
-            parts.push(format!(
-                "Read {reads} file{}",
-                if reads == 1 { "" } else { "s" }
-            ));
-        }
-        if searches > 0 {
-            parts.push(format!(
-                "searched {searches} place{}",
-                if searches == 1 { "" } else { "s" }
-            ));
-        }
-        if diffs > 0 {
-            parts.push(format!(
-                "read {diffs} diff{}",
-                if diffs == 1 { "" } else { "s" }
-            ));
-        }
-        if git_checks > 0 {
-            parts.push(format!(
-                "checked git {git_checks} time{}",
-                if git_checks == 1 { "" } else { "s" }
-            ));
-        }
-        if github_checks > 0 {
-            parts.push(format!(
-                "checked GitHub {github_checks} time{}",
-                if github_checks == 1 { "" } else { "s" }
-            ));
-        }
-        if inspections > 0 {
-            parts.push(format!(
-                "checked {inspections} thing{}",
-                if inspections == 1 { "" } else { "s" }
-            ));
-        }
-        let mut label = parts.join(", ");
+        let mut label = [
+            (reads, "Read", "file"),
+            (searches, "searched", "place"),
+            (diffs, "read", "diff"),
+            (git_checks, "checked git", "time"),
+            (github_checks, "checked GitHub", "time"),
+            (inspections, "checked", "thing"),
+        ]
+        .into_iter()
+        .filter(|(count, _, _)| *count > 0)
+        .map(|(count, verb, noun)| {
+            format!("{verb} {count} {noun}{}", if count == 1 { "" } else { "s" })
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
         if label.is_empty() {
             label = "Looked around".to_string();
         } else if reads == 0 {
-            // The first clause leads the label, so it is capitalized.
             let mut chars = label.chars();
             if let Some(first) = chars.next() {
                 label = first.to_uppercase().collect::<String>() + chars.as_str();
@@ -1603,8 +1357,6 @@ impl ThreadView {
         self.collapsed_chip_is_unfolded(first_id, &member_ids)
     }
 
-    /// The unfolded summary's contents: one quiet row per read or search.
-    /// A list rather than a wrap of chips, which was hard to scan.
     pub(super) fn render_collapsed_chip_list(
         &self,
         entry_ixs: &[usize],
@@ -1617,14 +1369,8 @@ impl ThreadView {
                 let Some(AgentThreadEntry::ToolCall(tool_call)) = entries.get(entry_ix) else {
                     return None;
                 };
-                let icon = match Self::low_value_class(tool_call, Some(&self.chip_cache), cx) {
-                    Some(acp_thread::CommandClass::Search) => IconName::MagnifyingGlass,
-                    Some(acp_thread::CommandClass::ReadDiff) => IconName::Diff,
-                    Some(acp_thread::CommandClass::GitInfo) => IconName::GitBranch,
-                    Some(acp_thread::CommandClass::GitHub) => IconName::PullRequest,
-                    Some(acp_thread::CommandClass::Inspect) => IconName::ToolTerminal,
-                    _ => IconName::FileCode,
-                };
+                let icon = Self::low_value_class(tool_call, Some(&self.chip_cache), cx)
+                    .map_or(IconName::FileCode, command_class_icon);
                 Some(
                     h_flex()
                         .w_full()
@@ -1669,8 +1415,7 @@ impl ThreadView {
         }
     }
 
-    /// Clicking the summary chip: folded -> unfold; unfolded in any way
-    /// (itself expanded, or a member chip expanded) -> fold everything.
+    /// Unfolded in any way (itself or a member expanded) folds everything.
     pub(super) fn toggle_collapsed_chip(
         &mut self,
         first_id: acp_v1::ToolCallId,
@@ -1690,8 +1435,6 @@ impl ThreadView {
         }
     }
 
-    /// One line of the summary chip's hover card: what a read or search was
-    /// about.
     pub(super) fn low_value_item_label(&self, tool_call: &ToolCall, cx: &App) -> SharedString {
         if let Some(location) = tool_call.locations.first()
             && matches!(tool_call.kind(), acp_v2::ToolKind::Read)
@@ -1699,8 +1442,6 @@ impl ThreadView {
             return location.path.to_string_lossy().into_owned().into();
         }
         if tool_call.terminals().next().is_some() {
-            // The parser already knows what the line was for; say that rather
-            // than re-summarizing the text.
             let facts = self.chip_cache.command(tool_call, cx);
             for segment in &facts.parsed.segments {
                 let label = match &segment.kind {
@@ -1715,8 +1456,6 @@ impl ThreadView {
                             }
                             None => paths.join(", "),
                         };
-                        // Contents from a revision are not what is on disk, so
-                        // the line says where they came from.
                         if let Some(revision) = revision {
                             label.push_str(&format!(" @ {revision}"));
                         }
@@ -1763,7 +1502,6 @@ impl ThreadView {
             .into()
     }
 
-    /// One tool call's chip.
     pub(super) fn render_tool_call_chip(
         &self,
         entry_ix: usize,
@@ -1775,8 +1513,6 @@ impl ThreadView {
         let id = tool_call.id.clone();
         let pulse_color = cx.theme().colors().text_accent;
         let has_terminals = tool_call.terminals().next().is_some();
-        // What the command reported about itself: counts, and where the first
-        // problem is so the chip can go there.
         let outcome = has_terminals
             .then(|| self.chip_cache.output(tool_call, cx).summary.clone())
             .flatten();
@@ -1788,26 +1524,16 @@ impl ThreadView {
             .as_ref()
             .is_some_and(|summary| summary.errors > 0 || summary.tests_failed > 0);
 
-        // Deleting, moving, and discarding are the chips worth catching in a
-        // wall of them.
         let destructive = has_terminals && self.chip_cache.command(tool_call, cx).destructive;
-        let is_edit =
-            matches!(tool_call.kind(), acp_v2::ToolKind::Edit) || tool_call.diffs().next().is_some();
-        // A read is about a file: it says the file's name, and the line range
-        // it happened to read is not worth a chip's width.
+        let is_edit = matches!(tool_call.kind(), acp_v2::ToolKind::Edit)
+            || tool_call.diffs().next().is_some();
         let read_file = (matches!(tool_call.kind(), acp_v2::ToolKind::Read)
             && tool_call.locations.len() == 1)
             .then(|| tool_call.locations.first())
             .flatten();
-        // A chip about an image expands to show it inline instead of opening
-        // anything.
         let is_image = self.tool_call_image(tool_call, cx).is_some();
-        // A search chip just says so; what was searched, and where, is the
-        // hover card's job.
         let is_search = matches!(tool_call.kind(), acp_v2::ToolKind::Search) && !has_terminals;
-        // Set for command chips, whose label is highlighted piece by piece.
         let mut command_label: Option<CommandChipLabel> = None;
-        // Set for a collapsed chain, which reads as a glyph and a name per act.
         let mut command_pieces: Option<Vec<CommandChipPiece>> = None;
         let headline: SharedString = if is_search {
             search_chip_label(&tool_call.label.read(cx).source())
@@ -1820,9 +1546,6 @@ impl ThreadView {
                 .unwrap_or_else(|| location.path.to_string_lossy().into_owned())
                 .into()
         } else if has_terminals {
-            // Expanded: the complete command, wrapped. Collapsed: what the line
-            // did, either as one label or as a glyph and a name per act, so a
-            // chain reads as a chain without becoming a chip per segment.
             let facts = self.chip_cache.command(tool_call, cx);
             let collapsed = if is_expanded {
                 CollapsedCommand::Label(CommandChipLabel::command(facts.command.clone()))
@@ -1836,8 +1559,6 @@ impl ThreadView {
                     text
                 }
                 CollapsedCommand::Pieces(pieces) if !pieces.is_empty() => {
-                    // The tooltip and any text-only reader still see the line
-                    // as one string.
                     let text = SharedString::from(
                         pieces
                             .iter()
@@ -1871,9 +1592,6 @@ impl ThreadView {
             }
         };
 
-        // Commands keep their bash highlighting on the chip, reusing the
-        // language the label markdown (a bash-tagged fenced code block)
-        // already resolved.
         let label_element = if let Some(pieces) = command_pieces.as_ref() {
             let markdown_style = self.chip_cache.style(window, cx);
             let mut command_text_style = markdown_style.base_text_style.clone();
@@ -1881,8 +1599,7 @@ impl ThreadView {
             command_text_style.color = cx.theme().colors().text_muted;
             let code_language = tool_call.label.read(cx).first_code_block_language();
             h_flex()
-                // Auto basis, as in the single-command branch below: a zero
-                // basis costs a content-sized chip its label's width.
+                // Auto basis; see the single-command branch below.
                 .flex_initial()
                 .min_w_0()
                 .gap_1()
@@ -1898,10 +1615,7 @@ impl ThreadView {
                     h_flex()
                         .flex_none()
                         .gap_0p5()
-                        // A drawn rule rather than a bar character: a
-                        // label full of `a|b|c` is exactly what a search
-                        // query looks like, and the eye cannot tell which
-                        // pipe belongs to the shell.
+                        // A rule, not `|`, which would read as a shell pipe.
                         .when(piece_ix > 0, |this| {
                             this.child(
                                 div()
@@ -1912,9 +1626,6 @@ impl ThreadView {
                                     .bg(cx.theme().colors().border),
                             )
                         })
-                        // On a line only half inside a devshell, the acts that
-                        // were get the nix mark; the badge above already named
-                        // it, so the mark carries no text of its own.
                         .when(piece.in_environment, |this| {
                             this.child(ChipGlyph::Language("nix").element(Color::Muted, cx))
                         })
@@ -1933,9 +1644,6 @@ impl ThreadView {
             let mut command_text_style = markdown_style.base_text_style.clone();
             command_text_style.font_size = rems_from_px(12_f32).into();
             command_text_style.color = cx.theme().colors().text_muted;
-            // Each command in the label is parsed on its own: a label built
-            // from clipped commands and separators is not a shell line, and
-            // highlighting it as one confuses every piece of it.
             let runs = self.chip_cache.highlight_label(
                 &command_label.unwrap_or_else(|| CommandChipLabel::command(headline.to_string())),
                 tool_call
@@ -1947,14 +1655,8 @@ impl ThreadView {
                 &markdown_style,
             );
             div()
-                // `flex_initial`, not `flex_1`: a basis of auto, which may
-                // shrink. `flex_1` means a basis of zero, so with `min_w_0` and
-                // hidden overflow the label contributed nothing to the chip's
-                // intrinsic width — a content-sized chip then sized to its
-                // glyphs and gave the label an ellipsis's worth of room,
-                // whatever the command said. Shrinking against the chip's cap
-                // still hands the label a definite width, so truncation beyond
-                // the cap works as it did.
+                // Not `flex_1`: a zero basis gives the label no intrinsic width,
+                // so a content-sized chip would shrink it to an ellipsis.
                 .flex_initial()
                 .min_w_0()
                 .debug_selector({
@@ -1963,8 +1665,6 @@ impl ThreadView {
                 })
                 .map(|this| {
                     if is_expanded {
-                        // The full command, wrapped over as many lines as it
-                        // takes.
                         this.whitespace_normal()
                     } else {
                         this.overflow_hidden()
@@ -1977,7 +1677,6 @@ impl ThreadView {
                 .child(StyledText::new(headline.clone()).with_runs(runs))
                 .into_any_element()
         } else {
-            // Paths truncate from the left so the file name stays visible.
             Label::new(headline.clone())
                 .size(LabelSize::Small)
                 .color(Color::Muted)
@@ -1990,17 +1689,12 @@ impl ThreadView {
             .terminals()
             .next()
             .and_then(|terminal| terminal.read(cx).output());
-        // A Bash call whose command detached returns as soon as the command is
-        // handed off, so its status is `completed` while the command runs on
-        // for minutes. ACP has no status for "still running elsewhere", so the
-        // agent marks the call and reports the command's own lifecycle
-        // separately; the card reads as running for as long as that lasts.
-        let backgrounded = self.thread.read(cx).tool_call_is_backgrounded(&tool_call.id);
-        // A subagent is backgrounded the same way: the `Agent` call completes
-        // the moment the subagent is handed off, so the call reads `completed`
-        // while the subagent works on. Where the adapter reports the
-        // subagent's own lifecycle, that is what the chip says; where it does
-        // not, there is nothing better than the call's status.
+        // A detached command's call reads `completed` while it runs on, and a
+        // subagent's likewise; their own reported lifecycles say otherwise.
+        let backgrounded = self
+            .thread
+            .read(cx)
+            .tool_call_is_backgrounded(&tool_call.id);
         let subagent_state = self.thread.read(cx).subagent_state_for_tool_call(tool_call);
         let running = match subagent_state {
             Some(state) => !state.is_terminal(),
@@ -2012,9 +1706,7 @@ impl ThreadView {
                     )
             }
         };
-        // A command the user killed exits non-zero like any other, so without
-        // asking the terminal whether the kill was deliberate, a stopped
-        // server would read as a command that broke.
+        // A user-stopped command exits non-zero but did not fail.
         let user_stopped = tool_call
             .terminals()
             .next()
@@ -2025,7 +1717,9 @@ impl ThreadView {
                 None => {
                     matches!(
                         tool_call.status(),
-                        ToolCallStatus::Rejected | ToolCallStatus::Canceled | ToolCallStatus::Failed
+                        ToolCallStatus::Rejected
+                            | ToolCallStatus::Canceled
+                            | ToolCallStatus::Failed
                     ) || terminal_output.is_some_and(|output| output.failed())
                 }
             };
@@ -2056,9 +1750,7 @@ impl ThreadView {
             let exit_code = terminal_output.and_then(|output| output.exit_status.exit_code);
             Some(
                 div()
-                    // Upstream's terminal header names its failure state the
-                    // same way. This fork says it on the chip instead, and
-                    // keeping the name is what lets upstream's tests find it.
+                    // Upstream's terminal header selector, which upstream's tests find.
                     .debug_selector(move || format!("terminal-tool-failed-{exit_code:?}"))
                     .child(
                         Icon::new(IconName::Close)
@@ -2068,9 +1760,6 @@ impl ThreadView {
                     .into_any_element(),
             )
         } else if subagent_state.is_some_and(|state| state.is_terminal()) {
-            // A subagent that is done. The one icon slot carries its status
-            // rather than an agent glyph: which agent ran it is the same for
-            // every subagent in the run, while whether it finished is not.
             Some(
                 Icon::new(IconName::Check)
                     .size(IconSize::Small)
@@ -2078,12 +1767,9 @@ impl ThreadView {
                     .into_any_element(),
             )
         } else if command_pieces.is_some() {
-            // Every act of a chain wears its own glyph; one more in front of
-            // them would only name the first.
+            // Each piece carries its own glyph.
             None
         } else if let Some(icon_path) = Self::tool_call_file_icon(tool_call, cx) {
-            // A chip about one file reads like the project panel: the
-            // file's own type icon, not a generic verb glyph.
             Some(
                 Icon::from_path(icon_path)
                     .size(IconSize::Small)
@@ -2091,8 +1777,6 @@ impl ThreadView {
                     .into_any_element(),
             )
         } else if has_terminals {
-            // A command's glyph says what the line was for, not just that a
-            // terminal was involved: a lone `cargo test` wears Rust's icon.
             let facts = self.chip_cache.command(tool_call, cx);
             let mut acts = facts
                 .parsed
@@ -2101,17 +1785,8 @@ impl ThreadView {
                 .filter(|segment| !segment.kind.is_noop());
             let glyph = match (acts.next(), acts.next(), destructive) {
                 (Some(only), None, false) => ChipGlyph::for_segment(only),
-                _ => ChipGlyph::Icon(match facts.class {
-                    _ if destructive => IconName::Trash,
-                    acp_thread::CommandClass::Search => IconName::MagnifyingGlass,
-                    acp_thread::CommandClass::Read => IconName::FileCode,
-                    acp_thread::CommandClass::ReadDiff => IconName::Diff,
-                    acp_thread::CommandClass::GitInfo => IconName::GitBranch,
-                    acp_thread::CommandClass::GitHub => IconName::PullRequest,
-                    acp_thread::CommandClass::Inspect | acp_thread::CommandClass::Other => {
-                        IconName::ToolTerminal
-                    }
-                }),
+                _ if destructive => ChipGlyph::Icon(IconName::Trash),
+                _ => ChipGlyph::Icon(command_class_icon(facts.class)),
             };
             Some(glyph.element(icon_color, cx))
         } else {
@@ -2127,7 +1802,6 @@ impl ThreadView {
             .then(|| self.chip_edit_stats(tool_call, cx))
             .flatten();
 
-        // A command that ran somewhere else says so, and says where on hover.
         let host = has_terminals
             .then(|| self.command_host_for(tool_call, cx))
             .flatten();
@@ -2136,15 +1810,13 @@ impl ThreadView {
             .flatten();
         let full_command =
             has_terminals.then(|| self.chip_cache.command(tool_call, cx).command.clone());
-        // Only a command Zed actually started has a process to kill: a display
-        // terminal is somebody else's, and `stop_by_user` refuses it anyway.
+        // A display terminal has no process of ours to kill.
         let stoppable_terminal = running
             .then(|| tool_call.terminals().next())
             .flatten()
             .filter(|terminal| terminal.read(cx).is_process_backed())
             .cloned();
-        // A backgrounded command has no process of ours at all, so stopping it
-        // is a request to the agent instead. Same control, same place.
+        // A backgrounded command is stopped by asking the agent.
         let stoppable_async_task = stoppable_terminal
             .is_none()
             .then(|| {
@@ -2160,9 +1832,6 @@ impl ThreadView {
         let chip = self
             .action_chip_base(("action-chip", entry_ix), is_expanded, cx)
             .group(chip_group.clone())
-            // A chain names every act it performed, so the chip may need the
-            // whole row for them rather than the three quarters a one-label
-            // chip is capped at.
             .when(command_pieces.is_some(), |this| this.max_w_full())
             .when(is_expanded && has_terminals, |this| {
                 this.w_full()
@@ -2173,8 +1842,6 @@ impl ThreadView {
             })
             .on_click(cx.listener({
                 let id = id.clone();
-                // Image reads expand to show the image inline; other reads open
-                // the file; everything else toggles its own expansion.
                 let opens_file = read_file.is_some() && !is_image;
                 move |this, _, window, cx| {
                     if opens_file {
@@ -2187,8 +1854,6 @@ impl ThreadView {
                 }
             }))
             .children(icon_element)
-            // Where it ran comes before what ran: on another machine, that is
-            // the first thing to know about the command.
             .when_some(host, |this, host| {
                 this.child(
                     h_flex()
@@ -2209,8 +1874,6 @@ impl ThreadView {
                         .tooltip(Tooltip::text(format!("Ran on {host}"))),
                 )
             })
-            // The devshell it ran in, for a line whose wrapper was stripped
-            // out of the label.
             .when_some(environment, |this, environment| {
                 let CommandEnvironment { name, partial } = environment;
                 this.child(
@@ -2270,11 +1933,7 @@ impl ThreadView {
                         })),
                 )
             })
-            // A long-running command — a dev server, a watcher, a tail — used to
-            // need the whole turn stopped to be stopped at all. The chip is
-            // where a stuck command is already being looked at, so the control
-            // goes here, and it kills that one terminal: the agent keeps going,
-            // and what it makes of a command that died is its own business.
+            // Kills this one terminal; the turn keeps going.
             .when_some(stoppable_terminal, |this, terminal| {
                 this.child(
                     IconButton::new(("stop-command", entry_ix), IconName::Stop)
@@ -2324,11 +1983,6 @@ impl ThreadView {
                 ))
             })
             .map(|this| {
-                // A command's hover card reads like a shell prompt: the
-                // full command, bash-highlighted, plus where it ran and how
-                // it finished. These cards can be entered and scrolled, the
-                // way the editor's own hover popovers behave; a chip with
-                // nothing but a headline keeps the plain tooltip.
                 if is_image && let Some(card) = self.image_hover_card(tool_call, cx) {
                     return this.hoverable_tooltip(card);
                 }
@@ -2344,12 +1998,7 @@ impl ThreadView {
                 }
             });
 
-        // Anything still executing pulses in place. That highlight is how a
-        // running call reads as running: it stays in the transcript rather than
-        // moving to the active area.
         let chip = if running && !is_expanded {
-            // Unmistakably alive: an accent border plus an accent-tinted
-            // pulse, not just a faint grey shimmer.
             chip.border_color(pulse_color.opacity(0.5))
                 .with_animation(
                     ("action-chip-pulse", entry_ix),
@@ -2363,19 +2012,13 @@ impl ThreadView {
             chip.into_any_element()
         };
 
-        // A chip is what a thread is usually scrolled back for — the diff that
-        // mattered, the command that proved something — so it takes a mark
-        // from the pointer, the way a message does.
         let entity = cx.entity();
         right_click_menu(("action-chip-bookmark", entry_ix))
             .trigger(move |_, _, _| chip)
             .menu(move |window, cx| {
                 let entity = entity.clone();
                 ContextMenu::build(window, cx, move |menu, _, cx| {
-                    // Asked when the menu opens, not on every frame: resolving
-                    // a mark walks the thread's entries, and a chip that paid
-                    // for that walk to label a menu nobody opened would make a
-                    // long thread quadratic to draw.
+                    // Resolved on open: per frame it would make drawing quadratic.
                     let bookmarked = entity.read(cx).is_bookmarked(entry_ix, cx);
                     let entity = entity.clone();
                     menu.entry(
@@ -2396,24 +2039,19 @@ impl ThreadView {
             .into_any_element()
     }
 
-    /// A command chip's collapsed label: what the line did, plus what it
-    /// concluded. A chained line is described by its acts, not its text, so a
-    /// wall of `sed`s and `rg`s reads as one look-around. Only when there is
-    /// nothing to summarize does it fall back to the commands themselves.
+    /// What the line did plus what it concluded, falling back to the command
+    /// text only when there is nothing to summarize.
     pub(super) fn collapsed_command(
         facts: &CommandFacts,
         outcome: Option<&str>,
     ) -> CollapsedCommand {
         const WIDTH: usize = 60;
-        // Enough pieces to see the shape of the line, before they become stubs.
-        // A piece is named, not quoted: `cargo test`, not `cargo test -p x…`.
         const PIECE_WIDTH: usize = 22;
 
         let command = facts.command.as_str();
         let parsed = &facts.parsed;
         if let Some(summary) = facts.summary.clone() {
-            // A line that is one real command is summarized by quoting it, so
-            // that much is shell. "Read 4 files" and its like are prose.
+            // A summary that quotes the command is highlighted as shell.
             let quotes_the_command = parsed.segments.iter().any(|segment| {
                 segment
                     .work_text()
@@ -2425,7 +2063,6 @@ impl ThreadView {
             } else {
                 CommandChipLabel::prose(summary)
             };
-            // What it was, then what it concluded: "pnpm lint · 3 errors".
             if let Some(outcome) = outcome {
                 label.text.push_str(&format!(" · {outcome}"));
             }
@@ -2445,11 +2082,6 @@ impl ThreadView {
                 acp_thread::command_display_prefix(segments[0].work_text(), WIDTH),
             )),
             _ => {
-                // Every act, not the first few and a count of the rest: a name
-                // like "cargo fmt" costs little enough that a line's whole
-                // shape fits, and "+2" told the reader nothing about what it
-                // was hiding. A chain long enough to outrun the chip's width
-                // is clipped by it, which at least clips the least recent.
                 let partial_environment = parsed.environment_is_partial();
                 CollapsedCommand::Pieces(
                     segments
@@ -2460,8 +2092,7 @@ impl ThreadView {
                                 &segment.short_label(),
                                 PIECE_WIDTH,
                             )),
-                            in_environment: partial_environment
-                                && segment.environment.is_some(),
+                            in_environment: partial_environment && segment.environment.is_some(),
                         })
                         .collect(),
                 )
@@ -2469,9 +2100,6 @@ impl ThreadView {
         }
     }
 
-    /// The shared shell of every chip: one uniform height and border, sized to
-    /// its own content. There is no grid: chips wrap at their natural width, and
-    /// only a very long label truncates against a generous cap.
     pub(super) fn action_chip_base(
         &self,
         id: impl Into<ElementId>,
@@ -2480,16 +2108,8 @@ impl ThreadView {
     ) -> Stateful<Div> {
         h_flex()
             .id(id)
-            // The pair is deliberate. `min_w_0` is what lets the cap below
-            // actually bind: a flex item's default minimum is its content, and
-            // a content minimum beats a maximum, so without it a long label
-            // pushes the chip past the cap and out of the row instead of
-            // truncating inside it. `flex_shrink_0` then keeps the chip's
-            // neighbours from spending that permission on its behalf — a chip's
-            // label and glyphs are its width, and a row that has run out of it
-            // wraps to the next line rather than squeezing what is already on
-            // it. A chip is never wider than the row (the cap is a fraction of
-            // it), so refusing to shrink can never overflow.
+            // `min_w_0` lets the max-width cap bind over the content minimum;
+            // `flex_shrink_0` makes a full row wrap rather than squeeze chips.
             .min_w_0()
             .flex_shrink_0()
             .max_w(relative(0.75))
@@ -2506,8 +2126,7 @@ impl ThreadView {
             .hover(|style| style.bg(cx.theme().colors().element_hover))
     }
 
-    /// The files a tool call's commands changed, as the repository saw them.
-    /// Empty until the command has exited and the status has settled.
+    /// Empty until the command has exited and git status has settled.
     pub(super) fn command_changed_files(
         tool_call: &ToolCall,
         cx: &App,
@@ -2523,13 +2142,7 @@ impl ThreadView {
         files
     }
 
-    /// Pictures a tool call's commands wrote, in the order their output named
-    /// them. Empty until a command has exited and the disk has vouched for the
-    /// paths it printed.
-    pub(super) fn command_output_images(
-        tool_call: &ToolCall,
-        cx: &App,
-    ) -> Vec<std::path::PathBuf> {
+    pub(super) fn command_output_images(tool_call: &ToolCall, cx: &App) -> Vec<std::path::PathBuf> {
         let mut paths: Vec<std::path::PathBuf> = Vec::new();
         for terminal in tool_call.terminals() {
             for path in terminal.read(cx).output_images() {
@@ -2541,9 +2154,7 @@ impl ThreadView {
         paths
     }
 
-    /// The diff editor for a file a command changed, once there is one. The
-    /// first call starts reading what the command found and what the file
-    /// holds now and returns nothing; the card asks again on its next frame.
+    /// `None` while loading; the first call starts the load.
     fn command_file_diff_editor(
         &self,
         entry_ix: usize,
@@ -2578,10 +2189,7 @@ impl ThreadView {
                     let buffer = project
                         .update(cx, |project, cx| project.open_buffer(path.clone(), cx))
                         .await?;
-                    // What the command found: the text captured when it
-                    // started, for a file that was already dirty; HEAD for a
-                    // file that was clean, which is the same thing and costs
-                    // nothing to keep.
+                    // A clean file's pre-command text is HEAD, so none was captured.
                     let old_text = match found {
                         Some(found) => Some(found.to_string()),
                         None => {
@@ -2596,10 +2204,7 @@ impl ThreadView {
                         }
                     };
                     let (new_text, languages) = cx.update(|_, cx| {
-                        (
-                            buffer.read(cx).text(),
-                            project.read(cx).languages().clone(),
-                        )
+                        (buffer.read(cx).text(), project.read(cx).languages().clone())
                     })?;
                     let (diff, editor) = cx.update(|window, cx| {
                         let diff = cx.new(|cx| {
@@ -2633,9 +2238,7 @@ impl ThreadView {
                             );
                             cache.evict_stale();
                         }
-                        // A file the project cannot open (deleted by the
-                        // command, or outside every worktree) has no diff to
-                        // show. Forgetting it lets a later hover try again.
+                        // Forget it so a later hover can retry.
                         Err(_) => {
                             this.command_file_diffs.borrow_mut().by_file.remove(&key);
                         }
@@ -2652,16 +2255,8 @@ impl ThreadView {
         None
     }
 
-    /// The card behind a command-changed file: which file, how much of it
-    /// moved, and the change itself. An edit nobody declared is still an edit,
-    /// and reading it should not mean opening a tab.
-    ///
-    /// The diff shown is this command's own: what the file held when the
-    /// command started against what it holds now. A file that was clean has
-    /// HEAD as its before-text and costs nothing to show; one that was already
-    /// dirty had its text read as the command began, and falls back to the
-    /// file's whole uncommitted diff — saying so — when that read did not
-    /// land. Either way the card is honest about what it is showing.
+    /// Shows this command's own change, or says it is the file's whole
+    /// uncommitted diff when the pre-command text of a dirty file was not read.
     pub(super) fn command_file_hover_card(
         &self,
         entry_ix: usize,
@@ -2671,17 +2266,9 @@ impl ThreadView {
         let file = file.clone();
         let full: SharedString = file.path.path.as_unix_str().to_string().into();
         let stats = diff_stats(file.added, file.deleted);
-        // Only a file whose before-text went unread shows more than this
-        // command did.
         let wider_than_the_command = file.pre_command_dirty && file.pre_command_text.is_none();
         let this = cx.entity().downgrade();
 
-        // The build closure fetches the editor by path each frame; on the first
-        // frame the load is still running and it returns `None`, and the load
-        // task ends by notifying the thread view. The observing variant of the
-        // hover card wraps that notify around to the card itself, so the empty
-        // frame is replaced the moment the editor is ready rather than only on
-        // the reader's next hover.
         chip_hover_card_observing(this.clone(), move |window, cx| {
             let editor = this
                 .update(cx, |this, cx| {
@@ -2733,9 +2320,6 @@ impl ThreadView {
         })
     }
 
-    /// What a command changed, when it changed more than a row can name: the
-    /// count, and the total it moved. Hovering lists the files; clicking opens
-    /// the diff.
     pub(super) fn render_command_files_chip(
         &self,
         entry_ix: usize,
@@ -2783,9 +2367,6 @@ impl ThreadView {
         )
     }
 
-    /// The shape both command-changed chips share: a glyph, what it is called,
-    /// how much it moved, and a click that opens the diff. Only the name and
-    /// the card behind it differ, so only those are arguments.
     fn render_command_change_chip(
         &self,
         id: SharedString,
@@ -2831,10 +2412,6 @@ impl ThreadView {
             .into_any_element()
     }
 
-    /// One file a command changed. It reads like an edit chip, because to the
-    /// reader it is one: the difference is only that nobody declared it, so
-    /// there is no per-call diff behind it and clicking opens the file's diff
-    /// against the repository.
     pub(super) fn render_command_file_chip(
         &self,
         entry_ix: usize,
@@ -2864,9 +2441,6 @@ impl ThreadView {
             SharedString::from(format!("command-file-chip-{entry_ix}-{path_ix}")),
             icon,
             name,
-            // What the command did to the file, rather than how far the file
-            // has drifted from HEAD: a file it added three lines to reads as
-            // +3 even when it was already dirty.
             diff_stats(file.added, file.deleted),
             file.path.clone(),
             self.command_file_hover_card(entry_ix, file, cx),
@@ -2874,27 +2448,19 @@ impl ThreadView {
         )
     }
 
-    /// A picture's shape as far as this view knows it: carried alongside data
-    /// the agent sent, read from the header for one that lives in a file, and
-    /// unknown until that read lands.
     fn chip_image_dimensions(&self, image: &ChipImage) -> Option<gpui::Size<u32>> {
         match image {
-            ChipImage::File(path) => match self.chip_cache.image_shapes.borrow().get(path.as_path())
-            {
-                Some(ImageShape::Known(dimensions)) => Some(*dimensions),
-                _ => None,
-            },
+            ChipImage::File(path) => {
+                match self.chip_cache.image_shapes.borrow().get(path.as_path()) {
+                    Some(ImageShape::Known(dimensions)) => Some(*dimensions),
+                    _ => None,
+                }
+            }
             ChipImage::Data { dimensions, .. } => *dimensions,
         }
     }
 
-    /// The box to draw a picture that lives in a file, starting the read of its
-    /// header the first time it is asked for.
-    ///
-    /// A picture the agent sent inline arrives with its dimensions and gets a
-    /// box shaped like itself; one it only named the path of used to take the
-    /// fixed box whatever shape it was, which is how a tall screenshot ended up
-    /// painting over the chips below it.
+    /// Starts reading the file's header the first time it is asked for.
     fn image_file_box_height(
         &self,
         path: &std::path::Path,
@@ -2915,10 +2481,6 @@ impl ThreadView {
         }
     }
 
-    /// Reads a picture's header off the foreground and remeasures the entry it
-    /// is in once the shape is known. The entry was measured at a placeholder
-    /// height, and a `ListState` keeps the height it measured, so the remeasure
-    /// is what makes the answer count for anything.
     fn read_image_shape(&self, path: std::path::PathBuf, entry_ix: usize, cx: &Context<Self>) {
         let Some(fs) = self
             .project
@@ -2935,11 +2497,10 @@ impl ThreadView {
         cx.spawn(async move |this, cx| {
             let shape = image_shape_of_file(&fs, &path).await;
             this.update(cx, |this, cx| {
-                this.chip_cache.image_shapes.borrow_mut().insert(path, shape);
-                // Not this entry: the one that draws it. A picture inside a
-                // run is drawn by the run's first entry, and remeasuring an
-                // entry that renders nothing leaves the block that grew
-                // still measured at its placeholder height.
+                this.chip_cache
+                    .image_shapes
+                    .borrow_mut()
+                    .insert(path, shape);
                 let item = this.drawn_item_for_entry(entry_ix, cx);
                 this.list_state.remeasure_items(item..item + 1);
                 cx.notify();
@@ -2949,9 +2510,6 @@ impl ThreadView {
         .detach();
     }
 
-    /// The picture an expanded image chip shows. Clicking opens it where images
-    /// open; right-clicking offers the picture itself, since a screenshot in a
-    /// thread is usually wanted somewhere else.
     fn render_inline_image(
         &self,
         entry_ix: usize,
@@ -2959,8 +2517,6 @@ impl ThreadView {
         image: ChipImage,
         cx: &Context<Self>,
     ) -> AnyElement {
-        // An image that came from a file opens as that file; one the agent sent
-        // inline has nothing behind it to open.
         let file = match &image {
             ChipImage::File(path) => Some(path.clone()),
             ChipImage::Data { .. } => None,
@@ -2976,16 +2532,11 @@ impl ThreadView {
         };
 
         let body = div()
-            // A command can produce more than one picture, so the entry alone
-            // does not identify the element.
             .id(SharedString::from(format!(
                 "chip-image-{entry_ix}-{image_ix}"
             )))
-            // A definite box. An image contributes no height until it has
-            // loaded, and an entry that grows after the list has measured it
-            // paints over the entries below. The box is sized to the picture
-            // where the picture's shape is known, so fitting it inside costs
-            // it nothing.
+            // A definite box: an image that grows after the list measured it
+            // paints over the entries below.
             .w(IMAGE_CHIP_WIDTH)
             .h(box_height)
             .child(
@@ -3012,7 +2563,9 @@ impl ThreadView {
                     .trigger(move |_, _, _| body)
                     .menu(move |window, cx| {
                         let copyable = copyable.clone();
-                        let path = file.as_ref().map(|path| path.to_string_lossy().into_owned());
+                        let path = file
+                            .as_ref()
+                            .map(|path| path.to_string_lossy().into_owned());
                         ContextMenu::build(window, cx, move |menu, _, _| {
                             let copyable = copyable.clone();
                             menu.entry("Copy Image", None, move |_, cx| {
@@ -3029,9 +2582,7 @@ impl ThreadView {
             .into_any_element()
     }
 
-    /// Opens a picture in Zed's own image viewer, as a tab like any other. A
-    /// file inside the project opens by its project path so it shares the tab
-    /// the project panel would open; one outside opens by its absolute path.
+    /// By project path when possible, so it shares the project panel's tab.
     pub(super) fn open_image_file(
         &self,
         path: &std::path::Path,
@@ -3063,9 +2614,6 @@ impl ThreadView {
         }
     }
 
-    /// Opens a command-changed file's diff against the repository. There is no
-    /// per-call diff to show: nobody declared this edit, so the repository's
-    /// own view of the file is the only one there is.
     fn open_command_file_diff(
         &mut self,
         path: &project::ProjectPath,
@@ -3117,13 +2665,7 @@ impl ThreadView {
                 .into_any_element()
         };
 
-        let chip_id = ActionChipId::EditFile {
-            tool_call_id: tool_call.id.clone(),
-            file_ix,
-        };
         let stats = self.edit_file_stats(tool_call, file, cx);
-
-        let _ = chip_id;
         self.action_chip_base(
             SharedString::from(format!("edit-file-chip-{entry_ix}-{file_ix}")),
             is_expanded,
@@ -3150,18 +2692,15 @@ impl ThreadView {
                 cx,
             ))
         })
-        .map(|this| {
-            match self.edit_hover_card(entry_ix, file, tool_call, cx) {
-                // Hoverable: the diff card can be entered and scrolled, the
-                // way the editor's own hover popovers behave.
+        .map(
+            |this| match self.edit_hover_card(entry_ix, file, tool_call, cx) {
                 Some(card) => this.hoverable_tooltip(card),
                 None => this.tooltip(Tooltip::text(name)),
-            }
-        })
+            },
+        )
         .into_any_element()
     }
 
-    /// The edit chip's hover card: the file, and the diff itself.
     pub(super) fn edit_hover_card(
         &self,
         entry_ix: usize,
@@ -3188,8 +2727,6 @@ impl ThreadView {
                         .buffer_font(_cx),
                 )
                 .child(
-                    // The card is enterable, so a long diff can be scrolled
-                    // rather than merely clipped.
                     card_scroll_region("edit-hover-diff", DIFF_CARD_WIDTH, DIFF_CARD_HEIGHT)
                         .child(editor.clone()),
                 )

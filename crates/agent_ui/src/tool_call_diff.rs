@@ -1,14 +1,8 @@
-//! One tool call's edits, as a diff multibuffer.
+//! One tool call's edits to one file: the real project buffer against the text
+//! the call found, in a [`SplittableEditor`] like the branch diff.
 //!
-//! A file chip opens this: the real project buffer, shown against the text as
-//! it stood before the call, with every hunk expanded. It is the same shape as
-//! the branch diff (a [`SplittableEditor`] over a multibuffer, so side by side
-//! works) but scoped to what one call did, since that is what the chip names.
-//!
-//! Decorating an already-open singleton editor was the alternative, and it is
-//! why this exists: that editor belongs to whoever opened it, its diff can be
-//! replaced or missing, and a failure to attach one looks identical to a file
-//! with no changes.
+//! Its own item rather than decorating an open editor, whose diff belongs to
+//! whoever opened it and can be replaced or missing without any visible error.
 
 use std::any::Any;
 use std::ops::Range;
@@ -39,8 +33,6 @@ use workspace::{
     searchable::SearchableItemHandle,
 };
 
-/// Which call's edits to which file. Reopening the same chip activates the
-/// existing tab; a different call editing the same file gets its own.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolCallDiffKey {
     pub tool_call_id: acp::ToolCallId,
@@ -56,87 +48,8 @@ pub struct ToolCallDiff {
 }
 
 impl ToolCallDiff {
-    /// Opens the diff for one edited file, reusing the tab if this call's diff
-    /// for it is already open. The buffer is opened from the project, so the
-    /// view is the real file with real syntax, not a copy of it.
-    pub fn deploy(
-        key: ToolCallDiffKey,
-        base_text: Arc<str>,
-        project: Entity<Project>,
-        workspace: WeakEntity<Workspace>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Task<Result<()>> {
-        let existing = workspace
-            .update(cx, |workspace, cx| {
-                workspace
-                    .items_of_type::<ToolCallDiff>(cx)
-                    .find(|item| item.read(cx).key == key)
-            })
-            .ok()
-            .flatten();
-        if let Some(existing) = existing {
-            let activated = workspace.update(cx, |workspace, cx| {
-                workspace.activate_item(&existing, true, true, window, cx);
-            });
-            return Task::ready(activated);
-        }
-
-        let Some(project_path) = project
-            .read(cx)
-            .find_project_path(&key.path, cx)
-            .or_else(|| Self::project_path_by_name(&key.path, &project, cx))
-        else {
-            // Nothing silent: a file we cannot place is worth saying out loud,
-            // since the click looks like it did nothing.
-            return Task::ready(Err(anyhow::anyhow!(
-                "no file in this project matches {}",
-                key.path.display()
-            )));
-        };
-
-        window.spawn(cx, async move |cx| {
-            let open_buffer =
-                project.update(cx, |project, cx| project.open_buffer(project_path, cx));
-            let buffer = open_buffer.await?;
-
-            let (diff, set_base_text) = cx.update(|_window, cx| {
-                let snapshot = buffer.read(cx).text_snapshot();
-                let language = buffer.read(cx).language().cloned();
-                let language_registry = buffer.read(cx).language_registry();
-                // The base is the text the call found, not anything git knows.
-                let diff = cx.new(|cx| {
-                    BufferDiff::new(&snapshot, language, language_registry, cx)
-                });
-                let task = diff.update(cx, |diff, cx| {
-                    diff.set_base_text(Some(base_text.clone()), snapshot.clone(), cx)
-                });
-                (diff, task)
-            })?;
-            set_base_text.await;
-
-            workspace.update_in(cx, |workspace, window, cx| {
-                let view = cx.new(|cx| {
-                    Self::new(
-                        key,
-                        buffer,
-                        diff,
-                        project.clone(),
-                        workspace.weak_handle(),
-                        window,
-                        cx,
-                    )
-                });
-                workspace.add_item_to_center(Box::new(view), window, cx);
-            })?;
-            Ok(())
-        })
-    }
-
-    /// A path an agent reported that the project cannot resolve directly
-    /// (agents report absolute paths, and remote projects report their own).
-    /// Matching on the file name keeps the chip working rather than silently
-    /// opening nothing.
+    /// Agents report absolute paths the project may not resolve (remote
+    /// projects especially), so fall back to matching the file name.
     fn project_path_by_name(
         path: &std::path::Path,
         project: &Entity<Project>,
@@ -220,7 +133,6 @@ impl ToolCallDiff {
         }
     }
 
-    /// The excerpts being shown: what the call actually changed.
     pub fn multibuffer(&self) -> &Entity<MultiBuffer> {
         &self.multibuffer
     }
@@ -230,8 +142,6 @@ impl ToolCallDiff {
     }
 }
 
-/// Whether this call's diff for this file is open somewhere in the workspace,
-/// so the chip that opens it can read as selected.
 pub fn is_tool_call_diff_open(
     key: &ToolCallDiffKey,
     workspace: &WeakEntity<Workspace>,
@@ -354,9 +264,7 @@ impl Item for ToolCallDiff {
     }
 }
 
-/// Puts the cursor on the first hunk, so the view opens on the change rather
-/// than at the top of the file.
-pub fn reveal_first_hunk(view: &Entity<ToolCallDiff>, window: &mut Window, cx: &mut App) {
+fn reveal_first_hunk(view: &Entity<ToolCallDiff>, window: &mut Window, cx: &mut App) {
     let editor = view.read(cx).rhs_editor(cx);
     let focus_handle = view.read(cx).focus_handle.clone();
     editor.update(cx, |editor, cx| {
@@ -381,7 +289,6 @@ pub fn reveal_first_hunk(view: &Entity<ToolCallDiff>, window: &mut Window, cx: &
     focus_handle.focus(window, cx);
 }
 
-/// Opens the diff and reveals its first change.
 pub fn open_tool_call_diff(
     key: ToolCallDiffKey,
     base_text: Arc<str>,
@@ -390,28 +297,68 @@ pub fn open_tool_call_diff(
     window: &mut Window,
     cx: &mut App,
 ) -> Task<()> {
-    let deploy = ToolCallDiff::deploy(
-        key.clone(),
-        base_text,
-        project,
-        workspace.clone(),
-        window,
-        cx,
-    );
-    window.spawn(cx, async move |cx| {
-        if deploy.await.log_err().is_none() {
-            return;
-        }
+    let existing = workspace
+        .update(cx, |workspace, cx| {
+            workspace
+                .items_of_type::<ToolCallDiff>(cx)
+                .find(|item| item.read(cx).key == key)
+        })
+        .ok()
+        .flatten();
+    if let Some(existing) = existing {
         workspace
-            .update_in(cx, |workspace, window, cx| {
-                let Some(view) = workspace
-                    .items_of_type::<ToolCallDiff>(cx)
-                    .find(|item| item.read(cx).key == key)
-                else {
-                    return;
-                };
-                reveal_first_hunk(&view, window, cx);
+            .update(cx, |workspace, cx| {
+                workspace.activate_item(&existing, true, true, window, cx);
             })
             .log_err();
+        reveal_first_hunk(&existing, window, cx);
+        return Task::ready(());
+    }
+
+    let Some(project_path) = project
+        .read(cx)
+        .find_project_path(&key.path, cx)
+        .or_else(|| ToolCallDiff::project_path_by_name(&key.path, &project, cx))
+    else {
+        log::error!("no file in this project matches {}", key.path.display());
+        return Task::ready(());
+    };
+
+    window.spawn(cx, async move |cx| {
+        let opened: Result<()> = async {
+            let open_buffer =
+                project.update(cx, |project, cx| project.open_buffer(project_path, cx));
+            let buffer = open_buffer.await?;
+
+            let (diff, set_base_text) = cx.update(|_window, cx| {
+                let snapshot = buffer.read(cx).text_snapshot();
+                let language = buffer.read(cx).language().cloned();
+                let language_registry = buffer.read(cx).language_registry();
+                let diff = cx.new(|cx| BufferDiff::new(&snapshot, language, language_registry, cx));
+                let task = diff.update(cx, |diff, cx| {
+                    diff.set_base_text(Some(base_text.clone()), snapshot.clone(), cx)
+                });
+                (diff, task)
+            })?;
+            set_base_text.await;
+
+            workspace.update_in(cx, |workspace, window, cx| {
+                let view = cx.new(|cx| {
+                    ToolCallDiff::new(
+                        key,
+                        buffer,
+                        diff,
+                        project.clone(),
+                        workspace.weak_handle(),
+                        window,
+                        cx,
+                    )
+                });
+                workspace.add_item_to_center(Box::new(view.clone()), window, cx);
+                reveal_first_hunk(&view, window, cx);
+            })
+        }
+        .await;
+        opened.log_err();
     })
 }

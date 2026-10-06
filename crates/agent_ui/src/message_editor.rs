@@ -210,8 +210,7 @@ pub struct MessageEditor {
     local_commands: SharedLocalCommands,
     agent_id: AgentId,
     thread_store: Option<Entity<ThreadStore>>,
-    /// Don't paint the editor background, letting the container's tint
-    /// (e.g. a message bubble) show through.
+    /// Lets a message bubble's tint show through.
     transparent_background: bool,
     _subscriptions: Vec<Subscription>,
     _parse_slash_command_task: Task<()>,

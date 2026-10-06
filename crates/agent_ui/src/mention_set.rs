@@ -1433,11 +1433,8 @@ impl Render for ImageHover {
             div()
                 .p_1p5()
                 .elevation_2(cx)
-                // A definite box, like every other image this UI shows. `h_auto`
-                // takes the picture's natural height once decoded, so a tall
-                // screenshot behind an `@`-mention grew a card over whatever sat
-                // under it; the picture is fitted inside the box rather than
-                // deciding it.
+                // A definite box: `h_auto` let a tall image grow the card over
+                // what sat under it.
                 .child(
                     div().w(rems(24.)).h(rems(18.)).child(
                         gpui::img(image)

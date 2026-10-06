@@ -738,16 +738,23 @@ fn resolve_outcome_from_selection(
     Some(selected_choice.build_outcome(is_allow))
 }
 
-/// Whether this thread still holds the views its entries are drawn with. A
-/// thread that has been off screen long enough drops them, and the agent keeps
-/// working in the meantime: the updates that arrive then have nothing to sync
-/// into and no list items to splice, and the rebuild on return covers them all.
+/// An off-screen thread drops its entry views; updates arriving meanwhile are
+/// covered by the rebuild on return.
 fn entry_views_are_built(thread_view: &Entity<ThreadView>, cx: &App) -> bool {
     thread_view
         .read(cx)
         .entry_view_state
         .read(cx)
         .views_are_built()
+}
+
+/// Config options may cover the model's settings (effort, ...) without offering
+/// the model itself; the connection's model picker is kept then.
+fn config_options_offer_model(options: &dyn acp_thread::AgentSessionConfigOptions) -> bool {
+    options
+        .config_options()
+        .iter()
+        .any(|option| option.category == Some(acp_v2::SessionConfigOptionCategory::Model))
 }
 
 fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
@@ -803,30 +810,19 @@ pub struct ConversationView {
     notification_subscriptions: HashMap<WindowHandle<AgentNotification>, Vec<Subscription>>,
     auth_task: Option<Task<()>>,
     loading_status: Option<SharedString>,
-    /// Keeps a load task alive after its view has already entered `Connected`
-    /// on the thread the load is still filling. The task normally lives in the
-    /// `Loading` state, so showing the thread early would drop it and cancel
-    /// the replay it is in the middle of.
+    /// Keeps the load task alive after entering `Connected` mid-replay;
+    /// dropping it would cancel the replay.
     _replay_load: Option<Entity<LoadingView>>,
     /// When settings change, use this to see if the theme has changed (which
     /// causes mermaid diagrams to re-render).
     last_theme_id: Option<String>,
     draft_prompt_persist_task: Option<Task<()>>,
-    /// Content handed to the view after construction, while the agent
-    /// connection is still being established. Applied to the message editor as
-    /// soon as the thread view exists.
     pending_initial_content: Option<AgentInitialContent>,
     /// Cache + worktree snapshot for resolving paths in markdown code spans.
     /// Shared with the child [`ThreadView`] when one is constructed.
     pub(crate) code_span_resolver: AgentCodeSpanResolver,
     request_elicitation_form_states: HashMap<ElicitationEntryId, ElicitationFormState>,
-    /// Where this view came from; a first send from an unstarted draft reuses
-    /// it when it finally starts the connection.
     source: AgentThreadSource,
-    /// A background session opened for an unstarted draft, purely so the
-    /// agent's models/config can be listed and picked before the first send.
-    /// The pick transfers to the real session at send; the preview dies with
-    /// the draft (or on agent rebind).
     draft_model_preview: Option<DraftModelPreview>,
     draft_preview_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -852,16 +848,12 @@ impl ConversationView {
         }
     }
 
-    /// Whether the thread this conversation is showing still holds its views.
-    /// What the off-screen sweep is observed by.
     #[cfg(test)]
     pub(crate) fn active_entry_views_are_built(&self, cx: &App) -> bool {
         self.active_thread()
             .is_some_and(|thread_view| entry_views_are_built(thread_view, cx))
     }
 
-    /// The agent/model logo icon, for showing the agent a thread belongs to
-    /// (e.g. on its tab).
     pub fn agent_logo(&self) -> IconName {
         self.agent.logo()
     }
@@ -902,98 +894,58 @@ impl ConversationView {
             .and_then(|id| self.thread_view(id))
     }
 
-    /// Installs content in the view's message editor after construction. When
-    /// the connection is still loading the content is held and applied to the
-    /// thread view the moment it is created, so a caller never has to wait for
-    /// the session to hand a message over.
     pub fn set_initial_content(
         &mut self,
         content: AgentInitialContent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(message_editor) = self.unstarted_message_editor().cloned() {
-            // Deferred: setting a message reads the workspace to resolve
-            // mentions, and callers (the workspace-switch carry, panel load)
-            // reach here from inside a workspace update. Applying it
-            // synchronously is a double-lease panic.
-            cx.defer_in(window, move |this, window, cx| {
-                let mut submit = false;
-                message_editor.update(cx, |editor, cx| match content {
-                    AgentInitialContent::ContentBlock {
-                        blocks,
-                        auto_submit,
-                    } => {
-                        submit = auto_submit;
-                        editor.set_message(blocks, window, cx);
-                    }
-                    AgentInitialContent::ThreadSummary { session_id, title } => {
-                        editor.insert_thread_summary(session_id, title, window, cx);
-                    }
-                    // SECURITY: never auto submit a prompt from an external
-                    // source.
-                    AgentInitialContent::FromExternalSource(prompt) => {
-                        editor.set_message(
-                            vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
-                                prompt.into_string(),
-                            ))],
-                            window,
-                            cx,
-                        );
-                    }
-                });
-                if submit {
-                    this.send_unstarted(window, cx);
-                }
-                cx.notify();
-            });
-            return;
-        }
-        if self.root_thread_view().is_none() {
+        if self.unstarted_message_editor().is_none() && self.root_thread_view().is_none() {
             self.pending_initial_content = Some(content);
             return;
-        };
-
-        // Deferred for the same reason as the unstarted arm: setting a message
-        // resolves mentions against the workspace, and callers are typically
-        // mid-update on it. Still within this effect cycle, so no frame
-        // renders the unsent message.
+        }
+        // Deferred: setting a message reads the workspace, and callers reach
+        // here from inside a workspace update (double-lease panic).
         cx.defer_in(window, move |this, window, cx| {
-            let Some(thread_view) = this.root_thread_view() else {
-                this.pending_initial_content = Some(content);
-                return;
+            let thread_view = this.root_thread_view();
+            let message_editor = match (this.unstarted_message_editor(), &thread_view) {
+                (Some(message_editor), _) => message_editor.clone(),
+                (None, Some(thread_view)) => thread_view.read(cx).message_editor.clone(),
+                (None, None) => {
+                    this.pending_initial_content = Some(content);
+                    return;
+                }
             };
-            let mut auto_submit = false;
-            thread_view.update(cx, |thread_view, cx| {
-                thread_view.message_editor.update(cx, |editor, cx| {
-                    match content {
-                        AgentInitialContent::ThreadSummary { session_id, title } => {
-                            editor.insert_thread_summary(session_id, title, window, cx);
-                        }
-                        AgentInitialContent::ContentBlock {
-                            blocks,
-                            auto_submit: submit,
-                        } => {
-                            auto_submit = submit;
-                            editor.set_message(blocks, window, cx);
-                        }
-                        AgentInitialContent::FromExternalSource(prompt) => {
-                            // SECURITY: never auto submit a prompt from an
-                            // external source.
-                            editor.set_message(
-                                vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
-                                    prompt.into_string(),
-                                ))],
-                                window,
-                                cx,
-                            );
-                        }
-                    }
-                });
-                if auto_submit {
-                    thread_view.send(window, cx);
+            let mut submit = false;
+            message_editor.update(cx, |editor, cx| match content {
+                AgentInitialContent::ContentBlock {
+                    blocks,
+                    auto_submit,
+                } => {
+                    submit = auto_submit;
+                    editor.set_message(blocks, window, cx);
+                }
+                AgentInitialContent::ThreadSummary { session_id, title } => {
+                    editor.insert_thread_summary(session_id, title, window, cx);
+                }
+                // SECURITY: never auto submit a prompt from an external source.
+                AgentInitialContent::FromExternalSource(prompt) => {
+                    editor.set_message(
+                        vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+                            prompt.into_string(),
+                        ))],
+                        window,
+                        cx,
+                    );
                 }
             });
+            if submit {
+                if this.unstarted_message_editor().is_some() {
+                    this.send_unstarted(window, cx);
+                } else if let Some(thread_view) = thread_view {
+                    thread_view.update(cx, |thread_view, cx| thread_view.send(window, cx));
+                }
+            }
             cx.notify();
         });
     }
@@ -1003,10 +955,7 @@ impl ConversationView {
         connected.threads.get(session_id).cloned()
     }
 
-    /// Drops the per-entry views of every thread this conversation holds, for a
-    /// tab that has been off screen long enough that its view tree is worth
-    /// more as memory than as the latency of building it again. Returns how
-    /// many threads dropped theirs.
+    /// Returns how many threads dropped their views.
     pub fn drop_entry_views(&mut self, cx: &mut Context<Self>) -> usize {
         let Some(connected) = self.as_connected() else {
             return 0;
@@ -1020,9 +969,6 @@ impl ConversationView {
             .count()
     }
 
-    /// Builds the views of the thread this conversation is showing, if they were
-    /// dropped while it was off screen. The subagent threads it also holds stay
-    /// dropped until one of them is the thread being shown.
     pub fn rebuild_active_entry_views(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(active) = self.active_thread().cloned() else {
             return;
@@ -1078,18 +1024,14 @@ impl ConversationView {
     }
 }
 
-/// Whether a new [`ConversationView`] connects immediately (resumed threads,
-/// tool-created threads, worktree delivery) or stays an inert composer until
-/// the user's first send (drafts).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnectionStart {
     Immediate,
     OnFirstSend,
 }
 
-/// The session an unstarted draft opens in the background so its models and
-/// config options exist to be picked. Holding the [`AcpThread`] keeps the
-/// session alive; the view renders whichever selector the agent offers.
+/// A background session an unstarted draft opens so a model can be picked
+/// before the first send; holding the thread keeps the session alive.
 struct DraftModelPreview {
     _thread: Entity<AcpThread>,
     config_options: Option<Rc<dyn acp_thread::AgentSessionConfigOptions>>,
@@ -1098,9 +1040,7 @@ struct DraftModelPreview {
 }
 
 enum ServerState {
-    /// A draft that has not started anything: no agent process, no session,
-    /// no worktree. It is only the composer the user types into; the first
-    /// send creates the rest.
+    /// No agent process or session until the first send.
     Unstarted {
         message_editor: Entity<MessageEditor>,
         _editor_subscription: Subscription,
@@ -1142,9 +1082,6 @@ impl AuthState {
     }
 }
 
-/// How often a load looks to see whether the connection has a thread worth
-/// showing yet. Short enough that a fast session is not held back by it, long
-/// enough that a slow one is not asking every frame.
 const REPLAY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 struct LoadingView {
@@ -1308,8 +1245,6 @@ impl ConversationView {
         this
     }
 
-    /// The inert draft state: a composer and nothing else. No agent process,
-    /// no session; typing is instant because nothing is being spawned.
     fn unstarted_state(
         agent: &Rc<dyn AgentServer>,
         connection_key: &Agent,
@@ -1337,11 +1272,8 @@ impl ConversationView {
                 cx,
             )
         });
-        // A restored draft (or a workspace switch carrying a draft over) seeds
-        // the composer with the saved text. Deferred: setting a message reads
-        // the workspace, and the panel-load path that builds restored drafts
-        // runs inside a workspace update (reading it synchronously here is a
-        // double-lease panic).
+        // Deferred: the panel-load path runs inside a workspace update, which
+        // setting a message reads (double-lease panic).
         if let Some(AgentInitialContent::ContentBlock { blocks, .. }) = initial_content {
             let message_editor = message_editor.clone();
             window.defer(cx, move |window, cx| {
@@ -1367,8 +1299,6 @@ impl ConversationView {
         }
     }
 
-    /// Whether this view is still a draft: unstarted (nothing running yet),
-    /// or started but with no messages sent.
     pub fn is_draft_view(&self, cx: &App) -> bool {
         matches!(self.server_state, ServerState::Unstarted { .. })
             || self
@@ -1393,11 +1323,7 @@ impl ConversationView {
         }
     }
 
-    /// Opens the background preview session for an unstarted draft: the
-    /// agent's shared connection, one session on it, and whichever selector
-    /// the agent offers (config options first, else the plain model picker).
-    /// Quietly does nothing on connect/auth failure: the draft works without
-    /// a selector, it just cannot pick a model before sending.
+    /// Does nothing on connect/auth failure: the draft just has no selector.
     fn spawn_draft_model_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.draft_model_preview = None;
         if self.unstarted_message_editor().is_none() {
@@ -1435,32 +1361,18 @@ impl ConversationView {
                 }
                 let session_id = thread.read(cx).session_id().clone();
                 let config_options = connection.session_config_options(&session_id, cx);
-                let (config_options_view, model_selector) = match &config_options {
-                    Some(options) => {
-                        let fs = this.project.read(cx).fs().clone();
-                        let offers_model = options.config_options().iter().any(|option| {
-                            option.category == Some(acp_v2::SessionConfigOptionCategory::Model)
-                        });
-                        let view = cx.new(|cx| {
-                            ConfigOptionsView::new(
-                                options.clone(),
-                                agent_server.clone(),
-                                fs,
-                                window,
-                                cx,
-                            )
-                        });
-                        let selector = (!offers_model)
-                            .then(|| {
-                                Self::draft_model_selector(&connection, &session_id, window, cx)
-                            })
-                            .flatten();
-                        (Some(view), selector)
-                    }
-                    None => (
-                        None,
-                        Self::draft_model_selector(&connection, &session_id, window, cx),
-                    ),
+                let offers_model = config_options
+                    .as_ref()
+                    .is_some_and(|options| config_options_offer_model(options.as_ref()));
+                let config_options_view = config_options.clone().map(|options| {
+                    let fs = this.project.read(cx).fs().clone();
+                    cx.new(|cx| ConfigOptionsView::new(options, agent_server, fs, window, cx))
+                });
+                let model_selector = if offers_model {
+                    None
+                } else {
+                    let focus_handle = cx.focus_handle();
+                    Self::new_model_selector(&connection, &session_id, focus_handle, window, cx)
                 };
                 if config_options_view.is_none() && model_selector.is_none() {
                     return;
@@ -1477,18 +1389,18 @@ impl ConversationView {
         }));
     }
 
-    fn draft_model_selector(
+    fn new_model_selector(
         connection: &Rc<dyn AgentConnection>,
         session_id: &acp_v1::SessionId,
+        focus_handle: FocusHandle,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Entity<ModelSelectorPopover>> {
         let selector = connection.model_selector(session_id)?;
-        let focus_handle = cx.focus_handle();
         Some(cx.new(|cx| {
             ModelSelectorPopover::new(
                 selector,
-                ui::PopoverMenuHandle::default(),
+                PopoverMenuHandle::default(),
                 focus_handle,
                 window,
                 cx,
@@ -1496,8 +1408,6 @@ impl ConversationView {
         }))
     }
 
-    /// The preview session's chosen config values, captured at send so they
-    /// transfer onto the real session before the first message goes out.
     fn draft_session_config_snapshot(
         &self,
     ) -> Vec<(acp_v2::SessionConfigId, acp_v2::SessionConfigOptionValue)> {
@@ -1525,10 +1435,7 @@ impl ConversationView {
             .collect()
     }
 
-    /// First send from an unstarted draft: this starts the view's own
-    /// connection with the message riding along. A draft is an ordinary thread
-    /// in the worktree it is already in, so sending it always sends here; a
-    /// thread that wants a worktree of its own got one when it was created.
+    /// Starts the connection with the draft's message as the first send.
     fn send_unstarted(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(message_editor) = self.unstarted_message_editor() else {
             return;
@@ -1538,33 +1445,8 @@ impl ConversationView {
             return;
         }
 
+        // The preview's picks ride in `session_config` onto the real session.
         let session_config = self.draft_session_config_snapshot();
-        self.start(
-            Some(AgentInitialContent::ContentBlock {
-                blocks,
-                auto_submit: true,
-            }),
-            session_config,
-            window,
-            cx,
-        );
-    }
-
-    /// Starts the agent for an unstarted draft, optionally delivering
-    /// `initial_content` (the composed first message) into the new session.
-    pub fn start(
-        &mut self,
-        initial_content: Option<AgentInitialContent>,
-        session_config: Vec<(acp_v2::SessionConfigId, acp_v2::SessionConfigOptionValue)>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !matches!(self.server_state, ServerState::Unstarted { .. }) {
-            return;
-        }
-        // The preview session served its purpose: the picked values ride in
-        // `session_config` and apply to the real session before the first
-        // message goes out.
         self.draft_model_preview = None;
         self.draft_preview_task = None;
         let state = Self::initial_state(
@@ -1575,7 +1457,10 @@ impl ConversationView {
             None,
             None,
             self.project.clone(),
-            initial_content,
+            Some(AgentInitialContent::ContentBlock {
+                blocks,
+                auto_submit: true,
+            }),
             session_config,
             self.source,
             window,
@@ -1812,10 +1697,6 @@ impl ConversationView {
             );
 
             let mut resumed_without_history = false;
-            // Opening an old thread waits for the agent to hand its whole
-            // transcript back, entry by entry. That wait and the view building
-            // that follows it are the two halves of "loading a thread takes
-            // forever", and only measuring says which half is which.
             let load_started = std::time::Instant::now();
             let resuming = resume_session_id.is_some();
             let result = if let Some(session_id) = resume_session_id.clone() {
@@ -1857,13 +1738,9 @@ impl ConversationView {
                 return;
             };
 
-            // The load task only resolves once the last replayed entry has
-            // arrived, but the connection creates and registers the thread
-            // before it asks for the replay, so entries have been landing in it
-            // the whole time. Take that thread as soon as it has something in it
-            // and show the conversation filling up: on a long session the replay
-            // is nearly the whole wait, and the reader spent it looking at a
-            // "Loading…" label instead of at their own conversation.
+            // The load only resolves after the last replayed entry, but the
+            // thread is registered before the replay starts: show it as soon
+            // as it has entries rather than a "Loading…" label.
             let mut connection_entry_subscription = Some(connection_entry_subscription);
             let mut initial_content = initial_content;
             let mut entered: Option<Entity<AcpThread>> = None;
@@ -1923,9 +1800,8 @@ impl ConversationView {
                 Ok(thread) => Ok(thread),
             };
 
-            // Carry the draft's picked config (model, effort, ...) onto the
-            // real session before anything is submitted to it. Only values
-            // differing from the session's own current state are set.
+            // Carry the draft's picked config onto the real session before
+            // anything is submitted to it.
             if !session_config.is_empty()
                 && let Ok(thread) = &result
             {
@@ -1986,11 +1862,8 @@ impl ConversationView {
                         }
                     }
                     Err(err) => {
-                        // A launch that failed used to reach the UI without
-                        // reaching the log, and reached it wearing only its
-                        // outermost context: "failed to spawn command …" with
-                        // no reason attached is what turned one `EMFILE` into
-                        // a day of process samples.
+                        // With the full context chain: an outermost "failed to
+                        // spawn command" alone hid an `EMFILE`.
                         log::error!("failed to load agent: {err:#}");
                         this.handle_load_error(
                             LoadError::Other(format!("{err:#}").into()),
@@ -2014,14 +1887,9 @@ impl ConversationView {
         }
     }
 
-    /// Enters `Connected` on `thread`: builds its view, installs the state and
-    /// focuses the composer if this view holds focus.
-    ///
-    /// A load calls this once, either as soon as the connection has a thread
-    /// worth showing (a session still replaying its history) or when the load
-    /// resolves, whichever came first. The load task lives in the `Loading`
-    /// state it replaces, so it is carried over rather than dropped: dropping it
-    /// would cancel the replay this is showing.
+    /// Called once per load: mid-replay or when the load resolves, whichever
+    /// comes first. The load task is carried over, since dropping it would
+    /// cancel the replay.
     #[allow(clippy::too_many_arguments)]
     fn enter_connected(
         &mut self,
@@ -2075,7 +1943,8 @@ impl ConversationView {
         }
 
         self.root_session_id = Some(root_session_id.clone());
-        let request_elicitation_subscription = Self::request_elicitation_subscription(&connection, cx);
+        let request_elicitation_subscription =
+            Self::request_elicitation_subscription(&connection, cx);
         self.set_server_state(
             ServerState::Connected(ConnectedServerState {
                 connection,
@@ -2127,29 +1996,9 @@ impl ConversationView {
 
         let count = thread.read(cx).entries().len();
         let list_state = ListState::new(0, gpui::ListAlignment::Top, px(2048.0));
-        // A run of actions is drawn by its first entry, so a thread's items
-        // grow after they are measured more than anything else in the app.
-        // Five reports of pictures painting over chips came in before there
-        // was a line to grep for; this is that line.
         list_state.report_stale_measurements();
         list_state.set_follow_mode(gpui::FollowMode::Tail);
 
-        // Opening a thread builds a view per entry before anything is drawn: a
-        // message editor per user message, an editor per diff, a terminal view
-        // per terminal. It is the part of opening an old thread that scales
-        // with the thread rather than with the screen, so it says how long it
-        // took and for how many entries.
-        //
-        // Building only the last screenful here and the rest behind the first
-        // paint was tried and reverted on 2026-08-19: the build carrying it
-        // died inside this function, before the line below could log, and a
-        // working build mattered more than the speed-up.
-        //
-        // What the threads left open all day cost is answered elsewhere
-        // instead: a tab off screen for long enough drops this whole tree and
-        // runs the same loop again on return (`ThreadView::rebuild_entry_views`),
-        // so the up-front build stays the one way a thread's views come into
-        // being and there is only one thing to keep correct.
         let sync_started = std::time::Instant::now();
         entry_view_state.update(cx, |view_state, cx| {
             for ix in 0..count {
@@ -2186,33 +2035,16 @@ impl ConversationView {
         if let Some(config_options) = config_options_provider {
             let agent_server = self.agent.clone();
             let fs = self.project.read(cx).fs().clone();
-            // An agent's config options may cover the model's *settings*
-            // (reasoning effort, and so on) without offering the model itself.
-            // Keep the connection's model picker in that case, or the model
-            // cannot be chosen at all.
-            let offers_model = config_options
-                .config_options()
-                .iter()
-                .any(|option| option.category == Some(acp_v2::SessionConfigOptionCategory::Model));
+            model_selector = if config_options_offer_model(config_options.as_ref()) {
+                None
+            } else {
+                let focus_handle = self.focus_handle(cx);
+                Self::new_model_selector(&connection, &session_id, focus_handle, window, cx)
+            };
             config_options_view =
                 Some(cx.new(|cx| {
                     ConfigOptionsView::new(config_options, agent_server, fs, window, cx)
                 }));
-            model_selector = if offers_model {
-                None
-            } else {
-                connection.model_selector(&session_id).map(|selector| {
-                    cx.new(|cx| {
-                        ModelSelectorPopover::new(
-                            selector,
-                            PopoverMenuHandle::default(),
-                            self.focus_handle(cx),
-                            window,
-                            cx,
-                        )
-                    })
-                })
-            };
             mode_selector = None;
         } else {
             // Fall back to dedicated mode/model selectors
@@ -2308,7 +2140,7 @@ impl ConversationView {
             });
 
         let weak = cx.weak_entity();
-        let thread_view = cx.new(|cx| {
+        cx.new(|cx| {
             ThreadView::new(
                 self.thread_id,
                 thread,
@@ -2335,8 +2167,7 @@ impl ConversationView {
                 window,
                 cx,
             )
-        });
-        thread_view
+        })
     }
 
     fn handle_auth_required(
@@ -2435,14 +2266,16 @@ impl ConversationView {
         &self.connection_key
     }
 
-    /// The user-supplied title from the metadata store, the single source of
-    /// truth for renames: both the tab's inline rename and the sidebar's row
-    /// rename write it, so both surfaces show the same title.
+    /// User renames are stored in ThreadMetadataStore.
+    /// Some agents can't set titles directly, so this should be checked
+    /// when rendering the thread's title.
     fn title_override(&self, cx: &App) -> Option<SharedString> {
-        ThreadMetadataStore::try_global(cx)?
-            .read(cx)
-            .entry(self.thread_id)
-            .and_then(|metadata| metadata.title_override.clone())
+        ThreadMetadataStore::try_global(cx).and_then(|store| {
+            store
+                .read(cx)
+                .entry(self.thread_id)
+                .and_then(|metadata| metadata.title_override.clone())
+        })
     }
 
     pub fn title(&self, cx: &App) -> SharedString {
@@ -2512,8 +2345,7 @@ impl ConversationView {
             event,
             AcpThreadEvent::StatusChanged | AcpThreadEvent::Stopped { .. }
         ) {
-            // Running-count consumers (the title bar) observe the
-            // thread-tabs registry; poke it so they re-read statuses.
+            // The title bar's running count observes the registry.
             crate::thread_tab_registry::ThreadTabsRegistry::global(cx)
                 .update(cx, |_registry, cx| cx.notify());
         }
@@ -2554,11 +2386,8 @@ impl ConversationView {
                                 .and_then(|entry| entry.focus_handle(cx))],
                         );
                     });
-                    // Splicing the new index measures the new item, but an
-                    // action that joins the run before it is drawn by that
-                    // run's first entry, which just grew and is still
-                    // measured at its old height. With pictures in the run
-                    // that overflow paints over the items below.
+                    // An action joining a run grows the run's first item, which
+                    // splicing does not remeasure.
                     let drawn = active.read(cx).drawn_item_for_entry(index, cx);
                     list_state.remeasure_items(drawn..drawn + 1);
                     if index > 0 {
@@ -2583,10 +2412,7 @@ impl ConversationView {
                     entry_view_state.update(cx, |view_state, cx| {
                         view_state.sync_entry(*index, thread, window, cx);
                     });
-                    // Not this entry: the one that draws it. An action inside a
-                    // run is drawn by the run's first entry, and remeasuring an
-                    // entry that renders nothing leaves the block that grew
-                    // still measured at its old height.
+                    // An action inside a run is drawn by the run's first entry.
                     let item = active.read(cx).drawn_item_for_entry(*index, cx);
                     list_state.remeasure_items(item..item + 1);
                     active.update(cx, |active, cx| {
@@ -2604,18 +2430,13 @@ impl ConversationView {
             }
             AcpThreadEvent::EntriesRemoved(range) => {
                 if let Some(active) = self.thread_view(&session_id) {
-                    // `remove` reindexes the expansions whether or not the views
-                    // are built; only the list state it feeds is skipped, since
-                    // a dropped thread has no items in it to splice out.
                     let views_built = entry_views_are_built(&active, cx);
                     let entry_view_state = active.read(cx).entry_view_state.clone();
                     let list_state = active.read(cx).list_state.clone();
                     entry_view_state.update(cx, |view_state, _cx| view_state.remove(range.clone()));
                     if views_built {
                         list_state.splice(range.clone(), 0);
-                        // Taking entries out of a run leaves the item that
-                        // draws what is left measured at the height it had
-                        // with them.
+
                         if range.start > 0 {
                             let drawn = active.read(cx).drawn_item_for_entry(range.start - 1, cx);
                             list_state.remeasure_items(drawn..drawn + 1);
@@ -2753,11 +2574,8 @@ impl ConversationView {
                         cx,
                     );
 
-                    // The turn completed while the user was not viewing this
-                    // conversation: mark the thread unread. Tabs and the
-                    // sidebar render the marker until the thread is viewed.
                     // Unlike `agent_status_visible`, an open sidebar does not
-                    // count as viewing the conversation itself.
+                    // count as viewing the conversation.
                     if !self.conversation_is_viewed(window, cx) {
                         let thread_id = self.thread_id;
                         crate::thread_read_state::ThreadReadState::global(cx).update(
@@ -3915,9 +3733,6 @@ impl ConversationView {
                 })
     }
 
-    /// Whether the user is looking at this conversation right now: the window
-    /// is active, this view's workspace is the active one, and the agent
-    /// panel is showing this view.
     fn conversation_is_viewed(&self, window: &Window, cx: &Context<Self>) -> bool {
         if !window.is_window_active() {
             return false;
@@ -4274,11 +4089,8 @@ impl ConversationView {
                 })
             });
         } else if let Some(message_editor) = self.unstarted_message_editor().cloned() {
-            // A draft that starts no server until its first send has no active
-            // thread, but it does have the editor the reader is looking at. The
-            // selection belongs there rather than in a queue that only drains
-            // when the thread connects, which for this kind of draft is after
-            // the message has already been sent.
+            // The pending queue drains on connect, which for an unstarted
+            // draft is after its message has been sent.
             message_editor.update(cx, |editor, cx| {
                 editor.insert_selections(selection, window, cx);
             });
@@ -4420,7 +4232,6 @@ fn placeholder_text(agent_name: &str, has_commands: bool) -> String {
 
 impl Focusable for ConversationView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        // Focusing an unstarted draft means focusing its composer.
         if let Some(message_editor) = self.unstarted_message_editor() {
             return message_editor.read(cx).focus_handle(cx);
         }
@@ -4467,10 +4278,7 @@ impl ConversationView {
 }
 
 impl ConversationView {
-    /// The draft screen: agent identity, the worktree choice, and the
-    /// composer. Nothing behind it is running; the first send creates the
-    /// agent session (and the worktree, when chosen).
-    fn render_unstarted(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_unstarted(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let ServerState::Unstarted { message_editor, .. } = &self.server_state else {
             return gpui::Empty.into_any_element();
         };
@@ -4478,9 +4286,6 @@ impl ConversationView {
         let editor_bg_color = cx.theme().colors().editor_background;
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
 
-        // The composer is the tab: same fill-the-container shape as an empty
-        // started thread, with the choices (agent, worktree) on the row below
-        // it, where a started thread keeps its status controls.
         message_editor.update(cx, |editor, cx| {
             editor.set_mode(
                 editor::EditorMode::Full {
@@ -4491,15 +4296,12 @@ impl ConversationView {
                 cx,
             );
         });
-        let _ = window;
 
         v_flex()
             .flex_1()
             .size_full()
             .bg(editor_bg_color)
-            // The enter-to-send binding (agent::Chat) is scoped to
-            // "AcpThread > Editor"; without this context the composer's Enter
-            // is a plain newline and a draft cannot be sent at all.
+            // agent::Chat (enter-to-send) is scoped to "AcpThread > Editor".
             .key_context("AcpThread")
             .child(
                 h_flex().flex_1().size_full().py_2().justify_center().child(
@@ -4524,9 +4326,6 @@ impl ConversationView {
                                 .w_full()
                                 .gap_1()
                                 .child(self.render_unstarted_agent_picker(cx))
-                                // The preview session's selectors, once it
-                                // connects: pick the model (and effort)
-                                // the FIRST message runs with.
                                 .children(
                                     self.draft_model_preview
                                         .as_ref()
@@ -4543,8 +4342,6 @@ impl ConversationView {
             .into_any_element()
     }
 
-    /// Which agent the first send starts. Pure data until then; picking one
-    /// rebinds the draft in place, keeping whatever was typed.
     fn render_unstarted_agent_picker(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let agent_label = self.connection_key.label();
         let agent_logo = self.connection_key.logo();
@@ -4625,8 +4422,7 @@ impl ConversationView {
             .into_any_element()
     }
 
-    /// Swaps which agent an unstarted draft will start, in place: the typed
-    /// message and the worktree choice survive the swap.
+    /// Keeps the typed message.
     pub(crate) fn set_unstarted_agent(
         &mut self,
         connection_key: Agent,
@@ -4668,7 +4464,7 @@ impl Render for ConversationView {
         let active_thread_renders_request_elicitations =
             self.active_thread_renders_request_elicitations();
         let content = match &self.server_state {
-            ServerState::Unstarted { .. } => self.render_unstarted(window, cx),
+            ServerState::Unstarted { .. } => self.render_unstarted(cx),
             ServerState::Loading { .. } => {
                 let label_text = self
                     .loading_status
@@ -4753,16 +4549,11 @@ fn render_agent_markdown(
     let workspace = workspace.clone();
     let worktree_roots = code_span_resolver.worktree_roots(cx);
     let resolver = code_span_resolver.clone();
-    // An agent-authored image inside markdown holds a definite height, the same
-    // one an image the chip layer draws holds. The transcript is a `ListState`
-    // that measures an entry once and paints it at that height; without a
-    // definite height an image contributes zero until it loads and then grows
-    // past its neighbours. Callers can override by setting `inline_image_height`
-    // themselves before render.
+    // The list measures an entry once, so an image without a definite height
+    // would grow past its neighbours when it loads.
     if style.inline_image_height.is_none() {
-        style.inline_image_height = Some(gpui::AbsoluteLength::Rems(
-            thread_view::IMAGE_CHIP_HEIGHT,
-        ));
+        style.inline_image_height =
+            Some(gpui::AbsoluteLength::Rems(thread_view::IMAGE_CHIP_HEIGHT));
     }
     MarkdownElement::new(markdown, style)
         .code_block_renderer(markdown::CodeBlockRenderer::Default {
@@ -4955,12 +4746,12 @@ pub(crate) mod tests {
     use editor::actions::Paste;
     use feature_flags::{AcpBetaFeatureFlag, FeatureFlag as _, FeatureFlagAppExt as _};
     use fs::FakeFs;
+    use futures::channel::oneshot;
     use gpui::{ClipboardItem, EventEmitter, TestAppContext, VisualTestContext, point, size};
     use parking_lot::Mutex;
     use project::Project;
     use serde_json::json;
     use settings::SettingsStore;
-    use futures::channel::oneshot;
     use std::any::Any;
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
@@ -6548,13 +6339,8 @@ pub(crate) mod tests {
             let viewport_size = cx.update(|window, _| window.viewport_size());
             assert!(editor_bounds.size.height > px(20.));
             assert!(editor_bounds.top() >= px(0.));
-            // Expanded, this fork's composer takes 80% of the window on
-            // purpose, so with a full notice area above it the box runs past
-            // the bottom of a 480px viewport: upstream's own test asserts a
-            // composer that is only ever as tall as what is left. What has to
-            // hold either way is that the composer is still reachable — its
-            // top on screen and its middle clickable — which is what the
-            // click and the typing below check.
+            // Expanded, the fork's composer takes 80% of the window, so it can
+            // run past the viewport; it only has to stay reachable.
             if expanded {
                 assert!(editor_bounds.top() < viewport_size.height);
                 assert!(editor_bounds.center().y < viewport_size.height);
@@ -6670,9 +6456,7 @@ pub(crate) mod tests {
         });
     }
 
-    /// A connection whose `load_session` replays entries into the thread and
-    /// then sits there, exactly like a long session coming back over the wire.
-    /// Releasing `finish` resolves the load.
+    /// `load_session` replays entries and resolves only once `finish` fires.
     #[derive(Clone)]
     struct ReplayingConnection {
         thread: Arc<Mutex<Option<Entity<AcpThread>>>>,
@@ -6716,15 +6500,9 @@ pub(crate) mod tests {
             _title: Option<SharedString>,
             cx: &mut App,
         ) -> Task<gpui::Result<Entity<AcpThread>>> {
-            let thread = build_test_thread(
-                self.clone(),
-                project,
-                "ReplayingConnection",
-                session_id,
-                cx,
-            );
-            // Registered before the replay, which is what makes it findable
-            // while the load is still outstanding.
+            let thread =
+                build_test_thread(self.clone(), project, "ReplayingConnection", session_id, cx);
+
             *self.thread.lock() = Some(thread.clone());
 
             for text in ["first replayed", "second replayed"] {
@@ -6786,10 +6564,6 @@ pub(crate) mod tests {
 
     #[gpui::test]
     async fn test_a_replaying_session_is_shown_while_it_replays(cx: &mut TestAppContext) {
-        // Opening a long thread waits on the agent replaying it, and that is
-        // nearly the whole wait. The entries are landing in the thread the
-        // whole time, so the reader should be watching them arrive rather than
-        // a "Loading…" label.
         init_test(cx);
 
         let fs = FakeFs::new(cx.executor());
@@ -6813,7 +6587,9 @@ pub(crate) mod tests {
                 ConversationView::new(
                     Rc::new(StubAgentServer::new(connection)),
                     connection_store,
-                    Agent::Custom { id: "replaying".into() },
+                    Agent::Custom {
+                        id: "replaying".into(),
+                    },
                     Some(session_id.clone()),
                     None,
                     None,
@@ -6834,14 +6610,11 @@ pub(crate) mod tests {
         cx.executor().advance_clock(REPLAY_POLL_INTERVAL * 2);
         cx.run_until_parked();
 
-        // The load has not resolved, so under the old code this would still be
-        // Loading with nothing to look at.
         conversation_view.read_with(cx, |view, cx| {
             let thread_view = view
                 .active_thread()
                 .expect("the replaying thread should be showing already");
-            // Two chunks of one assistant message make one entry; what matters
-            // is that replayed content is on screen while the load runs.
+            // Two chunks of one assistant message make one entry.
             assert_eq!(
                 thread_view.read(cx).thread.read(cx).entries().len(),
                 1,
@@ -8560,19 +8333,19 @@ pub(crate) mod tests {
         cx.run_until_parked();
         active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
             assert_thread_list_item_count_matches_entries(view, cx);
-            assert!(view.thread.read(cx).plan().is_none_or(acp_thread::Plan::is_empty));
+            assert!(
+                view.thread
+                    .read(cx)
+                    .plan()
+                    .is_none_or(acp_thread::Plan::is_empty)
+            );
         });
         connection.end_turn(session_id, acp_v1::StopReason::EndTurn);
         cx.run_until_parked();
     }
 
-    /// Upstream drives this through the activity bar's plan panel, with its
-    /// summary row, its expand disclosure and its Clear Plan button. This fork
-    /// has no such panel — the plan is one line inside the thread's working
-    /// indicator, the single plan surface — so what is asserted here is the
-    /// plan model the panel was reading: which plan is visible, what
-    /// dismissing does to it, that a later update brings it back, and that a
-    /// status change is carried through without rebuilding the entry.
+    /// The fork has no plan panel (the plan is one line in the working
+    /// indicator), so this asserts the plan model the panel read.
     #[gpui::test]
     async fn test_plan_dismissal_and_status_updates(cx: &mut TestAppContext) {
         use agent_client_protocol::schema::v2 as acp_v2;
@@ -8590,11 +8363,7 @@ pub(crate) mod tests {
                       entries: Vec<acp_v2::PlanEntry>,
                       cx: &mut VisualTestContext| {
             thread.update(cx, |thread, cx| {
-                thread.upsert_plan_items(
-                    acp_v2::PlanItems::new("status-plan", entries),
-                    None,
-                    cx,
-                );
+                thread.upsert_plan_items(acp_v2::PlanItems::new("status-plan", entries), None, cx);
             });
             cx.run_until_parked();
         };
@@ -8611,8 +8380,7 @@ pub(crate) mod tests {
             assert_eq!(plan.stats().pending, 1);
         });
 
-        // Dismissing is what the panel's Clear Plan button did: the plan stops
-        // being the visible one but is not forgotten.
+        // What the panel's Clear Plan button did.
         thread.update(cx, |thread, cx| thread.clear_plan(cx));
         cx.run_until_parked();
         thread.read_with(cx, |thread, _| {
@@ -8638,7 +8406,11 @@ pub(crate) mod tests {
         thread.read_with(cx, |thread, _| assert!(thread.plan().is_none()));
 
         // A real change brings it back.
-        upsert(&thread, vec![entry(acp_v2::PlanEntryStatus::InProgress)], cx);
+        upsert(
+            &thread,
+            vec![entry(acp_v2::PlanEntryStatus::InProgress)],
+            cx,
+        );
         thread.read_with(cx, |thread, _| {
             assert!(
                 thread
@@ -8650,8 +8422,7 @@ pub(crate) mod tests {
             );
         });
 
-        // Every status the fork's plan line maps to a glyph, and the entry's
-        // markdown is reused rather than rebuilt as the status moves.
+        // The entry's markdown is reused as the status moves.
         for status in [
             acp_v2::PlanEntryStatus::Completed,
             acp_v2::PlanEntryStatus::Cancelled,
@@ -8683,7 +8454,6 @@ pub(crate) mod tests {
             assert_eq!((stats.pending, stats.completed, stats.cancelled), (0, 1, 1));
         });
 
-        // An emptied plan draws nothing, and never became a transcript entry.
         thread.update(cx, |thread, cx| {
             thread.upsert_plan_items(acp_v2::PlanItems::new("status-plan", vec![]), None, cx);
             assert!(thread.plan().expect("empty selected plan").is_empty());
@@ -9693,8 +9463,7 @@ pub(crate) mod tests {
     }
 
     fn assert_thread_list_item_count_matches_entries(view: &ThreadView, cx: &App) {
-        // The working indicator lives in the message bar, so the list is exactly
-        // the thread's entries.
+        // The working indicator lives in the message bar, not the list.
         assert_eq!(
             view.list_state.item_count(),
             view.thread.read(cx).entries().len()
@@ -10117,8 +9886,6 @@ pub(crate) mod tests {
         });
     }
 
-    /// A bookmark is a stop of its own: movement that only knew about user
-    /// messages would skip straight past a marked agent reply.
     #[gpui::test]
     async fn test_movement_stops_at_bookmarks_as_well_as_user_messages(cx: &mut TestAppContext) {
         init_test(cx);
@@ -10163,7 +9930,6 @@ pub(crate) mod tests {
             );
         });
 
-        // Mark the first agent reply.
         thread_view.update(cx, |view, cx| {
             view.toggle_bookmark_at(1, cx);
             assert!(view.is_bookmarked(1, cx));
@@ -10172,8 +9938,6 @@ pub(crate) mod tests {
         });
         cx.run_until_parked();
 
-        // Stepping forward from the top now stops at the mark before it gets
-        // to the next user message, and stepping back returns the same way.
         thread_view.update_in(cx, |view, window, cx| {
             view.scroll_output_to_next_message(&ScrollOutputToNextMessage, window, cx);
             assert_eq!(view.list_state.logical_scroll_top().item_ix, 1);
@@ -10183,7 +9947,6 @@ pub(crate) mod tests {
             assert_eq!(view.list_state.logical_scroll_top().item_ix, 1);
         });
 
-        // Clearing the mark takes its stop away again.
         thread_view.update_in(cx, |view, window, cx| {
             view.toggle_bookmark_at(1, cx);
             assert!(!view.is_bookmarked(1, cx));
@@ -10193,8 +9956,6 @@ pub(crate) mod tests {
         });
     }
 
-    /// A thread's pull requests are not only its branch's: one it opened, or
-    /// was pointed at, arrives as a URL in the transcript.
     #[gpui::test]
     async fn test_a_pr_url_in_the_thread_joins_its_watched_set(cx: &mut TestAppContext) {
         init_test(cx);
@@ -10227,8 +9988,6 @@ pub(crate) mod tests {
             "the URL the agent printed should put its PR in the thread's set"
         );
 
-        // Taking it out has to stick: mining runs again on the next event and
-        // would otherwise put back exactly what was just removed.
         thread_view.update(cx, |view, cx| {
             view.dismiss_pr(watched[0].clone(), cx);
             assert!(view.watched_prs(cx).is_empty());
@@ -10253,8 +10012,7 @@ pub(crate) mod tests {
             );
         });
 
-        // Asking for it by hand is a different statement, and undoes the
-        // dismissal.
+        // Asking for it by hand undoes the dismissal.
         thread_view.update(cx, |view, cx| {
             view.watch_pr(
                 crate::thread_metadata_store::WatchedPr {
@@ -10267,10 +10025,8 @@ pub(crate) mod tests {
         });
     }
 
-    /// A PR taken out by hand has to be offerable again. `dismiss` moves it
-    /// out of `watched` and into `dismissed`, which nothing else read, so a
-    /// mined PR only this thread ever watched vanished from every source the
-    /// moment it was removed.
+    /// A mined PR only this thread watched used to vanish from every source
+    /// once removed.
     #[gpui::test]
     async fn test_a_removed_pr_is_offered_back_with_its_title(cx: &mut TestAppContext) {
         use crate::thread_metadata_store::{
@@ -10319,8 +10075,7 @@ pub(crate) mod tests {
             merge: gh_status::MergeState::Unknown,
         };
 
-        // The branch was polled once, which is the only place a title ever
-        // comes from.
+        // A branch poll is the only place a title comes from.
         cx.update(|_, cx| {
             ThreadMetadataStore::global(cx).update(cx, |store, cx| {
                 store.update_pr_snapshot(
@@ -10338,8 +10093,7 @@ pub(crate) mod tests {
         thread_view.update(cx, |view, cx| view.dismiss_pr(mined.clone(), cx));
         cx.run_until_parked();
 
-        // And then the branch stops resolving, as it does once the worktree
-        // is gone: nothing is polling for this PR any more.
+        // Then the branch stops resolving, as once the worktree is gone.
         cx.update(|_, cx| {
             ThreadMetadataStore::global(cx).update(cx, |store, cx| {
                 store.update_pr_snapshot(
@@ -10351,8 +10105,7 @@ pub(crate) mod tests {
                     cx,
                 );
             });
-            // Six more recent PRs in other threads, which is what used to
-            // push a removed one out of a list of six.
+            // Six more recent PRs used to push a removed one out of the menu.
             for number in 500..506u64 {
                 let other = ThreadId::new();
                 ThreadMetadataStore::global(cx).update(cx, |store, cx| {
@@ -10410,11 +10163,7 @@ pub(crate) mod tests {
         });
     }
 
-    /// What the agent read is not what the thread is about. A tool call's
-    /// output carries every PR it happened to print — a `gh pr list`, a
-    /// changelog, a search — and mining it filled the set with pull requests
-    /// nobody had seen. Only the agent's own prose counts, and its thinking
-    /// is the agent talking to itself rather than telling anyone anything.
+    /// Only the agent's own prose is mined: not tool output, not thinking.
     #[gpui::test]
     async fn test_only_what_the_thread_said_is_mined(cx: &mut TestAppContext) {
         init_test(cx);
@@ -10428,12 +10177,12 @@ pub(crate) mod tests {
                 acp_v1::ToolCall::new(acp_v1::ToolCallId::new("list"), "gh pr list")
                     .kind(acp_v1::ToolKind::Execute)
                     .status(acp_v1::ToolCallStatus::Completed)
-                    .content(vec![acp_v1::ToolCallContent::Content(acp_v1::Content::new(
-                        acp_v1::ContentBlock::Text(acp_v1::TextContent::new(
+                    .content(vec![acp_v1::ToolCallContent::Content(
+                        acp_v1::Content::new(acp_v1::ContentBlock::Text(acp_v1::TextContent::new(
                             "#5 A thing   https://github.com/owner/name/pull/5\n\
                              #6 Another   https://github.com/owner/name/pull/6",
-                        )),
-                    ))]),
+                        ))),
+                    )]),
             ),
             acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
                 "Opened https://github.com/owner/name/pull/412 for this.".into(),
@@ -10462,17 +10211,10 @@ pub(crate) mod tests {
         );
     }
 
-    /// A tool call whose terminal is still running is an entry the miner
-    /// cannot read yet, and the agent is free to leave one running for the rest
-    /// of the session: a dev server, a watcher, a tail. The resume point used
-    /// to be the lowest entry that had not finished, so one of those held the
-    /// whole thread behind it unread and every pass re-read — and re-allocated
-    /// the markdown of — every entry past it, on every streamed chunk. Now a
-    /// pass reads the entries still arriving and nothing else.
+    /// A command left running used to hold the miner's resume point, so every
+    /// pass re-read every entry after it.
     #[gpui::test]
-    async fn test_a_command_left_running_does_not_make_the_miner_reread(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_a_command_left_running_does_not_make_the_miner_reread(cx: &mut TestAppContext) {
         init_test(cx);
 
         let (conversation_view, cx) =
@@ -10480,8 +10222,6 @@ pub(crate) mod tests {
         let thread_view = active_thread(&conversation_view, cx);
         let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
 
-        // A command with no exit and so no output: an entry that never finishes
-        // arriving, however much arrives after it.
         thread.update(cx, |thread, cx| {
             thread
                 .upsert_tool_call_patch(
@@ -10528,8 +10268,6 @@ pub(crate) mod tests {
             );
         });
 
-        // Every later event runs the miner again, and there is one entry left
-        // for it to read.
         for _ in 0..3 {
             thread_view.update(cx, |view, cx| {
                 view.mine_pr_mentions(cx);
@@ -10542,63 +10280,16 @@ pub(crate) mod tests {
         }
     }
 
-    /// Three or more in one piece of text is a list — a query's answer, a
-    /// release note — and a list says nothing about which PRs a thread is
-    /// about, so none of it joins.
-    #[gpui::test]
-    async fn test_a_message_naming_a_list_of_prs_joins_none(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let connection = StubAgentConnection::new();
-        connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
-            acp_v1::ContentChunk::new(
-                "The open ones are https://github.com/owner/name/pull/1, \
-                 https://github.com/owner/name/pull/2, \
-                 https://github.com/owner/name/pull/3 and \
-                 https://github.com/owner/name/pull/4."
-                    .into(),
-            ),
-        )]);
-
-        let (conversation_view, cx) =
-            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
-        let thread =
-            active_thread(&conversation_view, cx).read_with(cx, |view, _| view.thread.clone());
-        thread
-            .update(cx, |thread, cx| thread.send_raw("Which are open?", cx))
-            .await
-            .unwrap();
-        cx.run_until_parked();
-
-        active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
-            assert!(
-                view.watched_prs(cx).is_empty(),
-                "a message listing four PRs should put none of them in the set"
-            );
-        });
-    }
-
-    /// The one command whose output does count: the one that made the PR.
-    /// The parser decides that from the command line, so a terminal labelled
-    /// `gh pr create` is read and any other would not be.
+    /// Headless, so the run is a plain subprocess: a PTY reader thread makes
+    /// the test scheduler non-deterministic.
     #[cfg(unix)]
-    #[gpui::test]
-    async fn test_a_created_pr_joins_from_the_command_that_made_it(cx: &mut TestAppContext) {
-        init_test(cx);
-        // A real subprocess runs on real threads.
-        cx.executor().allow_parking();
-
-        let (conversation_view, cx) =
-            setup_conversation_view(StubAgentServer::new(StubAgentConnection::new()), cx).await;
-        let thread_view = active_thread(&conversation_view, cx);
-        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
-
-        // Headless, so the run is a plain subprocess: a PTY reader thread
-        // makes the test scheduler non-deterministic.
+    async fn headless_terminal(
+        command: &str,
+        cx: &mut VisualTestContext,
+    ) -> Entity<terminal::Terminal> {
         cx.update(|_, cx| cx.set_global(terminal::HeadlessTerminal(true)));
-        let printed = "https://github.com/owner/name/pull/77";
         let (program, args) = task::ShellBuilder::new(&task::Shell::System, false)
-            .build(Some(format!("echo {printed}")), &[]);
+            .build(Some(command.to_owned()), &[]);
         let builder = cx
             .update(|_, cx| {
                 terminal::TerminalBuilder::new(
@@ -10628,14 +10319,23 @@ pub(crate) mod tests {
             })
             .await
             .unwrap();
-        let lower_terminal = cx.new(|cx| builder.subscribe(cx));
+        cx.new(|cx| builder.subscribe(cx))
+    }
 
-        let terminal_id = acp_v1::TerminalId::new("create-terminal");
-        let terminal = thread.update(cx, |thread, cx| {
-            // The label is what the parser reads, and what the agent ran.
+    /// A running terminal tool call whose label is `command`.
+    #[cfg(unix)]
+    fn register_running_command(
+        thread: &Entity<AcpThread>,
+        id: &str,
+        command: &str,
+        lower_terminal: Entity<terminal::Terminal>,
+        cx: &mut VisualTestContext,
+    ) -> Entity<acp_thread::Terminal> {
+        let terminal_id = acp_v1::TerminalId::new(format!("{id}-terminal"));
+        thread.update(cx, |thread, cx| {
             let terminal = thread.register_terminal_created(
                 terminal_id.clone(),
-                "gh pr create --fill".to_string(),
+                command.to_string(),
                 None,
                 None,
                 lower_terminal,
@@ -10644,43 +10344,72 @@ pub(crate) mod tests {
             thread
                 .handle_session_update(
                     acp_v1::SessionUpdate::ToolCall(
-                        acp_v1::ToolCall::new(acp_v1::ToolCallId::new("create-tool"), "gh pr create")
-                            .kind(acp_v1::ToolKind::Execute)
-                            .status(acp_v1::ToolCallStatus::InProgress)
-                            .content(vec![acp_v1::ToolCallContent::Terminal(acp_v1::Terminal::new(
-                                terminal_id.clone(),
-                            ))]),
+                        acp_v1::ToolCall::new(
+                            acp_v1::ToolCallId::new(format!("{id}-tool")),
+                            command,
+                        )
+                        .kind(acp_v1::ToolKind::Execute)
+                        .status(acp_v1::ToolCallStatus::InProgress)
+                        .content(vec![acp_v1::ToolCallContent::Terminal(
+                            acp_v1::Terminal::new(terminal_id),
+                        )]),
                     ),
                     cx,
                 )
                 .expect("terminal tool call");
             terminal
-        });
+        })
+    }
 
-        // A real process takes as long as it takes to exit, and the output is
-        // only there once it has: a running command has not said what it made.
-        //
-        // Real time, not the executor's, and with a wait between polls: a loop
-        // that only parks spins every core it can reach, which starves the
-        // process it is waiting for and makes the deadline the thing it fails
-        // on. The same shape as the stop-from-chip test, for the same reason.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    /// Polls in real time with a pause between polls: a real process exits on
+    /// its own clock, and a loop that only parks starves it of CPU.
+    #[cfg(unix)]
+    async fn wait_until(
+        cx: &mut VisualTestContext,
+        timeout: std::time::Duration,
+        failure: &str,
+        mut done: impl FnMut(&mut VisualTestContext) -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + timeout;
         loop {
             cx.run_until_parked();
-            if terminal.read_with(cx, |terminal, _| terminal.output().is_some()) {
-                break;
+            if done(cx) {
+                return;
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the command should have exited"
-            );
+            assert!(std::time::Instant::now() < deadline, "{failure}");
             cx.executor()
                 .timer(std::time::Duration::from_millis(50))
                 .await;
         }
+    }
 
-        // Mining reads entries as the thread reports them; the exit arrives
-        // after the last one, so ask for the pass the next event would do.
+    /// The one command whose output counts is the one that made the PR.
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_a_created_pr_joins_from_the_command_that_made_it(cx: &mut TestAppContext) {
+        init_test(cx);
+        // A real subprocess runs on real threads.
+        cx.executor().allow_parking();
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(StubAgentConnection::new()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+
+        let lower_terminal =
+            headless_terminal("echo https://github.com/owner/name/pull/77", cx).await;
+        // The label is what the parser reads.
+        let terminal =
+            register_running_command(&thread, "create", "gh pr create --fill", lower_terminal, cx);
+        wait_until(
+            cx,
+            std::time::Duration::from_secs(60),
+            "the command should have exited",
+            |cx| terminal.read_with(cx, |terminal, _| terminal.output().is_some()),
+        )
+        .await;
+
+        // The exit arrives after the last entry event.
         thread_view.update(cx, |view, cx| view.mine_pr_mentions(cx));
 
         thread_view.read_with(cx, |view, cx| {
@@ -10695,8 +10424,6 @@ pub(crate) mod tests {
         });
     }
 
-    /// Marks are pinned to what an entry carries, not to its index, so the
-    /// agent appending to a thread must not move them onto other rows.
     #[gpui::test]
     async fn test_a_bookmark_stays_on_its_entry_as_a_thread_grows(cx: &mut TestAppContext) {
         init_test(cx);
@@ -14517,21 +14244,10 @@ pub(crate) mod tests {
         })
     }
 
-    /// A command the agent leaves running — a dev server, a watcher, a tail —
-    /// used to need the whole turn stopped to be stopped at all. Its chip now
-    /// offers to kill that one terminal, and says afterwards that it was
-    /// stopped rather than that it failed.
-    #[cfg(unix)]
-    /// A command chip is as wide as its command, up to the chip's cap.
-    ///
-    /// It was as wide as its glyphs: the label had a flex basis of zero inside
-    /// a content-sized chip, so it contributed nothing to the chip's intrinsic
-    /// width and every terminal chip came out the same narrow width with an
-    /// ellipsis in it, whatever the command said.
+    /// The label used to have a flex basis of zero, so every terminal chip came
+    /// out the same narrow width whatever the command said.
     #[gpui::test]
-    async fn test_a_command_chip_is_as_wide_as_its_command_up_to_the_cap(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_a_command_chip_is_as_wide_as_its_command_up_to_the_cap(cx: &mut TestAppContext) {
         use agent_client_protocol::schema::{MaybeUndefined, v2 as acp_v2};
 
         init_test(cx);
@@ -14541,9 +14257,6 @@ pub(crate) mod tests {
         let thread_view = active_thread(&conversation_view, cx);
         let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
 
-        // Two finished commands in the same run, one short and one long. Under
-        // the old basis both chips were the width of their glyphs, so the
-        // difference between these two labels is the whole of the fix.
         for (tool_id, terminal_id, command) in [
             ("short-command", "short-terminal", "ls"),
             (
@@ -14604,26 +14317,12 @@ pub(crate) mod tests {
              got {wide:?} against {short:?} for `ls`"
         );
 
-        // The cap's own half of the behaviour is not asserted here, and it is
-        // worth saying why rather than asserting something weaker: the chip
-        // summarises a command to its first hundred characters before any
-        // layout happens, so two commands long enough to clamp against the cap
-        // already differ in label width before the cap is reached, and the
-        // chip's own bounds are not exposed to tests. The row the chips sit in
-        // is also whatever the fixture makes it, so resizing the window does
-        // not reliably move it.
+        // The cap is not asserted: the chip's own bounds are not exposed to
+        // tests, and labels are truncated before layout.
     }
 
-    /// A run of actions is drawn by its *first* entry and the rest draw
-    /// nothing, so the item whose height changes when a picture inside the run
-    /// is measured is the run's first one. `read_image_shape` remeasured the
-    /// picture's own entry, which for any picture that is not first in its run
-    /// is an `Empty` item, leaving the item that draws the picture measured at
-    /// the placeholder height it was given before the shape was known.
-    ///
-    /// Every remeasure of a thread entry goes through `drawn_item_for_entry`
-    /// now; this pins what that answers for a picture inside a run, which is
-    /// the thing each of those call sites was getting wrong by hand.
+    /// A run of actions is drawn by its first entry, so that is the item every
+    /// remeasure of a picture inside the run has to name.
     #[gpui::test]
     async fn test_a_picture_in_a_run_is_drawn_by_the_runs_first_item(cx: &mut TestAppContext) {
         init_test(cx);
@@ -14634,7 +14333,6 @@ pub(crate) mod tests {
         let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
         let list_state = thread_view.read_with(cx, |view, _| view.list_state.clone());
 
-        // The run's first action: the script that drew the pictures.
         thread.update(cx, |thread, cx| {
             thread
                 .handle_session_update(
@@ -14647,7 +14345,7 @@ pub(crate) mod tests {
                 )
                 .expect("command tool call");
         });
-        // Then two pictures, which join that run rather than starting their own.
+
         for n in 0..2 {
             thread.update(cx, |thread, cx| {
                 thread
@@ -14659,9 +14357,9 @@ pub(crate) mod tests {
                             )
                             .kind(acp_v1::ToolKind::Read)
                             .status(acp_v1::ToolCallStatus::Completed)
-                            .content(vec![acp_v1::ToolCallContent::Content(
-                                acp_v1::Content::new(png_image()),
-                            )]),
+                            .content(vec![
+                                acp_v1::ToolCallContent::Content(acp_v1::Content::new(png_image())),
+                            ]),
                         ),
                         cx,
                     )
@@ -14688,15 +14386,10 @@ pub(crate) mod tests {
              the item every one of their remeasures has to name"
         );
 
-        // The run's own item carries the whole group's height; the entries that
-        // draw nothing have none of it. Remeasuring one of those — which is
-        // what the picture's own index was — could not have fixed anything.
         let run = list_state
             .bounds_for_item(0)
             .expect("the run's item is measured");
-        // Two picture boxes are tens of times a chip row; the exact number
-        // depends on the window's rem size, so the assertion is that the run's
-        // item carries them at all rather than a bare row's worth.
+        // The exact height depends on the window's rem size.
         assert!(
             run.size.height > px(200.),
             "the run's item is as tall as the pictures it draws, not just the \
@@ -14715,6 +14408,9 @@ pub(crate) mod tests {
         }
     }
 
+    /// A command left running can be stopped from its chip without stopping
+    /// the turn, and then reads as stopped rather than failed.
+    #[cfg(unix)]
     #[gpui::test]
     async fn test_a_running_command_can_be_stopped_from_its_chip(cx: &mut TestAppContext) {
         init_test(cx);
@@ -14728,70 +14424,10 @@ pub(crate) mod tests {
         let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
 
         // A real process, since a display terminal has nothing of ours to
-        // kill and must not offer the control at all. Headless, so the run
-        // is a plain subprocess: a PTY reader thread makes the test
-        // scheduler non-deterministic.
-        cx.update(|_, cx| cx.set_global(terminal::HeadlessTerminal(true)));
-        let (program, args) = task::ShellBuilder::new(&task::Shell::System, false)
-            .build(Some("sleep 60".to_owned()), &[]);
-        let builder = cx
-            .update(|_, cx| {
-                terminal::TerminalBuilder::new(
-                    None,
-                    terminal::TerminalMode::task(task::SpawnInTerminal {
-                        command: Some(program.clone()),
-                        args: args.clone(),
-                        ..Default::default()
-                    }),
-                    task::Shell::WithArguments {
-                        program,
-                        args,
-                        title_override: None,
-                    },
-                    collections::HashMap::default(),
-                    terminal::terminal_settings::CursorShape::default(),
-                    terminal::terminal_settings::AlternateScroll::On,
-                    None,
-                    vec![],
-                    std::time::Duration::ZERO,
-                    false,
-                    0,
-                    cx,
-                    vec![],
-                    util::paths::PathStyle::local(),
-                )
-            })
-            .await
-            .unwrap();
-        let lower_terminal = cx.new(|cx| builder.subscribe(cx));
-
-        let terminal_id = acp_v1::TerminalId::new("running-terminal");
-        let tool_id = acp_v1::ToolCallId::new("running-tool");
-        let terminal = thread.update(cx, |thread, cx| {
-            let terminal = thread.register_terminal_created(
-                terminal_id.clone(),
-                "sleep 60".to_string(),
-                None,
-                None,
-                lower_terminal,
-                cx,
-            );
-            assert!(terminal.read(cx).is_process_backed());
-            thread
-                .handle_session_update(
-                    acp_v1::SessionUpdate::ToolCall(
-                        acp_v1::ToolCall::new(tool_id.clone(), "sleep 60")
-                            .kind(acp_v1::ToolKind::Execute)
-                            .status(acp_v1::ToolCallStatus::InProgress)
-                            .content(vec![acp_v1::ToolCallContent::Terminal(acp_v1::Terminal::new(
-                                terminal_id.clone(),
-                            ))]),
-                    ),
-                    cx,
-                )
-                .expect("terminal tool call");
-            terminal
-        });
+        // kill and must not offer the control at all.
+        let lower_terminal = headless_terminal("sleep 60", cx).await;
+        let terminal = register_running_command(&thread, "running", "sleep 60", lower_terminal, cx);
+        terminal.read_with(cx, |terminal, _| assert!(terminal.is_process_backed()));
         cx.run_until_parked();
 
         let stop = cx
@@ -14800,24 +14436,14 @@ pub(crate) mod tests {
 
         cx.simulate_click(stop.center(), gpui::Modifiers::none());
 
-        // Killing a real process is asynchronous, and under a full parallel
-        // run one turn of the executor is not long enough for the kill to be
-        // recorded: this assertion has failed twice in a loaded suite and
-        // passed every time on its own. Poll for it the way the exit below
-        // is polled for.
-        let killed = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            cx.run_until_parked();
-            if terminal.read_with(cx, |terminal, _| terminal.was_stopped_by_user()) {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < killed,
-                "clicking the chip's stop control should kill that one command"
-            );
-        }
+        wait_until(
+            cx,
+            std::time::Duration::from_secs(10),
+            "clicking the chip's stop control should kill that one command",
+            |cx| terminal.read_with(cx, |terminal, _| terminal.was_stopped_by_user()),
+        )
+        .await;
 
-        // The turn is untouched: only the command died.
         thread.read_with(cx, |thread, _| {
             assert!(
                 matches!(thread.status(), ThreadStatus::Idle),
@@ -14825,68 +14451,35 @@ pub(crate) mod tests {
             );
         });
 
-        // A real process takes as long as it takes to die, and under a loaded
-        // machine that is longer than one turn of the executor.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            cx.run_until_parked();
-            if terminal.read_with(cx, |terminal, _| terminal.output().is_some()) {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "timed out waiting for the killed command to report its exit"
-            );
-            cx.executor()
-                .timer(std::time::Duration::from_millis(50))
-                .await;
-        }
+        // Generous: ten seconds failed inside a full-suite run on a loaded
+        // machine.
+        wait_until(
+            cx,
+            std::time::Duration::from_secs(60),
+            "the killed command really did exit non-zero",
+            |cx| {
+                terminal.read_with(cx, |terminal, _| {
+                    terminal.output().is_some_and(|output| output.failed())
+                })
+            },
+        )
+        .await;
 
-        // And a killed command is not a failed one. It exits non-zero like
-        // any other, so the chip has to ask the terminal whether the kill was
-        // deliberate before it draws the failure glyph.
+        // A killed command exits non-zero like any other, so the chip has to
+        // ask whether the kill was deliberate before it draws the failure glyph.
         thread.update(cx, |thread, cx| {
             thread
                 .handle_session_update(
-                    acp_v1::SessionUpdate::ToolCallUpdate(
-                        acp_v1::ToolCallUpdate::new(
-                            tool_id.clone(),
-                            acp_v1::ToolCallUpdateFields::new()
-                                .status(acp_v1::ToolCallStatus::Completed),
-                        ),
-                    ),
+                    acp_v1::SessionUpdate::ToolCallUpdate(acp_v1::ToolCallUpdate::new(
+                        acp_v1::ToolCallId::new("running-tool"),
+                        acp_v1::ToolCallUpdateFields::new()
+                            .status(acp_v1::ToolCallStatus::Completed),
+                    )),
                     cx,
                 )
                 .expect("tool call completion");
         });
-        // The kill is a real failure as far as the terminal is concerned —
-        // it exits 1 — so the chip has to ask whether the kill was deliberate
-        // before it draws the failure glyph. How the exit reaches the
-        // terminal is as asynchronous as the exit itself, so this waits for
-        // the status the same way the exit above is waited for rather than
-        // assuming it arrived in the same turn.
-        // Real time, not the executor's, because the process this waits on is a
-        // real one and virtual time would run the deadline out before it could
-        // exit. Generous, because it only ever waits as long as the exit
-        // actually takes: ten seconds was enough alone and not enough inside a
-        // full-suite run on a loaded machine, which is how it failed on
-        // 2026-09-27 and passed on its own in under a second.
-        let reported = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        loop {
-            cx.run_until_parked();
-            if terminal.read_with(cx, |terminal, _| {
-                terminal.output().is_some_and(|output| output.failed())
-            }) {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < reported,
-                "the killed command really did exit non-zero"
-            );
-            cx.executor()
-                .timer(std::time::Duration::from_millis(50))
-                .await;
-        }
+        cx.run_until_parked();
         assert!(
             cx.debug_bounds("terminal-tool-failed-Some(1)").is_none(),
             "a command the user stopped must not read as one that failed"

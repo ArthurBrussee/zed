@@ -14,14 +14,9 @@ use watch::Receiver;
 
 use crate::Agent;
 
-/// How long the path from opening a thread to the agent answering may take
-/// before the launch is called failed. Generous, because a first launch
-/// installs the agent's package over whatever network the machine has. What it
-/// is really for is the launch that never finishes at all: a spinner that can
-/// spin forever is not a state, it is the absence of one, and a connection
-/// left in `Connecting` is also the entry every later thread joins — which is
-/// how one wedged launch turns into every thread sitting in "loading", saying
-/// nothing.
+/// Generous, since a first launch installs the agent's package. A launch that
+/// never finishes would otherwise leave every later thread joining a
+/// `Connecting` entry forever.
 const LAUNCH_DEADLINE: Duration = Duration::from_secs(180);
 
 pub enum AgentConnectionEntry {
@@ -254,15 +249,9 @@ impl AgentConnectionStore {
                 let started = Instant::now();
                 while let Ok(status) = loading_status_rx.recv().await {
                     let status = status.map(SharedString::from);
-                    // Each step of a launch, as it is reached. A launch that
-                    // stops needs no process sample to say where: the last of
-                    // these lines is the step it stopped at.
+                    // The last of these lines is the step a stuck launch stopped at.
                     if let Some(step) = status.as_ref() {
-                        log::info!(
-                            "quiet-ui launch: {} after {:?}",
-                            step,
-                            started.elapsed()
-                        );
+                        log::info!("quiet-ui launch: {} after {:?}", step, started.elapsed());
                     }
                     let key = key.clone();
                     let entry = entry.clone();
@@ -332,8 +321,6 @@ impl AgentConnectionStore {
             let result = futures::select_biased! {
                 result = connect => result,
                 _ = deadline => {
-                    // Every step of the launch is logged as it is reached, so
-                    // the last line before this one says where it stopped.
                     log::error!(
                         "quiet-ui launch: {agent} did not start within {}s; giving up",
                         LAUNCH_DEADLINE.as_secs()
@@ -361,8 +348,7 @@ impl AgentConnectionStore {
                         );
                         Err(load_error)
                     }
-                    // The cause is the answer — "Too many open files", "No such
-                    // file or directory" — and it only prints under `{:#}`.
+                    // The cause ("Too many open files") only prints under `{:#}`.
                     Err(err) => {
                         log::error!(
                             "quiet-ui launch: {agent} failed after {:?}: {err:#}",
@@ -383,9 +369,6 @@ mod tests {
     use gpui::TestAppContext;
     use std::any::Any;
 
-    /// An agent server whose launch never finishes — the shape a wedged
-    /// spawn, a hung `npm install` or a login shell that never returns all
-    /// take from here.
     struct NeverConnectingAgentServer;
 
     impl AgentServer for NeverConnectingAgentServer {
@@ -436,9 +419,7 @@ mod tests {
         cx.executor().advance_clock(LAUNCH_DEADLINE * 2);
         cx.run_until_parked();
 
-        // The thread that asked gets an error it can see and retry, rather
-        // than a spinner; and the entry the next thread would have joined is
-        // gone, so the next one launches instead of waiting on this one.
+        // The entry is gone, so the next thread launches afresh.
         store.read_with(cx, |store, cx| {
             assert_eq!(
                 store.connection_status(&key, cx),

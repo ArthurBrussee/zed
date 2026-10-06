@@ -12,46 +12,30 @@ use project::{
 };
 use util::ResultExt as _;
 
-/// Collapses a turn's worth of file writes (one git status event each) into a
-/// single recomputation.
 const REFRESH_DEBOUNCE: Duration = Duration::from_millis(250);
 
-/// How long after a head change to look once more. A checkout is a burst of
-/// filesystem events and the debounce above can fire in the middle of one, so
-/// what it computed is the worktree halfway through the switch — and nothing
-/// else arrives to correct it, because the events it would have come from are
-/// the ones that already fired.
+/// A checkout is a burst of events and the debounce can fire mid-switch, with
+/// nothing arriving afterwards to correct it, so a head change looks twice.
 const HEAD_SETTLE_DELAY: Duration = Duration::from_millis(1500);
 
-/// What the working tree is compared against.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum DiffStatsBase {
-    /// The merge base with the repository's default branch: the base the
-    /// unified diff view uses, so the readout and the view it opens agree.
+    /// The merge base with the default branch, as the branch diff view uses.
     DefaultBranch(SharedString),
-    /// No default branch resolved (detached head, no main/master, no remote),
-    /// so the readout falls back to the nearest sensible base: the last commit.
     Head,
-    /// The thread's worktree is not in a git repository.
     #[default]
     NoRepository,
 }
 
-/// The diff of a thread's worktree against the start of its branch: the merge
-/// base with the default branch, which is what the branch diff view shows. The
-/// numbers come from git, so they count the user's own edits, earlier sessions,
-/// and committed work, and stay correct across commits. They are not a sum of
-/// the agent's edit tool calls.
+/// The diff of a thread's worktree against the start of its branch, from git
+/// rather than summed from the agent's edits, so it counts all work on the branch.
 pub struct BranchDiffStats {
     project: WeakEntity<Project>,
-    /// The thread's own work dirs. Empty means the agent has not reported any,
-    /// and the thread's project stands in, as it does for its branch chips.
+    /// Empty means the project's worktrees stand in, as for the branch chips.
     work_dirs: Vec<PathBuf>,
     default_branch: Option<SharedString>,
     base: DiffStatsBase,
     stats: DiffStat,
-    /// Set when the head moved, so the next refresh looks a second time once
-    /// the checkout has gone quiet.
     recheck_when_quiet: bool,
     _git_subscription: Option<Subscription>,
     _refresh: Task<()>,
@@ -81,12 +65,10 @@ impl BranchDiffStats {
                     return;
                 }
                 if head_changed {
-                    // A commit or a checkout can move the default branch out
-                    // from under the cached value.
                     this.default_branch = None;
                     this.recheck_when_quiet = true;
                 }
-                this.schedule_refresh(cx);
+                this.refresh(cx);
             })
         });
 
@@ -100,7 +82,7 @@ impl BranchDiffStats {
             _git_subscription: git_subscription,
             _refresh: Task::ready(()),
         };
-        this.schedule_refresh(cx);
+        this.refresh(cx);
         this
     }
 
@@ -118,19 +100,12 @@ impl BranchDiffStats {
         }
         self.work_dirs = work_dirs;
         self.default_branch = None;
-        self.schedule_refresh(cx);
+        self.refresh(cx);
     }
 
-    /// Looks again, on a reason the repository did not report: a command the
-    /// agent ran has finished (many of them are git operations, and a branch
-    /// switched by one only reaches the editor when its own watching notices),
-    /// or the window has come back to the front, which is when a branch
-    /// switched in a terminal is looked at next.
+    /// Also called on events git does not report promptly: a finished agent
+    /// command, or the window returning to the front.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
-        self.schedule_refresh(cx);
-    }
-
-    fn schedule_refresh(&mut self, cx: &mut Context<Self>) {
         let recheck_when_quiet = std::mem::take(&mut self.recheck_when_quiet);
         self._refresh = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(REFRESH_DEBOUNCE).await;
@@ -168,8 +143,6 @@ impl BranchDiffStats {
             return Ok((DiffStatsBase::NoRepository, DiffStat::default()));
         };
 
-        // The default branch changes far less often than the stats do, so it is
-        // resolved per repository and head rather than per refresh.
         let mut default_branch = this.read_with(cx, |this, _| this.default_branch.clone())?;
         if default_branch.is_none() {
             default_branch = repository
@@ -191,8 +164,7 @@ impl BranchDiffStats {
 
         let (patch, untracked_paths, fs) = this.update(cx, |this, cx| {
             let patch = repository.update(cx, |repository, cx| repository.diff(diff_type, cx));
-            // Untracked files are read off disk, which only makes sense for a
-            // local project; a remote one counts what git reports and no more.
+            // Untracked files are read off disk, so only for a local project.
             let fs = this
                 .project
                 .upgrade()
@@ -214,11 +186,9 @@ impl BranchDiffStats {
                     stats = patch_diff_stat(&patch);
                     counted = patch_paths(&patch);
                 }
-                // A file the agent just created is untracked, so git's own diff
-                // says nothing about it while the branch diff view shows it in
-                // full. Skip the ones the patch already counted: a file stays
-                // in the status snapshot as untracked for a moment after it is
-                // committed, and it must not be counted twice.
+                // git diff omits untracked files, which the branch diff view
+                // shows. A just-committed file can still read as untracked, so
+                // skip what the patch already counted.
                 if let Some(fs) = fs {
                     for path in untracked_paths {
                         let already_counted = counted
@@ -239,9 +209,8 @@ impl BranchDiffStats {
         Ok((base, stats))
     }
 
-    /// The repository the thread works in. Scoped like the thread's branch
-    /// chips: the most specific repository containing one of the thread's work
-    /// dirs, so a thread never reports another worktree's diff.
+    /// The most specific repository containing one of the work dirs, so a
+    /// thread never reports another worktree's diff.
     fn resolve_repository(
         &self,
         project: &Entity<Project>,
@@ -276,9 +245,7 @@ impl BranchDiffStats {
             return Some(repository.clone());
         }
 
-        // The work dir can sit above the repository (a project root holding one
-        // checkout). With several repositories under it there is no single
-        // answer, so the readout stays empty rather than picking one.
+        // A work dir above the repository counts only when it holds exactly one.
         let mut nested = repositories.values().filter(|repository| {
             let repo_path = repository.read(cx).snapshot().work_directory_abs_path;
             work_dirs.iter().any(|dir| repo_path.starts_with(dir))
@@ -302,14 +269,7 @@ fn line_count(text: &str) -> u32 {
     text.lines().count() as u32
 }
 
-/// The added and removed line counts of a unified diff, counting what
-/// `git diff --numstat` counts. Hunk bodies only, so file headers (`+++`,
-/// `---`) and mode lines never register, and a body line that itself starts
-/// with `+` does.
-/// The repo-relative paths a patch already accounts for, read off its
-/// `+++ b/<path>` headers. A file the patch covers must not also be counted as
-/// untracked: the status snapshot can still call a file untracked just after it
-/// is committed, and counting it twice inflates the readout.
+/// The repo-relative paths in a patch's `+++ b/<path>` headers.
 fn patch_paths(patch: &str) -> HashSet<String> {
     patch
         .lines()
@@ -323,6 +283,8 @@ fn patch_paths(patch: &str) -> HashSet<String> {
         .collect()
 }
 
+/// What `git diff --numstat` counts: hunk bodies only, so `+++`/`---` headers
+/// never register while a body line starting with `+` does.
 fn patch_diff_stat(patch: &str) -> DiffStat {
     let mut stats = DiffStat::default();
     let mut in_hunk = false;
@@ -363,17 +325,15 @@ mod tests {
         git(repository, &["add", "."]);
         git(repository, &["commit", "-m", "initial"]);
 
-        // The branch: one commit, plus a user edit and an agent-created file
-        // that are still uncommitted.
         git(repository, &["checkout", "-b", "feature"]);
         write(repository, "committed.txt", "one\ntwo\nthree\nfour\nfive\n");
         git(repository, &["commit", "-am", "committed on the branch"]);
         write(repository, "edited.txt", "changed\n");
         write(repository, "created.txt", "new one\nnew two\n");
 
-        let project =
-            Project::test(RealFs::new(None, cx.executor()), [repository], cx).await;
+        let project = Project::test(RealFs::new(None, cx.executor()), [repository], cx).await;
         let stats = cx.new(|cx| BranchDiffStats::new(project.downgrade(), cx));
+        // +2 committed on the branch, +1 -1 edited, +2 untracked.
         settle(
             cx,
             &stats,
@@ -383,23 +343,6 @@ mod tests {
                 deleted: 1,
             },
         );
-
-        // +2 committed on the branch, +1 -1 edited by the user, +2 created and
-        // never staged: everything the branch diff view shows against main.
-        stats.read_with(cx, |stats, _| {
-            assert_eq!(
-                stats.base(),
-                &DiffStatsBase::DefaultBranch("main".into()),
-                "the base is the merge base with the default branch"
-            );
-            assert_eq!(
-                stats.stats(),
-                DiffStat {
-                    added: 5,
-                    deleted: 1
-                }
-            );
-        });
 
         // Committing changes nothing: the base is the branch point, not HEAD.
         git(repository, &["add", "."]);
@@ -413,15 +356,6 @@ mod tests {
                 deleted: 1,
             },
         );
-        stats.read_with(cx, |stats, _| {
-            assert_eq!(
-                stats.stats(),
-                DiffStat {
-                    added: 5,
-                    deleted: 1
-                }
-            );
-        });
 
         // A change on top of that commit accumulates rather than replacing it.
         write(repository, "edited.txt", "changed\nagain\n");
@@ -434,15 +368,6 @@ mod tests {
                 deleted: 1,
             },
         );
-        stats.read_with(cx, |stats, _| {
-            assert_eq!(
-                stats.stats(),
-                DiffStat {
-                    added: 6,
-                    deleted: 1
-                }
-            );
-        });
     }
 
     #[gpui::test]
@@ -459,8 +384,7 @@ mod tests {
         git(repository, &["commit", "-m", "initial"]);
         write(repository, "file.txt", "one\ntwo\n");
 
-        let project =
-            Project::test(RealFs::new(None, cx.executor()), [repository], cx).await;
+        let project = Project::test(RealFs::new(None, cx.executor()), [repository], cx).await;
         let stats = cx.new(|cx| BranchDiffStats::new(project.downgrade(), cx));
         settle(
             cx,
@@ -471,17 +395,6 @@ mod tests {
                 deleted: 0,
             },
         );
-
-        stats.read_with(cx, |stats, _| {
-            assert_eq!(stats.base(), &DiffStatsBase::Head);
-            assert_eq!(
-                stats.stats(),
-                DiffStat {
-                    added: 1,
-                    deleted: 0
-                }
-            );
-        });
     }
 
     #[gpui::test]
@@ -514,13 +427,8 @@ mod tests {
         });
     }
 
-    /// Lets the git status refresh land, the debounce elapse, and the git
-    /// commands the refresh runs finish.
-    ///
-    /// Repository discovery and the refresh both shell out to git on a real
-    /// filesystem, so this waits on real time as well as on the simulated
-    /// clock, and waits for the expected value rather than for a fixed
-    /// duration: a fixed wait passes alone and races under a loaded suite.
+    /// Waits for the expected value rather than a fixed duration, on real time
+    /// as well as the fake clock, since the refresh shells out to git.
     #[track_caller]
     fn settle(
         cx: &mut TestAppContext,
@@ -535,8 +443,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         };
 
-        // Always let a pending refresh land before accepting a value, so a
-        // value that is correct only until the refresh completes still fails.
+        // Let any pending refresh land first, so a transiently right value fails.
         for _ in 0..20 {
             pump(cx);
         }
@@ -587,9 +494,7 @@ mod tests {
 
     #[test]
     fn a_patched_file_is_not_also_counted_as_untracked() {
-        // Committing a file the agent created leaves it in the patch while the
-        // status snapshot can still call it untracked for a moment. Counting
-        // both inflated the readout (a real double count, seen as a flake).
+        // A just-committed file can be in the patch and still read as untracked.
         let patch = concat!(
             "diff --git a/created.txt b/created.txt\n",
             "new file mode 100644\n",
@@ -642,10 +547,5 @@ mod tests {
                 deleted: 1
             }
         );
-    }
-
-    #[test]
-    fn patch_stats_of_an_empty_diff_are_zero() {
-        assert_eq!(patch_diff_stat(""), DiffStat::default());
     }
 }

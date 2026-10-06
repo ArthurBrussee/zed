@@ -1,10 +1,7 @@
-//! Sends diff review comments (collected in any editor with the diff review
-//! overlay enabled, e.g. the uncommitted/branch/commit diff views) to the
-//! workspace's active agent thread as a single message.
+//! Sends diff review comments to the workspace's agent thread as one message.
 
 use crate::AgentPanel;
 use acp_thread::ThreadStatus;
-use agent_client_protocol::schema::v1 as acp;
 use agent_client_protocol::schema::v2 as acp_v2;
 use editor::{Editor, TakenReviewComment};
 use gpui::{App, Entity, SharedString, Task, Window};
@@ -14,8 +11,6 @@ use util::ResultExt as _;
 use util::paths::PathStyle;
 use workspace::Workspace;
 
-/// The diff editors in `workspace` that currently hold pending review
-/// comments, deduplicated by entity id.
 fn workspace_review_editors(workspace: &Entity<Workspace>, cx: &App) -> Vec<Entity<Editor>> {
     let mut editors: Vec<Entity<Editor>> = Vec::new();
     for item in workspace.read(cx).items(cx) {
@@ -36,8 +31,6 @@ fn workspace_review_editors(workspace: &Entity<Workspace>, cx: &App) -> Vec<Enti
     editors
 }
 
-/// Number of review comments pending across the workspace's diff editors. Used
-/// to surface the "N review comments will be attached" indicator by the input.
 pub(crate) fn pending_review_comment_count(workspace: &Entity<Workspace>, cx: &App) -> usize {
     workspace_review_editors(workspace, cx)
         .iter()
@@ -45,9 +38,8 @@ pub(crate) fn pending_review_comment_count(workspace: &Entity<Workspace>, cx: &A
         .sum()
 }
 
-/// Take the pending review comments out of every diff editor in the workspace
-/// and compose them into content blocks (one per editor) to attach to the next
-/// outgoing message. This empties the editors' comment state.
+/// One block per editor, to attach to the next outgoing message. Empties the
+/// editors' comment state.
 pub(crate) fn take_pending_review_blocks(
     workspace: &Entity<Workspace>,
     cx: &mut App,
@@ -61,13 +53,13 @@ pub(crate) fn take_pending_review_blocks(
             continue;
         }
         let message = compose_review_message(&editor, &comments, "", path_style, cx);
-        blocks.push(acp_v2::ContentBlock::Text(acp_v2::TextContent::new(message)));
+        blocks.push(acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+            message,
+        )));
     }
     blocks
 }
 
-/// Discard the pending review comments in the workspace's diff editors without
-/// sending them (the input's "clear" affordance).
 pub(crate) fn clear_pending_review_comments(workspace: &Entity<Workspace>, cx: &mut App) {
     for editor in workspace_review_editors(workspace, cx) {
         editor.update(cx, |editor, cx| {
@@ -76,8 +68,6 @@ pub(crate) fn clear_pending_review_comments(workspace: &Entity<Workspace>, cx: &
     }
 }
 
-/// Takes the review comments out of `editor` and sends them, plus an optional
-/// summary, to the active agent thread of the editor's workspace.
 pub(crate) fn send_review_to_agent(
     editor: &Entity<Editor>,
     summary: String,
@@ -114,9 +104,7 @@ pub(crate) fn send_review_to_agent(
     let message = compose_review_message(editor, &comments, summary.trim(), path_style, cx);
     let block = acp_v2::ContentBlock::Text(acp_v2::TextContent::new(message));
 
-    // Prefer the thread's view so the message goes through the normal send
-    // flow (and queues instead of interrupting a running turn). Fall back to
-    // sending on the thread directly.
+    // The thread's view queues instead of interrupting a running turn.
     if let Some(thread_view) = panel.read(cx).active_thread_view(cx) {
         let is_generating = thread.read(cx).status() != ThreadStatus::Idle;
         thread_view.update(cx, |thread_view, cx| {
@@ -140,10 +128,7 @@ pub(crate) fn send_review_to_agent(
     }
 }
 
-/// The first line of a composed review block. It states the comment count so
-/// that a sent review can be recognized in a user message's content and
-/// rendered as the same compact chip the input shows, instead of a wall of
-/// quoted diff.
+/// States the count so a sent review can be recognized and rendered as a chip.
 fn review_message_header(comment_count: usize) -> String {
     format!(
         "I reviewed the changes and left {comment_count} review comment{} below. Please address them.",
@@ -151,13 +136,7 @@ fn review_message_header(comment_count: usize) -> String {
     )
 }
 
-/// One comment recovered from a composed review block: enough structure for the
-/// message renderer to show it the way the diff shows it (path, line range,
-/// quoted code, comment text) instead of a wall of quoted diff.
 #[derive(Debug, Clone, PartialEq, Eq)]
-// Fields are read by the message-bubble renderer in thread_view.rs (owned by
-// the message-side rendering pass); the backend only produces them.
-#[allow(dead_code)]
 pub(crate) struct ReviewComment {
     pub path: SharedString,
     /// 1-based inclusive line range, when the comment names one.
@@ -166,64 +145,28 @@ pub(crate) struct ReviewComment {
     pub comment: SharedString,
 }
 
-/// A composed review block parsed back into its parts: the stated comment count,
-/// the structured per-comment data, and the raw composed text (still the source
-/// of truth for a plain expandable rendering).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ParsedReview {
-    pub comment_count: usize,
-    // Consumed by the message-bubble renderer (see ReviewComment).
-    #[allow(dead_code)]
     pub comments: Vec<ReviewComment>,
-    pub raw_text: SharedString,
 }
 
-/// The review blocks in a sent (or queued) message's content, parsed into their
-/// per-comment structure. A block is detected purely by its counted header, so
-/// this works identically on the queued path, where the block rides along as its
-/// own `ContentBlock` unchanged.
-pub(crate) fn review_comment_blocks<B: ReviewBlockText>(chunks: &[B]) -> Vec<ParsedReview> {
+/// Detected purely by the counted header, so sent and queued messages alike.
+pub(crate) fn review_comment_blocks(chunks: &[acp_v2::ContentBlock]) -> Vec<ParsedReview> {
     chunks
         .iter()
-        .filter_map(|chunk| parse_review_message(chunk.review_text()?))
+        .filter_map(|chunk| parse_review_message(block_text(chunk)?))
         .collect()
 }
 
-/// A block this module can read the text of. A message the user has sent
-/// carries the protocol's v2 blocks; the queue still composes v1 ones, and a
-/// review block is detected by its text either way.
-pub(crate) trait ReviewBlockText {
-    fn review_text(&self) -> Option<&str>;
-}
-
-impl ReviewBlockText for acp::ContentBlock {
-    fn review_text(&self) -> Option<&str> {
-        match self {
-            acp::ContentBlock::Text(text) => Some(&text.text),
-            _ => None,
-        }
+fn block_text(block: &acp_v2::ContentBlock) -> Option<&str> {
+    match block {
+        acp_v2::ContentBlock::Text(text) => Some(&text.text),
+        _ => None,
     }
 }
 
-impl ReviewBlockText for acp_v2::ContentBlock {
-    fn review_text(&self) -> Option<&str> {
-        match self {
-            acp_v2::ContentBlock::Text(text) => Some(&text.text),
-            _ => None,
-        }
-    }
-}
 
-/// The review blocks in a sent message's content, as `(comment count, text)`.
-pub(crate) fn review_blocks<B: ReviewBlockText>(chunks: &[B]) -> Vec<(usize, SharedString)> {
-    review_comment_blocks(chunks)
-        .into_iter()
-        .map(|parsed| (parsed.comment_count, parsed.raw_text))
-        .collect()
-}
-
-/// The `` `path` lines A-B: `` header line for one comment. Compose and parse
-/// share it so they stay exact inverses.
+/// Shared by compose and parse so they stay exact inverses.
 fn comment_header_line(path: &str, line_range: Option<(u32, u32)>) -> String {
     match line_range {
         Some((start, end)) if start != end => format!("`{path}` lines {start}-{end}:"),
@@ -232,8 +175,6 @@ fn comment_header_line(path: &str, line_range: Option<(u32, u32)>) -> String {
     }
 }
 
-/// Parses a comment header line back into `(path, line_range)`, or `None` when
-/// the line is not one.
 fn parse_comment_header(line: &str) -> Option<(SharedString, Option<(u32, u32)>)> {
     let line = line.trim_end();
     let rest = line.strip_prefix('`')?;
@@ -263,13 +204,10 @@ fn parse_comment_header(line: &str) -> Option<(SharedString, Option<(u32, u32)>)
     Some((SharedString::from(path.to_string()), line_range))
 }
 
-/// Parses a composed review block back into its per-comment structure. Returns
-/// `None` when `text` is not a review block (its first line does not state a
-/// count via `review_message_header`). A trailing summary (only the explicit
-/// `SendReviewToAgent` action supplies one, and it does so empty) is folded into
-/// the last comment's text, since it is not delimited by a header.
+/// A trailing summary has no header to delimit it, so it folds into the last
+/// comment's text.
 pub(crate) fn parse_review_message(text: &str) -> Option<ParsedReview> {
-    let comment_count = review_block_comment_count(text)?;
+    review_block_comment_count(text)?;
 
     let lines: Vec<&str> = text.lines().collect();
     let header_indices: Vec<usize> = lines
@@ -303,29 +241,21 @@ pub(crate) fn parse_review_message(text: &str) -> Option<ParsedReview> {
         });
     }
 
-    Some(ParsedReview {
-        comment_count,
-        comments,
-        raw_text: SharedString::from(text.to_string()),
-    })
+    Some(ParsedReview { comments })
 }
 
-/// A sent message's content without its review blocks: what the user actually
-/// typed. The review itself renders as a chip, not as quoted diff.
-pub(crate) fn without_review_blocks<B: ReviewBlockText>(chunks: Vec<B>) -> Vec<B> {
+pub(crate) fn without_review_blocks(
+    chunks: Vec<acp_v2::ContentBlock>,
+) -> Vec<acp_v2::ContentBlock> {
     chunks
         .into_iter()
         .filter(|chunk| {
-            chunk
-                .review_text()
-                .is_none_or(|text| review_block_comment_count(text).is_none())
+            block_text(chunk).is_none_or(|text| review_block_comment_count(text).is_none())
         })
         .collect()
 }
 
-/// The number of review comments in a composed review block, or `None` when the
-/// text is not one.
-pub(crate) fn review_block_comment_count(text: &str) -> Option<usize> {
+fn review_block_comment_count(text: &str) -> Option<usize> {
     let first_line = text.lines().next()?.trim();
     let count = first_line
         .strip_prefix("I reviewed the changes and left ")?
@@ -336,8 +266,6 @@ pub(crate) fn review_block_comment_count(text: &str) -> Option<usize> {
     (first_line == review_message_header(count)).then_some(count)
 }
 
-/// Resolves the editor-relative data (line range, quoted code) for one taken
-/// comment into the structured `ReviewComment` the composed message serializes.
 fn review_comment_from_taken(
     comment: &TakenReviewComment,
     snapshot: &multi_buffer::MultiBufferSnapshot,
@@ -369,9 +297,7 @@ fn review_comment_from_taken(
     }
 }
 
-/// Serializes a whole review into one message: a counted header, then per
-/// comment its path, line range, quoted code, and comment text, then an optional
-/// summary. Inverse of `parse_review_message`.
+/// Inverse of `parse_review_message`.
 fn serialize_review(comments: &[ReviewComment], summary: &str) -> String {
     let mut message = review_message_header(comments.len());
     message.push('\n');
@@ -398,8 +324,6 @@ fn serialize_review(comments: &[ReviewComment], summary: &str) -> String {
     message
 }
 
-/// One message for the whole review: per comment the file path, line range,
-/// quoted code, and comment text, then an optional summary.
 fn compose_review_message(
     editor: &Entity<Editor>,
     comments: &[TakenReviewComment],
@@ -485,10 +409,8 @@ mod tests {
              Looks fine otherwise\n"
         );
 
-        // A sent review is recognizable in the message's content, so the user
-        // message renders it as a chip instead of the composed wall of text.
-        let user_text = acp::ContentBlock::Text(acp::TextContent::new("please fix"));
-        let review = acp::ContentBlock::Text(acp::TextContent::new(message.clone()));
+        let user_text = acp_v2::ContentBlock::Text(acp_v2::TextContent::new("please fix"));
+        let review = acp_v2::ContentBlock::Text(acp_v2::TextContent::new(message.clone()));
         let chunks = vec![user_text.clone(), review];
 
         assert_eq!(review_block_comment_count(&message), Some(1));
@@ -501,26 +423,16 @@ mod tests {
             "only the counted header is a review block"
         );
 
-        let blocks = review_blocks(&chunks);
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].0, 1);
-        assert_eq!(blocks[0].1.as_ref(), message);
 
-        // The composed block parses back into structured per-comment data, so
-        // the message renderer can show it the way the diff does rather than as
-        // a wall of quoted text. The pending-review pipeline
-        // (`take_pending_review_blocks`) always composes with an empty summary,
-        // which is the case the structured parse targets (a trailing summary has
-        // no header to delimit it and would fold into the last comment).
+        // The pending-review pipeline composes with an empty summary.
         let pipeline_message =
             cx.update(|_, cx| compose_review_message(&editor, &comments, "", path_style, cx));
-        let pipeline_chunks = vec![acp::ContentBlock::Text(acp::TextContent::new(
-            pipeline_message.clone(),
+        let pipeline_chunks = vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+            pipeline_message,
         ))];
         let parsed = review_comment_blocks(&pipeline_chunks);
         assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].comment_count, 1);
-        assert_eq!(parsed[0].raw_text.as_ref(), pipeline_message);
+
         assert_eq!(
             parsed[0].comments,
             vec![ReviewComment {
@@ -540,8 +452,6 @@ mod tests {
 
     #[test]
     fn test_parse_review_message_variants() {
-        // Single line (no code fence), multi-line range, and whole-file forms
-        // all round-trip through serialize/parse.
         let comments = vec![
             ReviewComment {
                 path: "src/a.rs".into(),
@@ -567,10 +477,9 @@ mod tests {
         assert_eq!(review_block_comment_count(&message), Some(3));
 
         let parsed = parse_review_message(&message).expect("valid review block");
-        assert_eq!(parsed.comment_count, 3);
+
         assert_eq!(parsed.comments, comments);
 
-        // A plain message is not a review block.
         assert!(parse_review_message("just a message").is_none());
     }
 }

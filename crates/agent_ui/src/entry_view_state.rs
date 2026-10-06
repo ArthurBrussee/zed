@@ -50,13 +50,8 @@ pub struct EntryViewState {
     expanded_compactions: HashSet<usize>,
     expanded_tool_calls: HashSet<acp_v1::ToolCallId>,
     user_collapsed_tool_calls: HashSet<acp_v1::ToolCallId>,
-    /// Whether `entries` holds this thread's views. A thread that has been off
-    /// screen long enough drops them (see `ThreadView::drop_entry_views`) and
-    /// builds them again from the same entries when it comes back, so the
-    /// threads left open all day cost their view tree only while someone is
-    /// looking at one. Everything else here is keyed by entry index or tool
-    /// call id rather than by view, so it survives the drop and the thread
-    /// returns with its expansions intact.
+    /// False while an off-screen thread has dropped its views. Everything else
+    /// here is keyed by index or id, so it survives the drop.
     views_built: bool,
 }
 
@@ -89,15 +84,12 @@ impl EntryViewState {
         self.views_built
     }
 
-    /// Drops every per-entry view. The caller is responsible for the list state
-    /// that holds their focus handles.
+    /// The caller is responsible for the list state holding their focus handles.
     pub fn drop_views(&mut self) {
         self.entries.clear();
         self.views_built = false;
     }
 
-    /// Opens the gate `sync_entry` closes while the views are dropped. Called
-    /// once by the rebuild, immediately before it syncs every entry.
     pub fn mark_views_built(&mut self) {
         self.views_built = true;
     }
@@ -203,9 +195,7 @@ impl EntryViewState {
         false
     }
 
-    // Thoughts no longer expand in the transcript (their full text is a hover
-    // card), so nothing in production toggles them; the thread-search test still
-    // drives this to assert expanded thinking content is searchable.
+    // Thoughts no longer expand in the transcript; only tests toggle them.
     #[cfg(test)]
     pub(crate) fn toggle_thinking_block_expansion(&mut self, key: (usize, usize), cx: &App) {
         match AgentSettings::get_global(cx).thinking_display {
@@ -284,10 +274,7 @@ impl EntryViewState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // A thread whose views are dropped has no `entries` to sync into, and
-        // the rebuild syncs every entry anyway. Both of the callers that reach
-        // here while the agent works on an off-screen thread (a new entry, an
-        // updated one) are answered by that rebuild.
+        // The rebuild syncs every entry anyway.
         if !self.views_built {
             return;
         }
@@ -300,8 +287,7 @@ impl EntryViewState {
                 let can_rewind = thread.read(cx).supports_truncate(cx);
                 let has_client_id = message.client_id.is_some();
                 let is_subagent = thread.read(cx).parent_session_id().is_some();
-                // Attached review comments render as a chip next to the
-                // message, not as the wall of quoted diff they compose into.
+                // Attached review comments render as a chip instead.
                 let source_blocks = crate::diff_review::without_review_blocks(
                     message.content.source_blocks().to_vec(),
                 );
@@ -349,9 +335,7 @@ impl EntryViewState {
                         if !is_editable {
                             editor.set_read_only(true, cx);
                         }
-                        // The editor sits inside the accent-tinted message
-                        // bubble; its own background would paint over the
-                        // tint.
+                        // Its own background would paint over the bubble's tint.
                         editor.set_transparent_background(true, cx);
                         editor.set_source_message(source_blocks, window, cx);
                         editor
@@ -400,25 +384,24 @@ impl EntryViewState {
                 let workspace = self.workspace.clone();
                 let project = self.project.clone();
 
-                let tool_call_entry = if let Some(Entry::ToolCall(tool_call)) =
-                    self.entries.get_mut(index)
-                {
-                    tool_call
-                } else {
-                    self.set_entry(
-                        index,
-                        Entry::ToolCall(ToolCallEntry {
-                            content: HashMap::default(),
-                            patch_hunk_ids: HashSet::default(),
-                            terminals_seen: HashSet::default(),
-                            focus_handle: cx.focus_handle(),
-                        }),
-                    );
-                    let Some(Entry::ToolCall(tool_call)) = self.entries.get_mut(index) else {
-                        unreachable!()
+                let tool_call_entry =
+                    if let Some(Entry::ToolCall(tool_call)) = self.entries.get_mut(index) {
+                        tool_call
+                    } else {
+                        self.set_entry(
+                            index,
+                            Entry::ToolCall(ToolCallEntry {
+                                content: HashMap::default(),
+                                patch_hunk_ids: HashSet::default(),
+                                terminals_seen: HashSet::default(),
+                                focus_handle: cx.focus_handle(),
+                            }),
+                        );
+                        let Some(Entry::ToolCall(tool_call)) = self.entries.get_mut(index) else {
+                            unreachable!()
+                        };
+                        tool_call
                     };
-                    tool_call
-                };
                 let ToolCallEntry {
                     content: views,
                     terminals_seen,
@@ -428,14 +411,8 @@ impl EntryViewState {
                 for terminal in terminals {
                     let terminal_id = terminal.entity_id();
                     if terminals_seen.insert(terminal_id) {
-                        // A command that has already exited the first time this
-                        // entry is synced is history being replayed, not a
-                        // command that just started, and `expand_terminal_card`
-                        // is about the latter. Opening every command in a
-                        // restored thread was both wrong (the fork's card is a
-                        // quiet one-line chip) and the reason a loaded thread
-                        // built a terminal view per command in its history. A
-                        // failure still opens itself, through `auto_expanded`.
+                        // A command already exited when first synced is history
+                        // being replayed, not one that just started.
                         let already_finished =
                             is_tool_call_completed && terminal.read(cx).output().is_some();
                         if !already_finished {
@@ -457,14 +434,9 @@ impl EntryViewState {
                         }
                     }
 
-                    // The output is only drawn while the call is open, and in a
-                    // long thread almost none of them are. A `TerminalView` and
-                    // the `BlinkManager` behind it per command, for every
-                    // command the thread ever ran, is what the thread being
-                    // read was holding — and the off-screen sweep cannot help
-                    // the one thread that is on screen. Built when something
-                    // asks to see it; the toggles that open a call sync the
-                    // entry again so the view is there for the next frame.
+                    // The output is only drawn while the call is open, so a
+                    // view per command in a long thread is mostly waste. The
+                    // toggles that open a call sync the entry again.
                     if terminal_output_wanted {
                         views.entry(terminal_id).or_insert_with(|| {
                             create_terminal(
@@ -592,9 +564,7 @@ impl EntryViewState {
     }
 
     pub fn remove(&mut self, range: Range<usize>) {
-        // The reindexing below still has to happen with the views dropped: a
-        // thread truncated while off screen comes back with its expansions
-        // pointing at the entries that are left.
+        // The reindexing below still applies with the views dropped.
         if self.views_built {
             self.entries.drain(range.clone());
         }
@@ -697,11 +667,8 @@ impl AssistantMessageEntry {
 pub struct ToolCallEntry {
     content: HashMap<EntityId, AnyEntity>,
     patch_hunk_ids: HashSet<EntityId>,
-    /// The terminals this call has reported, whether or not a view was built
-    /// for one. A terminal's view is only built once something asks to see it,
-    /// so `content` can no longer stand in for "have we met this terminal
-    /// before" — which is what decides whether the card auto-expands and when
-    /// a command has carried on past its turn.
+    /// `content` holds views only for opened calls, so it cannot say whether
+    /// a terminal has been seen before.
     terminals_seen: HashSet<EntityId>,
     focus_handle: FocusHandle,
 }
@@ -1135,12 +1102,13 @@ mod tests {
         });
     }
 
-    /// A thread that goes off screen drops its views, keeps taking entries while
-    /// it is away, and comes back with a view for every one of them — including
-    /// the ones that arrived while it had none.
-    #[gpui::test]
-    async fn test_dropped_views_are_rebuilt_with_the_entries_that_arrived_meanwhile(
+    async fn setup_view_state(
         cx: &mut TestAppContext,
+    ) -> (
+        Rc<StubAgentConnection>,
+        gpui::Entity<acp_thread::AcpThread>,
+        gpui::Entity<EntryViewState>,
+        &mut gpui::VisualTestContext,
     ) {
         init_test(cx);
 
@@ -1163,7 +1131,6 @@ mod tests {
             })
             .await
             .unwrap();
-        let session_id = thread.update(cx, |thread, _| thread.session_id().clone());
 
         let view_state = cx.new(|_cx| {
             EntryViewState::new(
@@ -1174,6 +1141,15 @@ mod tests {
                 "Test Agent".into(),
             )
         });
+        (connection, thread, view_state, cx)
+    }
+
+    #[gpui::test]
+    async fn test_dropped_views_are_rebuilt_with_the_entries_that_arrived_meanwhile(
+        cx: &mut TestAppContext,
+    ) {
+        let (connection, thread, view_state, cx) = setup_view_state(cx).await;
+        let session_id = thread.update(cx, |thread, _| thread.session_id().clone());
 
         cx.update(|_, cx| {
             connection.send_update(
@@ -1195,16 +1171,13 @@ mod tests {
             ));
         });
 
-        // Off screen: the views go.
         view_state.update(cx, |view_state, _cx| view_state.drop_views());
         view_state.read_with(cx, |view_state, _cx| {
             assert!(!view_state.views_are_built());
             assert!(view_state.entry(0).is_none());
         });
 
-        // The agent keeps working. Syncing an entry while the views are dropped
-        // is the no-op that keeps this from indexing past the end of an empty
-        // list, which is what a running thread would otherwise do here.
+        // Syncing while dropped must be a no-op rather than index past the end.
         cx.update(|_, cx| {
             connection.send_update(
                 session_id.clone(),
@@ -1224,8 +1197,6 @@ mod tests {
             assert!(view_state.entry(1).is_none());
         });
 
-        // Back on screen: a view per entry, the one from while it was away
-        // included.
         let count = thread.read_with(cx, |thread, _cx| thread.entries().len());
         assert_eq!(count, 2);
         view_state.update_in(cx, |view_state, window, cx| {
@@ -1244,84 +1215,29 @@ mod tests {
         });
     }
 
-    /// Truncating a thread while its views are dropped still moves the
-    /// expansions the remaining entries carry, so the thread does not come back
-    /// with a compaction expanded that belongs to an entry that is gone.
     #[gpui::test]
     async fn test_truncation_while_dropped_still_reindexes_expansions(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree("/project", json!({})).await;
-        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
-
-        let (multi_workspace, cx) =
-            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
-        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
-
-        let view_state = cx.new(|_cx| {
-            EntryViewState::new(
-                workspace.downgrade(),
-                project.downgrade(),
-                None,
-                Arc::new(RwLock::new(SessionCapabilities::default())),
-                "Test Agent".into(),
-            )
-        });
+        let (_connection, _thread, view_state, cx) = setup_view_state(cx).await;
 
         view_state.update(cx, |view_state, _cx| {
             view_state.toggle_compaction_expansion(3);
             assert!(view_state.is_compaction_expanded(3));
             view_state.drop_views();
-            // The drain is skipped (there is nothing to drain), the reindexing
-            // is not.
             view_state.remove(0..2);
             assert!(!view_state.is_compaction_expanded(3));
             assert!(view_state.is_compaction_expanded(1));
         });
     }
 
-    /// A command that had already finished the first time its entry was synced
-    /// — every command in a thread restored from history — gets no terminal
-    /// view, because nothing is drawing its output. Opening the call is what
-    /// builds one.
+    /// A command already finished when first synced (history being restored)
+    /// gets no terminal view until the call is opened.
     #[gpui::test]
     async fn test_a_finished_commands_output_has_no_view_until_the_call_is_opened(
         cx: &mut TestAppContext,
     ) {
         use agent_client_protocol::schema::{MaybeUndefined, v2 as acp_v2};
 
-        init_test(cx);
-
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree("/project", json!({})).await;
-        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
-
-        let (multi_workspace, cx) =
-            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
-        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
-
-        let connection = Rc::new(StubAgentConnection::new());
-        let thread = cx
-            .update(|_, cx| {
-                connection.clone().new_session(
-                    project.clone(),
-                    PathList::new(&[Path::new(path!("/project"))]),
-                    cx,
-                )
-            })
-            .await
-            .unwrap();
-
-        let view_state = cx.new(|_cx| {
-            EntryViewState::new(
-                workspace.downgrade(),
-                project.downgrade(),
-                None,
-                Arc::new(RwLock::new(SessionCapabilities::default())),
-                "Test Agent".into(),
-            )
-        });
+        let (_connection, thread, view_state, cx) = setup_view_state(cx).await;
 
         // A finished command, exit status and all, before anything draws it.
         thread.update(cx, |thread, cx| {

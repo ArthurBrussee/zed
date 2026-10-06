@@ -24,11 +24,8 @@ use crate::{
     ToggleThinkingEffortMenu,
 };
 
-/// The external (ACP) agent's counterpart to the native agent's merged
-/// model/effort/fast-mode picker: one input-bar trigger reading the agent's
-/// salient values, opening one popover with a section per config option the
-/// agent advertises. The agent decides which options exist; nothing here is
-/// keyed on a specific option id.
+/// One trigger opening one popover with a section per advertised option; the
+/// external agent's counterpart to the native model/effort/fast-mode picker.
 pub struct ConfigOptionsView {
     config_options: Rc<dyn AgentSessionConfigOptions>,
     agent_server: Rc<dyn AgentServer>,
@@ -85,9 +82,7 @@ impl ConfigOptionsView {
         cx.new(|cx| ConfigOptionsMenu::new(config_options, agent_server, fs, cx))
     }
 
-    /// Opens the one settings popover, if the agent advertises an option of this
-    /// category at all. There is no per-category popover to open: the category's
-    /// section lives in the same popover as every other option's.
+    /// Every category's section lives in the same single popover.
     pub fn toggle_category_picker(
         &mut self,
         category: acp::SessionConfigOptionCategory,
@@ -224,16 +219,14 @@ impl ConfigOptionsView {
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        // Config option updates can mutate option values for existing IDs (for
-        // example, reasoning levels after a model switch). The menu reads the
-        // options on every render, so only the cached ids need refreshing.
+        // The menu reads the options on every render, so only the cached ids
+        // need refreshing.
         self.config_option_ids = Self::config_option_ids(&self.config_options);
         self.menu.update(cx, |_, cx| cx.notify());
         cx.notify();
     }
 
-    /// The trigger's label: the current value of every select option, joined the
-    /// way the native picker joins model and effort ("Sonnet 4.5 / High").
+    /// Joined the way the native picker joins model and effort ("Sonnet 4.5 / High").
     fn trigger_label(&self) -> SharedString {
         let values = self
             .config_options
@@ -269,9 +262,7 @@ impl Render for ConfigOptionsView {
             (Color::Muted, IconName::ChevronDown)
         };
 
-        // An enabled boolean (web search, fast mode, ...) has no room in the
-        // label, so it takes over the leading icon slot the way fast mode does
-        // in the native picker.
+        // An enabled boolean has no room in the label, so it takes the icon slot.
         let enabled_boolean = options.iter().any(|option| {
             matches!(&option.kind, acp::SessionConfigKind::Boolean(boolean) if boolean.current_value)
         });
@@ -413,9 +404,6 @@ fn config_options_tooltip(
     })
 }
 
-/// The one popover: a section per config option the agent advertises. Select
-/// options list their values (favorites first, star to favorite); boolean
-/// options render a switch.
 struct ConfigOptionsMenu {
     config_options: Rc<dyn AgentSessionConfigOptions>,
     agent_server: Rc<dyn AgentServer>,
@@ -611,10 +599,8 @@ impl Render for ConfigOptionsMenu {
 
         v_flex()
             .track_focus(&self.focus_handle)
-            // PopoverMenu draws exactly the view it is handed, so a menu with
-            // no surface of its own reads straight through to the thread
-            // behind it. This is the same surface the sandbox tooltip and the
-            // mention image hover use.
+            // PopoverMenu draws the view bare; without a surface the thread
+            // shows through.
             .elevation_2(cx)
             .min_w(rems(16.))
             .p_1()
@@ -652,8 +638,6 @@ impl Render for ConfigOptionsMenu {
 }
 
 /// Persists the value as the agent's default and applies it to the live session.
-/// Both halves are what every entry point (a picker row, a switch, a cycle
-/// keybinding) has always done.
 fn set_config_option(
     config_options: &Rc<dyn AgentSessionConfigOptions>,
     agent_server: &Rc<dyn AgentServer>,
@@ -1039,8 +1023,6 @@ mod tests {
             }
         });
 
-        // Every category the agent advertises opens the same single popover:
-        // there is one trigger, not one per option.
         for category in [
             acp::SessionConfigOptionCategory::Model,
             acp::SessionConfigOptionCategory::ThoughtLevel,
@@ -1056,8 +1038,6 @@ mod tests {
             );
         }
 
-        // The trigger reads every select option's current value, the way the
-        // native picker reads "Model / Effort".
         let label = cx.update(|_window, cx| view.read(cx).trigger_label());
         assert_eq!(label, SharedString::from("Small / High"));
     }
@@ -1133,7 +1113,10 @@ mod tests {
 
             let options = {
                 let mut options = self.options.borrow_mut();
-                if let Some(option) = options.iter_mut().find(|option| option.config_id == config_id) {
+                if let Some(option) = options
+                    .iter_mut()
+                    .find(|option| option.config_id == config_id)
+                {
                     match (&mut option.kind, value) {
                         (
                             acp::SessionConfigKind::Select(select),

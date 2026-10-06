@@ -20,8 +20,8 @@ use agent::{
     SkillLoadingIssuesUpdated, ThreadSandbox, VerifiedSandboxStatus,
 };
 use agent_settings::UserAgentsMd;
-use chrono::{DateTime, Utc};
 use agent_skills::MAX_SKILL_DESCRIPTION_LEN;
+use chrono::{DateTime, Utc};
 use cloud_api_types::{SubmitAgentThreadFeedbackBody, SubmitAgentThreadFeedbackCommentsBody};
 use editor::actions::OpenExcerpts;
 use sandbox::{SandboxFsPolicy, SandboxNetPolicy, SandboxPolicy};
@@ -59,49 +59,26 @@ use super::*;
 
 const DATA_RETENTION_LEARN_MORE_URL: &str = "https://support.claude.com/en/articles/15425996-data-retention-practices-for-mythos-class-models";
 
-/// The stand-in title shown from the moment the first message is sent until a
-/// real title arrives: a short single line, not the whole message.
 pub(crate) const PROVISIONAL_TITLE_LEN: usize = 48;
-/// How much of the conversation the local title generation sends: the first few
-/// messages, each truncated, are enough to name a thread.
 const TITLE_REQUEST_MESSAGE_COUNT: usize = 4;
 const TITLE_REQUEST_MESSAGE_LEN: usize = 2000;
 
-/// How many entries one pass of the pull-request miner has to read before the
-/// pass is worth a line in the log. A thread opened for the first time reads
-/// all of them and lands here once; anything after that is the miner reading
-/// what it has already read, which is the thing the line exists to catch.
+/// A thread's first mining pass reads every entry once; a later pass reading
+/// this many is re-reading what it already read.
 const MINED_ENTRY_READS_WORTH_REPORTING: usize = 32;
 
 /// The height an inline image occupies when nothing is known about its shape.
-/// Big enough to read a screenshot, small enough that a picture does not push
-/// the conversation off screen. Read by `render_agent_markdown` in
-/// `conversation_view.rs` so an agent-authored image inside markdown holds the
-/// same box as an image the chip layer draws.
 pub(super) const IMAGE_CHIP_HEIGHT: Rems = Rems(20.);
 
-/// The width an image chip's box is drawn at. A definite width is what makes
-/// the height below arithmetic rather than a measurement.
 pub(super) const IMAGE_CHIP_WIDTH: Rems = Rems(24.);
 
-/// As tall as a picture is allowed to make its entry. A phone screenshot is
-/// twice as tall as it is wide, and a full-page capture many times that; past
-/// this the picture letterboxes rather than taking the whole transcript.
 const IMAGE_CHIP_MAX_HEIGHT: Rems = Rems(32.);
 
-/// A picture that is mostly a wide strip still needs a row to be recognisable.
 const IMAGE_CHIP_MIN_HEIGHT: Rems = Rems(4.);
 
-/// The height to reserve for a picture of known shape at a given width, so the
-/// transcript measures the entry once and correctly. A `ListState` measures an
-/// entry before the image has decoded and paints it at that height forever, so
-/// a box that does not already fit the picture is a box the picture spills out
-/// of, over the chips below.
-///
-/// The dimensions arrive with the image (`ContentBlock::Image`) or are read
-/// from a file's header, so this is arithmetic and not a measurement that has
-/// to wait for a decode. Without them there is nothing to compute from and the
-/// fixed box stands.
+/// A `ListState` measures an entry before its image decodes and keeps that
+/// height, so the box must already fit the picture or it paints over the chips
+/// below.
 pub(super) fn image_box_height(dimensions: Option<gpui::Size<u32>>, width: Rems) -> Rems {
     let Some(dimensions) = dimensions.filter(|size| size.width > 0 && size.height > 0) else {
         return IMAGE_CHIP_HEIGHT;
@@ -380,8 +357,6 @@ mod chips;
 use bookmarks::{BookmarkAnchor, EntryKind, ThreadBookmarks};
 use chips::*;
 
-/// Strips the markdown code fences around a terminal command label,
-/// tolerating an optional language tag on the opening fence.
 fn strip_command_fences(source: &str) -> Cow<'_, str> {
     let inner = strip_fences_only(source);
     match strip_outer_quotes(inner.trim_matches(['\r'])) {
@@ -401,9 +376,8 @@ fn strip_fences_only(source: &str) -> &str {
     body.strip_suffix("\n```").unwrap_or(body)
 }
 
-/// Some agents send the whole command wrapped in one pair of quotes; shown
-/// verbatim it highlights as a single string literal. Strip the pair only
-/// when it wraps everything (the quote char appears nowhere inside).
+/// Some agents send the whole command wrapped in one pair of quotes, which
+/// would highlight as a single string literal.
 fn strip_outer_quotes(command: &str) -> Cow<'_, str> {
     let trimmed = command.trim();
     for quote in ['\'', '"'] {
@@ -411,13 +385,9 @@ fn strip_outer_quotes(command: &str) -> Cow<'_, str> {
             continue;
         }
         let inner = &trimmed[1..trimmed.len() - 1];
-        // A wrapper whose own quote never appears inside is plainly a wrapper.
         if !inner.contains(quote) {
             return Cow::Borrowed(inner);
         }
-        // Agents also send the whole line double-quoted with its inner quotes
-        // escaped; that is still a wrapper, and the escapes are not part of
-        // the command the user ran.
         let escaped = format!("\\{quote}");
         if inner.matches(quote).count() == inner.matches(&escaped).count() {
             return Cow::Owned(inner.replace(&escaped, &quote.to_string()));
@@ -541,6 +511,42 @@ fn render_cat_numbered_code_block(
         .into_any_element()
 }
 
+fn highlight_code_runs(
+    code: &str,
+    language: Option<&Arc<Language>>,
+    code_text_style: TextStyle,
+    markdown_style: &MarkdownStyle,
+) -> Vec<TextRun> {
+    if code.is_empty() {
+        return Vec::new();
+    }
+
+    let Some(language) = language else {
+        return vec![code_text_style.to_run(code.len())];
+    };
+
+    let mut runs = Vec::new();
+    let mut offset = 0;
+    for (range, highlight_id) in language.highlight_text(&Rope::from(code), 0..code.len()) {
+        if range.start > offset {
+            runs.push(code_text_style.to_run(range.start - offset));
+        }
+
+        let mut run_style = code_text_style.clone();
+        if let Some(highlight) = markdown_style.syntax.get(highlight_id).cloned() {
+            run_style = run_style.highlight(highlight);
+        }
+        runs.push(run_style.to_run(range.len()));
+        offset = range.end;
+    }
+
+    if offset < code.len() {
+        runs.push(code_text_style.to_run(code.len() - offset));
+    }
+
+    runs
+}
+
 #[cfg(test)]
 mod numbered_code_block_tests {
     use super::*;
@@ -635,35 +641,19 @@ impl PermissionSelection {
 
 pub struct ThreadView {
     pub(crate) root_thread_id: ThreadId,
-    /// How many entries from the start of the thread the PR miner has
-    /// considered. Entries are appended, so a pass leaves this at the whole
-    /// thread and the next one only looks at what arrived since.
+    /// How many entries the PR miner has passed over.
     mined_entries: usize,
-    /// The entries below [`Self::mined_entries`] that had not finished arriving
-    /// when the miner reached them, so the next pass re-reads those and nothing
-    /// else behind them.
-    ///
-    /// This was one watermark, set to the lowest entry that had not finished.
-    /// A tool call whose terminal is still running is one of those, and the
-    /// agent is free to leave one running for the rest of the session — a dev
-    /// server, a watcher, a tail — so the watermark stuck there and every
-    /// streamed chunk re-read and re-allocated every entry past it. The set of
-    /// entries still arriving is small; the thread behind them is not.
+    /// Entries below `mined_entries` that were still arriving when passed, to
+    /// re-read next time. A set rather than a low watermark because a terminal
+    /// left running (a dev server) would pin the watermark and make every pass
+    /// re-read the thread behind it.
     pub(crate) unread_entries: Vec<usize>,
-    /// Whether a pass has ever read the whole thread with nothing skipped.
-    /// That is the one reading that can say which pull requests already in the
-    /// set the current rules would not have mined, and it happens once.
+    /// Whether the passes together have read every entry, which is when the
+    /// watched set can be judged against the current rules (once).
     mined_whole_thread: bool,
-    /// Every pull request the miner has found so far, kept until the reading is
-    /// complete and then dropped.
-    ///
-    /// Judging the set against the current rules needs every PR the whole
-    /// thread names, and no single incremental pass sees them all: the pass
-    /// that finally reads the last entry still arriving may read nothing else.
-    /// Accumulating is what lets the reading be incremental and still be whole.
+    /// Every PR found until `mined_whole_thread`, since no single incremental
+    /// pass sees them all.
     mined_prs: Vec<WatchedPr>,
-    /// How many entries the last mining pass read, for the log line that pass
-    /// writes when it reads enough of them to be worth knowing about.
     pub(crate) mined_reads: usize,
     pub session_id: acp_v1::SessionId,
     pub parent_session_id: Option<acp_v1::SessionId>,
@@ -692,36 +682,19 @@ pub struct ThreadView {
     pub list_state: ListState,
     pub session_capabilities: SharedSessionCapabilities,
     pub expanded_tool_call_raw_inputs: HashSet<acp_v1::ToolCallId>,
-    /// The one action chip the user expanded by clicking it. Only one is
-    /// expanded at a time across the whole group.
+    /// Only one action chip is expanded at a time.
     expanded_action_chip: Option<ActionChipId>,
-    /// Markdown entities for the scripts a command carried (heredoc bodies,
-    /// `-c` payloads), built the first time the call is expanded so the code
-    /// can be shown highlighted rather than as one long line.
     command_script_markdown: RefCell<CommandScripts>,
-    /// Image read chips the user explicitly collapsed. Image chips start
-    /// expanded (seeing the image is the point), so this records the
-    /// exception rather than the rule.
+    /// Image chips start expanded, so this records the ones collapsed.
     collapsed_image_chips: HashSet<ActionChipId>,
-    /// Answers about commands and their output that rendering would otherwise
-    /// recompute for every chip on every frame.
     chip_cache: ChipCache,
-    /// Diff editors for the files a command changed, built the first time one
-    /// is hovered and keyed by the entry the command ran in, since two
-    /// commands that touched one file each changed something different about
-    /// it. Nobody declared these edits, so the diff is built from the text the
-    /// command found and the text on disk now.
+    /// Keyed by entry as well as path: two commands that touched one file each
+    /// changed something different about it.
     command_file_diffs: RefCell<CommandFileDiffs>,
-    /// The real-file editors an edit chip decorated with the agent's diff,
-    /// keyed by project path, so a chip does not re-decorate an editor that is
-    /// already showing the diff (opening the file is idempotent; adding the
-    /// diff is not).
-    /// The thought currently shown beside the progress indicator, pinned for a
-    /// minimum time so fast streams stay readable.
+    /// The thought shown beside the progress indicator, pinned for a minimum
+    /// time so fast streams stay readable.
     displayed_thought: Option<((usize, usize), std::time::Instant)>,
     thought_hold_timer: Option<Task<()>>,
-    /// In-flight local title generation for an agent that supplies no title of
-    /// its own (see [`Self::generate_title_if_needed`]).
     title_generation: Option<Task<()>>,
     collapsed_sandbox_authorization_details: HashSet<acp_v1::ToolCallId>,
     collapsed_sandbox_network_details: HashSet<acp_v1::ToolCallId>,
@@ -773,16 +746,11 @@ pub struct ThreadView {
     dismissed_skill_loading_issues: HashSet<SkillLoadingIssue>,
     pub(crate) thread_search_bar: Option<Entity<super::thread_search_bar::ThreadSearchBar>>,
     pub(crate) thread_search_visible: bool,
-    /// The input status bar's diff readout: this thread's worktree against the
-    /// start of its branch, straight from git.
     branch_diff_stats: Entity<BranchDiffStats>,
-    /// Set when the window came back to the front, so the diff readout is
-    /// recomputed the next time this thread draws it. A branch switched in a
-    /// terminal while Zed was in the background reaches the editor no other
-    /// way, and only the thread being looked at needs to pay for the answer.
+    /// Set on window activation: a branch switched in an outside terminal
+    /// reaches us no other way.
     diff_stats_stale: bool,
 }
-
 impl Focusable for ThreadView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -824,18 +792,11 @@ enum ToolCallLayout {
     Embedded,
     Floating,
     /// The body of an expanded action chip. The chip itself is the toggle, so
-    /// the header inside is inert: no hover, no click, no disclosure, output
-    /// always shown.
+    /// the header inside is inert and the output always shown.
     ChipBody,
 }
 
-/// One chip of an action group: an agent action (a tool call, or a run of
-/// adjacent wait calls collapsed into one) or one of an assistant message's
-/// thoughts. Chips are derived from thread entries at render time, so a chip is
-/// addressed by the entry it came from rather than owning any state.
-/// A file an edit tool call touched. `location_ix` is the call's own location
-/// for it, when the call reported one; a call that only sends diffs has none,
-/// and its file is named by the diff itself.
+/// `location_ix` is `None` for a call that only sends diffs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct EditedFile {
     path: std::path::PathBuf,
@@ -847,78 +808,47 @@ enum ActionChip {
     ToolCall {
         entry_ix: usize,
     },
-    /// A run's reads and searches, folded into one quiet summary chip
-    /// ("Read 3 files, searched 2"). Expanding shows the individual chips.
+    /// A run's reads and searches folded into one summary chip.
     Collapsed {
         entry_ixs: Vec<usize>,
     },
-    /// One edited file of a multi-file edit tool call. `file_ix` indexes the
-    /// call's distinct edited files, so a call touching several files reads as
-    /// one chip per file rather than a single "N files" chip.
+    /// One edited file of a multi-file edit tool call.
     EditFile {
         entry_ix: usize,
         file_ix: usize,
     },
-    /// One file a command changed, as the repository saw it. A command that
-    /// rewrites files says nothing about them itself, so these come from
-    /// watching the worktree rather than from reading the command.
+    /// One file a command changed, as the repository saw it.
     CommandFile {
         entry_ix: usize,
         path_ix: usize,
     },
-    /// The same, when there are too many to name: a codemod or a formatter can
-    /// touch a hundred files, and a hundred chips is not a report, it is a
-    /// wall. One chip says how many and opens the diff over all of them.
+    /// More than `MOST_NAMED_COMMAND_FILES` changed files, as one chip.
     CommandFiles {
         entry_ix: usize,
     },
 }
 
-/// Past this many files, a command's changes read as a count rather than as a
-/// chip each.
 const MOST_NAMED_COMMAND_FILES: usize = 6;
 
-/// What a chip needs to know about a command, and what its output reported.
-///
-/// Rendering asks these questions of every chip on every frame, and answering
-/// them costs a full parse of the command line and a scan of every line of its
-/// output. Computing them per frame is what made a long thread crawl, so they
-/// are computed once and reused until the thing they describe changes.
+/// Command parses and output scans, cached because computing them per chip
+/// per frame made long threads crawl.
 #[derive(Default)]
 struct ChipCache {
     commands: RefCell<HashMap<acp_v1::ToolCallId, Rc<CommandFacts>>>,
     outputs: RefCell<HashMap<acp_v1::ToolCallId, Rc<OutputFacts>>>,
-    /// Syntax highlighting for chip labels. Highlighting a label means parsing
-    /// it, which a wall of chips cannot afford to do on every frame it is
-    /// scrolled past; the text of a chip rarely changes, and the style it is
-    /// drawn in changes only with the theme.
     highlights: RefCell<HighlightCache>,
-    /// How many times each call's command has been parsed. The cache exists so
-    /// that happens once, and a chip that reparses as it draws is what made a
-    /// long thread crawl. Kept so the next report of a slow thread is a number
-    /// rather than a suspicion.
+    /// Counted so a chip reparsing at frame rate shows up in the log.
     command_parses: RefCell<HashMap<acp_v1::ToolCallId, usize>>,
-    /// The shape of each picture that lives in a file, so its box is sized to
-    /// the picture like an inline one's is. A file says its shape in the header
-    /// it opens with, but getting at that header is IO, so it is read once per
-    /// path in the background and the answer kept for as long as the view is.
+    /// Read once per path in the background, since reading a header is IO.
     image_shapes: RefCell<HashMap<std::path::PathBuf, ImageShape>>,
-    /// Answers that hold for the length of one frame, thrown away at the start
-    /// of the next: the style chips are drawn in, which entries are chips, and
-    /// the run each one belongs to. All three are asked for once per visible
-    /// entry, so the same questions come back many times over within a single
-    /// frame.
+    /// Cleared at the start of each frame.
     frame_style: RefCell<Option<MarkdownStyle>>,
     frame_chip_entries: RefCell<Vec<Option<bool>>>,
     frame_runs: RefCell<Vec<RunMemo>>,
 }
 
-/// The maximal run of chip entries containing `entry_ix`, inclusive, or `None`
-/// when that entry is not a chip.
-///
-/// Records what it learns for every entry in the run, not just the one asked
-/// about: each entry the list draws asks for its own run, and without this a
-/// run of N entries is walked N times for one frame's worth of answers.
+/// The maximal run of chip entries containing `entry_ix`, inclusive. Memoizes
+/// every entry in the run, or a run of N entries is walked N times per frame.
 fn find_run(
     entry_ix: usize,
     len: usize,
@@ -937,8 +867,6 @@ fn find_run(
     while end + 1 < len && is_chip(end + 1) {
         end += 1;
     }
-    // The entries that stopped the walk are not chips, and saying so here
-    // saves the two entries flanking every run a walk of their own.
     if start > 0 {
         memo[start - 1] = RunMemo::NotAChip;
     }
@@ -951,45 +879,33 @@ fn find_run(
     Some((start, end))
 }
 
-/// What is known about the run an entry belongs to, within one frame.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 enum RunMemo {
     #[default]
     Unknown,
     NotAChip,
-    /// The maximal run of chip entries this one sits in, inclusive.
     Run {
         start: usize,
         end: usize,
     },
 }
 
-/// What is known about the shape of a picture on disk.
 #[derive(Clone, Copy)]
 pub(super) enum ImageShape {
-    /// The header is being read. Until it answers the box is as tall as a
-    /// picture is ever allowed to be: too tall only letterboxes, while too
-    /// short is the box a tall screenshot paints out of and over the chips
-    /// under it.
+    /// The header is being read. The box is drawn at the maximum height
+    /// meanwhile: too tall only letterboxes, too short paints over the chips.
     Reading,
     Known(gpui::Size<u32>),
-    /// Read and not understood: an SVG, a format `image` does not decode, a
-    /// file that was gone by the time it was opened. Nothing better than the
-    /// fixed box is available for it.
     Unknown,
 }
 
-/// Highlight runs, kept for as long as the style they were built in holds.
 #[derive(Default)]
 struct HighlightCache {
-    /// What the runs were built for: the base font and colour, the syntax
-    /// theme, and the language. Any of these moving invalidates all of them.
+    /// Base font, colour, syntax theme and language the runs were built for.
     token: Option<(gpui::Font, gpui::Hsla, usize, usize)>,
     runs: HashMap<HighlightKey, Rc<Vec<gpui::TextRun>>>,
 }
 
-/// A label as far as highlighting is concerned: its text, and which of it is
-/// shell. The same words highlight differently as a command and as prose.
 #[derive(PartialEq, Eq, Hash)]
 struct HighlightKey {
     text: SharedString,
@@ -999,27 +915,21 @@ struct HighlightKey {
 struct CommandFacts {
     /// The label these were read from. A command that changes is reparsed.
     source: SharedString,
-    /// The command with its markdown fences stripped.
     command: String,
     parsed: acp_thread::ParsedCommand,
     class: acp_thread::CommandClass,
     destructive: bool,
-    /// Where it ran, when that is not here. A line only partly remote still
-    /// ran somewhere else, and that is worth saying.
     host: Option<String>,
-    /// What the line did, for the chip's label.
     summary: Option<String>,
 }
 
 struct OutputFacts {
-    /// How much output had arrived when this was scanned. Output only grows,
-    /// so a length that has not changed means a scan that need not be redone.
+    /// Output only grows, so an unchanged length means no rescan.
     scanned_len: usize,
     summary: Option<acp_thread::OutputSummary>,
 }
 
 impl CommandFacts {
-    /// The facts of a bare command line, for callers with no tool call in hand.
     #[cfg(test)]
     fn for_command(command: &str) -> Self {
         let parsed = acp_thread::parse_command(command);
@@ -1039,14 +949,12 @@ impl CommandFacts {
 }
 
 impl ChipCache {
-    /// Drops what only held for the frame that has just ended.
     fn begin_frame(&self) {
         self.frame_style.borrow_mut().take();
         self.frame_chip_entries.borrow_mut().clear();
         self.frame_runs.borrow_mut().clear();
     }
 
-    /// The style chip labels are drawn in, built once for the frame.
     fn style(&self, window: &Window, cx: &App) -> MarkdownStyle {
         self.frame_style
             .borrow_mut()
@@ -1056,9 +964,6 @@ impl ChipCache {
             .clone()
     }
 
-    /// Highlight runs for one chip label. The same label is highlighted on
-    /// every frame it is on screen, and highlighting parses it, so the runs
-    /// live until the style they were built in moves.
     fn highlight_label(
         &self,
         label: &chips::CommandChipLabel,
@@ -1073,9 +978,7 @@ impl ChipCache {
             language.map_or(0, |language| Arc::as_ptr(language) as usize),
         );
         let mut cache = self.highlights.borrow_mut();
-        // A thread long enough to hold thousands of distinct labels has left
-        // the early ones far off screen; keeping them all would be a leak in
-        // everything but name.
+        // Bounded so a very long thread does not keep every label it ever drew.
         if cache.token.as_ref() != Some(&token) || cache.runs.len() > 4096 {
             cache.token = Some(token);
             cache.runs.clear();
@@ -1126,13 +1029,9 @@ impl ChipCache {
         facts
     }
 
-    /// Counts a command line being parsed, and says so once the count has run
-    /// far past the one parse a call is supposed to need. Logged as it doubles,
-    /// so a chip reparsing at frame rate says so in a handful of lines rather
-    /// than one per frame.
+    /// Logs at each doubling past a few parses, since a streaming label
+    /// legitimately reparses a handful of times.
     fn note_command_parse(&self, id: &acp_v1::ToolCallId) {
-        /// One parse per call is the design. A few more mean the label moved,
-        /// which a streaming label does; this many mean it is being redone.
         const WORTH_REPORTING: usize = 8;
 
         let mut parses = self.command_parses.borrow_mut();
@@ -1147,9 +1046,6 @@ impl ChipCache {
     }
 
     fn output(&self, tool_call: &ToolCall, cx: &App) -> Rc<OutputFacts> {
-        // Borrowed, never copied. Taking the output by value to measure its
-        // length meant a `cargo test`'s worth of text was memcpy'd once per
-        // chip per frame, on the frames the cache was about to answer anyway.
         let output = tool_call
             .terminals()
             .next()
@@ -1172,36 +1068,20 @@ impl ChipCache {
             .insert(tool_call.id.clone(), facts.clone());
         facts
     }
-
 }
 
-/// The call of an entry that is a command which has finished running: a tool
-/// call that has left the states a running one is in, with a terminal whose
-/// process has ended. What such a command did to the repository is now on
-/// disk, and its chip no longer needs the line it kept for the command's
-/// output.
-/// One pull request the `+` menu could offer, with what is known about it.
-///
-/// A thread's own branch PRs carry a title; one watched by number does not,
-/// and borrows the title from whichever thread saw it on a branch. What
-/// neither has, the menu says as a number, which is what it always did.
+/// One pull request the `+` menu could offer.
 pub(super) struct PrMenuCandidate {
     pub(super) pr: WatchedPr,
     pub(super) title: Option<SharedString>,
     state: Option<gh_status::PrState>,
-    /// When the thread that saw this one last moved, which is the best
-    /// available answer to "how recently was this in front of you".
+    /// When the thread that saw this one last moved.
     seen_at: Option<DateTime<Utc>>,
 }
 
 impl PrMenuCandidate {
-    /// How long a title the menu will carry. A pull request title can be a
-    /// sentence, and the menu is a column beside a chip, not a page.
     const MAX_TITLE: usize = 52;
 
-    /// Whether the pull request is done with: merged or closed ones go under
-    /// the ones still open, since a thread is far more often pointed at work
-    /// in flight.
     fn finished(&self) -> bool {
         matches!(
             self.state,
@@ -1209,8 +1089,6 @@ impl PrMenuCandidate {
         )
     }
 
-    /// The title first, because that is what anyone recognises, and the
-    /// number after it for the one thing a title does not say.
     fn label(&self) -> String {
         let number = self.pr.number;
         let Some(title) = &self.title else {
@@ -1224,6 +1102,7 @@ impl PrMenuCandidate {
     }
 }
 
+/// The id of a tool call whose command has finished running.
 fn finished_command_id(entry: &AgentThreadEntry, cx: &App) -> Option<acp_v1::ToolCallId> {
     let AgentThreadEntry::ToolCall(call) = entry else {
         return None;
@@ -1241,35 +1120,24 @@ fn finished_command_id(entry: &AgentThreadEntry, cx: &App) -> Option<acp_v1::Too
         .then(|| call.id.clone())
 }
 
-/// A command-changed file's diff, from the moment it is first asked for.
 enum CommandFileDiff {
-    /// The text the command found and what the file holds now are being read;
-    /// the task is held so that closing the thread stops the work.
-    Loading { _task: Task<()> },
-    /// The editor, and the diff whose multibuffer it draws: the diff owns the
-    /// buffers, so letting go of it empties the card.
+    Loading {
+        _task: Task<()>,
+    },
     Ready {
         editor: Entity<Editor>,
+        /// Owns the buffers the editor's multibuffer draws.
         _diff: Entity<acp_thread::Diff>,
-        /// When a card last asked for this editor, so the ones nobody has
-        /// come back to can be told from the ones they have.
         last_used: u64,
     },
 }
 
-/// How many commands' scripts are kept. One chip is expanded at a time, so
-/// anything further back than the last few is a command nobody is reading.
 const KEPT_COMMAND_SCRIPTS: usize = 8;
 
-/// The highlighted scripts commands carried, and how recently each was drawn.
-///
-/// Every script is a `Markdown`, and every `Markdown` watches the theme, so
-/// holding one per command ever expanded meant a session's worth of entities
-/// and global observers for code nobody was still looking at.
+/// Bounded because each `Markdown` holds a theme observer.
 #[derive(Default)]
 struct CommandScripts {
     by_call: HashMap<acp_v1::ToolCallId, CommandScript>,
-    /// Ticks on every use, which is what "recently" is measured in.
     uses: u64,
 }
 
@@ -1279,7 +1147,6 @@ struct CommandScript {
 }
 
 impl CommandScripts {
-    /// The scripts of one command, marking it as the most recently drawn.
     fn get(&mut self, id: &acp_v1::ToolCallId) -> Option<Vec<(SharedString, Entity<Markdown>)>> {
         self.uses += 1;
         let uses = self.uses;
@@ -1291,7 +1158,8 @@ impl CommandScripts {
     fn insert(&mut self, id: acp_v1::ToolCallId, scripts: Vec<(SharedString, Entity<Markdown>)>) {
         self.uses += 1;
         let last_used = self.uses;
-        self.by_call.insert(id, CommandScript { scripts, last_used });
+        self.by_call
+            .insert(id, CommandScript { scripts, last_used });
         let used = self
             .by_call
             .iter()
@@ -1302,34 +1170,22 @@ impl CommandScripts {
     }
 }
 
-/// How many built diff editors are kept. A card shows one at a time; the rest
-/// are there so that hovering back over a file is instant.
 const KEPT_COMMAND_FILE_DIFFS: usize = 8;
 
-/// The diff editors built for files commands changed, and how recently each
-/// was looked at.
-///
-/// Every editor here holds a multibuffer, its own focus handles and a pair of
-/// global observers, and every one of them is walked whenever gpui sweeps any
-/// of those sets. Without a bound, a session spent reading chips is a session
-/// spent accumulating editors nobody can see.
+/// Bounded because each editor holds focus handles and global observers.
 #[derive(Default)]
 struct CommandFileDiffs {
     by_file: HashMap<(usize, project::ProjectPath), CommandFileDiff>,
-    /// Ticks on every use, which is what "recently" is measured in.
     uses: u64,
 }
 
 impl CommandFileDiffs {
-    /// Marks a use and returns its stamp.
     fn touch(&mut self) -> u64 {
         self.uses += 1;
         self.uses
     }
 
-    /// Drops all but the [`KEPT_COMMAND_FILE_DIFFS`] most recently used
-    /// editors. A diff still loading is left alone: it has no editor yet, and
-    /// dropping it would cancel the read a card is waiting on.
+    /// Leaves loading diffs alone: dropping one cancels a read a card awaits.
     fn evict_stale(&mut self) {
         let used = self.by_file.iter().filter_map(|(key, state)| match state {
             CommandFileDiff::Ready { last_used, .. } => Some((*last_used, key.clone())),
@@ -1341,12 +1197,7 @@ impl CommandFileDiffs {
     }
 }
 
-/// Of things stamped with when they were last used, the ones to drop so that
-/// only the `keep` most recent remain.
-///
-/// Two things cannot share a stamp — it comes from a counter that only goes
-/// up — so equal stamps are only possible in a test, and they keep the order
-/// they were handed over in.
+/// The keys to drop so only the `keep` most recently used remain.
 fn stale_by_use<K>(used: impl Iterator<Item = (u64, K)>, keep: usize) -> Vec<K> {
     let mut used = used
         .enumerate()
@@ -1362,35 +1213,21 @@ fn stale_by_use<K>(used: impl Iterator<Item = (u64, K)>, keep: usize) -> Vec<K> 
     used.into_iter().map(|(_, _, key)| key).collect()
 }
 
-/// A picture a chip stands for, however the agent delivered it.
 #[derive(Clone)]
 enum ChipImage {
-    /// An image on disk, which may live outside the project. Its shape is only
-    /// known once its header has been read, which the view does once per path
-    /// and keeps in `ChipCache::image_shapes`.
+    /// May live outside the project.
     File(std::path::PathBuf),
-    /// Image data the call carried, with no file behind it, and the dimensions
-    /// decoded alongside it.
     Data {
         image: Arc<gpui::Image>,
         dimensions: Option<gpui::Size<u32>>,
     },
 }
 
-/// What a chip click expands. Tool-call expansion is keyed by id (it drives the
-/// tool call's own `EntryViewState` expansion). Thoughts are not here: they do
-/// not expand, so they carry no click-expansion state.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum ActionChipId {
     ToolCall(acp_v1::ToolCallId),
-    /// The reads-and-searches summary chip, keyed by its first call.
+    /// Keyed by its first call.
     Collapsed(acp_v1::ToolCallId),
-    /// One file of a multi-file edit call. Expanding it shows only that file's
-    /// diff, so it does not drive the tool call's own expansion state.
-    EditFile {
-        tool_call_id: acp_v1::ToolCallId,
-        file_ix: usize,
-    },
 }
 
 impl ToolCallLayout {
@@ -1624,7 +1461,6 @@ impl ThreadView {
             Self::handle_message_editor_event,
         ));
 
-        // The edits summary reads the action log's changed buffers.
         let action_log = thread.read(cx).action_log().clone();
         subscriptions.push(cx.observe(&action_log, |_this, _action_log, cx| {
             cx.notify();
@@ -1640,18 +1476,12 @@ impl ThreadView {
                         | AcpThreadEvent::StatusChanged
                         | AcpThreadEvent::Stopped { .. }
                 ) {
-                    // The agent reports its work dirs as the session runs, and
-                    // they scope the diff readout to this thread's worktree.
                     this.sync_branch_diff_work_dirs(cx);
                     this.mine_pr_mentions(cx);
                     cx.notify();
                 }
-                // A command that has finished is a reason to look at the
-                // repository again: many of the agent's commands are git
-                // operations, and git's own watching reports a branch switch
-                // whenever it happens to notice it. Its chip also gives back
-                // the line it kept for the command's output, which a list that
-                // measured the taller shape has to be told about.
+                // A finished command may have been a git operation git's own
+                // watching has not noticed yet, and its chip shrinks.
                 if let AcpThreadEvent::EntryUpdated(entry_ix) = event
                     && let Some(finished) = thread
                         .read(cx)
@@ -1666,8 +1496,6 @@ impl ThreadView {
             },
         ));
 
-        // Repaint the input status bar's PR badges when gh_status polling lands
-        // fresh data for the thread's branches.
         if let Some(gh_store) = gh_status::GhStatusStore::try_global(cx) {
             subscriptions.push(cx.observe(&gh_store, |_this, _store, cx| cx.notify()));
         }
@@ -1850,10 +1678,8 @@ impl ThreadView {
 
         this.sync_reported_activity(cx);
         this.sync_branch_diff_work_dirs(cx);
-        // Opening a thread is when its watched set gets re-decided: the
-        // entries are all here, so this pass reads the whole transcript and
-        // can retire what a keener set of rules once mined. A thread that
-        // never runs again would otherwise keep those forever.
+        // Reads the whole transcript, so it can retire PRs older mining rules
+        // added, even in a thread that never runs again.
         this.mine_pr_mentions(cx);
         this.sync_editor_mode(cx);
         this.sync_existing_elicitation_states(window, cx);
@@ -2571,8 +2397,7 @@ impl ThreadView {
         let is_generating = thread.read(cx).status() != ThreadStatus::Idle;
 
         if is_editor_empty {
-            // Leaving review comments on a diff and pressing send with an empty
-            // input still sends: the comments become the message.
+            // Pending review comments alone are a message.
             let review_blocks = self.take_pending_review_blocks(cx);
             if !review_blocks.is_empty() {
                 cx.emit(AcpThreadViewEvent::Interacted);
@@ -2603,7 +2428,6 @@ impl ThreadView {
         if is_generating {
             cx.emit(AcpThreadViewEvent::Interacted);
             self.queue_message(message_editor, window, cx);
-            // Pending review comments ride along with the queued message.
             let review_blocks = self.take_pending_review_blocks(cx);
             if !review_blocks.is_empty() {
                 self.add_to_queue(review_blocks, Vec::new(), window, cx);
@@ -2722,9 +2546,6 @@ impl ThreadView {
         .detach_and_log_err(cx);
     }
 
-    /// Pending review comments left on the workspace's diff editors, composed
-    /// into content blocks and cleared. Empty unless the user has left review
-    /// comments on a "changes since" diff.
     fn take_pending_review_blocks(&self, cx: &mut App) -> Vec<acp_v2::ContentBlock> {
         self.workspace
             .upgrade()
@@ -2732,8 +2553,6 @@ impl ThreadView {
             .unwrap_or_default()
     }
 
-    /// Number of review comments pending on the workspace's diff editors, for
-    /// the "N review comments will be attached" indicator by the input.
     fn pending_review_comment_count(&self, cx: &App) -> usize {
         self.workspace
             .upgrade()
@@ -2748,18 +2567,14 @@ impl ThreadView {
         cx.notify();
     }
 
-    /// The branches of the worktrees THIS thread works in. One agent runs per
-    /// worktree, so the thread's own work dirs (its worktree roots before the
-    /// agent reports any) select the worktrees; the repository's other linked
-    /// worktrees belong to other threads and must not contribute branches.
+    /// The branches of this thread's own work dirs; the repository's other
+    /// linked worktrees belong to other threads.
     fn thread_branches(&self, cx: &App) -> Vec<(PathBuf, String)> {
         let Some(project) = self.project.upgrade() else {
             return Vec::new();
         };
         let project = project.read(cx);
 
-        // Every worktree in the project that has a branch, keyed by its path:
-        // the repositories themselves plus the linked worktrees they know of.
         let mut worktree_branches: Vec<(PathBuf, String)> = Vec::new();
         for repo in project.repositories(cx).values() {
             let snapshot = repo.read(cx).snapshot();
@@ -2780,8 +2595,8 @@ impl ThreadView {
         branches_for_thread_paths(&thread_paths, &worktree_branches)
     }
 
-    /// The directories THIS thread works in: the ones the agent reports, or,
-    /// until it reports any, its project's worktree roots.
+    /// The work dirs the agent reports, or the project's worktree roots until it
+    /// reports any.
     fn thread_work_dirs(&self, cx: &App) -> Vec<PathBuf> {
         match self.thread.read(cx).work_dirs() {
             Some(work_dirs) if !work_dirs.paths().is_empty() => work_dirs
@@ -2809,12 +2624,8 @@ impl ThreadView {
             .update(cx, |stats, cx| stats.set_work_dirs(work_dirs, cx));
     }
 
-    /// Reads the entries the miner has not read yet and adds any pull request
-    /// they name to this thread's watched set.
-    ///
-    /// A URL is the only thing taken as a statement, and only in the two
-    /// places that say what a thread is about ([`Self::pr_mention_sources`]);
-    /// a bare `#123` in prose is not a claim that the thread watches that PR.
+    /// Adds PRs named by URL in entries not yet read to the watched set; a bare
+    /// `#123` in prose is not a claim that the thread watches that PR.
     pub(crate) fn mine_pr_mentions(&mut self, cx: &mut Context<Self>) {
         let Some(store) = ThreadMetadataStore::try_global(cx) else {
             return;
@@ -2823,10 +2634,7 @@ impl ThreadView {
         if entries.is_empty() {
             return;
         }
-        // Entries can be taken out of a thread as well as added to it, and an
-        // index means nothing across that. A thread that shrank is read again
-        // from the start, which is also what the watermark on its own could not
-        // do: clamped past the end, it skipped every entry there was.
+        // Indices mean nothing once entries are removed, so start over.
         if entries.len() < self.mined_entries {
             self.mined_entries = 0;
             self.unread_entries.clear();
@@ -2836,19 +2644,13 @@ impl ThreadView {
         let started = Instant::now();
         let generating = self.thread.read(cx).status() == acp_thread::ThreadStatus::Generating;
         let mut found: Vec<WatchedPr> = Vec::new();
-        // What this pass looks at: the entries a previous one could not read
-        // yet, and the ones that have arrived since. Nothing else — an entry
-        // read to completion says all it is going to say.
         let behind = std::mem::take(&mut self.unread_entries);
         let fresh = self.mined_entries.min(entries.len())..entries.len();
         self.mined_reads = 0;
         for ix in behind.into_iter().chain(fresh) {
             let entry = &entries[ix];
-            // An entry still being written is not read at all, and a later pass
-            // comes back to it. Reading half of one does not just mine the
-            // prefix a URL is passing through: it also shows the miner two of
-            // the three pull requests that would have made the sentence a list,
-            // and a list is meant to join nothing.
+            // Half an entry can hold a truncated URL, or two PRs of what will
+            // become a list, which is meant to join nothing.
             if !Self::entry_has_finished(entry, ix + 1 == entries.len(), generating, cx) {
                 self.unread_entries.push(ix);
                 continue;
@@ -2867,12 +2669,8 @@ impl ThreadView {
             }
         }
         self.mined_entries = entries.len();
-        // Dropping what the current rules would not have mined is only safe
-        // off a complete reading: judging the set against a thread that is
-        // still being written would drop a PR whose sentence has not arrived.
-        // "Complete" is cumulative — the passes together have read every entry
-        // — so the comparison is made against everything found, not against
-        // what this pass happened to see.
+        // Only a complete reading may drop PRs the current rules would not
+        // mine, or a PR whose sentence has not arrived yet would go.
         let adopt_rules = !self.mined_whole_thread && self.unread_entries.is_empty();
         if !self.mined_whole_thread {
             for pr in &found {
@@ -2887,10 +2685,6 @@ impl ThreadView {
         } else {
             Vec::new()
         };
-        // A pass that reads a lot of entries is a pass repeating work, and a
-        // machine with the thread that does it is the only place that can say
-        // so. The first pass over a long thread reads it all once and is
-        // expected to land here; a later one should not.
         if self.mined_reads > MINED_ENTRY_READS_WORTH_REPORTING {
             log::info!(
                 "quiet-ui perf: mined {} thread entries ({} left unread) in {:.0}ms",
@@ -2922,12 +2716,6 @@ impl ThreadView {
         });
     }
 
-    /// Whether an entry has finished arriving, and so can be read as a
-    /// statement rather than as a sentence someone is halfway through.
-    ///
-    /// "Not the last entry" is not this test. A message a tool call started
-    /// after is finished, and one still streaming at the end of a turn is not,
-    /// and the two are told apart by the turn rather than by position.
     fn entry_has_finished(
         entry: &AgentThreadEntry,
         is_last: bool,
@@ -2935,14 +2723,9 @@ impl ThreadView {
         cx: &App,
     ) -> bool {
         match entry {
-            // A message grows until something else starts after it or the
-            // turn ends.
             AgentThreadEntry::AssistantMessage(_) => !is_last || !generating,
-            // A command's output is the thing being written, and a terminal
-            // reports none until its process has exited. The call's own
-            // status is not the test: the agent reports a call completed some
-            // time after the command it ran actually stopped, and one of
-            // several commands running at once says nothing about the others.
+            // Not the call's status: agents report completion late, and one of
+            // several parallel commands says nothing about the others.
             AgentThreadEntry::ToolCall(call) => call
                 .terminals()
                 .all(|terminal| terminal.read(cx).output().is_some()),
@@ -2950,16 +2733,10 @@ impl ThreadView {
         }
     }
 
-    /// The pieces of text in an entry that say which pull requests the thread
-    /// is about.
-    ///
-    /// Two of them. An assistant message's own prose, which is the agent
-    /// telling the user about a PR — not its thinking, which is the agent
-    /// talking to itself. And the output of a command that created a PR,
-    /// which is the URL of the one it just made. Everything else a command
-    /// printed is data the agent looked at: a `gh pr list`, a `git log`, a
-    /// search that hit a changelog. Reading those is what filled the set with
-    /// pull requests nobody ever saw, one collapsed chip at a time.
+    /// An assistant message's prose (not its thinking) and the output of a
+    /// command that created a PR. Other command output is data the agent
+    /// looked at (`gh pr list`, `git log`), and mining it filled the set with
+    /// PRs nobody saw.
     fn pr_mention_sources(entry: &AgentThreadEntry, cx: &App) -> Vec<String> {
         match entry {
             AgentThreadEntry::AssistantMessage(message) => message
@@ -2982,9 +2759,6 @@ impl ThreadView {
                     if !acp_thread::creates_pull_request(&command) {
                         return None;
                     }
-                    // Only what it printed on the way out: a command still
-                    // running has not said what it made yet, and the chip
-                    // will ask again when it has.
                     Some(terminal.output()?.content.clone())
                 })
                 .collect(),
@@ -2992,7 +2766,6 @@ impl ThreadView {
         }
     }
 
-    /// The pull requests this thread watches, in the order they joined.
     pub(crate) fn watched_prs(&self, cx: &App) -> Vec<WatchedPr> {
         ThreadMetadataStore::try_global(cx)
             .and_then(|store| {
@@ -3004,16 +2777,13 @@ impl ThreadView {
             .unwrap_or_default()
     }
 
-    /// Takes a PR out of the set by hand, and keeps it out.
     pub(crate) fn dismiss_pr(&mut self, pr: WatchedPr, cx: &mut Context<Self>) {
         let Some(store) = ThreadMetadataStore::try_global(cx) else {
             return;
         };
         let thread_id = self.root_thread_id;
-        // Taking a PR out can be the last moment anything knows what it is
-        // called: a mined PR only this thread watched stops being polled for,
-        // and its title would be gone by the time the `+` menu offered it
-        // back.
+        // A dismissed PR stops being polled, so remember its title for the
+        // `+` menu now.
         let title = self.resolve_pr_title(&pr, cx);
         store.update(cx, |store, cx| {
             store.update_pr_snapshot(
@@ -3031,7 +2801,6 @@ impl ThreadView {
         cx.notify();
     }
 
-    /// Adds a PR by hand, which also undoes a previous removal of it.
     pub(crate) fn watch_pr(&mut self, pr: WatchedPr, cx: &mut Context<Self>) {
         let Some(store) = ThreadMetadataStore::try_global(cx) else {
             return;
@@ -3054,16 +2823,15 @@ impl ThreadView {
         cx.notify();
     }
 
-    /// What a pull request is called, from whatever still knows: the live gh
-    /// store first, then any thread that saw it as a branch PR, then a title
-    /// some thread already wrote down.
     fn resolve_pr_title(&self, pr: &WatchedPr, cx: &App) -> Option<SharedString> {
         if let Some(store) = gh_status::GhStatusStore::try_global(cx)
             && let Some(cwd) = self
                 .thread_branches(cx)
                 .first()
                 .map(|(path, _)| path.clone())
-            && let Some(status) = store.read(cx).pr_by_number(&cwd, pr.number, pr.repo.as_deref())
+            && let Some(status) = store
+                .read(cx)
+                .pr_by_number(&cwd, pr.number, pr.repo.as_deref())
         {
             return Some(status.title.clone());
         }
@@ -3087,17 +2855,11 @@ impl ThreadView {
         None
     }
 
-    /// PR badges for the thread's own worktree branch(es), sourced from the
-    /// shared gh_status store (the sidebar keeps the branches watched). A branch
-    /// with no PR gets a muted "no PR" pill so PR state is always visible.
     fn thread_pr_chips(&self, cx: &App) -> Vec<ui::ThreadItemPrChip> {
         let branches = self.thread_branches(cx);
         let store = gh_status::GhStatusStore::try_global(cx);
         let store = store.as_ref().map(|store| store.read(cx));
         let (watched, dismissed) = self.watched_pr_status(store, cx);
-        // The same answer the sidebar row gives, from the same function: the
-        // snapshot fallback and the "no PR" pill are not the sidebar's, they
-        // are the thread's.
         gh_status::thread_pr_chips(
             branches
                 .iter()
@@ -3116,8 +2878,6 @@ impl ThreadView {
         )
     }
 
-    /// The PRs this thread watches by number that the store has answered for,
-    /// and the dismissals that have to be applied whatever the source.
     fn watched_pr_status(
         &self,
         store: Option<&gh_status::GhStatusStore>,
@@ -3159,8 +2919,6 @@ impl ThreadView {
         cx: &mut Context<Self>,
     ) {
         let contents = self.resolve_message_contents(&message_editor, cx);
-        // Pending review comments on the workspace's diffs attach to this
-        // message. Taken now (synchronously) so they clear as the turn starts.
         let review_blocks = self.take_pending_review_blocks(cx);
 
         self.thread_error.take();
@@ -3185,7 +2943,6 @@ impl ThreadView {
                 return Ok(None);
             }
 
-            // The user's own message leads; the review comments follow it.
             contents.extend(review_blocks);
 
             let _ = cx.update(|window, cx| {
@@ -3379,17 +3136,8 @@ impl ThreadView {
         .detach();
     }
 
-    /// Gives the thread a short generated title when its agent supplied none.
-    ///
-    /// External ACP agents are supposed to send a title through
-    /// `SessionInfoUpdate`; Claude does, Codex never does, and the thread is
-    /// then left showing the provisional title taken from the user's first
-    /// message. At the end of a turn, any thread that still has no
-    /// agent-supplied title (only the provisional one, or none) gets one
-    /// generated locally with the summarization model, the same machinery the
-    /// native agent's titles use. Threads whose agent did supply a title, user
-    /// renames (a metadata title override), subagents, and native threads
-    /// (which generate their own) are all left alone.
+    /// Titles a thread locally at the end of a turn when its agent supplied
+    /// none (Codex never sends one), unless the user renamed it.
     fn generate_title_if_needed(&mut self, cx: &mut Context<Self>) {
         if self.is_subagent() || self.title_generation.is_some() {
             return;
@@ -3418,9 +3166,6 @@ impl ThreadView {
         let Some(request) = self.build_title_request(cx) else {
             return;
         };
-        // Generating a title for an agent that supplies none is this fork's
-        // own courtesy, so a host with no model registry configured simply
-        // does without it rather than panicking on the first message.
         let Some(model) = LanguageModelRegistry::try_read_global(cx)
             .and_then(|registry| registry.thread_summary_model(cx))
         else {
@@ -3454,8 +3199,6 @@ impl ThreadView {
         }));
     }
 
-    /// A summarization request over the thread's messages, ending in the same
-    /// "name this thread" prompt the native agent's title generation uses.
     fn build_title_request(&self, cx: &App) -> Option<language_model::LanguageModelRequest> {
         use language_model::{LanguageModelRequest, LanguageModelRequestMessage, Role};
 
@@ -3559,8 +3302,6 @@ impl ThreadView {
         let error = error.into();
         self.emit_thread_error_telemetry(&error, cx);
         self.thread_error = Some(error);
-        // The rendered markdown is built from the error it is shown with; a new
-        // error must not keep showing the previous one's text.
         self.thread_error_markdown = None;
         cx.notify();
     }
@@ -4253,25 +3994,14 @@ impl ThreadView {
         });
     }
 
-    /// Drops this thread's per-entry view tree — a message editor per user
-    /// message, an editor per diff, a terminal view per terminal — for a thread
-    /// nobody is looking at. The thread, its entries, its running commands and
-    /// everything the sidebar reads are untouched: only the views go, and
-    /// [`Self::rebuild_entry_views`] builds them again from the same entries
-    /// when the thread comes back on screen.
-    ///
-    /// Refuses while a past message is being edited, because that editor holds
-    /// text the thread does not and dropping it would throw the edit away.
-    /// Returns whether anything was dropped.
+    /// Drops the per-entry view tree of a thread nobody is looking at. Refuses
+    /// while a past message is being edited, since that editor holds the edit.
     pub fn drop_entry_views(&mut self, cx: &mut Context<Self>) -> bool {
         if self.editing_message.is_some() || !self.entry_view_state.read(cx).views_are_built() {
             return false;
         }
-        // The scroll position is not recorded here. The list's own scroll handler
-        // already writes it to the thread whenever the reader moves, and asking
-        // an unrendered list where it is scrolled to answers "the top" — which
-        // for a thread opened in the background and never drawn would overwrite
-        // a real saved position with the beginning of the thread.
+        // Not saving the scroll position: an unrendered list answers "the top",
+        // and the scroll handler has already saved the real one.
         self.entry_view_state
             .update(cx, |state, _cx| state.drop_views());
         self.list_state.reset(0);
@@ -4279,9 +4009,8 @@ impl ThreadView {
         true
     }
 
-    /// Re-syncs one entry's views after its expansion changed. Views that are
-    /// only drawn while a call is open — a command's terminal — are built when
-    /// something asks to see them, so a toggle has to say so.
+    /// Views drawn only while a call is open (a terminal) are built on demand,
+    /// so an expansion change has to re-sync.
     fn sync_entry_views(&mut self, entry_ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let thread = self.thread.clone();
         self.entry_view_state.update(cx, |state, cx| {
@@ -4289,9 +4018,7 @@ impl ThreadView {
         });
     }
 
-    /// Builds the views for every entry again, the same way opening the thread
-    /// does. A no-op when they are already built, so it is safe to call on
-    /// every activation.
+    /// A no-op when the views are already built.
     pub fn rebuild_entry_views(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.entry_view_state.read(cx).views_are_built() {
             return;
@@ -4308,10 +4035,8 @@ impl ThreadView {
             for ix in 0..count {
                 state.sync_entry(ix, &thread, window, cx);
             }
-            list_state.splice_focusable(
-                0..0,
-                (0..count).map(|ix| state.entry(ix)?.focus_handle(cx)),
-            );
+            list_state
+                .splice_focusable(0..0, (0..count).map(|ix| state.entry(ix)?.focus_handle(cx)));
         });
 
         if following_tail {
@@ -4325,8 +4050,6 @@ impl ThreadView {
         self.sync_editor_mode(cx);
         cx.notify();
 
-        // The other half of the line the initial build writes, and the one that
-        // says what returning to a dropped thread costs.
         log::info!(
             "quiet-ui perf: rebuilt views for {count} thread entries in {:.0}ms",
             rebuild_started.elapsed().as_secs_f64() * 1000.
@@ -4962,8 +4685,7 @@ impl ThreadView {
         };
         let has_awaiting_permission = awaiting_permission.is_some();
 
-        // The plan is not here: it lives in the thread's working indicator, the
-        // one plan surface.
+        // The plan lives in the working indicator instead.
         if changed_buffers.is_empty() && queue_is_empty && !has_awaiting_permission {
             return None;
         }
@@ -5711,9 +5433,7 @@ impl ThreadView {
         cx.notify();
     }
 
-    /// The compaction barrier for agents that report compaction as a tool
-    /// call: the same transcript-wide marker as native compaction, with
-    /// nothing to expand.
+    /// The compaction marker for agents that report compaction as a tool call.
     fn render_compaction_barrier(
         &self,
         entry_ix: usize,
@@ -5791,10 +5511,7 @@ impl ThreadView {
             acp_thread::ContextCompactionStatus::Canceled => "Compaction Canceled",
             acp_thread::ContextCompactionStatus::Other(_) => "Context Compaction",
         };
-        // Compaction is a break in the conversation, not a message in it: it
-        // renders as one unmistakable marker across the transcript. Only a
-        // compaction that produced a summary has anything to expand (external
-        // agents compact without one).
+        // External agents compact without a summary, leaving nothing to expand.
         let expandable = has_details && !is_compacting;
         let chevron_end = if is_expanded {
             IconName::ChevronUp
@@ -6208,18 +5925,9 @@ impl ThreadView {
         )
     }
 
-    /// The row above the message input: the pending review comments chip on the
-    /// left and, while a turn generates, the prominent stop button on the right.
-    /// The stop lives here (not in the status bar, and never gated on the
-    /// input's contents) so cancelling a turn is always one obvious click.
-    /// Above the input: the pending-review-comments chip, and, while a turn is
-    /// generating, the working indicator (spinner, plan, elapsed, tokens) on the
-    /// same line as the Stop button. Stop is never gated on the input's
-    /// The active area sits above the input box: the pending review comments,
-    /// the plan, and the working indicator. The plan gets a row to itself; it
-    /// used to share the indicator's row, where it was laid out with a zero
-    /// flex basis and so collapsed to an ellipsis whenever the row's other
-    /// content took the width. Stop lives in the input box, not here.
+    /// Above the input: the live thought, the plan and the working indicator.
+    /// The plan gets its own row; sharing the indicator's, it collapsed to an
+    /// ellipsis.
     fn render_active_area(
         &mut self,
         _window: &Window,
@@ -6239,8 +5947,6 @@ impl ThreadView {
                 .w_full()
                 .px_1()
                 .gap_1()
-                // The live thought sits above the plan: it is what the agent
-                // is doing right now, the plan is where that is going.
                 .when_some(
                     (!confirmation).then_some(active_thought).flatten(),
                     |this, thought| this.child(h_flex().w_full().min_w_0().child(thought)),
@@ -6257,9 +5963,7 @@ impl ThreadView {
         )
     }
 
-    /// The thought the agent is having right now, shown beside the progress
-    /// indicator. Thinking is only ever shown there: the transcript skips
-    /// thoughts-only messages, and there are no thought chips.
+    /// Thinking is only shown here; the transcript skips thoughts.
     fn render_active_thought(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         const MIN_THOUGHT_DISPLAY: Duration = Duration::from_secs(1);
 
@@ -6269,9 +5973,8 @@ impl ThreadView {
             self.thought_hold_timer = None;
             return None;
         }
-        // The latest thought of the current turn, wherever it sits: it stays
-        // up while the commands it led to run, and only leaves when a newer
-        // thought replaces it or the turn ends.
+        // The latest thought of the current turn stays up while the commands it
+        // led to run.
         let entries = thread.entries();
         let (latest_key, latest) = entries
             .iter()
@@ -6286,8 +5989,6 @@ impl ThreadView {
                 Some(((entry_ix, chunk_ix), markdown))
             })?;
 
-        // A newer thought does not replace the shown one until the shown one
-        // has been up for a beat; otherwise a fast stream is unreadable.
         if let Some((shown_key, shown_at)) = self.displayed_thought
             && shown_key != latest_key
         {
@@ -6328,9 +6029,6 @@ impl ThreadView {
             .map(|(_, markdown)| markdown)
     }
 
-    /// The working indicator, live thought, and plan, aligned to the input's
-    /// content width. Rendered above the activity bar (edits, queued
-    /// messages): what the agent is doing now reads before what is waiting.
     pub(crate) fn render_active_area_row(
         &mut self,
         window: &mut Window,
@@ -6338,9 +6036,8 @@ impl ThreadView {
     ) -> Option<AnyElement> {
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
         self.render_active_area(window, cx).map(|area| {
-            // min_w_0 on both levels: without it the column cannot shrink
-            // below its content's intrinsic width, and a narrow window clips
-            // the plan instead of truncating its rows.
+            // min_w_0 on both levels, or a narrow window clips the plan instead
+            // of truncating its rows.
             h_flex()
                 .w_full()
                 .min_w_0()
@@ -6380,8 +6077,6 @@ impl ThreadView {
             .when(!has_messages, |this| this.flex_1().size_full())
             .child(
                 h_flex()
-                    // A little more air above the box than below it, so the
-                    // composer sits apart from the thread's output.
                     .pt_4()
                     .pb_2()
                     .bg(editor_bg_color)
@@ -6487,10 +6182,7 @@ impl ThreadView {
                 let keybinding_size = rems_from_px(12_f32);
                 let steer_on = entry.steer;
 
-                // A message queued with review comments carries them just like a
-                // sent one, so it shows the same review-comment visual instead of
-                // the composed text in its read-only editor.
-                let review = crate::diff_review::review_blocks(&entry.content);
+                let review = crate::diff_review::review_comment_blocks(&entry.content);
                 let review_only = !review.is_empty()
                     && crate::diff_review::without_review_blocks(entry.content.clone()).is_empty();
 
@@ -6666,12 +6358,6 @@ impl ThreadView {
             .is_some_and(|model| model.supports_split_token_display())
     }
 
-    /// How full the context window is, pinned to the top right of the
-    /// conversation (not the input status bar) so it reads as a property of the
-    /// thread rather than of the message being composed.
-    /// How full the context window is, shown in the input bar beside the
-    /// thread's diff and PR chips rather than floating over the transcript,
-    /// where it sat on top of the conversation it was describing.
     fn render_context_window_indicator(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let usage = self.render_token_usage(cx)?;
         Some(h_flex().flex_none().child(usage).into_any_element())
@@ -6990,10 +6676,6 @@ impl ThreadView {
         )
     }
 
-    /// The fast-mode content merged into the model popover's third section: a
-    /// fast-mode on/off row plus, when the provider warns before enabling it,
-    /// the warning inline with an enable-and-dismiss row. Returns `None` for
-    /// models without fast mode so the popover shows only model and effort.
     fn fast_mode_menu_section(
         &self,
         cx: &Context<Self>,
@@ -7073,10 +6755,6 @@ impl ThreadView {
         Some((provider_id, model_id, confirmation))
     }
 
-    /// The thinking/effort content merged into the model popover's second
-    /// section: a thinking on/off toggle (when the model allows disabling it)
-    /// and the supported effort levels. Returns `None` for models without
-    /// thinking so the model popover shows only the model list.
     fn effort_menu_section(
         &self,
         cx: &Context<Self>,
@@ -7093,8 +6771,6 @@ impl ThreadView {
         let can_disable = model.supports_disabling_thinking();
         let thinking_enabled = thread_read.thinking_enabled();
         let effort_levels = model.supported_effort_levels();
-        // Match the standalone control: effort only applies when thinking is on
-        // (or can't be turned off).
         let show_effort = !effort_levels.is_empty() && (!can_disable || thinking_enabled);
 
         let selected_value = thread_read.thinking_effort().cloned();
@@ -7205,15 +6881,7 @@ impl ThreadView {
         });
     }
 
-    /// The persistent bar directly below the message input. It hosts the
-    /// option controls (add-context, profile, mode, the merged agent settings
-    /// picker) on the left and, on the right, this thread's worktree diff
-    /// against the start of its branch (clicking it opens that same diff) and
-    /// the thread's PR
-    /// badges. Running state lives in the tabs, the thread's working indicator,
-    /// and the stop button above the input; the context-window indicator sits at
-    /// the bottom right of the conversation. There is no send button: Enter
-    /// sends via the editor's Chat action.
+    /// The bar below the message input. There is no send button: Enter sends.
     fn render_input_status_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         if std::mem::take(&mut self.diff_stats_stale) {
             self.branch_diff_stats
@@ -7221,7 +6889,6 @@ impl ThreadView {
         }
         let branch_diff_stats = self.branch_diff_stats.read(cx);
         let is_generating = self.thread.read(cx).status() != ThreadStatus::Idle;
-        // An unstarted draft: the same state that hosts the worktree choice.
         let is_draft = self.list_state.item_count() == 0;
         let diff_stats = branch_diff_stats.stats();
         let diff_tooltip = match branch_diff_stats.base() {
@@ -7232,9 +6899,7 @@ impl ThreadView {
             DiffStatsBase::NoRepository => "This worktree is not in a git repository".to_string(),
         };
 
-        // Model, thinking effort, and fast mode are one control: the popover
-        // carries a section each, and the trigger reads "Model / Effort" with a
-        // fast-mode icon when it is on.
+        // Model, thinking effort and fast mode are one control.
         if let Some(model_selector) = self.model_selector.clone() {
             let effort_section = self.effort_menu_section(cx);
             let fast_mode_section = self.fast_mode_menu_section(cx);
@@ -7261,9 +6926,8 @@ impl ThreadView {
                     .child(self.render_add_context_button(cx))
                     .children(self.profile_selector.clone())
                     .map(|this| match self.config_options_view.clone() {
-                        // The model picker only survives beside the config
-                        // options when the agent's own options do not offer the
-                        // model (see ConversationView's selector construction).
+                        // ConversationView only keeps a model selector beside
+                        // config options that do not offer the model.
                         Some(config_view) => this
                             .children(self.model_selector.clone())
                             .child(config_view),
@@ -7276,19 +6940,12 @@ impl ThreadView {
                 h_flex()
                     .flex_wrap()
                     .gap_1p5()
-                    // How full the context window is, ahead of what the branch
-                    // looks like: it is about the conversation, and it is the
-                    // one of these that changes as you type.
                     .children(self.render_context_window_indicator(cx))
-                    // A draft has done no work and may not even end up on this
-                    // branch (it can start a new worktree on send), so the
-                    // branch's diff and PRs are not its own and are not shown.
+                    // A draft may start a new worktree on send, so this
+                    // branch's diff and PRs are not its own.
                     .when(!is_draft, |this| {
                         this
-                            // Always rendered, +0/-0 included, so the bar keeps its
-                            // shape when the first edit lands.
-                            // Reads as a button/chip (border, hover, pointer), not inert
-                            // text, so its click-to-open-diff affordance is obvious.
+                            // Rendered at +0/-0 too, so the bar keeps its shape.
                             .child(
                                 h_flex()
                                     .id("thread-diff-stat")
@@ -7325,15 +6982,9 @@ impl ThreadView {
             .into_any()
     }
 
-    /// Upstream's way out of a draft its composer has locked: a draft that
-    /// could not be resolved keeps the composer read-only until it is
-    /// explicitly thrown away, and without a control for that there is no way
-    /// back. Upstream draws it in the thread-controls row, which this fork
-    /// replaces with the status bar, so it lives here instead.
-    fn render_discard_protected_draft_button(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
+    /// Upstream's button, moved here because the fork replaces the
+    /// thread-controls row it lived in.
+    fn render_discard_protected_draft_button(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.message_editor.read(cx).editor().read(cx).read_only(cx) {
             return None;
         }
@@ -7356,9 +7007,6 @@ impl ThreadView {
         )
     }
 
-    /// The thread's pull requests, and the controls for saying which they
-    /// are. Editing lives here rather than in the sidebar: this is the
-    /// thread's own surface, and the sidebar's chips are a readout.
     fn render_thread_pr_controls(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let chips = self.thread_pr_chips(cx);
         let mut elements: Vec<AnyElement> = Vec::with_capacity(chips.len() + 1);
@@ -7369,8 +7017,6 @@ impl ThreadView {
             elements.push(
                 ui::PrChip::new(("thread-pr-chip", index), chip)
                     .large(true)
-                    // Only a real pull request can be taken out; the muted
-                    // "no PR" pill is a statement, not a member of the set.
                     .map(|chip| match watched {
                         Some(watched) => {
                             chip.on_remove(group, "Stop Watching This PR", move |_, _window, cx| {
@@ -7387,8 +7033,7 @@ impl ThreadView {
         elements
     }
 
-    /// Which pull request a chip stands for, or `None` for the inert "no PR"
-    /// pill. The URL is the only place a chip says which repository it is in.
+    /// `None` for the "no PR" pill.
     fn watched_pr_of_chip(chip: &ui::ThreadItemPrChip) -> Option<WatchedPr> {
         Self::watched_pr_of_url(chip.url.as_ref()?)
     }
@@ -7410,15 +7055,6 @@ impl ThreadView {
             })
     }
 
-    /// The PRs worth offering: the ones this thread or any other has seen,
-    /// narrowed to the ones that could plausibly belong to this thread. Plus
-    /// the clipboard, for one nothing has seen.
-    ///
-    /// A number is not something anyone recognises, so every entry is
-    /// labelled with the pull request's title. The rest is about being short:
-    /// this thread's repository only, open pull requests before finished
-    /// ones, most recently seen first, and a handful rather than the hundreds
-    /// a long-running install accumulates.
     fn build_add_pr_menu(
         &self,
         window: &mut Window,
@@ -7459,8 +7095,6 @@ impl ThreadView {
                     let label = candidate.label();
                     let pr = candidate.pr;
                     let entity = entity.clone();
-                    // `watch_pr` undoes a removal, so putting one back is the
-                    // same action as adding one that was never here.
                     menu = menu.entry(label, None, move |_, cx| {
                         let pr = pr.clone();
                         entity.update(cx, |this, cx| this.watch_pr(pr, cx));
@@ -7473,25 +7107,12 @@ impl ThreadView {
         })
     }
 
-    /// How many the `+` menu offers. Short enough to read at a glance: the
-    /// one you want is almost always one of the last few, and the clipboard
-    /// is there for the rest.
     const PR_MENU_LIMIT: usize = 6;
 
-    /// The pull requests the `+` menu offers, best first.
-    /// The pull requests this thread took out by hand, offered back.
-    ///
-    /// `dismiss` moves a PR out of `watched` and into `dismissed`, and nothing
-    /// else reads `dismissed`, so a mined PR only this thread ever watched
-    /// disappeared from every source the moment it was removed. These come
-    /// first, under their own header, and do not count against the limit —
-    /// being pushed out of a list of six by six PRs from other threads is the
-    /// other way this went wrong.
-    pub(super) fn pr_menu_removed(
-        &self,
-        already: &[WatchedPr],
-        cx: &App,
-    ) -> Vec<PrMenuCandidate> {
+    /// PRs this thread dismissed, offered back. Nothing else reads `dismissed`,
+    /// so a mined PR only this thread watched would otherwise vanish; they do
+    /// not count against `PR_MENU_LIMIT`.
+    pub(super) fn pr_menu_removed(&self, already: &[WatchedPr], cx: &App) -> Vec<PrMenuCandidate> {
         let Some(store) = ThreadMetadataStore::try_global(cx) else {
             return Vec::new();
         };
@@ -7533,10 +7154,8 @@ impl ThreadView {
         let this_repo = self.thread_repo(cx);
 
         let mut candidates: Vec<PrMenuCandidate> = Vec::new();
-        // Titles come from the PRs a thread's branch was polled for, which is
-        // the only place a title is recorded. A PR watched by number carries
-        // none of its own, so it borrows the one from whichever thread saw it
-        // as a branch PR.
+        // A PR watched by number has no title of its own, so it borrows one
+        // from any thread that saw it as a branch PR.
         let mut titles: Vec<(WatchedPr, SharedString, gh_status::PrState)> = Vec::new();
         for thread_id in store.entry_ids().collect::<Vec<_>>() {
             let Some(snapshot) = store.pr_snapshot(thread_id) else {
@@ -7563,9 +7182,8 @@ impl ThreadView {
         }
 
         for candidate in &mut candidates {
-            if let Some((_, title, state)) = titles
-                .iter()
-                .find(|(known, _, _)| *known == candidate.pr)
+            if let Some((_, title, state)) =
+                titles.iter().find(|(known, _, _)| *known == candidate.pr)
             {
                 candidate.title = Some(title.clone());
                 candidate.state = Some(*state);
@@ -7579,8 +7197,6 @@ impl ThreadView {
             !already.contains(&candidate.pr)
                 && !removed_here.contains(&candidate.pr)
                 && match (&this_repo, &candidate.pr.repo) {
-                    // A thread whose repository is not known yet is not a
-                    // reason to offer nothing; it is a reason not to narrow.
                     (Some(this_repo), Some(repo)) => repo == this_repo,
                     _ => true,
                 }
@@ -7595,8 +7211,6 @@ impl ThreadView {
         candidates
     }
 
-    /// Adds a PR to the offer, keeping the most recent sighting of one that
-    /// several threads have seen.
     fn offer_pr(
         candidates: &mut Vec<PrMenuCandidate>,
         pr: WatchedPr,
@@ -7616,8 +7230,7 @@ impl ThreadView {
         });
     }
 
-    /// Which repository this thread's work is in, by the pull requests its own
-    /// branches have. `None` when nothing has answered for them yet.
+    /// Inferred from the PRs of the thread's own branches.
     fn thread_repo(&self, cx: &App) -> Option<String> {
         let branches = self.thread_branches(cx);
         if let Some(store) = gh_status::GhStatusStore::try_global(cx) {
@@ -7643,7 +7256,6 @@ impl ThreadView {
             .or_else(|| snapshot.watched.iter().find_map(|pr| pr.repo.clone()))
     }
 
-    /// The pull request a URL names, as the watched set spells one.
     fn watched_pr_of_url(url: &str) -> Option<WatchedPr> {
         let mention = acp_thread::pr_mentions(url).into_iter().next()?;
         Some(WatchedPr {
@@ -7652,9 +7264,6 @@ impl ThreadView {
         })
     }
 
-    /// The Stop button, in the status bar under the input rather than over it.
-    /// It is never gated on the input's contents, so cancelling a turn is
-    /// always one click.
     fn render_stop_button(&self, cx: &Context<Self>) -> AnyElement {
         Button::new("stop-generation", "Stop")
             .label_size(LabelSize::Small)
@@ -7671,8 +7280,6 @@ impl ThreadView {
             .into_any_element()
     }
 
-    /// The pending review comments, shown inside the input box: they attach to
-    /// the next message, so they belong with the message being composed.
     fn render_pending_review_comments(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let count = self.pending_review_comment_count(cx);
         if count == 0 {
@@ -7711,12 +7318,8 @@ impl ThreadView {
         )
     }
 
-    /// Asks the agent to stop one command it detached.
-    ///
-    /// There is no process of ours behind a backgrounded command, so this is a
-    /// request rather than a signal, and the turn is left alone: what the agent
-    /// makes of a command that stopped is its own business, the same as with a
-    /// terminal killed from its chip.
+    /// A request rather than a signal: no process of ours is behind a command
+    /// the agent detached.
     fn stop_async_task(&mut self, async_task_id: SharedString, cx: &mut Context<Self>) {
         let thread = self.thread.read(cx);
         let session_id = thread.session_id().clone();
@@ -7725,10 +7328,7 @@ impl ThreadView {
         cx.spawn(async move |_, _| task.await.log_err()).detach();
     }
 
-    /// What this thread has in flight, in the row above the message box: the
-    /// same pill the sidebar's rows draw, so the thread being looked at says
-    /// what it is doing without a glance sideways. Nothing while it is idle,
-    /// and the counts inside it are silent at zero.
+    /// The same pill the sidebar's rows draw.
     fn render_input_activity_pill(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let thread = self.thread.read(cx);
         let running_work = thread.running_work(cx);
@@ -7737,17 +7337,12 @@ impl ThreadView {
             subagents: running_work.subagents,
             async_tasks: running_work.async_tasks,
         };
-        // A turn that has handed control back with a command still running is
-        // still working, the same rule the sidebar's rows use.
         if thread.status() == ThreadStatus::Idle && work.is_empty() {
             return None;
         }
         Some(ui::agent_activity_pill("input-activity", work, cx))
     }
 
-    /// The right end of the input status bar: the loading spinner while added
-    /// context resolves, and nothing otherwise. There is no send affordance at
-    /// all (not even a hint): Enter sends via the editor's Chat action.
     fn render_input_run_indicator(&self, _cx: &mut Context<Self>) -> AnyElement {
         if self.is_loading_contents {
             return div()
@@ -8334,18 +7929,13 @@ impl ThreadView {
     fn render_entries(&mut self, cx: &mut Context<Self>) -> List {
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
         let accent = cx.theme().colors().text_accent;
-        // Resolved once for the frame rather than once per row: resolving a
-        // mark walks every entry, and a row that paid for that walk itself
-        // would make a long thread quadratic to draw.
+        // Once per frame: resolving a mark walks every entry.
         let bookmarked: HashSet<usize> = self.bookmarked_indices(cx).into_iter().collect();
         let centered_container = move |content: AnyElement, bookmarked: bool| {
             h_flex().w_full().justify_center().child(
                 div()
                     .when_some(max_content_width, |this, max_w| this.max_w(max_w))
                     .w_full()
-                    // A marked entry carries a quiet rule down its inside
-                    // edge: enough to find by eye while scrolling, and it
-                    // costs the row no height.
                     .when(bookmarked, |this| this.border_l_2().border_color(accent))
                     .child(content),
             )
@@ -8376,9 +7966,7 @@ impl ThreadView {
         window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
-        // Thinking is shown beside the progress indicator while it happens and
-        // is not part of the transcript. Render it empty to keep the list index
-        // 1:1 with the thread entries.
+        // Thinking is shown beside the progress indicator, not in the transcript.
         if self
             .thread
             .read(cx)
@@ -8471,9 +8059,6 @@ impl ThreadView {
                         }))
                     })
                     .child(
-                        // Chat-bubble layout: the message sits right-aligned
-                        // at up to 80% of the row width, tinted with the
-                        // accent color instead of a full-width bordered card.
                         h_flex().w_full().justify_end().child(
                         div()
                             .relative()
@@ -8604,9 +8189,6 @@ impl ThreadView {
                     .into_any()
             }
             AgentThreadEntry::AssistantMessage(message) => {
-                // A message that is nothing but thoughts is part of the action
-                // group around it: its thoughts are chips like any other action,
-                // drawn by the run's first entry (see the tool call arm).
                 if let Some((run_start, run_len)) = self.action_run_bounds(entry_ix, cx) {
                     if entry_ix != run_start {
                         return Empty.into_any();
@@ -8621,40 +8203,36 @@ impl ThreadView {
                     );
                 }
 
-                // Thinking is only ever shown as the live thought beside the
-                // progress indicator; the transcript renders just the prose.
                 let mut is_blank = true;
                 let is_last = entry_ix + 1 == total_entries;
 
-                let message_body = v_flex()
-                    .w_full()
-                    .gap_3()
-                    .children(message.chunks.iter().enumerate().filter_map(
-                        |(chunk_ix, chunk)| match chunk {
-                            AssistantMessageChunk::Message { block, .. } => {
-                                let this_is_blank = !block.visible_content(cx);
-                                is_blank = is_blank && this_is_blank;
-                                (!this_is_blank).then(|| {
-                                    div()
-                                        .id(("assistant-message-chunk", chunk_ix))
-                                        .child(self.render_message_content(
-                                            entry_ix, chunk_ix, block, window, cx,
-                                        ))
-                                        .into_any_element()
-                                })
-                            }
-                            AssistantMessageChunk::Thought { .. } => None,
-                        },
-                    ))
-                    .into_any();
+                let message_body =
+                    v_flex()
+                        .w_full()
+                        .gap_3()
+                        .children(message.chunks.iter().enumerate().filter_map(
+                            |(chunk_ix, chunk)| match chunk {
+                                AssistantMessageChunk::Message { block, .. } => {
+                                    let this_is_blank = !block.visible_content(cx);
+                                    is_blank = is_blank && this_is_blank;
+                                    (!this_is_blank).then(|| {
+                                        div()
+                                            .id(("assistant-message-chunk", chunk_ix))
+                                            .child(self.render_message_content(
+                                                entry_ix, chunk_ix, block, window, cx,
+                                            ))
+                                            .into_any_element()
+                                    })
+                                }
+                                AssistantMessageChunk::Thought { .. } => None,
+                            },
+                        ))
+                        .into_any();
 
                 if is_blank {
                     Empty.into_any()
                 } else {
                     let prose_bubble = {
-                        // Chat-bubble layout: assistant prose sits near flush
-                        // left in a subtly tinted, rounded bubble at up to 96% of
-                        // the row width.
                         v_flex()
                             .group("agent-message")
                             .relative()
@@ -8663,12 +8241,16 @@ impl ThreadView {
                             .when(is_last, |this| this.pb_4())
                             .w_full()
                             .text_ui(cx)
-                            .child(h_flex().w_full().justify_start().child(
-                                div().w_full().max_w(relative(0.96)).py_2().child(message_body),
-                            ))
                             .child(
-                                // Hover-revealed copy button at the response's
-                                // top-right; reuses the context menu's copy logic.
+                                h_flex().w_full().justify_start().child(
+                                    div()
+                                        .w_full()
+                                        .max_w(relative(0.96))
+                                        .py_2()
+                                        .child(message_body),
+                                ),
+                            )
+                            .child(
                                 div()
                                     .absolute()
                                     .top_2()
@@ -8712,12 +8294,8 @@ impl ThreadView {
                 self.render_compaction_barrier(entry_ix, tool_call, cx)
             }
             AgentThreadEntry::ToolCall(tool_call) => {
-                // A run of consecutive agent actions renders as one compact grid
-                // of headline chips (a group ends at the next assistant text
-                // message). The run's first entry draws the whole group; the
-                // rest draw nothing so the list index stays 1:1 with the thread
-                // entries. Permission prompts are not chips and fall through
-                // to their full rendering below.
+                // The run's first entry draws the whole chip group; the rest
+                // draw nothing so list indices stay 1:1 with thread entries.
                 if let Some((run_start, run_len)) = self.action_run_bounds(entry_ix, cx) {
                     if entry_ix != run_start {
                         return Empty.into_any();
@@ -9363,15 +8941,12 @@ impl ThreadView {
         self.scroll_to_end(cx);
     }
 
-    /// The marks set in this thread, as the store has them. A thread with no
-    /// marks is the common case and costs an empty set.
     fn bookmarks(&self, cx: &App) -> ThreadBookmarks {
         ThreadMetadataStore::try_global(cx)
             .and_then(|store| store.read(cx).bookmarks(self.root_thread_id).cloned())
             .unwrap_or_default()
     }
 
-    /// What each entry can be marked as, by index.
     fn entry_anchors(&self, cx: &App) -> Vec<Option<BookmarkAnchor>> {
         let entries = self.thread.read(cx).entries();
         bookmarks::anchors(entries.iter().map(EntryKind::of))
@@ -9386,13 +8961,11 @@ impl ThreadView {
             .is_some_and(|anchor| self.bookmarks(cx).contains(&anchor))
     }
 
-    /// The entries carrying a mark right now.
     pub(crate) fn bookmarked_indices(&self, cx: &App) -> Vec<usize> {
         self.bookmarks(cx).resolve(&self.entry_anchors(cx))
     }
 
-    /// Everywhere next/previous stops: the marks, and the user messages that
-    /// start each turn.
+    /// Where next/previous stops: the marks and the user messages.
     pub(crate) fn waypoint_indices(&self, cx: &App) -> Vec<usize> {
         let marks = self.bookmarks(cx);
         let entries = self.thread.read(cx).entries();
@@ -9409,9 +8982,6 @@ impl ThreadView {
         cx.notify();
     }
 
-    /// Marks the entry, or clears the mark already on it. An entry with no
-    /// identity of its own (a plan, a compaction) cannot be marked, and says
-    /// so by doing nothing.
     pub(crate) fn toggle_bookmark_at(&mut self, entry_ix: usize, cx: &mut Context<Self>) {
         let Some(anchor) = self.anchor_at(entry_ix, cx) else {
             return;
@@ -9428,8 +8998,6 @@ impl ThreadView {
         cx.notify();
     }
 
-    /// The entry at the top of the viewport is the one being read, so it is
-    /// the one the keybinding marks.
     fn toggle_bookmark(
         &mut self,
         _: &ToggleBookmark,
@@ -9613,9 +9181,6 @@ impl ThreadView {
         });
     }
 
-    /// Subagent tool calls of this thread that are still running. Surfaced as a
-    /// chip next to the working indicator so a quiet turn that is really several
-    /// subagents deep reads as such.
     pub(crate) fn running_subagent_count(&self, cx: &App) -> usize {
         self.thread
             .read(cx)
@@ -9634,49 +9199,43 @@ impl ThreadView {
             .count()
     }
 
-    /// The review comments attached to a sent user message, rendered the same
-    /// way the diff review overlay shows them: each comment's quoted code and
-    /// text in a bordered, tinted block, so the message and the diff agree.
     fn render_sent_review_comments(
         &self,
         entry_ix: usize,
         message: &acp_thread::UserMessage,
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
-        let blocks = crate::diff_review::review_blocks(message.content.source_blocks());
-        if blocks.is_empty() {
+        let reviews = crate::diff_review::review_comment_blocks(message.content.source_blocks());
+        if reviews.is_empty() {
             return None;
         }
-        Some(self.render_review_comments(("sent-review", entry_ix), &blocks, cx))
+        Some(self.render_review_comments(("sent-review", entry_ix), &reviews, cx))
     }
 
-    /// The review-comment visual shared by a sent message's bubble and a queued
-    /// message's row: one bordered, tinted block per comment, each showing the
-    /// quoted code it anchors to and then the comment text, matching the diff
-    /// review overlay's comment block.
-    ///
-    /// The blocks are parsed out of the composed review text (`review_blocks`,
-    /// the only public accessor today). When `diff_review::review_comment_blocks`
-    /// lands (a structured `Vec<ParsedReview { comments: Vec<{ path, range,
-    /// quoted_code, comment }> }>`), this should read that instead of parsing.
+    /// Matches the diff review overlay's comment block.
     fn render_review_comments(
         &self,
         id_seed: impl Into<ElementId>,
-        blocks: &[(usize, SharedString)],
+        reviews: &[crate::diff_review::ParsedReview],
         cx: &Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors();
-        let comments: Vec<ParsedReviewComment> = blocks
-            .iter()
-            .flat_map(|(_, text)| parse_review_block(text))
-            .collect();
+        let comments = reviews.iter().flat_map(|review| review.comments.iter());
 
         v_flex()
             .id(id_seed)
             .pt_1p5()
             .w_full()
             .gap_1p5()
-            .children(comments.into_iter().map(|comment| {
+            .children(comments.map(|comment| {
+                let location: SharedString = match comment.line_range {
+                    Some((start, end)) if start != end => {
+                        format!("{} lines {start}-{end}", comment.path).into()
+                    }
+                    Some((start, _)) => format!("{} line {start}", comment.path).into(),
+                    None => comment.path.clone(),
+                };
+                let code = (!comment.quoted_code.is_empty()).then(|| comment.quoted_code.clone());
                 v_flex()
                     .w_full()
                     .gap_1()
@@ -9687,12 +9246,12 @@ impl ThreadView {
                     .border_color(colors.border)
                     .bg(colors.surface_background)
                     .child(
-                        Label::new(comment.location)
+                        Label::new(location)
                             .size(LabelSize::XSmall)
                             .color(Color::Muted)
                             .buffer_font(cx),
                     )
-                    .when_some(comment.code, |this, code| {
+                    .when_some(code, |this, code| {
                         this.child(
                             v_flex()
                                 .w_full()
@@ -9712,19 +9271,14 @@ impl ThreadView {
                         div()
                             .text_xs()
                             .text_color(colors.text)
-                            .child(comment.comment),
+                            .child(comment.comment.clone()),
                     )
             }))
             .into_any_element()
     }
 
-    /// The plan as one compact line inside the working indicator, and, while
-    /// expanded, the full list under it. This is the thread's only plan
-    /// surface: there is no separate task list.
-    /// The plan as its own full-width block above the input. Collapsed it is
-    /// the last completed item, the current one, and the next one; expanded it
-    /// is every completed and upcoming item in those same rows, rather than a
-    /// second list underneath.
+    /// The thread's only plan surface. Collapsed: the last completed item, the
+    /// current one and the next one.
     pub(crate) fn render_plan(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let plan = self.thread.read(cx).plan()?;
         if plan.is_empty() {
@@ -9744,10 +9298,7 @@ impl ThreadView {
             .collect();
         let current = plan.stats().in_progress_entry;
 
-        // Collapsed shows the tail of what is done and the head of what is not;
-        // expanded shows all of both. A "+1" overflow row costs the same space
-        // as the item it hides, so two items are always shown in full rather
-        // than one item plus a "+1 completed" line.
+        // A "+1" overflow row costs as much space as the item it hides.
         let collapsed_take = |len: usize| if len <= 2 { len } else { 1 };
         let shown_completed: Vec<&PlanEntry> = if expanded {
             completed.clone()
@@ -9770,9 +9321,7 @@ impl ThreadView {
                 .gap_1p5()
                 .min_w_0()
                 .child(h_flex().w_2().flex_none().justify_center().child(glyph))
-                // The label takes the row's free width and shrinks within it.
-                // Without flex_1 here the text is laid out against a zero basis
-                // and truncates to an ellipsis.
+                // Without flex_1 the label gets a zero basis and truncates.
                 .child(
                     div().flex_1().min_w_0().child(
                         Label::new(text)
@@ -9783,9 +9332,6 @@ impl ThreadView {
                 )
         };
 
-        // Overflow counts sit on their own line under the entries they stand
-        // for, aligned to the text column, so they read as a continuation
-        // rather than a suffix of one entry.
         let overflow_row = |text: String| {
             h_flex()
                 .w_full()
@@ -9810,8 +9356,6 @@ impl ThreadView {
             ));
         }
         if let Some(entry) = current {
-            // The in-progress item speaks the same language as the turn itself:
-            // the shared running glyph.
             rows = rows.child(plan_row(
                 ui::agent_running_indicator().into_any_element(),
                 plan_entry_text(entry, cx),
@@ -9837,10 +9381,8 @@ impl ThreadView {
                 .id("plan-line")
                 .w_full()
                 .min_w_0()
-                // Air between the transcript above and the plan.
                 .mt_2()
                 .mb_1()
-                // Say that the block expands: pointer plus a quiet hover tint.
                 .cursor_pointer()
                 .rounded_md()
                 .hover(|this| this.bg(cx.theme().colors().element_hover.opacity(0.5)))
@@ -9872,12 +9414,11 @@ impl ThreadView {
 
         let is_blocked_on_terminal_command =
             !confirmation && self.is_blocked_on_terminal_command(cx);
-        // The plan renders as a sibling row above this indicator; when its
-        // in-progress entry is drawn it already carries the running glyph.
-        let plan_carries_the_spinner = !confirmation
-            && self.thread.read(cx).plan().is_some_and(|plan| {
-                !plan.is_empty() && plan.stats().in_progress_entry.is_some()
-            });
+        let plan_carries_the_spinner =
+            !confirmation
+                && self.thread.read(cx).plan().is_some_and(|plan| {
+                    !plan.is_empty() && plan.stats().in_progress_entry.is_some()
+                });
         let is_waiting = confirmation || self.thread.read(cx).has_in_progress_tool_calls();
 
         let turn_tokens_label = elapsed_label
@@ -9896,8 +9437,6 @@ impl ThreadView {
             IconName::ArrowDown
         };
 
-        // The indicator shares the Stop button's row above the input, so it
-        // takes the row's free width and carries no padding of its own.
         h_flex()
             .id("generating-spinner")
             .min_w_0()
@@ -9920,11 +9459,8 @@ impl ThreadView {
                         ),
                     )
                 } else if is_blocked_on_terminal_command || plan_carries_the_spinner {
-                    // The plan's in-progress row (rendered just above this) has
-                    // the running glyph; a second one here would say no more.
                     this
                 } else {
-                    // The same running glyph as sidebar rows and thread tabs.
                     this.child(
                         h_flex()
                             .w_2()
@@ -10005,10 +9541,6 @@ impl ThreadView {
         });
     }
 
-    /// One assistant chunk's blocks, each with its own context menu, so the
-    /// menu's copy entries name the block the pointer is over. This fork draws
-    /// them inside a chat bubble rather than upstream's flush column, but what
-    /// a block is and how it is rendered is upstream's.
     fn render_message_content(
         &self,
         entry_ix: usize,
@@ -10085,20 +9617,21 @@ impl ThreadView {
                             }
                         });
 
-                    let bookmark_item = ContextMenuEntry::new(if this.is_bookmarked(entry_ix, cx) {
-                        "Remove Bookmark"
-                    } else {
-                        "Bookmark This Point"
-                    })
-                    .action(Box::new(ToggleBookmark))
-                    .handler({
-                        let entity = entity.clone();
-                        move |_, cx| {
-                            entity.update(cx, |this, cx| {
-                                this.toggle_bookmark_at(entry_ix, cx);
-                            });
-                        }
-                    });
+                    let bookmark_item =
+                        ContextMenuEntry::new(if this.is_bookmarked(entry_ix, cx) {
+                            "Remove Bookmark"
+                        } else {
+                            "Bookmark This Point"
+                        })
+                        .action(Box::new(ToggleBookmark))
+                        .handler({
+                            let entity = entity.clone();
+                            move |_, cx| {
+                                entity.update(cx, |this, cx| {
+                                    this.toggle_bookmark_at(entry_ix, cx);
+                                });
+                            }
+                        });
 
                     let scroll_item = if is_at_top {
                         ContextMenuEntry::new("Scroll to Bottom").handler({
@@ -10264,8 +9797,8 @@ impl ThreadView {
         window: &Window,
         cx: &Context<Self>,
     ) -> Div {
-        // The label's markdown source is a fenced code block; strip the fences
-        // so the copy button yields just the command text.
+        // The label's markdown source is a fenced code block (```\n...\n```);
+        // strip the fences so the copy button yields just the command text.
         let command_source = command.read(cx).source();
         let command_text = strip_command_fences(&command_source).to_string();
 
@@ -10319,9 +9852,7 @@ impl ThreadView {
             .child(div().absolute().top_1().right_1().child(copy_button))
     }
 
-    /// The file-type icon (the project panel's, via [`FileIcons`]) for a tool
-    /// call that acts on exactly one file. `None` for terminals and for tool
-    /// calls that touch several files or none, which keep their kind icon.
+    /// `None` for terminals and calls not on exactly one file.
     fn tool_call_file_icon(tool_call: &ToolCall, cx: &App) -> Option<SharedString> {
         file_icon_for_locations(
             &tool_call.locations,
@@ -10345,37 +9876,22 @@ impl ThreadView {
         }
     }
 
-    /// Whether an entry belongs to a run of chips. Every tool call does, except
-    /// permission prompts and subagent calls, which keep their full rendering
-    /// and so end the run. So does an assistant message that puts nothing in
-    /// the transcript: it draws no chip of its own, but it counts here so that
-    /// it does not split the chips around it into separate groups. An assistant
-    /// message that says something (any non-blank prose chunk) ends the run.
+    /// Permission prompts and compactions end a run of chips; an assistant
+    /// message that draws nothing does not split one.
     fn is_chip_entry(entry: &AgentThreadEntry, cx: &App) -> bool {
         match entry {
             AgentThreadEntry::ToolCall(tool_call) => {
                 !matches!(
                     tool_call.status(),
                     ToolCallStatus::WaitingForConfirmation { .. }
-                )
-                    // Compaction renders as the transcript-wide barrier, never
-                    // as an action chip.
-                    && !tool_call.is_compaction(cx)
+                ) && !tool_call.is_compaction(cx)
             }
             AgentThreadEntry::AssistantMessage(_) => Self::draws_no_transcript_content(entry, cx),
             _ => false,
         }
     }
 
-    /// A message with nothing in it for the transcript to draw: one that only
-    /// thinks (thinking is shown beside the progress indicator and nowhere
-    /// else), and one that is empty.
-    ///
-    /// The empty case is not hypothetical. An agent message is an ordered list
-    /// of blocks, and an agent that emits a blank text block between two tool
-    /// calls produces an entry that renders nothing at all. An entry nobody can
-    /// see must not break the run of chips it sits in, or one run of actions
-    /// arrives as several short rows.
+    /// Thoughts-only or empty: agents emit blank text blocks between tool calls.
     fn draws_no_transcript_content(entry: &AgentThreadEntry, cx: &App) -> bool {
         match entry {
             AgentThreadEntry::AssistantMessage(message) => {
@@ -10385,8 +9901,6 @@ impl ThreadView {
         }
     }
 
-    /// A message that only thinks: silent in the transcript, and with a thought
-    /// to show beside the progress indicator.
     fn is_thoughts_only_message(entry: &AgentThreadEntry, cx: &App) -> bool {
         Self::draws_no_transcript_content(entry, cx)
             && matches!(
@@ -10396,13 +9910,10 @@ impl ThreadView {
             )
     }
 
-    /// The distinct edited-file locations of an edit tool call, as indices into
-    /// `locations`. Empty for non-edit calls; a call with fewer than two
-    /// distinct files stays a single chip (there is no per-file breakdown to
-    /// split).
+    /// The distinct files of an edit tool call; empty for other calls.
     fn edited_files(tool_call: &ToolCall, cx: &App) -> Vec<EditedFile> {
-        let is_edit =
-            matches!(tool_call.kind(), acp_v2::ToolKind::Edit) || tool_call.diffs().next().is_some();
+        let is_edit = matches!(tool_call.kind(), acp_v2::ToolKind::Edit)
+            || tool_call.diffs().next().is_some();
         if !is_edit {
             return Vec::new();
         }
@@ -10421,10 +9932,7 @@ impl ThreadView {
             return files;
         }
 
-        // An agent that sends a patch (Codex) reports the diffs but no
-        // locations at all, which leaves the call its generic "editing files"
-        // label. Its diffs still name the files, so they are the fallback: the
-        // call is one chip per file either way.
+        // An agent that sends a patch (Codex) reports diffs but no locations.
         for diff in tool_call.diffs() {
             let Some(path) = diff.read(cx).file_path(cx) else {
                 continue;
@@ -10442,10 +9950,7 @@ impl ThreadView {
     }
 
     /// The non-blank thought chunks of an assistant message, as
-    /// `(chunk_ix, markdown)`. Each is one chip: the agent's distinct thoughts
-    /// arrive as distinct chunks (streaming deltas of one thought merge into a
-    /// single chunk in [`AcpThread`]), so one chip per chunk is one chip per
-    /// thought.
+    /// `(chunk_ix, markdown)`.
     fn thought_chunks<'a>(
         message: &'a AssistantMessage,
         cx: &'a App,
@@ -10464,10 +9969,7 @@ impl ThreadView {
             })
     }
 
-    /// Whether a message has anything for the transcript to draw: prose, but
-    /// also a picture or a resource link, which say nothing in markdown and
-    /// are still the whole content of the message that carries them.
-    /// Thinking does not count; it is shown beside the progress indicator.
+    /// Thinking does not count; images and resource links do.
     fn has_content(message: &AssistantMessage, cx: &App) -> bool {
         message.chunks.iter().any(|chunk| match chunk {
             AssistantMessageChunk::Message { block, .. } => block.visible_content(cx),
@@ -10475,13 +9977,8 @@ impl ThreadView {
         })
     }
 
-    /// The entry, if any, that is currently in progress and therefore belongs to
-    /// the working indicator (the active area), not the transcript: a running
-    /// terminal, or a still-streaming tail message that is nothing but thoughts,
-    /// at the end of a `Generating` turn. Always the last entry, since that is
-    /// the only one a turn is still producing.
-    /// The thought the agent is having right now, which the active area shows
-    /// beside the progress indicator.
+    /// A still-streaming thoughts-only tail entry, which the active area shows
+    /// instead of the transcript.
     fn active_area_entry(
         entries: &[AgentThreadEntry],
         generating: bool,
@@ -10494,8 +9991,6 @@ impl ThreadView {
         Self::is_thoughts_only_message(&entries[ix], cx).then_some(ix)
     }
 
-    /// The number of leading entries the transcript draws: every entry except
-    /// the in-progress tail the active area shows.
     fn visible_entry_count(&self, cx: &App) -> usize {
         let thread = self.thread.read(cx);
         let entries = thread.entries();
@@ -10506,11 +10001,7 @@ impl ThreadView {
         }
     }
 
-    /// The maximal run of consecutive chip-able entries containing `entry_ix`,
-    /// as `(run_start, run_len)`. The run ends at the next assistant text
-    /// message (or any other non-chip entry); a lone tool call is a run of
-    /// length one. The in-progress tail is trimmed off first, so it is never
-    /// grouped into a run.
+    /// The run of chip entries containing `entry_ix`, as `(run_start, run_len)`.
     fn action_run_bounds(&self, entry_ix: usize, cx: &App) -> Option<(usize, usize)> {
         let entries = self.thread.read(cx).entries();
         let visible = self.visible_entry_count(cx);
@@ -10519,9 +10010,6 @@ impl ThreadView {
         }
         let entries = &entries[..visible];
 
-        // Every entry the list draws asks this, so within a frame the whole
-        // run is answered the first time any of it is, rather than walked
-        // again for each entry it contains.
         let mut runs = self.chip_cache.frame_runs.borrow_mut();
         if runs.len() < entries.len() {
             runs.resize(entries.len(), RunMemo::Unknown);
@@ -10551,7 +10039,6 @@ impl ThreadView {
         Some(Self::chunk_of_run(start, end, entry_ix))
     }
 
-    /// Run bounds without a view to memoize through, for tests.
     #[cfg(test)]
     fn action_run_bounds_in(
         entries: &[AgentThreadEntry],
@@ -10572,13 +10059,8 @@ impl ThreadView {
         Some(Self::chunk_of_run(start, end, entry_ix))
     }
 
-    /// The part of a run that `entry_ix` is drawn in. A run's chips are drawn
-    /// by its first entry as one block, which the list can only skip or draw
-    /// whole; past a certain length that block is several screens tall and
-    /// every frame pays for all of it. Splitting a long run into blocks lets
-    /// the list leave the ones that are nowhere near the viewport alone. The
-    /// answer is the same for every entry of a block, so each block is drawn
-    /// once, by its own first entry.
+    /// Splits long runs into blocks: a run is drawn whole by its first entry, so
+    /// an unsplit long run makes every frame pay for screens of chips.
     fn chunk_of_run(start: usize, end: usize, entry_ix: usize) -> (usize, usize) {
         const MAX_RUN: usize = 48;
 
@@ -10586,9 +10068,6 @@ impl ThreadView {
         (chunk_start, MAX_RUN.min(end + 1 - chunk_start))
     }
 
-    /// The chips a run of entries renders as. One chip per tool call and one per
-    /// thought, except that adjacent wait calls (agents that poll can emit long
-    /// stretches of them) collapse into a single counted chip.
     fn action_chips(&self, run_start: usize, run_len: usize, cx: &App) -> Vec<ActionChip> {
         let entries = self.thread.read(cx).entries();
         let visible = self.visible_entry_count(cx);
@@ -10601,40 +10080,7 @@ impl ThreadView {
         )
     }
 
-    /// Opens this edited file's diff as its own tab: an editor over the
-    /// call's single-file diff multibuffer, hunks expanded.
-    /// Opens (or, when already open, closes) a diff tab for one edited file.
-    /// The tab shows the file's real project buffer with the agent's changes
-    /// as expanded diff hunks: the tab carries the file's name, line numbers
-    /// are the file's own, and the buffer is editable in place. The tool
-    /// call's detached ACP diff is only a fallback for buffers the action log
-    /// no longer tracks.
-    /// Opens a diff view for one edited file. The view is always the REAL
-    /// project buffer (real path, real line numbers, LSP, editable) with the
-    /// agent's pre-edit content as the diff base; the agent's own detached
-    /// buffer is never shown, since it has no language server and its line
-    /// numbers lead into a scratch file.
-    ///
-    /// Each chip owns its own view: two edits of one file open two diffs, each
-    /// against the base that edit started from.
-    /// Opens the edited file's REAL project editor (real path, real tab, LSP,
-    /// editable) and shows the agent's change in its gutter by attaching a
-    /// diff whose base is the agent's pre-edit content. This is the exact
-    /// decoration Zed's own single-file review applies, done unconditionally
-    /// for this one editor so it does not depend on the `single_file_review`
-    /// setting. `workspace.open_path` is idempotent, so clicking again just
-    /// re-activates the tab rather than stacking duplicates.
-    /// Opens the real project file for one edited file and shows the agent's
-    /// change in it: a normal editor (real tab title, real path, language
-    /// server, editable), with the agent's pre-edit content attached as the
-    /// diff base so the gutter shows exactly what changed. Never a detached
-    /// scratch buffer.
-    ///
-    /// Opening the same file again just re-activates its tab and re-reveals the
-    /// change, rather than stacking duplicates.
-    /// Opens the place a tool complained about: the file it named, at the line
-    /// it named. Paths come from compiler output, so they may be relative to
-    /// the worktree or absolute.
+    /// Paths come from compiler output, so may be relative or absolute.
     fn open_output_location(
         &mut self,
         location: &acp_thread::OutputLocation,
@@ -10684,6 +10130,8 @@ impl ThreadView {
             .detach_and_log_err(cx);
     }
 
+    /// Opens the real project buffer against the text the call found, so each
+    /// edit of one file gets its own diff.
     fn open_edit_file_diff(
         &mut self,
         entry_ix: usize,
@@ -10702,8 +10150,6 @@ impl ThreadView {
             .diff_for_edited_file(tool_call, &file, cx)
             .map(|diff| diff.read(cx).base_text().clone())?;
 
-        // One call's edits to one file, as their own diff view: a multibuffer
-        // of the real buffer against the text as the call found it.
         crate::tool_call_diff::open_tool_call_diff(
             crate::tool_call_diff::ToolCallDiffKey {
                 tool_call_id: tool_call.id.clone(),
@@ -10719,8 +10165,6 @@ impl ThreadView {
         Some(())
     }
 
-    /// The `+added -removed` readout on an edit chip: a chip of its own, so that
-    /// it reads as the clickable thing it is (it opens the call's diff).
     fn render_diff_stat_chip(
         &self,
         element_id: impl Into<ElementId>,
@@ -10728,10 +10172,6 @@ impl ThreadView {
         on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
         cx: &Context<Self>,
     ) -> AnyElement {
-        // The chip's tint says which way the change went: green for growing,
-        // red for shrinking, and grey when it neither grew nor shrank, which
-        // is a rewrite rather than a lean either way. The counts keep their own
-        // colours regardless.
         let tint = match stats.lines_added.cmp(&stats.lines_removed) {
             std::cmp::Ordering::Greater => cx.theme().status().success,
             std::cmp::Ordering::Less => cx.theme().status().error,
@@ -10750,8 +10190,6 @@ impl ThreadView {
             .hover(|style| style.bg(tint.opacity(0.25)))
             .tooltip(Tooltip::text("Show Diff"))
             .on_click(cx.listener(move |this, _, window, cx| {
-                // The parent chip has its own click; without this the click
-                // would trigger both.
                 cx.stop_propagation();
                 on_click(this, window, cx);
             }))
@@ -10774,12 +10212,8 @@ impl ThreadView {
             .into_any_element()
     }
 
-    /// A thought's chip: the think icon plus a short summary of the thought.
-    /// Thoughts do not expand; the full thought shows on hover, so a run of
-    /// thinking reads as quiet chips rather than a wall of collapsible text.
-    /// The live thought: quiet italic text with a slow shimmer, styled
-    /// nothing like the action chips so it reads as the agent's voice rather
-    /// than one of its actions. Hover shows the full thought.
+    /// The live thought, styled unlike the action chips so it reads as the
+    /// agent's voice. Hover shows the full thought.
     fn render_thought_chip(
         &self,
         key: (usize, usize),
@@ -10822,8 +10256,6 @@ impl ThreadView {
                         |this, delta| this.opacity(delta),
                     ),
             )
-            // The full thought is the hover card: there is no click-to-expand.
-            // A long one scrolls in the card rather than being clipped.
             .hoverable_tooltip(chip_hover_card(move |window, cx| {
                 let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
                 card_scroll_region("thought-hover-scroll", rems(24.), rems(24.))
@@ -10890,18 +10322,11 @@ impl ThreadView {
         ));
         let border_color = self.tool_card_border_color(cx);
 
-        // One-line summary of the command, styled like the subtle Read/Search
-        // rows. The label's markdown source is a fenced code block; strip the
-        // fences and show the same interesting-part summary the chip does. The
-        // full command surfaces in a tooltip whenever the summary hides part of
-        // it (a long command, a chain, or a multi-line script).
         let command_text = strip_command_fences(&tool_call.label.read(cx).source()).to_string();
         let display_command: SharedString =
             acp_thread::command_display_prefix(&command_text, 100).into();
         let show_full_command = display_command.as_ref() != command_text.trim();
 
-        // Bash-highlight the one-line command, reusing the language the label
-        // markdown (a bash-tagged fenced code block) already resolved.
         let command_language = tool_call.label.read(cx).first_code_block_language();
         let command_element = {
             let markdown_style =
@@ -10926,8 +10351,7 @@ impl ThreadView {
             .entry_view_state
             .read(cx)
             .is_tool_call_user_collapsed(&tool_call.id);
-        // Failed commands open their output so problems are visible without a
-        // click; an explicit collapse by the user wins.
+        // Failed commands open their output unless the user collapsed them.
         let auto_expanded = (tool_failed || command_failed) && !user_collapsed;
         let inert_header = layout == ToolCallLayout::ChipBody;
         let is_expanded = inert_header || needs_confirmation || user_expanded || auto_expanded;
@@ -10940,12 +10364,9 @@ impl ThreadView {
                 .w_full()
                 .flex_none()
                 .gap_1p5()
-                // Matches the dimming of the other quiet one-line tool rows.
                 .opacity(0.85)
                 .px_1()
                 .rounded(rems_from_px(3_f32))
-                // Same hover affordance as the edit/read one-line rows; inside an
-                // expanded chip the header is plain text.
                 .when(!inert_header, |this| {
                     this.hover(|s| s.bg(cx.theme().colors().element_hover.opacity(0.5)))
                         .cursor_pointer()
@@ -11086,18 +10507,11 @@ impl ThreadView {
             .and_then(|entry| entry.terminal(terminal));
 
         v_flex()
-            // Slightly deeper indent than prose and tighter vertical rhythm:
-            // tool rows read as quiet annotations between messages. The
-            // header's px_1 hover padding brings the icon back to the same
-            // column as the other one-line rows.
             .when(layout == ToolCallLayout::Standalone, |this| {
                 this.my_0p5().ml_5().mr_5()
             })
             .children(header_element)
             .when(is_expanded, |this| {
-                // The one-line row above already shows the command; the
-                // expansion adds only the terminal output (no repeated
-                // command block, no working-dir label).
                 this.child(
                     v_flex()
                         .mt_1()
@@ -11107,13 +10521,10 @@ impl ThreadView {
                         .border_l_1()
                         .when(tool_failed || command_failed, |this| this.border_dashed())
                         .border_color(border_color)
-                        // The script the command carried, before its output:
-                        // what ran reads before what it printed.
                         .children(self.render_command_scripts(tool_call, window, cx))
                         .when_some(tool_call.sandbox_not_applied.as_ref(), |this, reason| {
-                            // Upstream renders this warning inside its terminal
-                            // card header, which our one-line row replaces; the
-                            // warning data is shared, the rendering is ours.
+                            // Upstream renders this inside the terminal card
+                            // header our one-line row replaces.
                             let TerminalSandboxWarning {
                                 title,
                                 detail,
@@ -11161,9 +10572,6 @@ impl ThreadView {
                             div()
                                 .rounded_md()
                                 .overflow_hidden()
-                                // The terminal paints its own background; an
-                                // editor-coloured margin above it shows as a
-                                // light band over a dark terminal.
                                 .bg(cx.theme().colors().terminal_background)
                                 .text_ui_sm(cx)
                                 .h_full()
@@ -11192,8 +10600,6 @@ impl ThreadView {
             .into_any()
     }
 
-    /// Render the "ran without sandbox" warning shown on a terminal tool card,
-    /// tailored to *why* the sandbox wasn't applied.
     fn sandbox_not_applied_warning(
         &self,
         reason: &SandboxNotAppliedReason,
@@ -11378,8 +10784,7 @@ impl ThreadView {
             })
             .unwrap_or_else(|| (false, false, focus_handle.clone()));
 
-        // Edits render as a subtle one-line label (like Read/Search) instead of
-        // a card; the diff is available behind the disclosure chevron.
+        // Edits render as a one-line row; the diff is behind the disclosure.
         let use_card_layout = needs_confirmation || is_terminal_tool;
 
         let has_image_content = tool_call.content().iter().any(|c| c.image().is_some());
@@ -11390,10 +10795,8 @@ impl ThreadView {
             || (should_show_raw_input && tool_call.raw_input.is_some());
 
         let is_collapsible = has_content && !needs_confirmation;
-        // One-line rows expand/collapse on click (like terminal rows).
-        // Rows whose click opens a file keep that behavior, except edits,
-        // whose go-to-file moves to a hover icon button so click can
-        // toggle the diff.
+        // An edit row's click toggles the diff; go-to-file moves to a hover
+        // button.
         let click_toggles_expand = is_collapsible && (is_edit || !has_location);
         let show_goto_file_button = is_edit && has_location && is_collapsible;
         let is_open = self
@@ -11556,32 +10959,28 @@ impl ThreadView {
                                 .child(input_output_header("Output:".into())),
                         )
                     })
-                    .children(
-                        tool_call
-                            .content()
-                            .iter()
-                            .enumerate()
-                            .map(|(content_ix, content)| {
-                                let output_id = SharedString::from(format!(
-                                    "tool-call-output-{entry_ix}-{content_ix}"
-                                ));
-                                div()
-                                    .id(output_id.clone())
-                                    .debug_selector(move || output_id.to_string())
-                                    .child(self.render_tool_call_content(
-                                        active_session_id,
-                                        entry_ix,
-                                        content,
-                                        content_ix,
-                                        tool_call,
-                                        use_card_layout,
-                                        failed_or_canceled,
-                                        focus_handle,
-                                        window,
-                                        cx,
-                                    ))
-                            }),
-                    )
+                    .children(tool_call.content().iter().enumerate().map(
+                        |(content_ix, content)| {
+                            let output_id = SharedString::from(format!(
+                                "tool-call-output-{entry_ix}-{content_ix}"
+                            ));
+                            div()
+                                .id(output_id.clone())
+                                .debug_selector(move || output_id.to_string())
+                                .child(self.render_tool_call_content(
+                                    active_session_id,
+                                    entry_ix,
+                                    content,
+                                    content_ix,
+                                    tool_call,
+                                    use_card_layout,
+                                    failed_or_canceled,
+                                    focus_handle,
+                                    window,
+                                    cx,
+                                ))
+                        },
+                    ))
                     .into_any(),
                 ToolCallStatus::Rejected => Empty.into_any(),
             }
@@ -11623,14 +11022,10 @@ impl ThreadView {
                         .bg(cx.theme().colors().editor_background)
                         .overflow_hidden()
                 } else {
-                    // Tighter vertical rhythm and dimmed further than the
-                    // muted text color alone: quiet one-line rows.
                     this.my_0p5().opacity(0.85)
                 }
             })
             .when(layout == ToolCallLayout::Standalone, |this| {
-                // One-line rows sit slightly deeper than prose (px_5), so they
-                // read as quiet annotations; cards keep the prose margin.
                 this.map(|this| {
                     if use_card_layout {
                         this.ml_5()
@@ -12663,9 +12058,8 @@ impl ThreadView {
             move || format!("PERMISSION_BUTTONS-{session_id}-{dropdown_label}")
         };
 
-        // The granularity dropdown is deliberately not rendered: permission
-        // prompts are the exception (sessions default to an auto-approving
-        // mode), so when one appears it is a plain Allow/Deny decision.
+        // Not rendered: with sessions auto-approving by default, a prompt is a
+        // plain Allow/Deny decision.
         let _dropdown = if let Some((pattern_list, tool_name)) = patterns {
             self.render_permission_granularity_dropdown_with_patterns(
                 choices,
@@ -13259,8 +12653,6 @@ impl ThreadView {
             .into_any_element()
         };
 
-        // Quiet +added -removed line counts for edit one-liners, derived
-        // from the tool call's diffs.
         let edit_stats_element = is_edit
             .then(|| {
                 let mut stats = action_log::DiffStats::default();
@@ -13375,9 +12767,6 @@ impl ThreadView {
                     .children(edit_stats_element)
                     .map(|this| {
                         if click_toggles_expand {
-                            // Edit rows expand/collapse on click, like
-                            // terminal rows; go-to-file moves to the hover
-                            // icon button on the right.
                             let id = tool_call.id.clone();
                             this.on_click(cx.listener(move |this, _, window, cx| {
                                 this.entry_view_state.update(cx, |state, _cx| {
@@ -13432,15 +12821,13 @@ impl ThreadView {
             .when(!is_edit, |this| this.child(gradient_overlay))
     }
 
-    /// The image a tool call is about, if any: the picture is the point of such
-    /// a call, so the chip shows it rather than describing it.
-    ///
-    /// An agent delivers one either way: as a file it read, or as image data on
-    /// the call itself. A screenshot usually lands outside the project, so a
-    /// path that no worktree claims still counts.
+    /// A screenshot usually lands outside the project, so a path no worktree
+    /// claims still counts.
     fn tool_call_image(&self, tool_call: &ToolCall, cx: &App) -> Option<ChipImage> {
-        if let Some((image, dimensions)) =
-            tool_call.content().iter().find_map(|content| content.image())
+        if let Some((image, dimensions)) = tool_call
+            .content()
+            .iter()
+            .find_map(|content| content.image())
         {
             return Some(ChipImage::Data {
                 image: image.clone(),
@@ -13463,9 +12850,7 @@ impl ThreadView {
         Some(ChipImage::File(path))
     }
 
-    /// Whether a call is about a picture, without resolving where it lives.
-    /// Chip grouping runs without a project handle, and a call that carries an
-    /// image must not be folded into a summary either way.
+    /// Without resolving the path: chip grouping runs without a project.
     fn tool_call_has_image(tool_call: &ToolCall, _cx: &App) -> bool {
         tool_call
             .content()
@@ -13477,8 +12862,7 @@ impl ThreadView {
                 .is_some_and(|location| Self::path_is_image(&location.path))
     }
 
-    /// Whether a path names an image we can draw. SVG is excluded: the image
-    /// element rasterizes bitmaps, and Zed opens vector files as text.
+    /// SVG is excluded: `img` rasterizes bitmaps, and Zed opens SVGs as text.
     fn path_is_image(path: &std::path::Path) -> bool {
         path.extension()
             .and_then(|extension| extension.to_str())
@@ -13708,7 +13092,14 @@ impl ThreadView {
             self.render_resource_link(resource_link, cx)
         } else if let Some((image, dimensions)) = content.image() {
             let location = tool_call.and_then(|tool_call| tool_call.locations.first().cloned());
-            self.render_image_output(entry_ix, image.clone(), dimensions, location, card_layout, cx)
+            self.render_image_output(
+                entry_ix,
+                image.clone(),
+                dimensions,
+                location,
+                card_layout,
+                cx,
+            )
         } else {
             Empty.into_any_element()
         }
@@ -13979,9 +13370,6 @@ impl ThreadView {
                 )
             })
             .child(
-                // Same definite box as an inline image chip, sized to the
-                // picture's own shape so it is fitted into the box without
-                // being letterboxed inside it or running past its bottom.
                 div()
                     .w(IMAGE_CHIP_WIDTH)
                     .h(image_box_height(dimensions, IMAGE_CHIP_WIDTH))
@@ -14848,8 +14236,7 @@ impl ThreadView {
             .style(ButtonStyle::Filled)
             .on_click(cx.listener(|this, _, window, cx| {
                 this.clear_thread_error(cx);
-                // The errored thread is still a live tab; a plain NewThread
-                // would just re-focus it.
+                // A plain NewThread would re-focus the errored thread's tab.
                 window.dispatch_action(crate::NewAdditionalThread.boxed_clone(), cx);
             }))
     }
@@ -14944,10 +14331,6 @@ impl ThreadView {
         }
     }
 
-    /// Agent errors whose payload is JSON (a usage limit, a quota, a provider
-    /// error) render as the payload's human-readable message, with its links
-    /// clickable and its error code as a quiet secondary label. Anything else
-    /// renders raw.
     fn render_any_thread_error(
         &mut self,
         error: SharedString,
@@ -15013,13 +14396,12 @@ impl ThreadView {
             .dismiss_action(self.dismiss_error_button(cx))
     }
 
-    /// The scripts a command carried, shown as highlighted code when its chip
-    /// is expanded. ssh is already unwrapped by the parser, so a script that
-    /// ran on another machine appears the same way a local one does.
-    /// Builds the highlighted code for whatever scripts a command carried, so
-    /// expanding its chip can show them. Done on expansion because rendering
-    /// cannot create entities.
-    fn prepare_command_scripts(&mut self, tool_call_id: &acp_v1::ToolCallId, cx: &mut Context<Self>) {
+    /// Done on expansion because rendering cannot create entities.
+    fn prepare_command_scripts(
+        &mut self,
+        tool_call_id: &acp_v1::ToolCallId,
+        cx: &mut Context<Self>,
+    ) {
         if self
             .command_script_markdown
             .borrow_mut()
@@ -15702,8 +15084,6 @@ impl ThreadView {
         let current_speed = thread.read(cx).speed().unwrap_or_default();
         let new_speed = current_speed.toggle();
 
-        // Enabling with a pending provider warning goes through the agent
-        // settings popover, which shows the warning inline.
         if new_speed == Speed::Fast && self.pending_fast_mode_confirmation(cx).is_some() {
             if let Some(model_selector) = self.model_selector.clone() {
                 window.defer(cx, move |window, cx| {
@@ -15804,9 +15184,6 @@ impl Render for ThreadView {
         // renders (settings, connection state, feature flags).
         self.sync_local_commands(cx);
 
-        // The list renders its entries while this frame's tree is laid out, so
-        // anything the chips work out along the way holds until the next frame
-        // starts here.
         self.chip_cache.begin_frame();
 
         let has_messages = self.list_state.item_count() > 0;
@@ -16352,73 +15729,6 @@ fn strip_leading_command(text: &str, command_name: &str) -> String {
         .unwrap_or_else(|| trimmed.to_string())
 }
 
-/// One comment parsed out of a composed review block: where it anchors, the
-/// quoted code it points at, and the comment text.
-struct ParsedReviewComment {
-    location: SharedString,
-    code: Option<SharedString>,
-    comment: SharedString,
-}
-
-/// Parses a composed review block (`diff_review::compose_review_message`'s
-/// output) back into its comments. The block is a header line, then per comment
-/// a `` `path` line N: `` header, an optional fenced code quote, and the comment
-/// text. This is a thin reader over the only public accessor
-/// (`review_blocks`); it should be replaced by `diff_review::review_comment_blocks`
-/// once that structured API is available.
-fn parse_review_block(text: &str) -> Vec<ParsedReviewComment> {
-    fn is_location_line(line: &str) -> bool {
-        let trimmed = line.trim();
-        trimmed.starts_with('`') && trimmed.ends_with(':')
-    }
-
-    let lines: Vec<&str> = text.lines().collect();
-    let mut comments = Vec::new();
-    let mut index = 0;
-
-    // Skip the header and anything before the first comment.
-    while index < lines.len() && !is_location_line(lines[index]) {
-        index += 1;
-    }
-
-    while index < lines.len() {
-        let location = lines[index].trim().trim_end_matches(':').replace('`', "");
-        index += 1;
-
-        // Optional fenced code quote.
-        let mut code: Option<String> = None;
-        if lines.get(index).map(|line| line.trim()) == Some("```") {
-            index += 1;
-            let mut body: Vec<&str> = Vec::new();
-            while index < lines.len() && lines[index].trim() != "```" {
-                body.push(lines[index]);
-                index += 1;
-            }
-            if index < lines.len() {
-                index += 1;
-            }
-            code = Some(body.join("\n"));
-        }
-
-        // The comment text runs until the next comment's location line.
-        let mut body: Vec<&str> = Vec::new();
-        while index < lines.len() && !is_location_line(lines[index]) {
-            body.push(lines[index]);
-            index += 1;
-        }
-
-        comments.push(ParsedReviewComment {
-            location: location.trim().to_string().into(),
-            code: code.map(Into::into),
-            comment: body.join("\n").trim().to_string().into(),
-        });
-    }
-
-    comments
-}
-
-/// The project panel's file-type icon for a tool call's locations: only when
-/// the call is about exactly one file with an extension to key on.
 fn file_icon_for_locations(
     locations: &[acp_v1::ToolCallLocation],
     has_terminal: bool,
@@ -16436,10 +15746,8 @@ fn plan_entry_text(entry: &PlanEntry, cx: &App) -> SharedString {
     entry.content.read(cx).source().to_string().into()
 }
 
-/// Resolves each of a thread's work dirs to the worktree that hosts it, and
-/// that worktree's branch. The most specific (longest) worktree path containing
-/// a work dir wins, so a thread working in a linked worktree resolves to that
-/// worktree's branch and never to the main checkout's or a sibling worktree's.
+/// The most specific worktree containing a work dir wins, so a linked worktree
+/// resolves to its own branch, not the main checkout's.
 fn branches_for_thread_paths(
     thread_paths: &[PathBuf],
     worktree_branches: &[(PathBuf, String)],
@@ -16518,21 +15826,18 @@ mod tests {
 
     #[test]
     fn a_diff_editor_nobody_came_back_to_is_the_one_dropped() {
-        // Nothing to do until there are more than the cache keeps.
-        let held = (1..=3).map(|use_| (use_, use_ as usize)).collect::<Vec<_>>();
+        let held = (1..=3)
+            .map(|use_| (use_, use_ as usize))
+            .collect::<Vec<_>>();
         assert_eq!(stale_by_use(held.into_iter(), 3), Vec::<usize>::new());
 
-        // Five kept, two of them looked at again: the three nobody came back
-        // to go, and the order they are named in does not depend on the map.
         let held = vec![(1, "a"), (2, "b"), (3, "c"), (9, "d"), (8, "e")];
         assert_eq!(stale_by_use(held.into_iter(), 2), vec!["c", "b", "a"]);
 
-        // Equal stamps keep the order they arrived in, so the oldest still
-        // goes. Real stamps come from a counter and are never equal.
+        // Equal stamps keep their arrival order.
         let held = vec![(5, "b"), (5, "a"), (1, "c")];
         assert_eq!(stale_by_use(held.into_iter(), 2), vec!["c"]);
 
-        // Keeping none drops everything, newest first.
         let held = vec![(1, "a"), (2, "b")];
         assert_eq!(stale_by_use(held.into_iter(), 0), vec!["b", "a"]);
     }
@@ -16543,38 +15848,23 @@ mod tests {
 
     #[test]
     fn a_box_is_as_tall_as_its_picture_needs() {
-        // A 16:9 screenshot at 24rem wide needs 13.5rem, not the 20rem the
-        // fixed box used to reserve.
         assert_eq!(box_height(1920, 1080), 13.5);
-        // A square one needs its full width back.
         assert_eq!(box_height(600, 600), 24.);
-        // Twice as tall as wide is a phone screenshot, and still fits.
         assert_eq!(box_height(500, 1000), 32.);
-    }
-
-    #[test]
-    fn a_very_tall_picture_is_capped_rather_than_endless() {
-        // A full-page capture would want 240rem; it letterboxes instead.
+        // Capped, and a wide strip still gets a row.
         assert_eq!(box_height(400, 4000), 32.);
-    }
-
-    #[test]
-    fn a_wide_strip_still_gets_a_row() {
         assert_eq!(box_height(4000, 100), 4.);
-    }
 
-    #[test]
-    fn an_unmeasurable_picture_keeps_the_fixed_box() {
-        assert_eq!(image_box_height(None, IMAGE_CHIP_WIDTH).0, IMAGE_CHIP_HEIGHT.0);
-        // A zero dimension would divide by zero rather than describe a shape.
+        assert_eq!(
+            image_box_height(None, IMAGE_CHIP_WIDTH).0,
+            IMAGE_CHIP_HEIGHT.0
+        );
         assert_eq!(
             image_box_height(Some(gpui::size(0, 100)), IMAGE_CHIP_WIDTH).0,
             IMAGE_CHIP_HEIGHT.0
         );
     }
 
-    /// A real file of the given shape, so the header parsed off it is the one a
-    /// picture of that shape actually carries.
     fn png_bytes(width: u32, height: u32) -> Vec<u8> {
         let mut bytes = std::io::Cursor::new(Vec::new());
         image::DynamicImage::ImageRgba8(image::RgbaImage::new(width, height))
@@ -16588,15 +15878,13 @@ mod tests {
         use super::chips::image_shape_of_file;
 
         let fs = FakeFs::new(cx.executor());
-        // The capture from the 2026-09-07 report: 1024 wide and taller than the
-        // fixed box, which is how it came to paint over the chips under it.
-        fs.insert_tree(path!("/project"), json!({ "src": {} })).await;
+        fs.insert_tree(path!("/project"), json!({ "src": {} }))
+            .await;
         fs.insert_file(
             path!("/project/platform-1024-light.png"),
             png_bytes(1024, 1536),
         )
         .await;
-        // A landscape capture, for the other direction.
         fs.insert_file(path!("/project/wide.png"), png_bytes(1600, 400))
             .await;
 
@@ -16608,16 +15896,12 @@ mod tests {
         };
         assert_eq!(dimensions, gpui::size(1024, 1536));
 
-        // Its box is the picture's shape, capped, rather than the fixed one it
-        // used to take. The fixed box was 12rem short of holding it.
         assert_eq!(
             image_box_height(Some(dimensions), IMAGE_CHIP_WIDTH).0,
             IMAGE_CHIP_MAX_HEIGHT.0
         );
         assert!(IMAGE_CHIP_HEIGHT.0 < IMAGE_CHIP_MAX_HEIGHT.0);
 
-        // A landscape capture gets a box shorter than the fixed one, so the
-        // shape is read for its own sake and not just to grow the box.
         let ImageShape::Known(dimensions) =
             image_shape_of_file(&fs, path!("/project/wide.png").as_ref()).await
         else {
@@ -16631,12 +15915,10 @@ mod tests {
         use super::chips::image_shape_of_file;
 
         let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(path!("/project"), json!({ "src": {} })).await;
-        // A vector image has no pixel dimensions to read, and `image` does not
-        // decode it at all.
+        fs.insert_tree(path!("/project"), json!({ "src": {} }))
+            .await;
         fs.insert_file(path!("/project/logo.svg"), b"<svg/>".to_vec())
             .await;
-        // A name that promises a png over bytes that are not one.
         fs.insert_file(path!("/project/truncated.png"), b"not a png".to_vec())
             .await;
         let fs: Arc<dyn fs::Fs> = fs;
@@ -16676,29 +15958,22 @@ mod tests {
 
     #[test]
     fn a_long_run_of_actions_is_drawn_in_blocks() {
-        // A run the list can afford to draw at once stays whole.
         assert_eq!(ThreadView::chunk_of_run(3, 10, 3), (3, 8));
         assert_eq!(ThreadView::chunk_of_run(3, 10, 10), (3, 8));
 
-        // A longer one is split, and every entry of a block agrees on which
-        // block it is in, so each block is drawn exactly once by its own first
-        // entry.
         assert_eq!(ThreadView::chunk_of_run(0, 99, 0), (0, 48));
         assert_eq!(ThreadView::chunk_of_run(0, 99, 47), (0, 48));
         assert_eq!(ThreadView::chunk_of_run(0, 99, 48), (48, 48));
         assert_eq!(ThreadView::chunk_of_run(0, 99, 95), (48, 48));
         assert_eq!(ThreadView::chunk_of_run(0, 99, 96), (96, 4));
 
-        // A run that does not start at the first entry splits from where it
-        // starts, not from the top of the thread.
+        // Split from the run's start, not the thread's.
         assert_eq!(ThreadView::chunk_of_run(10, 109, 57), (10, 48));
         assert_eq!(ThreadView::chunk_of_run(10, 109, 58), (58, 48));
     }
 
     #[test]
     fn a_half_devshell_line_marks_the_acts_that_ran_in_it() {
-        // The badge names mapper once; without the marks the reader cannot tell
-        // which half of the line had that toolchain.
         let pieces = collapsed_pieces(
             "cd .. && nix develop .#mapper --command bash -c \
             'cd arcade && cargo fmt && cargo check' ; echo RUST_CLEAN; \
@@ -16717,8 +15992,7 @@ mod tests {
             ]
         );
 
-        // A line wholly inside one is not mixed, so nothing is marked: the
-        // badge alone already covers every act.
+        // A line wholly inside one needs no marks.
         let whole = collapsed_pieces(
             "nix develop .#mapper --command bash -c 'cargo fmt && cargo check && cargo test'",
         );
@@ -16736,9 +16010,6 @@ mod tests {
             .iter()
             .map(|piece| piece.label.text.as_str())
             .collect();
-        // Each act also names the crate it was pointed at (`cargo_names_the_
-        // crates_it_was_pointed_at`), so the five pieces are distinguishable
-        // by more than position.
         assert_eq!(
             texts,
             [
@@ -16750,13 +16021,11 @@ mod tests {
             ],
             "every act, not the first few and a count of the rest"
         );
-        // Every piece is a command in its own right, wearing Rust's own icon.
         for piece in &pieces {
             assert_eq!(piece.glyph, ChipGlyph::Language("rust"));
             assert_eq!(piece.label.commands, vec![0..piece.label.text.len()]);
         }
 
-        // A chain of different acts: each keeps its own glyph.
         let mixed = collapsed_pieces("python3 gen.py && cargo test && rg TODO src");
         assert_eq!(
             mixed
@@ -16771,13 +16040,11 @@ mod tests {
         );
         assert_eq!(mixed[0].label.text, "python3 gen.py");
 
-        // A summary that quotes the command is shell; the outcome after it is
-        // not, so it stays out of the highlighted range.
+        // The outcome after the command is not shell.
         let summarized = collapsed_label("pnpm lint", Some("3 errors"));
         assert_eq!(summarized.text, "pnpm lint · 3 errors");
         assert_eq!(summarized.commands, vec![0.."pnpm lint".len()]);
 
-        // A summary that describes the line is prose: none of it is shell.
         let described = collapsed_label(
             "git show HEAD:a.ts | sed -n '1,20p'; git show HEAD:b.ts | sed -n '1,20p'",
             None,
@@ -16785,7 +16052,6 @@ mod tests {
         assert_eq!(described.text, "Read 2 files at HEAD");
         assert!(described.commands.is_empty());
 
-        // A single command keeps the full width, and all of it is shell.
         let single = collapsed_label("cargo build --release", None);
         assert_eq!(single.text, "cargo build --release");
         assert_eq!(single.commands, vec![0..single.text.len()]);
@@ -16819,20 +16085,11 @@ mod tests {
         cx.update(|cx| {
             let message = test_assistant_message(&[("Opened a PR.", false)], cx);
 
-            // A message still streaming at the end of a turn is not finished;
-            // the same message once the turn ends is.
             assert!(!ThreadView::entry_has_finished(&message, true, true, cx));
             assert!(ThreadView::entry_has_finished(&message, true, false, cx));
-
-            // And a message a tool call started after is finished even though
-            // the turn is still running, which is the case "not the last
-            // entry" got right and nothing else did.
             assert!(ThreadView::entry_has_finished(&message, false, true, cx));
 
-            // A call is judged by its terminals, not by its own status: the
-            // agent reports a call completed some time after the command it
-            // ran actually stopped. One carrying no terminal has nothing left
-            // to arrive whatever its status says.
+            // A call is judged by its terminals, not its status.
             for status in [
                 ToolCallStatus::Pending,
                 ToolCallStatus::InProgress,
@@ -16867,19 +16124,14 @@ mod tests {
             ) else {
                 unreachable!()
             };
-            // Only a call with a terminal is a command; give it one the way an
-            // agent does, so the chip path treats it as such.
             let cache = ChipCache::default();
 
             let facts = cache.command(&tool_call, cx);
             assert!(facts.destructive, "rm -rf is destructive");
             assert_eq!(facts.command, "rm -rf build");
 
-            // Asking again reuses the same answer rather than reparsing: this
-            // is the whole point, since rendering asks on every frame.
             assert!(Rc::ptr_eq(&facts, &cache.command(&tool_call, cx)));
 
-            // A command that changes is parsed again.
             tool_call.label = cx.new(|cx| {
                 Markdown::new(
                     "```bash\ncargo build\n```".to_string().into(),
@@ -16910,8 +16162,6 @@ mod tests {
                 AgentThreadEntry::ToolCall(tool_call)
             };
 
-            // A screenshot outside the project, amid reads that would
-            // otherwise all fold into one summary chip.
             let entries = vec![
                 read("1", "src/main.rs", cx),
                 read("2", "src/lib.rs", cx),
@@ -16928,8 +16178,6 @@ mod tests {
                 "a png a call read is a picture wherever it lives"
             );
 
-            // The image keeps a chip of its own, and the reads around it
-            // collapse with each other rather than swallowing it.
             assert_eq!(
                 ThreadView::action_chips_in(&entries, 0, 5, cx),
                 vec![
@@ -16945,11 +16193,8 @@ mod tests {
         });
     }
 
-
-    /// An edit tool call whose locations name the given files (no diffs, so the
-    /// chip split is exercised from locations alone).
-    /// An edit call the way a patch-sending agent (Codex) reports it: diffs
-    /// that name the files, and no locations at all.
+    /// The way a patch-sending agent (Codex) reports an edit: diffs, no
+    /// locations.
     fn test_patch_tool_call(id: &str, files: &[&str], cx: &mut App) -> AgentThreadEntry {
         let AgentThreadEntry::ToolCall(mut tool_call) =
             test_tool_call(id, "editing files", acp_v1::ToolKind::Edit, None, cx)
@@ -16992,8 +16237,9 @@ mod tests {
 
     /// An assistant message of the given chunks, `(text, is_thought)`.
     fn test_assistant_message(chunks: &[(&str, bool)], cx: &mut App) -> AgentThreadEntry {
-        let language_registry =
-            std::sync::Arc::new(language::LanguageRegistry::test(cx.background_executor().clone()));
+        let language_registry = std::sync::Arc::new(language::LanguageRegistry::test(
+            cx.background_executor().clone(),
+        ));
         let chunks = chunks
             .iter()
             .map(|(text, is_thought)| {
@@ -17039,24 +16285,22 @@ mod tests {
         let mut memo = vec![RunMemo::Unknown; chips.len()];
         assert_eq!(find_run(2, chips.len(), &is_chip, &mut memo), Some((1, 3)));
 
-        // The walk answered its whole run, and the entries that stopped it.
         assert_eq!(memo[0], RunMemo::NotAChip);
         assert_eq!(memo[4], RunMemo::NotAChip);
         for ix in 1..=3 {
             assert_eq!(memo[ix], RunMemo::Run { start: 1, end: 3 });
         }
-        // Nothing beyond what it had to touch.
         assert_eq!(memo[5], RunMemo::Unknown);
 
-        // Every entry of the run agrees with a walk of its own, which is what
-        // the memo stands in for.
         asked.borrow_mut().clear();
         for ix in 1..=3 {
             let mut fresh = vec![RunMemo::Unknown; chips.len()];
-            assert_eq!(find_run(ix, chips.len(), &is_chip, &mut fresh), Some((1, 3)));
+            assert_eq!(
+                find_run(ix, chips.len(), &is_chip, &mut fresh),
+                Some((1, 3))
+            );
         }
 
-        // A run of one, and a run that ends at the last entry.
         let mut memo = vec![RunMemo::Unknown; chips.len()];
         assert_eq!(find_run(5, chips.len(), &is_chip, &mut memo), Some((5, 5)));
         assert_eq!(find_run(0, chips.len(), &is_chip, &mut memo), None);
@@ -17064,14 +16308,16 @@ mod tests {
 
         let all = [true, true, true];
         let mut memo = vec![RunMemo::Unknown; all.len()];
-        assert_eq!(find_run(1, all.len(), |ix| all[ix], &mut memo), Some((0, 2)));
+        assert_eq!(
+            find_run(1, all.len(), |ix| all[ix], &mut memo),
+            Some((0, 2))
+        );
     }
 
-    /// An assistant message whose only content is a picture: no markdown in
-    /// it at all, and nothing about it invisible.
     fn test_assistant_message_with_image(cx: &mut App) -> AgentThreadEntry {
-        let language_registry =
-            std::sync::Arc::new(language::LanguageRegistry::test(cx.background_executor().clone()));
+        let language_registry = std::sync::Arc::new(language::LanguageRegistry::test(
+            cx.background_executor().clone(),
+        ));
         let block = acp_thread::MessageContent::new(
             acp_v2::ContentBlock::Image(acp_v2::ImageContent::new(
                 "iVBORw0KGgo=".to_string(),
@@ -17083,10 +16329,10 @@ mod tests {
         );
         AgentThreadEntry::AssistantMessage(AssistantMessage {
             chunks: vec![AssistantMessageChunk::Message {
-                        identity: acp_thread::MessageIdentity::Legacy(None),
-                        meta: None,
-                        block,
-                    }],
+                identity: acp_thread::MessageIdentity::Legacy(None),
+                meta: None,
+                block,
+            }],
             indented: false,
             is_subagent_output: false,
         })
@@ -17097,17 +16343,12 @@ mod tests {
         crate::test_support::init_test(cx);
 
         cx.update(|cx| {
-            // The shape that scattered a run of chips across several short
-            // rows: an agent message is an ordered list of blocks, and a blank
-            // text block between two tool calls is an entry that renders
-            // nothing at all.
             let entries = vec![
                 test_tool_call("1", "Read foo.rs", acp_v1::ToolKind::Read, None, cx),
                 test_assistant_message(&[("", false)], cx),
                 test_tool_call("2", "Read bar.rs", acp_v1::ToolKind::Read, None, cx),
                 test_assistant_message(&[("  \n\t ", false)], cx),
                 test_tool_call("3", "Read baz.rs", acp_v1::ToolKind::Read, None, cx),
-                // A message with no blocks at all, which is the same thing.
                 test_assistant_message(&[], cx),
                 test_tool_call("4", "Read qux.rs", acp_v1::ToolKind::Read, None, cx),
             ];
@@ -17123,7 +16364,6 @@ mod tests {
                 );
             }
 
-            // One run, not four.
             for ix in 0..entries.len() {
                 assert_eq!(
                     ThreadView::action_run_bounds_in(&entries, ix, cx),
@@ -17132,16 +16372,12 @@ mod tests {
                 );
             }
 
-            // A message whose only content is a picture draws plenty, even
-            // though it says nothing in markdown. Reading "draws nothing" as
-            // "has no prose" hid an image-only reply behind an empty run.
             let with_image = test_assistant_message_with_image(cx);
             assert!(
                 !ThreadView::draws_no_transcript_content(&with_image, cx),
                 "an image is content, so the message that carries one ends a run"
             );
 
-            // Prose still ends it, which is the whole point of the boundary.
             let entries = vec![
                 test_tool_call("1", "Read foo.rs", acp_v1::ToolKind::Read, None, cx),
                 test_assistant_message(&[("", false), ("Here is what I found.", false)], cx),
@@ -17168,92 +16404,30 @@ mod tests {
                 test_tool_call("1", "Read foo.rs", acp_v1::ToolKind::Read, None, cx),
                 test_assistant_message(&[("First thought.", true), ("Second thought.", true)], cx),
                 test_tool_call("2", "Edited foo.rs", acp_v1::ToolKind::Edit, None, cx),
-                // Prose ends the run, thoughts of its own or not.
                 test_assistant_message(&[("A thought.", true), ("The answer.", false)], cx),
                 test_tool_call("3", "Read bar.rs", acp_v1::ToolKind::Read, None, cx),
             ];
 
-            // Thinking is shown beside the progress indicator while it happens,
-            // and nowhere else: it draws no chip and is not transcript content.
-            // It stays part of the run so it does not split the chips around it.
             assert!(ThreadView::is_thoughts_only_message(&entries[1], cx));
             assert!(
                 !ThreadView::is_thoughts_only_message(&entries[3], cx),
                 "a message that says something is transcript prose, thoughts or not"
             );
 
-            // A thoughts-only message does not end the run of chips around it.
             assert_eq!(
                 ThreadView::action_run_bounds_in(&entries, 0, cx),
                 Some((0, 3))
             );
             assert_eq!(ThreadView::action_run_bounds_in(&entries, 3, cx), None);
 
-            // Only the live thought is shown, and only while generating.
-            assert_eq!(
-                ThreadView::active_area_entry(&entries[..2], true, cx),
-                Some(1)
-            );
-            assert_eq!(
-                ThreadView::active_area_entry(&entries[..2], false, cx),
-                None
-            );
-
             assert_eq!(
                 ThreadView::action_chips_in(&entries, 0, 3, cx),
                 vec![
-                    // A lone read keeps its own chip (two or more collapse into
-                    // a summary); the fileless edit says nothing worth a chip
-                    // and draws none until its per-file chips arrive.
+                    // A fileless edit draws no chip until its files arrive.
                     ActionChip::ToolCall { entry_ix: 0 },
                 ]
             );
         });
-    }
-
-    #[test]
-    fn review_blocks_are_detected_and_parsed_for_display() {
-        let text = "I reviewed the changes and left 2 review comments below. Please address them.\n\
-             \n\
-             `src/main.rs` lines 10-12:\n\
-             ```\n\
-             fn main() {\n    todo!()\n}\n\
-             ```\n\
-             This needs an implementation.\n\
-             \n\
-             `src/lib.rs` line 3:\n\
-             ```\n\
-             pub struct Foo;\n\
-             ```\n\
-             Rename this.\n";
-
-        // The detector the sent-message bubble AND the queued-message row share:
-        // both call `review_blocks` on their content, so both recognize this.
-        let block = acp_v1::ContentBlock::Text(acp_v1::TextContent::new(text.to_string()));
-        let content = vec![block];
-        let detected = crate::diff_review::review_blocks(&content);
-        assert_eq!(detected.len(), 1);
-        assert_eq!(detected[0].0, 2, "the block reports its comment count");
-
-        // A review-only message has no typed text left once the review block is
-        // dropped: that is what makes the queued row show the visual, not text.
-        assert!(crate::diff_review::without_review_blocks(content).is_empty());
-
-        // The composed text parses back into per-comment blocks for display.
-        let comments = parse_review_block(text);
-        assert_eq!(comments.len(), 2);
-        assert_eq!(comments[0].location.as_ref(), "src/main.rs lines 10-12");
-        assert_eq!(
-            comments[0].code.as_deref(),
-            Some("fn main() {\n    todo!()\n}")
-        );
-        assert_eq!(
-            comments[0].comment.as_ref(),
-            "This needs an implementation."
-        );
-        assert_eq!(comments[1].location.as_ref(), "src/lib.rs line 3");
-        assert_eq!(comments[1].code.as_deref(), Some("pub struct Foo;"));
-        assert_eq!(comments[1].comment.as_ref(), "Rename this.");
     }
 
     #[gpui::test]
@@ -17263,7 +16437,6 @@ mod tests {
         cx.update(|cx| {
             let entries = vec![
                 test_edit_tool_call("1", &["/project/src/main.rs"], cx),
-                // Three locations, two distinct files: one chip per distinct file.
                 test_edit_tool_call(
                     "2",
                     &["/project/a.rs", "/project/b.rs", "/project/a.rs"],
@@ -17271,8 +16444,6 @@ mod tests {
                 ),
             ];
 
-            // A single-file edit is one chip, named after its file rather than
-            // after the call's (possibly generic) title.
             assert_eq!(
                 ThreadView::action_chips_in(&entries, 0, 1, cx),
                 vec![ActionChip::EditFile {
@@ -17281,7 +16452,6 @@ mod tests {
                 }]
             );
 
-            // A multi-file edit splits into one chip per distinct file.
             assert_eq!(
                 ThreadView::action_chips_in(&entries, 1, 1, cx),
                 vec![
@@ -17299,7 +16469,6 @@ mod tests {
             let AgentThreadEntry::ToolCall(multi) = &entries[1] else {
                 unreachable!()
             };
-            // The two chips map to the first occurrence of each distinct file.
             assert_eq!(
                 ThreadView::edited_files(multi, cx)
                     .into_iter()
@@ -17317,9 +16486,6 @@ mod tests {
         crate::test_support::init_test(cx);
 
         cx.update(|cx| {
-            // Codex sends a patch: diffs name the files, locations are empty.
-            // Keying the split on locations alone left this one "files" chip,
-            // which is the shape that kept surviving.
             let entries = vec![test_patch_tool_call(
                 "1",
                 &["/project/a.rs", "/project/b.rs"],
@@ -17328,10 +16494,7 @@ mod tests {
             let AgentThreadEntry::ToolCall(patch) = &entries[0] else {
                 unreachable!()
             };
-            assert!(
-                patch.locations.is_empty(),
-                "this is the no-locations shape the fix is about"
-            );
+            assert!(patch.locations.is_empty());
 
             let files = ThreadView::edited_files(patch, cx);
             assert_eq!(
@@ -17365,8 +16528,6 @@ mod tests {
         crate::test_support::init_test(cx);
 
         cx.update(|cx| {
-            // A still-streaming thoughts-only tail belongs to the active area
-            // while the turn is generating, and to the transcript once it ends.
             let entries = vec![
                 test_tool_call("1", "Read foo.rs", acp_v1::ToolKind::Read, None, cx),
                 test_assistant_message(&[("Still thinking.", true)], cx),
@@ -17374,14 +16535,12 @@ mod tests {
             assert_eq!(ThreadView::active_area_entry(&entries, true, cx), Some(1));
             assert_eq!(ThreadView::active_area_entry(&entries, false, cx), None);
 
-            // A thought that is not the tail has settled: never skipped.
             let entries = vec![
                 test_assistant_message(&[("A thought.", true)], cx),
                 test_tool_call("1", "Read foo.rs", acp_v1::ToolKind::Read, None, cx),
             ];
             assert_eq!(ThreadView::active_area_entry(&entries, true, cx), None);
 
-            // A tail that says something is real transcript, not in progress.
             let entries = vec![test_assistant_message(&[("The answer.", false)], cx)];
             assert_eq!(ThreadView::active_area_entry(&entries, true, cx), None);
         });
@@ -17392,10 +16551,6 @@ mod tests {
         crate::test_support::init_test(cx);
 
         cx.update(|cx| {
-            // A blank thought draws nothing, so it belongs to whatever run it
-            // sits in rather than splitting it — but it is still not a chip of
-            // its own, and a run made only of these draws nothing at all
-            // (`render_action_group` returns `Empty` when no chip was built).
             let entries = vec![test_assistant_message(&[("  \n", true)], cx)];
             assert!(ThreadView::draws_no_transcript_content(&entries[0], cx));
             assert!(!ThreadView::is_thoughts_only_message(&entries[0], cx));
@@ -17423,19 +16578,13 @@ mod tests {
                 test_tool_call("6", "Read bar.rs", acp_v1::ToolKind::Read, None, cx),
             ];
 
-            // Waiting is not an action worth reporting, so it draws nothing at
-            // all; the calls around it stay in one run rather than being split
-            // into separate groups by the hidden waits.
             assert_eq!(
                 ThreadView::action_chips_in(&entries, 0, 6, cx),
-                // The two reads fold into one summary chip.
                 vec![ActionChip::Collapsed {
                     entry_ixs: vec![3, 5]
                 }]
             );
 
-            // Reads separated by a real command do not fold across it: only
-            // consecutive stretches collapse.
             let entries = vec![
                 test_tool_call("1", "Read foo.rs", acp_v1::ToolKind::Read, None, cx),
                 test_tool_call("2", "Read baz.rs", acp_v1::ToolKind::Read, None, cx),
@@ -17453,7 +16602,6 @@ mod tests {
                 ]
             );
 
-            // A run of nothing but waits produces no chips.
             let entries = vec![wait("1", cx), wait("2", cx)];
             assert_eq!(ThreadView::action_chips_in(&entries, 0, 2, cx), vec![]);
         });
@@ -17502,8 +16650,6 @@ mod tests {
                 "the icon is keyed on the path's extension, like the project panel"
             );
 
-            // Terminals, multi-file calls, and calls with no location keep the
-            // tool-kind icon.
             assert_eq!(
                 file_icon_for_locations(&[location("/project/src/main.rs")], true, cx),
                 None
@@ -17533,15 +16679,11 @@ mod tests {
             (PathBuf::from("/repo/wt/other"), "other".to_string()),
         ];
 
-        // A thread in a linked worktree resolves only to that worktree's
-        // branch, even though the main checkout is an ancestor of it and the
-        // sibling worktree is a peer.
         assert_eq!(
             branches_for_thread_paths(&[PathBuf::from("/repo/wt/mine")], &worktree_branches),
             vec![(PathBuf::from("/repo/wt/mine"), "mine".to_string())]
         );
 
-        // A subdirectory of a worktree still resolves to that worktree.
         assert_eq!(
             branches_for_thread_paths(
                 &[PathBuf::from("/repo/wt/mine/crates/agent_ui")],
@@ -17550,29 +16692,20 @@ mod tests {
             vec![(PathBuf::from("/repo/wt/mine"), "mine".to_string())]
         );
 
-        // A thread in the main checkout gets the main branch only.
         assert_eq!(
             branches_for_thread_paths(&[PathBuf::from("/repo")], &worktree_branches),
             vec![(PathBuf::from("/repo"), "main".to_string())]
         );
 
-        // A path outside every known worktree resolves to nothing.
         assert!(
             branches_for_thread_paths(&[PathBuf::from("/elsewhere")], &worktree_branches)
                 .is_empty()
         );
-    }
 
-    #[test]
-    fn thread_branches_dedupe_repeated_work_dirs() {
-        let worktree_branches = vec![(PathBuf::from("/repo"), "main".to_string())];
+        // Repeated work dirs in one worktree dedupe.
         assert_eq!(
             branches_for_thread_paths(
-                &[
-                    PathBuf::from("/repo"),
-                    PathBuf::from("/repo/crates"),
-                    PathBuf::from("/repo/assets"),
-                ],
+                &[PathBuf::from("/repo"), PathBuf::from("/repo/crates")],
                 &worktree_branches
             ),
             vec![(PathBuf::from("/repo"), "main".to_string())]
@@ -17653,9 +16786,7 @@ mod tests {
             ThreadView::strip_edit_verb("Created src/main.rs"),
             "src/main.rs"
         );
-        // Nothing to strip: the path is the whole label.
         assert_eq!(ThreadView::strip_edit_verb("src/main.rs"), "src/main.rs");
-        // A path that merely starts with the letters of a verb is untouched.
         assert_eq!(ThreadView::strip_edit_verb("editor.rs"), "editor.rs");
     }
 
@@ -17684,7 +16815,6 @@ mod tests {
         multi_workspace.update_in(cx, |_, window, cx| {
             open_tool_call_diff(
                 key.clone(),
-                // What the file said before the call edited it.
                 "first\nsecond\nthird\n".into(),
                 project.clone(),
                 workspace.downgrade(),
@@ -17715,8 +16845,7 @@ mod tests {
             assert_eq!(hunks, 1, "one changed line is one hunk");
         });
 
-        // Opening the same chip again activates the same tab rather than
-        // stacking another copy of it.
+        // Reopening activates the same tab.
         multi_workspace.update_in(cx, |_, window, cx| {
             open_tool_call_diff(
                 key,
