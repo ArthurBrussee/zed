@@ -122,15 +122,8 @@ pub trait AgentConnection {
     }
 
     /// The thread an in-flight [`Self::load_session`] or
-    /// [`Self::resume_session`] is filling, if the connection has created it
-    /// already.
-    ///
-    /// A long session's history replays over the wire entry by entry, and the
-    /// connection registers the thread before it asks for the replay so those
-    /// updates have somewhere to land. The task the load returns only resolves
-    /// once the last entry has arrived, so without this the reader waits out
-    /// the whole replay looking at nothing; with it they can watch the
-    /// conversation fill up.
+    /// [`Self::resume_session`] is filling, so a long replay can be watched
+    /// before the load task resolves.
     fn loading_thread(
         &self,
         _session_id: &acp_v1::SessionId,
@@ -242,11 +235,7 @@ pub trait AgentConnection {
 
     fn cancel(&self, session_id: &acp_v1::SessionId, cx: &mut App);
 
-    /// Stops one task the agent detached, leaving the turn alone.
-    ///
-    /// A backgrounded command has no process of ours to kill — the agent owns
-    /// it — so stopping it is a request rather than a signal. Agents that never
-    /// report detached work never get asked.
+    /// Asks the agent to stop one task it detached, leaving the turn alone.
     fn stop_async_task(
         &self,
         _session_id: &acp_v1::SessionId,

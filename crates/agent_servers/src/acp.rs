@@ -679,11 +679,8 @@ fn client_capabilities_for_agent(
     let mut meta = acp::Meta::from_iter([
         ("terminal_output".into(), true.into()),
         ("terminal-auth".into(), true.into()),
-        // The AIR extension, which is how the Claude adapter learns that a
-        // client can be told about work it detaches. Without it a
-        // `run_in_background` command's lifecycle is never reported at all:
-        // the Bash card completes the moment the command hands off and
-        // nothing here knows it is still running.
+        // Without this the Claude adapter never reports detached commands or
+        // backgrounded subagents.
         (
             AIR_META_KEY.into(),
             serde_json::json!({
@@ -1727,11 +1724,7 @@ impl AgentConnection for AcpConnection {
         self.agent_capabilities.load_session
     }
 
-    fn loading_thread(
-        &self,
-        session_id: &acp::SessionId,
-        _cx: &App,
-    ) -> Option<Entity<AcpThread>> {
+    fn loading_thread(&self, session_id: &acp::SessionId, _cx: &App) -> Option<Entity<AcpThread>> {
         self.sessions
             .borrow()
             .get(session_id)
@@ -3596,9 +3589,7 @@ mod tests {
 
     #[test]
     fn client_capabilities_advertise_the_air_async_tasks_extension() {
-        // This is the whole reason a `run_in_background` command's lifecycle
-        // ever reaches Zed: the adapter checks this exact shape, and sends
-        // nothing to a client that does not carry it.
+        // The adapter checks this exact shape.
         let capabilities = client_capabilities_for_agent(&AgentId::new("claude-code"), false);
         let meta = capabilities
             .meta
@@ -3617,16 +3608,11 @@ mod tests {
                 AIR_ASYNC_TASKS_CAPABILITY,
                 AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY
             ])),
-            "only the capabilities Zed actually handles are claimed"
         );
     }
 
     #[test]
     fn an_extension_session_update_survives_being_parsed() {
-        // v1's `SessionUpdate` has no variant for an unknown kind, and a
-        // notification that fails to parse is dropped rather than passed on,
-        // so reading the payload raw is what keeps these updates reaching us
-        // at all.
         let params = serde_json::json!({
             "sessionId": "session-1",
             "update": {
@@ -3636,10 +3622,7 @@ mod tests {
                 "canStop": true,
             },
         });
-        assert!(
-            serde_json::from_value::<acp::SessionNotification>(params.clone()).is_err(),
-            "sanity: the typed shape is what rejects it"
-        );
+        assert!(serde_json::from_value::<acp::SessionNotification>(params.clone()).is_err());
         let raw = RawSessionNotification::parse_message(SESSION_UPDATE_NOTIFICATION, &params)
             .expect("the raw shape keeps it");
         assert_eq!(raw.session_id, acp::SessionId::new("session-1"));
@@ -3648,7 +3631,6 @@ mod tests {
             Some("async_task_spawned")
         );
 
-        // And a standard update still reaches the typed shape by the same path.
         let params = serde_json::json!({
             "sessionId": "session-1",
             "update": {
@@ -3659,8 +3641,7 @@ mod tests {
         let raw = RawSessionNotification::parse_message(SESSION_UPDATE_NOTIFICATION, &params)
             .expect("a standard update parses raw too");
         assert!(matches!(
-            serde_json::from_value::<acp::SessionUpdate>(raw.update)
-                .expect("and then typed"),
+            serde_json::from_value::<acp::SessionUpdate>(raw.update).expect("and then typed"),
             acp::SessionUpdate::AgentMessageChunk(_)
         ));
     }
@@ -3678,13 +3659,10 @@ mod tests {
                 .and_then(|backgrounded| backgrounded.as_bool()),
             Some(true)
         );
-        // A call from an agent that says nothing about detached work is not
-        // backgrounded, whatever else it carries.
         let meta: acp::Meta =
             serde_json::from_value(serde_json::json!({ "claudeCode": { "toolName": "Bash" } }))
                 .unwrap();
         assert!(air_async_tasks_meta(Some(&meta)).is_none());
-        assert!(air_async_tasks_meta(None).is_none());
     }
 
     #[test]
@@ -6355,15 +6333,8 @@ fn handle_read_text_file(
     .detach();
 }
 
-/// A `session/update` notification whose payload is kept raw.
-///
-/// The Claude adapter reports work it detaches as `sessionUpdate` kinds that
-/// are not in the schema, and v1's `SessionUpdate` has no variant for an
-/// unknown one — so parsing the notification as the typed shape fails, and a
-/// notification that fails to parse is an error rather than something passed to
-/// the next handler. Taking the payload raw and doing the typed parse
-/// afterwards is what lets an extension kind through without changing the path
-/// any standard update takes.
+/// A `session/update` notification with its payload kept raw, so extension
+/// kinds that v1's `SessionUpdate` cannot parse still get through.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RawSessionNotification {
     #[serde(rename = "sessionId")]
@@ -6401,9 +6372,6 @@ impl JsonRpcMessage for RawSessionNotification {
 impl JsonRpcNotification for RawSessionNotification {}
 
 impl From<acp::SessionNotification> for RawSessionNotification {
-    /// For a notification built in code rather than read off the wire. A
-    /// typed update always serializes, so a failure here can only be a bug;
-    /// `null` makes it one the handler reports rather than one that panics.
     fn from(notification: acp::SessionNotification) -> Self {
         Self {
             session_id: notification.session_id,
@@ -6415,23 +6383,17 @@ impl From<acp::SessionNotification> for RawSessionNotification {
 
 const SESSION_UPDATE_NOTIFICATION: &str = "session/update";
 
-/// The AIR extension's namespace inside an ACP `_meta`, as the adapter writes
-/// it: `_meta.jetbrains.air`. Zed advertises the extension from the client side
-/// with the same shape, which is how the adapter learns to send any of this.
+/// `_meta.jetbrains.air`, the AIR extension's namespace.
 const AIR_META_KEY: &str = "jetbrains";
 const AIR_EXTENSION_KEY: &str = "air";
 const AIR_EXTENSION_VERSION: u64 = 1;
 const AIR_ASYNC_TASKS_CAPABILITY: &str = "asyncTasks";
-/// The AIR capability that makes the adapter report its subagents' own
-/// lifecycle. Without it a backgrounded subagent is invisible: the `Agent`
-/// call completes the moment the subagent is handed off, so the call says
-/// "done" while the subagent works on.
 const AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY: &str = "nativeSubagentSessions";
 const ASYNC_TASK_STOP_METHOD: &str = "_session/async_task/stop";
 
-/// The AIR extension's `asyncTasks` payload on a message's `_meta`, if it
-/// carries one.
-fn air_async_tasks_meta(meta: Option<&acp::Meta>) -> Option<&serde_json::Map<String, serde_json::Value>> {
+fn air_async_tasks_meta(
+    meta: Option<&acp::Meta>,
+) -> Option<&serde_json::Map<String, serde_json::Value>> {
     meta?
         .get(AIR_META_KEY)?
         .get(AIR_EXTENSION_KEY)?
@@ -6439,25 +6401,24 @@ fn air_async_tasks_meta(meta: Option<&acp::Meta>) -> Option<&serde_json::Map<Str
         .as_object()
 }
 
-/// Reads one of the adapter's three async-task updates off an unknown
-/// `sessionUpdate` and applies it.
-///
-/// The fields are read one at a time rather than through a derived struct
-/// because every one of them is optional on the wire except the task's id: a
-/// progress report exists to carry whichever of them has just become known.
+/// A non-empty string field of an extension update.
+fn update_string_field(update: &serde_json::Value, name: &str) -> Option<SharedString> {
+    update
+        .get(name)
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(SharedString::from)
+}
+
+/// Every field but the task's id is optional on the wire: a progress report
+/// carries whichever has just become known.
 fn apply_async_task_update(
     update: &serde_json::Value,
     thread: &WeakEntity<AcpThread>,
     cx: &mut AsyncApp,
 ) {
-    let field = |name: &str| {
-        update
-            .get(name)
-            .and_then(|value| value.as_str())
-            .map(|value| value.trim())
-            .filter(|value| !value.is_empty())
-            .map(SharedString::from)
-    };
+    let field = |name: &str| update_string_field(update, name);
     let Some(id) = field("asyncTaskId") else {
         return;
     };
@@ -6516,22 +6477,12 @@ fn apply_async_task_update(
     }
 }
 
-/// The AIR extension's subagent reports on a parent session. Only sent to a
-/// client that advertised [`AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY`], and
-/// read off the raw payload because v1 has no variant for an extension kind.
 fn apply_subagent_update(
     update: &serde_json::Value,
     thread: &WeakEntity<AcpThread>,
     cx: &mut AsyncApp,
 ) {
-    let field = |name: &str| {
-        update
-            .get(name)
-            .and_then(|value| value.as_str())
-            .map(|value| value.trim())
-            .filter(|value| !value.is_empty())
-            .map(SharedString::from)
-    };
+    let field = |name: &str| update_string_field(update, name);
     let Some(session_id) = field("subagentSessionId") else {
         return;
     };
@@ -6542,8 +6493,6 @@ fn apply_subagent_update(
             let subagent = acp_thread::Subagent {
                 session_id,
                 name: field("name"),
-                // The adapter sends the task it was given, and the prompt it
-                // was given when there is no shorter description of it.
                 task: field("task").or_else(|| field("prompt")),
                 state: acp_thread::AsyncTaskState::Running,
             };
@@ -6578,9 +6527,8 @@ fn handle_session_notification(
         .and_then(|kind| kind.as_str())
         .unwrap_or_default()
         .to_owned();
-    // An extension kind has no typed shape, so it is read off the raw payload
-    // and never reaches `handle_session_update`, which would ignore it anyway.
-    if session_update_kind.starts_with("async_task_") {
+    let is_async_task = session_update_kind.starts_with("async_task_");
+    if is_async_task || session_update_kind.starts_with("subagent_") {
         let thread = {
             let sessions = ctx.sessions.borrow();
             let Some(session) = sessions.get(&raw.session_id) else {
@@ -6588,18 +6536,11 @@ fn handle_session_notification(
             };
             session.thread.clone()
         };
-        apply_async_task_update(&raw.update, &thread, cx);
-        return;
-    }
-    if session_update_kind.starts_with("subagent_") {
-        let thread = {
-            let sessions = ctx.sessions.borrow();
-            let Some(session) = sessions.get(&raw.session_id) else {
-                return;
-            };
-            session.thread.clone()
-        };
-        apply_subagent_update(&raw.update, &thread, cx);
+        if is_async_task {
+            apply_async_task_update(&raw.update, &thread, cx);
+        } else {
+            apply_subagent_update(&raw.update, &thread, cx);
+        }
         return;
     }
     let update = match serde_json::from_value::<acp::SessionUpdate>(raw.update) {
@@ -6722,10 +6663,8 @@ fn handle_session_notification(
         );
     }
 
-    // A Bash call whose command detached returns at once, so its card would
-    // read as finished while the command runs on for minutes. The agent marks
-    // the call itself, on the update the tool result already emits, so the
-    // marker cannot arrive out of order with the completion it qualifies.
+    // The marker rides the call's own update, so it is never out of order
+    // with the completion it qualifies.
     if let acp::SessionUpdate::ToolCallUpdate(tcu) = &notification.update
         && air_async_tasks_meta(tcu.meta.as_ref())
             .and_then(|async_tasks| async_tasks.get("backgrounded"))

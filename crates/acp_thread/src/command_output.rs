@@ -1,15 +1,6 @@
-//! Reading a command's own report of how it went.
-//!
-//! A chip that says "cargo check ran" is a receipt. The thing worth showing is
-//! what the run concluded: how many errors, how many tests failed, and where
-//! the first problem is so it can be opened. Every toolchain says this in its
-//! output already, in a handful of long-stable shapes, so we read those rather
-//! than asking the agent to summarize.
-//!
-//! This is deliberately forgiving: unknown output yields an empty summary and
-//! the chip falls back to naming the command.
+//! Reads a command's own verdict (errors, test counts, first error location)
+//! out of its output. Unknown output yields an empty summary.
 
-/// A file position a tool complained about.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutputLocation {
     pub path: String,
@@ -24,7 +15,6 @@ pub struct OutputSummary {
     pub warnings: usize,
     pub tests_passed: usize,
     pub tests_failed: usize,
-    /// Where to go to start fixing things.
     pub first_error: Option<OutputLocation>,
 }
 
@@ -33,8 +23,6 @@ impl OutputSummary {
         self.errors == 0 && self.warnings == 0 && self.tests_passed == 0 && self.tests_failed == 0
     }
 
-    /// A short readout for a chip: what the run concluded, in the order a
-    /// reader cares about.
     pub fn label(&self) -> Option<String> {
         if self.is_empty() {
             return None;
@@ -65,7 +53,6 @@ impl OutputSummary {
     }
 }
 
-/// Reads a command's output for its own verdict.
 pub fn summarize_output(output: &str) -> OutputSummary {
     let mut summary = OutputSummary::default();
     let mut counted_errors = 0usize;
@@ -161,7 +148,7 @@ pub fn summarize_output(output: &str) -> OutputSummary {
     summary
 }
 
-/// `(count, word)` pairs, so "1 failed | 41 passed" reads as its numbers.
+/// `(count, word)` pairs: "1 failed | 41 passed".
 fn numbered_words(text: &str) -> Vec<(usize, &str)> {
     let words: Vec<&str> = text.split_whitespace().collect();
     let mut pairs = Vec::new();
@@ -218,40 +205,22 @@ fn parse_tsc_location(text: &str) -> Option<OutputLocation> {
     })
 }
 
-/// Raster formats a chip can draw. SVG is left out for the same reason the
-/// chip layer leaves it out: the image element rasterizes bitmaps, and Zed
-/// opens vector files as text.
+/// Raster formats only: Zed opens vector files as text.
 const IMAGE_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "avif",
 ];
 
-/// At most this many pictures from one command. A command that names forty
-/// files is not showing you a result, and a chip is not a gallery.
-pub const MAX_OUTPUT_IMAGES: usize = 2;
+const MAX_OUTPUT_IMAGES: usize = 2;
 
-/// Characters that sit against a path in output without being part of it.
-/// The two ends are not the same set: a leading `.` is `./`, and trimming it
-/// would turn a relative path into a different, absolute one.
+// A leading `.` is `./`, so only the end trims sentence punctuation.
 const PATH_TRIM_START: &[char] = &['"', '\'', '`', '(', '[', '{', '<'];
-
-/// Closing quotes and brackets, the punctuation of a sentence, and `file`'s
-/// own trailing colon.
 const PATH_TRIM_END: &[char] = &[
     '"', '\'', '`', ')', ']', '}', '>', ',', ';', ':', '.', '!', '?',
 ];
 
-/// Paths to pictures a command's own output names, in the order they appear.
-///
-/// A command that writes an image says so and then shows nothing, which means
-/// leaving the app to look at the thing it just made. The path it printed is
-/// enough to draw it.
-///
-/// Only the output is read. A path that appears in the command itself is an
-/// intention rather than a result — the file may never have been written — so
-/// the command text is deliberately not a source here.
-///
-/// This says which paths were *named*, nothing more. Whether they exist, and
-/// whether they were written while the command ran, is the caller's to check.
+/// Paths to pictures a command's output names. The command text is not read:
+/// a path there is an intention, not a result. Whether the files exist is the
+/// caller's to check.
 pub fn image_paths_in_output(output: &str) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
     for token in output.split_whitespace() {
@@ -261,8 +230,7 @@ pub fn image_paths_in_output(output: &str) -> Vec<String> {
         if path.is_empty() || !has_image_extension(path) {
             continue;
         }
-        // A word ending in ".png" is not a path. Requiring a separator keeps
-        // prose out; a tool that reports a file it wrote gives one.
+        // Requiring a separator keeps prose like "result.png" out.
         if !path.contains('/') && !path.contains('\\') {
             continue;
         }
@@ -280,7 +248,6 @@ fn has_image_extension(path: &str) -> bool {
     let Some((stem, extension)) = path.rsplit_once('.') else {
         return false;
     };
-    // ".png" on its own is a dotfile, not a picture called something.
     if stem.is_empty() || stem.ends_with(['/', '\\']) {
         return false;
     }
@@ -293,59 +260,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reads_the_path_a_command_said_it_wrote() {
-        // The reported line, as the terminal showed it: the script printed the
-        // path, and `file` named it again.
-        let output = "\
-/tmp/deeptag-80.png
-/tmp/deeptag-80.png: PNG image data, 1920 x 1080, 8-bit/color RGB, non-interlaced";
-        assert_eq!(image_paths_in_output(output), vec!["/tmp/deeptag-80.png"]);
-    }
+    fn image_paths_named_in_output() {
+        for (output, expected) in [
+            (
+                "/tmp/deeptag-80.png\n/tmp/deeptag-80.png: PNG image data, 1920 x 1080",
+                vec!["/tmp/deeptag-80.png"],
+            ),
+            ("saved '/tmp/out.png',\n", vec!["/tmp/out.png"]),
+            (
+                "wrote `./build/chart.svg.png`.\n",
+                vec!["./build/chart.svg.png"],
+            ),
+            (
+                "/tmp/a.png\n/tmp/a.png\n/tmp/b.png\n",
+                vec!["/tmp/a.png", "/tmp/b.png"],
+            ),
+            ("wrote the output to result.png\n", vec![]),
+            ("wrote /tmp/plot.svg\n", vec![]),
+            ("wrote /tmp/notes.txt\n", vec![]),
+            ("touched /tmp/.png\n", vec![]),
+        ] {
+            assert_eq!(image_paths_in_output(output), expected, "{output}");
+        }
 
-    #[test]
-    fn a_word_ending_in_png_is_not_a_path() {
-        assert!(image_paths_in_output("wrote the output to result.png\n").is_empty());
-        assert!(image_paths_in_output("regenerating sprites.png assets\n").is_empty());
-    }
-
-    #[test]
-    fn quoting_and_punctuation_are_not_part_of_the_path() {
-        assert_eq!(
-            image_paths_in_output("saved '/tmp/out.png',\n"),
-            vec!["/tmp/out.png"]
-        );
-        assert_eq!(
-            image_paths_in_output("wrote `./build/chart.svg.png`.\n"),
-            vec!["./build/chart.svg.png"]
-        );
-    }
-
-    #[test]
-    fn a_command_that_names_forty_files_is_not_a_gallery() {
         let output = (0..40)
             .map(|ix| format!("/tmp/frame-{ix}.png"))
             .collect::<Vec<_>>()
             .join("\n");
         assert_eq!(image_paths_in_output(&output).len(), MAX_OUTPUT_IMAGES);
-    }
-
-    #[test]
-    fn the_same_picture_named_twice_is_one_picture() {
-        let output = "/tmp/a.png\n/tmp/a.png\n/tmp/b.png\n";
-        assert_eq!(image_paths_in_output(output), vec!["/tmp/a.png", "/tmp/b.png"]);
-    }
-
-    #[test]
-    fn vector_and_non_image_files_are_left_alone() {
-        assert!(image_paths_in_output("wrote /tmp/plot.svg\n").is_empty());
-        assert!(image_paths_in_output("wrote /tmp/notes.txt\n").is_empty());
-        // A dotfile named for the extension is not a picture called something.
-        assert!(image_paths_in_output("touched /tmp/.png\n").is_empty());
-    }
-
-    #[test]
-    fn output_that_mentions_no_picture_says_nothing() {
-        assert!(image_paths_in_output("cargo check\n    Finished dev\n").is_empty());
     }
 
     #[test]

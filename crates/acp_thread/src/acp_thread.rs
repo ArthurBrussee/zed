@@ -19,7 +19,6 @@ pub use command_output::*;
 pub use command_parse::*;
 pub use connection::*;
 pub use diff::*;
-pub use pr_mentions::*;
 use feature_flags::{AcpBetaFeatureFlag, FeatureFlagAppExt as _};
 #[cfg(any(test, feature = "test-support"))]
 use futures::future::BoxFuture;
@@ -35,6 +34,7 @@ use language::{
 };
 use markdown::{Markdown, MarkdownOptions};
 pub use mention::*;
+pub use pr_mentions::*;
 use project::lsp_store::{FormatTrigger, LspFormatTarget};
 use project::{
     AgentLocation, Project,
@@ -93,16 +93,10 @@ pub fn meta_with_tool_name(tool_name: &str) -> acp_v1::Meta {
     acp_v1::Meta::from_iter([(TOOL_NAME_META_KEY.into(), tool_name.into())])
 }
 
-/// The namespace the Claude adapter puts its own metadata under.
-pub const CLAUDE_CODE_META_KEY: &str = "claudeCode";
+const CLAUDE_CODE_META_KEY: &str = "claudeCode";
 
-/// The tool name the Claude adapter reports.
-///
-/// It names its tools in its own namespace rather than in ACP's `name` field
-/// or the legacy flat key, so a call from Claude carries a name nothing else
-/// here would find. Read only where the name itself is the question — what a
-/// call is labelled remains ACP's answer to give.
-pub fn claude_tool_name_from_meta(meta: &Option<acp_v1::Meta>) -> Option<SharedString> {
+/// The Claude adapter reports tool names only in its own meta namespace.
+fn claude_tool_name_from_meta(meta: &Option<acp_v1::Meta>) -> Option<SharedString> {
     meta.as_ref()
         .and_then(|meta| meta.get(CLAUDE_CODE_META_KEY))
         .and_then(|claude| claude.get("toolName"))
@@ -110,10 +104,7 @@ pub fn claude_tool_name_from_meta(meta: &Option<acp_v1::Meta>) -> Option<SharedS
         .map(|name| SharedString::from(name.to_owned()))
 }
 
-/// Whether a tool of this name is an agent handing work to a subagent.
-///
-/// `spawn_agent` is Codex's. `Agent` and `Task` are Claude's: `Task` is the
-/// older spelling and still what some versions report, so both count.
+/// `spawn_agent` is Codex's; `Agent` and `Task` (older versions) are Claude's.
 fn is_subagent_tool_name(name: &str) -> bool {
     matches!(name, "spawn_agent" | "Agent" | "Task")
 }
@@ -1238,8 +1229,6 @@ impl ToolCallPatch {
     }
 }
 
-/// `str::contains` ignoring ASCII case, without lowercasing the haystack into a
-/// string of its own first.
 fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
     haystack
         .as_bytes()
@@ -1399,8 +1388,6 @@ impl ToolCall {
         };
 
         if kind == &acp_v2::ToolKind::Execute {
-            // Terminal command labels are bash-tagged fenced code blocks so
-            // they render with shell syntax highlighting.
             execute_command_label_source(title).into()
         } else if kind == &acp_v2::ToolKind::Edit {
             edit_label_source(title, locations).into()
@@ -1475,11 +1462,8 @@ impl ToolCall {
             MaybeUndefined::Null => Some(Vec::new()),
             MaybeUndefined::Value(content) => Some(content.prepare(terminals)?),
         };
-        // Only a call with no title of its own falls back to plain text; a
-        // command's label is a fenced code block, which is markdown.
         let was_plain_text = self.effective_title().is_none();
-        // An edit's label is derived from the files it touches, so new
-        // locations change it just as a new title does.
+        // An edit's label is derived from its locations.
         let mut label_changed =
             !title.is_undefined() || !kind.is_undefined() || !locations.is_undefined();
         if !kind.is_undefined() {
@@ -1724,23 +1708,14 @@ impl ToolCall {
             })
     }
 
-    /// Whether this call is an agent working through a subagent.
-    ///
-    /// Three ways to tell, because the agents disagree: the tool's own name,
-    /// the name the Claude adapter reports in its own namespace — which is the
-    /// only place a Claude subagent says so, and so the only reason one has
-    /// ever been counted — and Zed's own subagent-session metadata.
     pub fn is_subagent(&self) -> bool {
-        self.tool_name
-            .as_deref()
-            .is_some_and(is_subagent_tool_name)
+        self.tool_name.as_deref().is_some_and(is_subagent_tool_name)
             || claude_tool_name_from_meta(&self.meta)
                 .is_some_and(|name| is_subagent_tool_name(&name))
             || self.subagent_session_info.is_some()
     }
 
-    /// Whether this call is an agent waiting (polling, sleeping) rather than
-    /// doing work. Some agents emit long stretches of these, which UIs collapse.
+    /// Polling or sleeping rather than doing work.
     pub fn is_wait(&self, cx: &App) -> bool {
         is_wait_call(
             self.tool_name.as_deref(),
@@ -1749,16 +1724,12 @@ impl ToolCall {
         )
     }
 
-    /// Whether this call is the agent looking up its own tools. That is the
-    /// agent arranging its toolbox, not work on the project, and it says
-    /// nothing a reader of the thread wants to know.
+    /// The agent looking up its own tools, not working on the project.
     pub fn is_tool_lookup(&self, cx: &App) -> bool {
         is_tool_lookup_call(self.tool_name.as_deref(), &self.label.read(cx).source())
     }
 
-    /// Whether this call sent nothing to a running process. Agents poke
-    /// interactive commands with empty stdin writes to see what comes back,
-    /// and each one would otherwise be a chip about no keystrokes at all.
+    /// An empty stdin write: an agent poking an interactive command.
     pub fn is_empty_stdin_write(&self, cx: &App) -> bool {
         is_empty_stdin_write_call(
             self.tool_name.as_deref(),
@@ -1767,9 +1738,7 @@ impl ToolCall {
         )
     }
 
-    /// Whether this call is the agent compacting its context. Some agents
-    /// report compaction as an ordinary tool call; the UI renders it as the
-    /// same transcript-wide barrier as native compaction, not as an action.
+    /// Some agents report compaction as an ordinary tool call.
     pub fn is_compaction(&self, cx: &App) -> bool {
         if self
             .tool_name
@@ -1778,9 +1747,8 @@ impl ToolCall {
         {
             return true;
         }
-        // Only the first line, and only lowercased when there is something to
-        // lowercase: this is asked of every entry on every frame, and a command
-        // label is the whole command.
+        // Asked of every entry on every frame, so no lowercased copy of what
+        // may be a whole command.
         let label = self.label.read(cx).source();
         let first_line = label.lines().next().unwrap_or("");
         if !contains_ignore_ascii_case(first_line, "compact") {
@@ -1839,9 +1807,6 @@ impl ToolCall {
         Some(ResolvedLocation { buffer, position })
     }
 
-    /// A tool call built the way a session builds one, for tests that have no
-    /// agent behind them. It goes through `from_acp` so a test's call carries
-    /// the same title and label a real one would.
     #[cfg(any(test, feature = "test-support"))]
     pub fn for_test(
         tool_call: acp_v1::ToolCall,
@@ -1859,15 +1824,11 @@ impl ToolCall {
         .expect("a tool call with no terminal content to resolve")
     }
 
-    /// Structured content on a call a test built by hand, for the cases a
-    /// `from_acp` payload cannot express: a live terminal, or a finalized diff.
     #[cfg(any(test, feature = "test-support"))]
     pub fn set_content_for_test(&mut self, content: Vec<ToolCallContent>) {
         self.structured_content = content;
     }
 
-    /// The status a test wants the call to be in, without a payload to report
-    /// it with.
     #[cfg(any(test, feature = "test-support"))]
     pub fn set_status_for_test(&mut self, status: ToolCallStatus) {
         self.set_legacy_status(status);
@@ -2689,9 +2650,6 @@ impl ContentBlock {
         Some((Arc::new(gpui::Image::from_bytes(format, bytes)), dimensions))
     }
 
-    /// A picture's shape, read from the header the format opens with rather
-    /// than by decoding it. Public because a picture the agent only named the
-    /// path of has to be measured the same way, from bytes read off disk.
     pub fn image_dimensions(bytes: &[u8], format: gpui::ImageFormat) -> Option<gpui::Size<u32>> {
         let format = match format {
             gpui::ImageFormat::Png => image::ImageFormat::Png,
@@ -3554,15 +3512,11 @@ pub struct AcpThread {
     /// reveal text gradually without changing the authoritative message.
     streaming_text_buffer: Option<StreamingTextBuffer>,
     idle_sleep_prevention: IdleSleepPrevention,
-    /// Tasks the agent detached, in the order it announced them.
     async_tasks: Vec<AsyncTask>,
-    /// Subagents the adapter has reported, terminal ones dropped as they
-    /// report in. Only populated for an agent that reports their lifecycle.
+    /// Only populated for an agent that reports subagent lifecycles.
     subagents: Vec<Subagent>,
-    /// Tool calls whose command detached into the background. The agent marks
-    /// the call itself, which is the only thing that arrives in order with the
-    /// call's own completion; the task carrying the command's lifecycle can
-    /// name the call later or never.
+    /// The task carrying a command's lifecycle can name its call late or
+    /// never, so the call's own backgrounded marker is kept as well.
     backgrounded_tool_calls: HashSet<acp_v1::ToolCallId>,
 }
 
@@ -3742,18 +3696,10 @@ pub enum ThreadStatus {
     Generating,
 }
 
-/// What a generating thread currently has in flight. `Generating` says an agent
-/// is working; this says what the work is, for surfaces that have room for a
-/// number but not for a list.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RunningWork {
-    /// Commands whose process has not exited yet.
     pub terminals: usize,
-    /// Subagent calls still running.
     pub subagents: usize,
-    /// Work the agent detached and is still running: a backgrounded command
-    /// has no terminal of ours to watch, so it is counted from what the agent
-    /// says about it.
     pub async_tasks: usize,
 }
 
@@ -3763,12 +3709,8 @@ impl RunningWork {
     }
 }
 
-/// Where a task the agent detached has got to.
-///
-/// The names are the adapter's: `running`, `paused`, `completed`, `failed`,
-/// `stopped`. A state this build does not know is treated as running, because
-/// the only thing the thread does with a non-terminal task is count it, and a
-/// task counted one turn too long is better than one that vanishes.
+/// An unknown state is treated as running: a task counted too long is better
+/// than one that vanishes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AsyncTaskState {
     Running,
@@ -3794,13 +3736,9 @@ impl AsyncTaskState {
     }
 }
 
-/// Work the agent is running outside its turn.
-///
-/// Claude detaches `run_in_background` commands and hands control back at
-/// once, so a turn can end with minutes of work still going. The tool call
-/// that started it reaches `completed` the moment the command is handed off,
-/// which is why the command's own lifecycle arrives separately and is kept
-/// here.
+/// Work the agent runs outside its turn, such as Claude's `run_in_background`
+/// commands. The tool call that started it completes on hand-off, so the
+/// lifecycle arrives separately.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AsyncTask {
     pub id: SharedString,
@@ -3808,46 +3746,21 @@ pub struct AsyncTask {
     pub description: Option<SharedString>,
     pub state: AsyncTaskState,
     pub summary: Option<SharedString>,
-    /// The tool call the task came out of, when the agent knows which. It can
-    /// arrive after the task itself.
+    /// Can arrive after the task itself.
     pub tool_call_id: Option<acp_v1::ToolCallId>,
-    /// Where the task's own log is being written, when it has one.
     pub output_file_path: Option<SharedString>,
-    /// Whether the agent will stop this task on request.
     pub can_stop: bool,
 }
 
-/// A subagent the agent is running, as the adapter reports it.
-///
-/// Claude backgrounds subagents the way it backgrounds commands: the `Agent`
-/// call completes the moment the subagent is handed off, the turn can end, and
-/// the subagent keeps working. So the call's own status says nothing about
-/// whether the work is still going, and the lifecycle has to come from the
-/// adapter's own `subagent_spawned` / `subagent_state_update` reports. Those
-/// only arrive at all for a client that advertises support for them.
-///
-/// The states are [`AsyncTaskState`]'s: the adapter uses the same vocabulary
-/// here as for detached commands (`running`, `completed`, `failed`,
-/// `stopped`), and the only thing done with a non-terminal one is count it.
+/// A subagent as the adapter reports its lifecycle. Claude's `Agent` call
+/// completes on hand-off, so the call's status says nothing about whether the
+/// subagent is still working.
 #[derive(Debug, Clone)]
 pub struct Subagent {
-    /// The subagent's own session, which is also how its updates are keyed.
     pub session_id: acp_v1::SessionId,
-    /// What kind of subagent it is, when the adapter says.
     pub name: Option<SharedString>,
-    /// What it was asked to do, which is what its chip reads as.
     pub task: Option<SharedString>,
     pub state: AsyncTaskState,
-}
-
-impl Subagent {
-    /// The label for a subagent with nothing better to say than its session.
-    pub fn display_label(&self) -> SharedString {
-        self.task
-            .clone()
-            .or_else(|| self.name.clone())
-            .unwrap_or_else(|| SharedString::from("Subagent"))
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -4171,25 +4084,13 @@ impl AcpThread {
         self.had_error
     }
 
-    /// What this thread is running right now, counted from the entries it
-    /// already holds. Only work with evidence it is alive counts: a terminal
-    /// whose own tool call is still in flight or which the agent said it
-    /// detached, a subagent whose call is still `InProgress`, and a task the
-    /// agent reported as still out. Replayed history counts for nothing.
+    /// What this thread is running right now. Only work with evidence it is
+    /// alive counts; replayed history counts for nothing.
     pub fn running_work(&self, cx: &App) -> RunningWork {
         let mut work = RunningWork::default();
-        // A terminal's output is only filled by its exit, so "no output" on
-        // its own says nothing about whether anything is running: a terminal
-        // rebuilt from history when a thread is loaded or replayed never gets
-        // one, and neither does one whose turn was cancelled mid-command. The
-        // call it belongs to knows more, but not enough on its own either — a
-        // call can be left reading `InProgress` by an agent that died, by a
-        // cancellation, or by a transcript that records a turn which never
-        // finished. What settles all of them at once is that no turn is
-        // running: there is then nobody left to finish the call, so it is
-        // stuck rather than busy. Outside a turn the only evidence a command
-        // is alive is the agent having said it detached, which is what keeps a
-        // backgrounded command counted for the minutes it runs on.
+        // Replayed and cancelled terminals never get output, and calls can be
+        // left `InProgress` by a dead agent or a cancel. Outside a turn nobody
+        // is left to finish them, so only detached work counts then.
         let turn_is_running = !matches!(self.foreground_activity(), ForegroundActivity::Idle);
         for entry in &self.entries {
             let AgentThreadEntry::ToolCall(call) = entry else {
@@ -4208,10 +4109,6 @@ impl AcpThread {
                 .terminals()
                 .filter(|terminal| terminal.read(cx).output().is_none())
                 .count();
-            // A call whose subagent the adapter is reporting on is counted
-            // from that report instead, below: the call completes at once for
-            // a backgrounded subagent, so its status would say zero while the
-            // work runs on.
             if call.is_subagent()
                 && matches!(call.status(), ToolCallStatus::InProgress)
                 && !self.subagent_is_reported(call)
@@ -4219,9 +4116,7 @@ impl AcpThread {
                 work.subagents += 1;
             }
         }
-        // Reported subagents count whether or not a turn is running, which is
-        // the whole point of asking for the reports: Claude's are backgrounded
-        // and outlive the turn that launched them.
+        // Reported subagents count whether or not a turn is running.
         work.subagents += self
             .subagents
             .iter()
@@ -4235,21 +4130,14 @@ impl AcpThread {
         work
     }
 
-    /// The tasks the agent has detached, terminal ones included until the
-    /// session drops them.
     pub fn async_tasks(&self) -> &[AsyncTask] {
         &self.async_tasks
     }
 
-    /// The subagents the adapter has reported on, in the order they spawned.
     pub fn subagents(&self) -> &[Subagent] {
         &self.subagents
     }
 
-    /// The reported state of the subagent a tool call spawned, when the
-    /// adapter is reporting on it. This is what a subagent's chip reads its
-    /// status from: the call's own status reaches `completed` as soon as the
-    /// subagent is handed off.
     pub fn subagent_state_for_tool_call(&self, call: &ToolCall) -> Option<AsyncTaskState> {
         let session_id = &call.subagent_session_info.as_ref()?.session_id;
         self.subagents
@@ -4258,8 +4146,6 @@ impl AcpThread {
             .map(|subagent| subagent.state)
     }
 
-    /// Whether this call's subagent is one the adapter reports on, in which
-    /// case the report rather than the call decides whether it is running.
     fn subagent_is_reported(&self, call: &ToolCall) -> bool {
         call.subagent_session_info.as_ref().is_some_and(|info| {
             self.subagents
@@ -4268,24 +4154,21 @@ impl AcpThread {
         })
     }
 
-    /// The live task a tool call's command detached into, if the agent has said
-    /// which call it came from.
-    pub fn async_task_for_tool_call(&self, tool_call_id: &acp_v1::ToolCallId) -> Option<&AsyncTask> {
+    pub fn async_task_for_tool_call(
+        &self,
+        tool_call_id: &acp_v1::ToolCallId,
+    ) -> Option<&AsyncTask> {
         self.async_tasks.iter().find(|task| {
             !task.state.is_terminal() && task.tool_call_id.as_ref() == Some(tool_call_id)
         })
     }
 
-    /// Whether a tool call's command is still running somewhere the call's own
-    /// status cannot say. A backgrounded Bash call goes to `completed` the
-    /// moment the command detaches, so the card would otherwise read as
-    /// finished for the minutes the command runs on.
+    /// A backgrounded call reads `completed` while its command runs on.
     pub fn tool_call_is_backgrounded(&self, tool_call_id: &acp_v1::ToolCallId) -> bool {
         self.backgrounded_tool_calls.contains(tool_call_id)
             || self.async_task_for_tool_call(tool_call_id).is_some()
     }
 
-    /// The agent marked this tool call's command as having detached.
     pub fn mark_tool_call_backgrounded(
         &mut self,
         tool_call_id: acp_v1::ToolCallId,
@@ -4302,9 +4185,7 @@ impl AcpThread {
             .iter_mut()
             .find(|existing| existing.id == task.id)
         {
-            // A task can be announced after its own terminal edge: the Bash
-            // result proving a command was backgrounded arrives late. Keep the
-            // state that was already reached.
+            // A task can be announced after its own terminal state.
             Some(existing) => {
                 let state = existing.state;
                 let summary = existing.summary.take();
@@ -4320,8 +4201,6 @@ impl AcpThread {
         cx.notify();
     }
 
-    /// A progress report, which may be the first thing to say which tool call
-    /// a task came from or where its log is.
     pub fn async_task_progress(
         &mut self,
         id: &str,
@@ -4372,10 +4251,7 @@ impl AcpThread {
         cx.notify();
     }
 
-    /// Everything the agent had detached is over: the session is closing, or
-    /// the agent said so. A task left counted here would keep a thread reading
-    /// as working for as long as it stayed open.
-    pub fn clear_async_tasks(&mut self, cx: &mut Context<Self>) {
+    fn clear_async_tasks(&mut self, cx: &mut Context<Self>) {
         if self.async_tasks.is_empty() && self.backgrounded_tool_calls.is_empty() {
             return;
         }
@@ -4384,10 +4260,7 @@ impl AcpThread {
         cx.notify();
     }
 
-    /// A tool call stops reading as backgrounded once the task it detached into
-    /// is over. The marker alone cannot say when that is — it rides the call's
-    /// own update and never speaks again — so the task's terminal state is what
-    /// releases it.
+    /// The marker never updates, so a task's terminal state releases it.
     fn settle_backgrounded_tool_calls(&mut self) {
         let finished: Vec<acp_v1::ToolCallId> = self
             .async_tasks
@@ -5229,9 +5102,7 @@ impl AcpThread {
     ) {
         let path_style = self.project.read(cx).path_style(cx);
 
-        // Provider-native compaction arrives from external agents as an ordinary
-        // assistant message. It is a thread event, not something the model said,
-        // so it becomes a compaction entry rather than a loose message.
+        // External agents announce native compaction as an assistant message.
         if let acp_v2::ContentBlock::Text(text_content) = &chunk
             && !is_thought
             && is_context_compaction_notice(&text_content.text)
@@ -5663,10 +5534,7 @@ impl AcpThread {
         cx.emit(AcpThreadEvent::SubagentSpawned(session_id));
     }
 
-    /// A subagent the adapter is reporting the lifecycle of. Emits the same
-    /// event as [`Self::subagent_spawned`], so the subagent's own session is
-    /// loaded exactly as before, and additionally remembers it so it can be
-    /// counted and drawn while it runs.
+    /// Like [`Self::subagent_spawned`], but also tracks the lifecycle.
     pub fn subagent_reported(&mut self, subagent: Subagent, cx: &mut Context<Self>) {
         let session_id = subagent.session_id.clone();
         match self
@@ -5674,8 +5542,7 @@ impl AcpThread {
             .iter_mut()
             .find(|existing| existing.session_id == subagent.session_id)
         {
-            // A spawn can arrive after its own terminal edge; keep the state
-            // that was already reached, as detached tasks do.
+            // A spawn can arrive after its own terminal state.
             Some(existing) => {
                 let state = existing.state;
                 *existing = subagent;
@@ -5709,10 +5576,7 @@ impl AcpThread {
         cx.notify();
     }
 
-    /// Nothing the agent spawned can still be running: the session is closing,
-    /// or the agent is unusable. A subagent left counted here would keep the
-    /// thread reading as working for as long as it stayed open.
-    pub fn clear_subagents(&mut self, cx: &mut Context<Self>) {
+    fn clear_subagents(&mut self, cx: &mut Context<Self>) {
         if self.subagents.is_empty() {
             return;
         }
@@ -5743,9 +5607,7 @@ impl AcpThread {
         let ix = match self.index_for_tool_call(update.id()) {
             Some(ix) => ix,
             None => {
-                // An update for a tool call this thread never saw (out-of-order
-                // or replayed ACP traffic). A placeholder entry would render as
-                // a useless "Tool call not found" chip; drop it with a trace.
+                // A placeholder entry would render as a useless chip.
                 log::warn!("ignoring update for unknown tool call {:?}", update.id());
                 return Ok(());
             }
@@ -7039,10 +6901,7 @@ impl AcpThread {
         permission_outcome: RequestPermissionOutcome,
         cx: &mut Context<Self>,
     ) {
-        // A plan entry is only in progress while a turn is working on it. The
-        // agent will not correct this itself: it stopped, so the next plan
-        // update may be many turns away, and until then the entry keeps a
-        // running spinner on work nobody is doing.
+        // The agent stopped, so it will not correct an in-progress entry itself.
         for plan in self.plans.values_mut() {
             for entry in &mut plan.entries {
                 if entry.source.status == acp_v2::PlanEntryStatus::InProgress {
@@ -7714,9 +7573,6 @@ impl AcpThread {
     }
 
     pub fn emit_load_error(&mut self, error: LoadError, cx: &mut Context<Self>) {
-        // Nothing the agent detached can still be running if the agent itself
-        // is unusable, and a task left counted would keep the thread reading as
-        // working for as long as it stayed open.
         self.clear_async_tasks(cx);
         self.clear_subagents(cx);
         cx.emit(AcpThreadEvent::LoadError(error));
@@ -7929,11 +7785,7 @@ impl AcpThread {
     }
 }
 
-/// Normalizes a terminal command title into a bash-tagged fenced code block so
-/// the label renders with shell syntax highlighting. Reuses the body of any
-/// fence the agent already sent, whatever its language tag.
-/// Labels that name no file and so tell the user nothing an edit's pencil icon
-/// doesn't already say. Codex sends these; Claude names the file itself.
+/// Edit labels that name no file (Codex sends these).
 const GENERIC_EDIT_LABELS: &[&str] = &[
     "edit",
     "edits",
@@ -7965,10 +7817,7 @@ fn is_generic_edit_label(title: &str) -> bool {
     normalized.is_empty() || GENERIC_EDIT_LABELS.contains(&normalized.as_str())
 }
 
-/// The markdown source of an edit tool call's label. A label that names no file
-/// (Codex reports "editing files") is replaced by the files the call actually
-/// touches, so the row says what was edited; a label that already names the file
-/// is kept as-is.
+/// A label that names no file is replaced by the files the call touches.
 fn edit_label_source(title: &str, locations: &[acp_v1::ToolCallLocation]) -> String {
     if !is_generic_edit_label(title) {
         return MarkdownEscaped(title).to_string();
@@ -7991,13 +7840,7 @@ fn edit_label_source(title: &str, locations: &[acp_v1::ToolCallLocation]) -> Str
     }
 }
 
-/// Whether a tool call is a wait: an agent polling or sleeping instead of doing
-/// work. No agent in-tree emits one, so this is recognized by the name the agent
-/// reports (Codex-style `wait`, `wait_for_task`) or, for agents that report none,
-/// by a title that says nothing but that it is waiting. Calls that run a terminal
-/// or touch files are never waits, whatever they are called.
-/// See [`ToolCall::is_tool_lookup`].
-pub fn is_tool_lookup_call(tool_name: Option<&str>, title: &str) -> bool {
+fn is_tool_lookup_call(tool_name: Option<&str>, title: &str) -> bool {
     let names_lookup = |name: &str| {
         let name = name.trim().to_lowercase().replace(['-', ' '], "_");
         name == "toolsearch" || name.starts_with("tool_search") || name.starts_with("search_tools")
@@ -8008,8 +7851,7 @@ pub fn is_tool_lookup_call(tool_name: Option<&str>, title: &str) -> bool {
     }
 }
 
-/// See [`ToolCall::is_empty_stdin_write`].
-pub fn is_empty_stdin_write_call(
+fn is_empty_stdin_write_call(
     tool_name: Option<&str>,
     title: &str,
     raw_input: Option<&serde_json::Value>,
@@ -8022,8 +7864,7 @@ pub fn is_empty_stdin_write_call(
     if !writes_stdin {
         return false;
     }
-    // `chars` carries the keystrokes. A payload we cannot read is not the same
-    // as an empty one, so only an absent or empty `chars` counts.
+    // An unreadable payload is not an empty one.
     match raw_input {
         Some(input) => input
             .get("chars")
@@ -8032,7 +7873,9 @@ pub fn is_empty_stdin_write_call(
     }
 }
 
-pub fn is_wait_call(tool_name: Option<&str>, title: &str, kind: &acp_v2::ToolKind) -> bool {
+/// Recognized by a reported name (`wait`, `wait_for_task`), else by a title
+/// that only says it is waiting. Calls that run or touch files never are.
+fn is_wait_call(tool_name: Option<&str>, title: &str, kind: &acp_v2::ToolKind) -> bool {
     if matches!(
         kind,
         acp_v2::ToolKind::Execute
@@ -8059,11 +7902,12 @@ pub fn is_wait_call(tool_name: Option<&str>, title: &str, kind: &acp_v2::ToolKin
     else {
         return false;
     };
-    // "Wait", "Waiting", "Wait 5s", "Waiting for the build" are waits;
-    // "Waitlist users" (a word that merely starts with wait) is not.
+    // Not "Waitlist".
     rest.is_empty() || rest.starts_with(' ')
 }
 
+/// A bash-tagged fence for shell highlighting, reusing the body of any fence
+/// the agent already sent.
 fn execute_command_label_source(title: &str) -> String {
     let command = title
         .strip_prefix("```")
@@ -8074,12 +7918,8 @@ fn execute_command_label_source(title: &str) -> String {
     format!("```bash\n{command}\n```")
 }
 
-/// Strips the quoting agents sometimes wrap a command title in: sending the
-/// command as a JSON string literal (or a shell-quoted string) makes the whole
-/// command highlight as one string instead of as bash. A command that merely
-/// contains quotes (`echo "hi"`, `git commit -m "x"`) is left alone: only a
-/// quote pair enclosing the entire command, with no unescaped occurrence of the
-/// same quote inside it, is quoting of the command rather than part of it.
+/// Strips a JSON string literal or single quotes wrapped around a whole
+/// command, which would otherwise highlight as one string.
 fn unquote_command(command: &str) -> Cow<'_, str> {
     let trimmed = command.trim();
     if trimmed.len() < 2 {
@@ -8087,8 +7927,7 @@ fn unquote_command(command: &str) -> Cow<'_, str> {
     }
 
     if trimmed.starts_with('"') && trimmed.ends_with('"') {
-        // A JSON string literal round-trips through serde, which both rejects
-        // the `"a" && "b"` shape (two literals, not one) and unescapes `\"`.
+        // serde rejects `"a" && "b"` and unescapes `\"`.
         if let Ok(unquoted) = serde_json::from_str::<String>(trimmed)
             && !unquoted.trim().is_empty()
         {
@@ -8111,9 +7950,8 @@ fn unquote_command(command: &str) -> Cow<'_, str> {
     Cow::Borrowed(command)
 }
 
-/// A verbatim prefix of the command for one-line display: always a substring
-/// of the real command, never a parsed summary. Ends in an ellipsis whenever
-/// anything is omitted, whether by length or by further lines.
+/// A verbatim one-line prefix of the command, with an ellipsis when anything
+/// is omitted.
 pub fn command_display_prefix(command: &str, max_chars: usize) -> String {
     let trimmed = command.trim();
     let first_line = trimmed.lines().next().unwrap_or("").trim_end();
@@ -8126,10 +7964,8 @@ pub fn command_display_prefix(command: &str, max_chars: usize) -> String {
     prefix
 }
 
-/// Whether an assistant message is really the agent announcing that it compacted
-/// the context ("Context compacted to fit the model's context window."). The
-/// length cap keeps a model that merely writes *about* compaction from being
-/// mistaken for the notice itself.
+/// "Context compacted to fit the model's context window." The length cap keeps
+/// prose about compaction from matching.
 fn is_context_compaction_notice(text: &str) -> bool {
     const MAX_NOTICE_LEN: usize = 200;
 
@@ -8143,17 +7979,14 @@ fn is_context_compaction_notice(text: &str) -> bool {
         || (text.contains("compacted") && text.contains("context window"))
 }
 
-/// The human-readable part of a structured agent error. Agents report budget and
-/// usage failures as a JSON blob, often behind a prefix:
-/// `Internal error: { "message": "You've hit your usage limit…", "codexErrorInfo": "usageLimitExceeded" }`.
+/// Agents report usage failures as a JSON blob, often behind a prefix:
+/// `Internal error: { "message": "…", "codexErrorInfo": "usageLimitExceeded" }`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentErrorPayload {
     pub message: String,
     pub code: Option<String>,
 }
 
-/// Parses the JSON payload out of an agent error message, if there is one.
-/// Returns `None` for a plain-text error, which the UI renders raw.
 pub fn parse_agent_error_payload(raw: &str) -> Option<AgentErrorPayload> {
     payload_from_json(&extract_json_value(raw)?)
 }
@@ -8164,8 +7997,6 @@ fn extract_json_value(raw: &str) -> Option<serde_json::Value> {
         return Some(value);
     }
 
-    // The JSON is usually preceded by a prefix ("Internal error: ") and
-    // sometimes followed by trailing prose.
     let start = trimmed.find('{')?;
     let end = trimmed.rfind('}')?;
     if end < start {
@@ -8212,8 +8043,7 @@ fn payload_from_json(value: &serde_json::Value) -> Option<AgentErrorPayload> {
         });
     };
 
-    // A message that is itself a JSON blob (double-encoded payloads) unwraps
-    // to the message inside it.
+    // Double-encoded payloads.
     if let Some(mut nested) = parse_agent_error_payload(message) {
         nested.code = nested.code.or(code);
         return Some(nested);
@@ -8236,9 +8066,7 @@ fn json_scalar_to_string(value: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// Wraps bare `http(s)` URLs in markdown links so an error message's links are
-/// clickable. URLs already written as a markdown link or an autolink are left
-/// alone, and trailing prose punctuation is kept out of the link target.
+/// Wraps bare `http(s)` URLs in markdown links, leaving existing links alone.
 pub fn linkify_urls(text: &str) -> String {
     const SCHEMES: [&str; 2] = ["https://", "http://"];
 
@@ -8263,7 +8091,6 @@ pub fn linkify_urls(text: &str) -> String {
         let (candidate, remainder) = from.split_at(end);
         rest = remainder;
 
-        // `](https://…)` is a markdown link's target, `<https://…>` an autolink.
         if before.ends_with("](") || before.ends_with('<') {
             linkified.push_str(candidate);
             continue;
@@ -8446,24 +8273,19 @@ mod tests {
 
     #[test]
     fn quoted_commands_are_unquoted_so_they_highlight_as_bash() {
-        // An agent sending the command as a JSON string literal made the whole
-        // command highlight as one string.
         assert_eq!(
             execute_command_label_source("\"cargo test --workspace\""),
             "```bash\ncargo test --workspace\n```"
         );
-        // Single-quoted the same way.
         assert_eq!(
             execute_command_label_source("'ls -la'"),
             "```bash\nls -la\n```"
         );
-        // A JSON literal's escapes are unescaped, not left in the command.
         assert_eq!(
             execute_command_label_source(r#""git commit -m \"fix: thing\"""#),
             "```bash\ngit commit -m \"fix: thing\"\n```"
         );
 
-        // Commands that legitimately contain quotes are untouched.
         for command in [
             "echo \"hi\"",
             "git commit -m \"wip\" && echo \"done\"",
@@ -8478,7 +8300,6 @@ mod tests {
             );
         }
 
-        // Already-fenced labels keep working, unquoted through the same path.
         assert_eq!(
             execute_command_label_source("```sh\n\"cargo test\"\n```"),
             "```bash\ncargo test\n```"
@@ -8489,15 +8310,9 @@ mod tests {
     fn command_display_prefixes() {
         assert_eq!(command_display_prefix("cargo build", 60), "cargo build");
         assert_eq!(
-            command_display_prefix("cargo build && cargo test", 60),
-            "cargo build && cargo test"
-        );
-        // Length cut: a plain substring plus the ellipsis, nothing skipped.
-        assert_eq!(
             command_display_prefix("echo abcdefghijklmnop", 9),
             "echo abcd…"
         );
-        // A multi-line script always says there is more.
         assert_eq!(
             command_display_prefix("cargo build\ncargo test", 60),
             "cargo build…"
@@ -8507,14 +8322,12 @@ mod tests {
 
     #[test]
     fn json_error_payloads_are_parsed_into_message_and_code() {
-        // The exact payload Codex reports a usage-limit failure with.
         let raw = r#"Internal error: { "message": "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Jul 20th, 2026 11:23 PM.", "codexErrorInfo": "usageLimitExceeded" }"#;
         let payload = parse_agent_error_payload(raw).expect("the payload is JSON behind a prefix");
         assert_eq!(payload.code.as_deref(), Some("usageLimitExceeded"));
         assert!(payload.message.starts_with("You've hit your usage limit."));
         assert!(!payload.message.contains("codexErrorInfo"));
 
-        // Bare JSON, no prefix.
         assert_eq!(
             parse_agent_error_payload(r#"{"message": "boom", "code": 429}"#),
             Some(AgentErrorPayload {
@@ -8523,7 +8336,6 @@ mod tests {
             })
         );
 
-        // Nested: the message lives one level down.
         assert_eq!(
             parse_agent_error_payload(r#"{"error": {"message": "nope", "type": "overloaded"}}"#),
             Some(AgentErrorPayload {
@@ -8532,7 +8344,6 @@ mod tests {
             })
         );
 
-        // Double-encoded: the message is itself a JSON blob.
         assert_eq!(
             parse_agent_error_payload(
                 r#"{"message": "{\"message\": \"inner\", \"code\": \"x\"}"}"#
@@ -8543,14 +8354,15 @@ mod tests {
             })
         );
 
-        // A code with no message is not a payload we can render better than raw.
-        assert_eq!(parse_agent_error_payload(r#"{"code": "boom"}"#), None);
-
-        // Plain text, a JSON array, and an unparseable blob fall back to raw.
-        assert_eq!(parse_agent_error_payload("Something went wrong"), None);
-        assert_eq!(parse_agent_error_payload(r#"["a", "b"]"#), None);
-        assert_eq!(parse_agent_error_payload("Internal error: {oops"), None);
-        assert_eq!(parse_agent_error_payload(""), None);
+        for raw in [
+            r#"{"code": "boom"}"#,
+            "Something went wrong",
+            r#"["a", "b"]"#,
+            "Internal error: {oops",
+            "",
+        ] {
+            assert_eq!(parse_agent_error_payload(raw), None, "{raw}");
+        }
     }
 
     #[test]
@@ -8563,36 +8375,24 @@ mod tests {
              visit [https://x.dev/u](https://x.dev/u) to buy."
         );
 
-        // Already-linked URLs are left alone.
-        assert_eq!(
-            linkify_urls("see [docs](https://zed.dev/docs) and <https://zed.dev>"),
-            "see [docs](https://zed.dev/docs) and <https://zed.dev>"
-        );
-
-        // Text with no URL is unchanged, including the word http on its own.
-        assert_eq!(linkify_urls("no links here"), "no links here");
-        assert_eq!(linkify_urls("http is a protocol"), "http is a protocol");
+        for unchanged in [
+            "see [docs](https://zed.dev/docs) and <https://zed.dev>",
+            "http is a protocol",
+        ] {
+            assert_eq!(linkify_urls(unchanged), unchanged);
+        }
     }
 
     #[test]
     fn generic_edit_labels_are_derived_from_the_edited_files() {
         let location = |path: &str| acp_v1::ToolCallLocation::new(PathBuf::from(path));
 
-        // Codex reports a generic verb: name the file instead.
-        assert_eq!(
-            edit_label_source("editing files", &[location("/project/src/main.rs")]),
-            "main.rs"
-        );
-        assert_eq!(
-            edit_label_source("Editing Files.", &[location("/project/src/main.rs")]),
-            "main.rs"
-        );
-        assert_eq!(
-            edit_label_source("", &[location("/project/src/main.rs")]),
-            "main.rs"
-        );
-
-        // Several files collapse to a count; the same file twice is one file.
+        for title in ["editing files", "Editing Files.", ""] {
+            assert_eq!(
+                edit_label_source(title, &[location("/project/src/main.rs")]),
+                "main.rs"
+            );
+        }
         assert_eq!(
             edit_label_source(
                 "editing files",
@@ -8612,15 +8412,8 @@ mod tests {
             "a.rs"
         );
 
-        // Nothing to derive from: keep the label.
         assert_eq!(edit_label_source("editing files", &[]), "editing files");
-
-        // Claude's labels already name the file and are left alone (escaped, as
-        // before).
-        assert_eq!(
-            edit_label_source("Edited src/main.rs", &[location("/project/src/main.rs")]),
-            "Edited src/main.rs"
-        );
+        // Labels that name the file are kept, escaped.
         assert_eq!(
             edit_label_source("Create foo_bar.rs", &[location("/project/foo_bar.rs")]),
             "Create foo\\_bar.rs"
@@ -8681,8 +8474,6 @@ mod tests {
                 .unwrap_or_else(|| panic!("expected markdown, got {block:?}"))
         });
         cx.run_until_parked();
-        // Diagram rendering is opt-in per markdown entity: without this a
-        // fenced `mermaid` block in an agent's reply renders as plain code.
         markdown.read_with(cx, |markdown, _| {
             assert!(markdown.renders_mermaid_diagrams());
         });
@@ -9812,41 +9603,21 @@ mod tests {
 
     #[test]
     fn wait_calls_are_recognized_by_name_then_title() {
-        // The agent-reported tool name wins when there is one.
-        assert!(is_wait_call(Some("wait"), "Polling", &acp_v2::ToolKind::Other));
-        assert!(is_wait_call(
-            Some("wait_for_task"),
-            "Polling",
-            &acp_v2::ToolKind::Other
-        ));
-        assert!(!is_wait_call(
-            Some("read_file"),
-            "Waiting",
-            &acp_v2::ToolKind::Read
-        ));
-
-        // Agents that report no name are recognized by their title.
-        assert!(is_wait_call(None, "Wait", &acp_v2::ToolKind::Other));
-        assert!(is_wait_call(None, "Waiting…", &acp_v2::ToolKind::Other));
-        assert!(is_wait_call(
-            None,
-            "Waiting for the build",
-            &acp_v2::ToolKind::Other
-        ));
-        assert!(!is_wait_call(
-            None,
-            "Waitlist the user",
-            &acp_v2::ToolKind::Other
-        ));
-        assert!(!is_wait_call(None, "Read foo.rs", &acp_v2::ToolKind::Read));
-
-        // Calls that actually do something are never waits.
-        assert!(!is_wait_call(
-            Some("wait"),
-            "wait 5",
-            &acp_v2::ToolKind::Execute
-        ));
-        assert!(!is_wait_call(Some("wait"), "wait", &acp_v2::ToolKind::Edit));
+        use acp_v2::ToolKind as Kind;
+        for (name, title, kind, expected) in [
+            (Some("wait"), "Polling", Kind::Other, true),
+            (Some("wait_for_task"), "Polling", Kind::Other, true),
+            (Some("read_file"), "Waiting", Kind::Read, false),
+            (None, "Wait", Kind::Other, true),
+            (None, "Waiting…", Kind::Other, true),
+            (None, "Waiting for the build", Kind::Other, true),
+            (None, "Waitlist the user", Kind::Other, false),
+            (None, "Read foo.rs", Kind::Read, false),
+            (Some("wait"), "wait 5", Kind::Execute, false),
+            (Some("wait"), "wait", Kind::Edit, false),
+        ] {
+            assert_eq!(is_wait_call(name, title, &kind), expected, "{title}");
+        }
     }
 
     #[test]
@@ -9854,10 +9625,7 @@ mod tests {
         assert!(is_tool_lookup_call(Some("ToolSearch"), "ToolSearch"));
         assert!(is_tool_lookup_call(Some("tool_search"), "tool_search"));
         assert!(is_tool_lookup_call(Some("search_tools"), "search_tools"));
-        // Agents that report no name are recognized by their title.
         assert!(is_tool_lookup_call(None, "ToolSearch"));
-
-        // Searching the project is the opposite of arranging a toolbox.
         assert!(!is_tool_lookup_call(Some("grep"), "Search for `foo`"));
         assert!(!is_tool_lookup_call(None, "Searched the codebase"));
     }
@@ -9867,39 +9635,20 @@ mod tests {
         let empty = json!({ "chars": "" });
         let keystrokes = json!({ "chars": "y\n" });
         let unreadable = json!({ "data": [3] });
-
-        assert!(is_empty_stdin_write_call(
-            Some("write_stdin"),
-            "write_stdin",
-            Some(&empty)
-        ));
-        // No input at all is the same probe.
-        assert!(is_empty_stdin_write_call(
-            Some("write_stdin"),
-            "write_stdin",
-            None
-        ));
-        // Agents that report no name are recognized by their title.
-        assert!(is_empty_stdin_write_call(None, "write_stdin", Some(&empty)));
-
-        // A write that carries keystrokes is real work, and so is one whose
-        // payload we cannot read.
-        assert!(!is_empty_stdin_write_call(
-            Some("write_stdin"),
-            "write_stdin",
-            Some(&keystrokes)
-        ));
-        assert!(!is_empty_stdin_write_call(
-            Some("write_stdin"),
-            "write_stdin",
-            Some(&unreadable)
-        ));
-        // Everything else is untouched.
-        assert!(!is_empty_stdin_write_call(
-            Some("read_file"),
-            "Read foo.rs",
-            None
-        ));
+        for (name, title, input, expected) in [
+            (Some("write_stdin"), "write_stdin", Some(&empty), true),
+            (Some("write_stdin"), "write_stdin", None, true),
+            (None, "write_stdin", Some(&empty), true),
+            (Some("write_stdin"), "write_stdin", Some(&keystrokes), false),
+            (Some("write_stdin"), "write_stdin", Some(&unreadable), false),
+            (Some("read_file"), "Read foo.rs", None, false),
+        ] {
+            assert_eq!(
+                is_empty_stdin_write_call(name, title, input),
+                expected,
+                "{name:?} {input:?}"
+            );
+        }
     }
 
     #[test]
@@ -10805,8 +10554,6 @@ mod tests {
                 );
                 assert!(lower.read(cx).get_content().contains("early"));
                 let (_, tool) = thread.tool_call(&tool_id).expect("tool");
-                // An Execute call's label is a bash-tagged fence in this fork,
-                // so the command highlights; upstream shows the bare title.
                 assert_eq!(tool.label.read(cx).source(), "```bash\nNew caption\n```");
                 assert_eq!(tool.terminals().next(), Some(&terminal));
             });
@@ -10847,7 +10594,10 @@ mod tests {
                 })
                 .expect("explicit command clear remains authoritative");
             terminal.read_with(cx, |terminal, cx| {
-                assert_eq!(terminal.command().read(cx).source(), "```bash\nTerminal\n```");
+                assert_eq!(
+                    terminal.command().read(cx).source(),
+                    "```bash\nTerminal\n```"
+                );
             });
             thread
                 .update(cx, |thread, cx| {
@@ -11373,75 +11123,75 @@ mod tests {
         );
     }
 
-    /// Test that killing a terminal via Terminal::kill properly:
-    /// 1. Causes wait_for_exit to complete (doesn't hang forever)
-    /// 2. The underlying terminal still has the output that was written before the kill
-    ///
-    /// This test verifies that the fix to kill_active_task (which now also kills
-    /// the shell process in addition to the foreground process) properly allows
-    /// wait_for_exit to complete instead of hanging indefinitely.
-    #[cfg(unix)]
+    fn create_display_terminal(
+        thread: &mut AcpThread,
+        terminal_id: &acp_v1::TerminalId,
+        cx: &mut Context<AcpThread>,
+    ) {
+        let builder = ::terminal::TerminalBuilder::new_display_only(
+            ::terminal::terminal_settings::CursorShape::default(),
+            ::terminal::terminal_settings::AlternateScroll::On,
+            None,
+            0,
+            cx.background_executor(),
+            thread.project().read(cx).path_style(cx),
+        );
+        let lower = cx.new(|cx| builder.subscribe(cx));
+        thread.on_terminal_provider_event(
+            TerminalProviderEvent::Created {
+                terminal_id: terminal_id.clone(),
+                label: "cargo test".to_string(),
+                cwd: None,
+                output_byte_limit: None,
+                terminal: lower,
+            },
+            cx,
+        );
+    }
+
+    fn execute_call_with_terminal(
+        id: &'static str,
+        status: acp_v1::ToolCallStatus,
+        terminal_id: &acp_v1::TerminalId,
+    ) -> acp_v1::SessionUpdate {
+        acp_v1::SessionUpdate::ToolCall(
+            acp_v1::ToolCall::new(id, "cargo test")
+                .kind(acp_v1::ToolKind::Execute)
+                .status(status)
+                .content(vec![acp_v1::ToolCallContent::Terminal(
+                    acp_v1::Terminal::new(terminal_id.clone()),
+                )]),
+        )
+    }
+
+    fn claude_subagent_meta(session_id: Option<&str>) -> acp_v1::Meta {
+        let mut meta = acp_v1::Meta::from_iter([(
+            CLAUDE_CODE_META_KEY.into(),
+            serde_json::json!({ "toolName": "Agent" }),
+        )]);
+        if let Some(session_id) = session_id {
+            meta.insert(
+                SUBAGENT_SESSION_INFO_META_KEY.into(),
+                serde_json::json!({ "session_id": session_id, "message_start_index": 0 }),
+            );
+        }
+        meta
+    }
+
     #[gpui::test]
     async fn test_display_only_terminal_reports_its_own_exit(cx: &mut gpui::TestAppContext) {
-        use ::terminal::TerminalBuilder;
-        use ::terminal::terminal_settings::{AlternateScroll, CursorShape};
-
         init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        let project = Project::test(fs, [], cx).await;
-        let connection = Rc::new(FakeAgentConnection::new());
-        let thread = cx
-            .update(|cx| {
-                connection.new_session(
-                    project.clone(),
-                    PathList::new(&[Path::new(path!("/test"))]),
-                    cx,
-                )
-            })
-            .await
-            .unwrap();
+        let thread = new_test_thread(cx).await;
 
-        // The shape an external agent's terminal takes: a display-only
-        // terminal mirroring a process the agent runs itself.
         let terminal_id = acp_v1::TerminalId::new("display-only");
         thread.update(cx, |thread, cx| {
-            let builder = TerminalBuilder::new_display_only(
-                CursorShape::default(),
-                AlternateScroll::On,
-                None,
-                0,
-                cx.background_executor(),
-                thread.project().read(cx).path_style(cx),
-            );
-            let lower = cx.new(|cx| builder.subscribe(cx));
-            thread.on_terminal_provider_event(
-                TerminalProviderEvent::Created {
-                    terminal_id: terminal_id.clone(),
-                    label: "cargo build".to_string(),
-                    cwd: None,
-                    output_byte_limit: None,
-                    terminal: lower,
-                },
-                cx,
-            );
+            create_display_terminal(thread, &terminal_id, cx);
         });
         cx.run_until_parked();
-
-        // Nothing has ended: there is no process here to have ended.
         thread.read_with(cx, |thread, cx| {
-            assert!(
-                thread
-                    .terminals
-                    .get(&terminal_id)
-                    .unwrap()
-                    .read(cx)
-                    .output()
-                    .is_none(),
-                "a command still running reports no output"
-            );
+            assert!(thread.terminals[&terminal_id].read(cx).output().is_none());
         });
 
-        // Everything before this instant is time the command was running.
         let still_running_at = Instant::now();
         thread.update(cx, |thread, cx| {
             thread.on_terminal_provider_event(
@@ -11455,43 +11205,19 @@ mod tests {
         cx.run_until_parked();
 
         thread.read_with(cx, |thread, cx| {
-            let terminal = thread.terminals.get(&terminal_id).unwrap().read(cx);
+            let terminal = thread.terminals[&terminal_id].read(cx);
             let output = terminal
                 .output()
                 .expect("the reported exit ends the command");
-            assert_eq!(
-                output.exit_status.exit_code,
-                Some(1),
-                "the agent's exit code is what the command exited with"
-            );
-            assert!(
-                output.ended_at >= still_running_at,
-                "the command ended when it was reported to, not when it started"
-            );
+            assert_eq!(output.exit_status.exit_code, Some(1));
+            assert!(output.ended_at >= still_running_at);
         });
     }
 
     #[gpui::test]
     async fn test_detached_work_keeps_a_thread_and_its_card_working(cx: &mut gpui::TestAppContext) {
-        // A `run_in_background` command's Bash call returns as soon as the
-        // command detaches, so the turn ends and the card completes while the
-        // command runs on. The agent reports the command's own lifecycle
-        // separately, and that is the only thing that says the thread is still
-        // working.
         init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        let project = Project::test(fs, [], cx).await;
-        let connection = Rc::new(FakeAgentConnection::new());
-        let thread = cx
-            .update(|cx| {
-                connection.new_session(
-                    project.clone(),
-                    PathList::new(&[Path::new(path!("/test"))]),
-                    cx,
-                )
-            })
-            .await
-            .unwrap();
+        let thread = new_test_thread(cx).await;
 
         let tool_call_id = acp_v1::ToolCallId::new("bash-call");
         thread.update(cx, |thread, cx| {
@@ -11507,32 +11233,18 @@ mod tests {
                 .unwrap();
         });
         cx.run_until_parked();
-
         thread.read_with(cx, |thread, cx| {
-            assert!(
-                thread.running_work(cx).is_empty(),
-                "a completed call with nothing detached is not work in flight"
-            );
-            assert!(
-                !thread.tool_call_is_backgrounded(&tool_call_id),
-                "and its card is finished"
-            );
+            assert!(thread.running_work(cx).is_empty());
+            assert!(!thread.tool_call_is_backgrounded(&tool_call_id));
         });
 
-        // The marker rides the call's own update, so it can arrive before the
-        // task that carries the command's lifecycle names the call.
+        // The marker can arrive before the task that names the call.
         thread.update(cx, |thread, cx| {
             thread.mark_tool_call_backgrounded(tool_call_id.clone(), cx);
         });
         thread.read_with(cx, |thread, cx| {
-            assert!(
-                thread.tool_call_is_backgrounded(&tool_call_id),
-                "a marked call reads as still running"
-            );
-            assert!(
-                thread.running_work(cx).is_empty(),
-                "the marker alone says nothing about how much work is in flight"
-            );
+            assert!(thread.tool_call_is_backgrounded(&tool_call_id));
+            assert!(thread.running_work(cx).is_empty());
         });
 
         thread.update(cx, |thread, cx| {
@@ -11558,18 +11270,15 @@ mod tests {
                     subagents: 0,
                     async_tasks: 1,
                 },
-                "a detached command is work in flight even with the turn over"
             );
             assert_eq!(
                 thread
                     .async_task_for_tool_call(&tool_call_id)
                     .map(|task| task.id.clone()),
                 Some("task-1".into()),
-                "and the card can find it, so it can offer to stop it"
             );
         });
 
-        // Progress can be the first thing to say where the log is.
         thread.update(cx, |thread, cx| {
             thread.async_task_progress(
                 "task-1",
@@ -11583,12 +11292,11 @@ mod tests {
         thread.read_with(cx, |thread, _| {
             let task = &thread.async_tasks()[0];
             assert_eq!(task.summary.as_deref(), Some("42 passed"));
-            assert_eq!(task.output_file_path.as_deref(), Some("/tmp/task-1-final.log"));
             assert_eq!(
-                task.description.as_deref(),
-                Some("running the suite"),
-                "a progress report carries only what it knows; the rest stands"
+                task.output_file_path.as_deref(),
+                Some("/tmp/task-1-final.log")
             );
+            assert_eq!(task.description.as_deref(), Some("running the suite"));
         });
 
         thread.update(cx, |thread, cx| {
@@ -11601,14 +11309,8 @@ mod tests {
             );
         });
         thread.read_with(cx, |thread, cx| {
-            assert!(
-                thread.running_work(cx).is_empty(),
-                "a task that reached a terminal state is not in flight"
-            );
-            assert!(
-                !thread.tool_call_is_backgrounded(&tool_call_id),
-                "and the card it was marked on is finished with it"
-            );
+            assert!(thread.running_work(cx).is_empty());
+            assert!(!thread.tool_call_is_backgrounded(&tool_call_id));
         });
     }
 
@@ -11616,23 +11318,8 @@ mod tests {
     async fn test_a_detached_task_announced_late_keeps_the_state_it_reached(
         cx: &mut gpui::TestAppContext,
     ) {
-        // The Bash result proving a command was backgrounded can arrive after
-        // the command's own terminal edge, so the spawn can be the last thing
-        // to turn up. Replaying it must not resurrect the task.
         init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        let project = Project::test(fs, [], cx).await;
-        let connection = Rc::new(FakeAgentConnection::new());
-        let thread = cx
-            .update(|cx| {
-                connection.new_session(
-                    project.clone(),
-                    PathList::new(&[Path::new(path!("/test"))]),
-                    cx,
-                )
-            })
-            .await
-            .unwrap();
+        let thread = new_test_thread(cx).await;
 
         let task = AsyncTask {
             id: "task-1".into(),
@@ -11650,212 +11337,53 @@ mod tests {
             thread.async_task_spawned(task, cx);
         });
         thread.read_with(cx, |thread, cx| {
-            assert!(
-                thread.running_work(cx).is_empty(),
-                "the task stays stopped, and there is only one of it"
-            );
+            assert!(thread.running_work(cx).is_empty());
             assert_eq!(thread.async_tasks().len(), 1);
         });
     }
 
-    /// A thread read back from history, and a turn cut off mid-command, both
-    /// leave terminals with no output behind them. Neither is work in flight,
-    /// and counting them is what marked thousands of sidebar rows as busy with
-    /// nothing running.
-    #[gpui::test]
-    async fn test_settled_commands_are_not_running_work(cx: &mut gpui::TestAppContext) {
-        use ::terminal::TerminalBuilder;
-        use ::terminal::terminal_settings::{AlternateScroll, CursorShape};
-
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        let project = Project::test(fs, [], cx).await;
-        let connection = Rc::new(FakeAgentConnection::new());
-        let thread = cx
-            .update(|cx| {
-                connection.new_session(
-                    project.clone(),
-                    PathList::new(&[Path::new(path!("/test"))]),
-                    cx,
-                )
-            })
-            .await
-            .unwrap();
-
-        let display_terminal = |thread: &mut AcpThread,
-                                terminal_id: &acp_v1::TerminalId,
-                                cx: &mut Context<AcpThread>| {
-            let builder = TerminalBuilder::new_display_only(
-                CursorShape::default(),
-                AlternateScroll::On,
-                None,
-                0,
-                cx.background_executor(),
-                thread.project().read(cx).path_style(cx),
-            );
-            let lower = cx.new(|cx| builder.subscribe(cx));
-            thread.on_terminal_provider_event(
-                TerminalProviderEvent::Created {
-                    terminal_id: terminal_id.clone(),
-                    label: "cargo test".to_string(),
-                    cwd: None,
-                    output_byte_limit: None,
-                    terminal: lower,
-                },
-                cx,
-            );
-        };
-
-        // History: a finished call whose terminal never reported an exit, which
-        // is what a replayed `terminal_output` without a `terminal_exit` looks
-        // like.
-        let replayed = acp_v1::TerminalId::new("replayed-command");
-        thread.update(cx, |thread, cx| {
-            display_terminal(thread, &replayed, cx);
-            thread
-                .handle_session_update(
-                    acp_v1::SessionUpdate::ToolCall(
-                        acp_v1::ToolCall::new("replayed-call", "cargo test")
-                            .kind(acp_v1::ToolKind::Execute)
-                            .status(acp_v1::ToolCallStatus::Completed)
-                            .content(vec![acp_v1::ToolCallContent::Terminal(acp_v1::Terminal::new(
-                                replayed.clone(),
-                            ))]),
-                    ),
-                    cx,
-                )
-                .unwrap();
-        });
-        cx.run_until_parked();
-        thread.read_with(cx, |thread, cx| {
-            assert!(
-                thread.running_work(cx).is_empty(),
-                "a finished call's terminal is not running, whatever its output says"
-            );
-        });
-
-        // A turn cut off mid-command: the call is in flight while the turn runs,
-        // and settles with it. A subagent left `InProgress` goes the same way.
-        let (complete, request) = start_test_turn(&thread, cx);
-        cx.run_until_parked();
-        let cancelled = acp_v1::TerminalId::new("cancelled-command");
-        thread.update(cx, |thread, cx| {
-            display_terminal(thread, &cancelled, cx);
-            thread
-                .handle_session_update(
-                    acp_v1::SessionUpdate::ToolCall(
-                        acp_v1::ToolCall::new("cancelled-call", "cargo test")
-                            .kind(acp_v1::ToolKind::Execute)
-                            .status(acp_v1::ToolCallStatus::InProgress)
-                            .content(vec![acp_v1::ToolCallContent::Terminal(acp_v1::Terminal::new(
-                                cancelled.clone(),
-                            ))]),
-                    ),
-                    cx,
-                )
-                .unwrap();
-            thread
-                .handle_session_update(
-                    acp_v1::SessionUpdate::ToolCall(
-                        acp_v1::ToolCall::new("cancelled-subagent", "Investigate the failure")
-                            .status(acp_v1::ToolCallStatus::InProgress)
-                            .meta(meta_with_tool_name("spawn_agent")),
-                    ),
-                    cx,
-                )
-                .unwrap();
-        });
-        cx.run_until_parked();
-        thread.read_with(cx, |thread, cx| {
-            assert_eq!(
-                thread.running_work(cx),
-                RunningWork {
-                    terminals: 1,
-                    subagents: 1,
-                    async_tasks: 0,
-                },
-                "a call still in flight is still work in flight"
-            );
-        });
-
-        // `cancel` settles the turn's entries before it returns, then waits for
-        // the turn's own send task. This test holds that turn's completion, so
-        // letting go of it is what lets the wait finish.
-        let cancelled_turn = thread.update(cx, |thread, cx| thread.cancel(cx));
-        drop(complete);
-        cancelled_turn.await;
-        let _ = request.await;
-        cx.run_until_parked();
-        thread.read_with(cx, |thread, cx| {
-            assert!(
-                thread.running_work(cx).is_empty(),
-                "cancelling the turn settles the command and the subagent it left behind"
-            );
-        });
-    }
-
+    /// Terminals with no output are left behind by replayed history and by
+    /// cancelled turns; counting them marked idle sidebar rows as busy.
     #[gpui::test]
     async fn test_running_work_counts_only_what_is_still_in_flight(cx: &mut gpui::TestAppContext) {
-        use ::terminal::TerminalBuilder;
-        use ::terminal::terminal_settings::{AlternateScroll, CursorShape};
-
         init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        let project = Project::test(fs, [], cx).await;
-        let connection = Rc::new(FakeAgentConnection::new());
-        let thread = cx
-            .update(|cx| {
-                connection.new_session(
-                    project.clone(),
-                    PathList::new(&[Path::new(path!("/test"))]),
-                    cx,
-                )
-            })
-            .await
-            .unwrap();
-
+        let thread = new_test_thread(cx).await;
         thread.read_with(cx, |thread, cx| {
-            assert!(
-                thread.running_work(cx).is_empty(),
-                "a thread that has done nothing is running nothing"
-            );
+            assert!(thread.running_work(cx).is_empty());
         });
 
-        // A turn has to be running for a call to be in flight: a call nobody is
-        // working on is stuck, not busy, which is what the counts now say.
-        let (complete, request) = start_test_turn(&thread, cx);
-        cx.run_until_parked();
-
-        let terminal_id = acp_v1::TerminalId::new("running-command");
+        // A replayed call whose terminal never reported an exit.
+        let replayed = acp_v1::TerminalId::new("replayed-command");
         thread.update(cx, |thread, cx| {
-            let builder = TerminalBuilder::new_display_only(
-                CursorShape::default(),
-                AlternateScroll::On,
-                None,
-                0,
-                cx.background_executor(),
-                thread.project().read(cx).path_style(cx),
-            );
-            let lower = cx.new(|cx| builder.subscribe(cx));
-            thread.on_terminal_provider_event(
-                TerminalProviderEvent::Created {
-                    terminal_id: terminal_id.clone(),
-                    label: "cargo test".to_string(),
-                    cwd: None,
-                    output_byte_limit: None,
-                    terminal: lower,
-                },
-                cx,
-            );
+            create_display_terminal(thread, &replayed, cx);
             thread
                 .handle_session_update(
-                    acp_v1::SessionUpdate::ToolCall(
-                        acp_v1::ToolCall::new("terminal-call", "cargo test")
-                            .kind(acp_v1::ToolKind::Execute)
-                            .status(acp_v1::ToolCallStatus::InProgress)
-                            .content(vec![acp_v1::ToolCallContent::Terminal(acp_v1::Terminal::new(
-                                terminal_id.clone(),
-                            ))]),
+                    execute_call_with_terminal(
+                        "replayed-call",
+                        acp_v1::ToolCallStatus::Completed,
+                        &replayed,
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            assert!(thread.running_work(cx).is_empty());
+        });
+
+        let in_flight = |thread: &mut AcpThread,
+                         call: &'static str,
+                         subagent: &'static str,
+                         terminal_id: &acp_v1::TerminalId,
+                         cx: &mut Context<AcpThread>| {
+            create_display_terminal(thread, terminal_id, cx);
+            thread
+                .handle_session_update(
+                    execute_call_with_terminal(
+                        call,
+                        acp_v1::ToolCallStatus::InProgress,
+                        terminal_id,
                     ),
                     cx,
                 )
@@ -11863,33 +11391,33 @@ mod tests {
             thread
                 .handle_session_update(
                     acp_v1::SessionUpdate::ToolCall(
-                        acp_v1::ToolCall::new("subagent-call", "Investigate the failure")
+                        acp_v1::ToolCall::new(subagent, "Investigate the failure")
                             .status(acp_v1::ToolCallStatus::InProgress)
                             .meta(meta_with_tool_name("spawn_agent")),
                     ),
                     cx,
                 )
                 .unwrap();
+        };
+        let busy = RunningWork {
+            terminals: 1,
+            subagents: 1,
+            async_tasks: 0,
+        };
+
+        // Work that finishes on its own.
+        let (complete, request) = start_test_turn(&thread, cx);
+        cx.run_until_parked();
+        let finished = acp_v1::TerminalId::new("finished-command");
+        thread.update(cx, |thread, cx| {
+            in_flight(thread, "terminal-call", "subagent-call", &finished, cx);
         });
         cx.run_until_parked();
-
-        thread.read_with(cx, |thread, cx| {
-            assert_eq!(
-                thread.running_work(cx),
-                RunningWork {
-                    terminals: 1,
-                    subagents: 1,
-                    async_tasks: 0,
-                },
-                "a command with no exit and a subagent still working are both in flight"
-            );
-        });
-
-        // Both end: the command exits, the subagent's call completes.
+        thread.read_with(cx, |thread, cx| assert_eq!(thread.running_work(cx), busy));
         thread.update(cx, |thread, cx| {
             thread.on_terminal_provider_event(
                 TerminalProviderEvent::Exit {
-                    terminal_id: terminal_id.clone(),
+                    terminal_id: finished.clone(),
                     status: acp_v1::TerminalExitStatus::new().exit_code(0),
                 },
                 cx,
@@ -11898,48 +11426,54 @@ mod tests {
                 .handle_session_update(
                     acp_v1::SessionUpdate::ToolCallUpdate(acp_v1::ToolCallUpdate::new(
                         acp_v1::ToolCallId::new("subagent-call"),
-                        acp_v1::ToolCallUpdateFields::new().status(acp_v1::ToolCallStatus::Completed),
+                        acp_v1::ToolCallUpdateFields::new()
+                            .status(acp_v1::ToolCallStatus::Completed),
                     )),
                     cx,
                 )
                 .unwrap();
         });
         cx.run_until_parked();
-
         thread.read_with(cx, |thread, cx| {
-            assert!(
-                thread.running_work(cx).is_empty(),
-                "work that has finished is not work in flight"
-            );
+            assert!(thread.running_work(cx).is_empty());
         });
-
         complete
             .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
             .expect("turn should still be running");
         request.await.expect("turn should complete");
+
+        // Work a cancelled turn leaves behind.
+        let (complete, request) = start_test_turn(&thread, cx);
+        cx.run_until_parked();
+        let cancelled = acp_v1::TerminalId::new("cancelled-command");
+        thread.update(cx, |thread, cx| {
+            in_flight(
+                thread,
+                "cancelled-call",
+                "cancelled-subagent",
+                &cancelled,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| assert_eq!(thread.running_work(cx), busy));
+
+        // `cancel` waits for the turn's send task, which this test holds.
+        let cancelled_turn = thread.update(cx, |thread, cx| thread.cancel(cx));
+        drop(complete);
+        cancelled_turn.await;
+        request.await.ok();
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            assert!(thread.running_work(cx).is_empty());
+        });
     }
 
-    /// Claude's subagents are its `Agent` and `Task` tool calls, and it names
-    /// its tools in its own metadata namespace rather than in ACP's `name`
-    /// field or the legacy flat key. Nothing read that namespace, so a running
-    /// Claude subagent was never counted — the pill said a thread was merely
-    /// spinning while two subagents worked under it.
+    /// Claude names its tools only in its own meta namespace.
     #[gpui::test]
     async fn test_claude_subagents_are_counted_while_they_work(cx: &mut gpui::TestAppContext) {
         init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        let project = Project::test(fs, [], cx).await;
-        let connection = Rc::new(FakeAgentConnection::new());
-        let thread = cx
-            .update(|cx| {
-                connection.new_session(
-                    project.clone(),
-                    PathList::new(&[Path::new(path!("/test"))]),
-                    cx,
-                )
-            })
-            .await
-            .unwrap();
+        let thread = new_test_thread(cx).await;
 
         let claude_tool = |name: &str| {
             acp_v1::Meta::from_iter([(
@@ -11947,62 +11481,37 @@ mod tests {
                 serde_json::json!({ "toolName": name }),
             )])
         };
-        let subagent = |id: &'static str, title: &'static str, name: &str, status| {
+        let call = |id: &'static str, name: &str, status| {
             acp_v1::SessionUpdate::ToolCall(
-                acp_v1::ToolCall::new(id, title)
+                acp_v1::ToolCall::new(id, id)
                     .status(status)
                     .meta(claude_tool(name)),
             )
         };
 
-        // A call is only in flight while somebody is working on it.
         let (complete, request) = start_test_turn(&thread, cx);
         cx.run_until_parked();
 
-        // Both of Claude's spellings, running at once.
         thread.update(cx, |thread, cx| {
-            thread
-                .handle_session_update(
-                    subagent(
-                        "agent-call",
-                        "Investigate the failing test",
-                        "Agent",
-                        acp_v1::ToolCallStatus::InProgress,
-                    ),
-                    cx,
-                )
-                .unwrap();
-            thread
-                .handle_session_update(
-                    subagent(
-                        "task-call",
-                        "Summarise the diff",
-                        "Task",
-                        acp_v1::ToolCallStatus::InProgress,
-                    ),
-                    cx,
-                )
-                .unwrap();
+            for (id, name) in [
+                ("agent-call", "Agent"),
+                ("task-call", "Task"),
+                ("bash-call", "Bash"),
+            ] {
+                thread
+                    .handle_session_update(call(id, name, acp_v1::ToolCallStatus::InProgress), cx)
+                    .unwrap();
+            }
         });
         cx.run_until_parked();
         thread.read_with(cx, |thread, cx| {
-            assert_eq!(
-                thread.running_work(cx).subagents,
-                2,
-                "both of Claude's subagents are working, and the pill says two"
-            );
+            assert_eq!(thread.running_work(cx).subagents, 2);
         });
 
-        // And the count drops as each finishes.
         thread.update(cx, |thread, cx| {
             thread
                 .handle_session_update(
-                    subagent(
-                        "agent-call",
-                        "Investigate the failing test",
-                        "Agent",
-                        acp_v1::ToolCallStatus::Completed,
-                    ),
+                    call("agent-call", "Agent", acp_v1::ToolCallStatus::Completed),
                     cx,
                 )
                 .unwrap();
@@ -12012,65 +11521,25 @@ mod tests {
             assert_eq!(thread.running_work(cx).subagents, 1);
         });
 
-        // A tool of Claude's that is not a subagent is not counted as one.
-        thread.update(cx, |thread, cx| {
-            thread
-                .handle_session_update(
-                    subagent(
-                        "bash-call",
-                        "cargo test",
-                        "Bash",
-                        acp_v1::ToolCallStatus::InProgress,
-                    ),
-                    cx,
-                )
-                .unwrap();
-        });
-        cx.run_until_parked();
-        thread.read_with(cx, |thread, cx| {
-            assert_eq!(thread.running_work(cx).subagents, 1);
-        });
-
-        // Ending the turn settles the one left in flight: there is nobody left
-        // to finish it, so it is stuck rather than busy.
+        // Nobody is left to finish a call once the turn ends.
         complete
             .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
             .expect("turn should still be running");
         request.await.expect("turn should complete");
         cx.run_until_parked();
         thread.read_with(cx, |thread, cx| {
-            assert_eq!(
-                thread.running_work(cx).subagents,
-                0,
-                "a subagent left in flight by a finished turn is not still working"
-            );
+            assert_eq!(thread.running_work(cx).subagents, 0);
         });
     }
 
-    /// Claude backgrounds its subagents: the `Agent` call completes the moment
-    /// the subagent is handed off, the turn ends, and the subagents keep
-    /// working. Counting them from the call's status therefore reports zero for
-    /// exactly the minutes they are running, which is what the pill used to do.
-    /// With the adapter's own reports they are counted until each says it is
-    /// done, turn or no turn.
+    /// Claude's `Agent` call completes when the subagent is handed off, so only
+    /// the adapter's lifecycle reports say it is still running.
     #[gpui::test]
     async fn test_reported_subagents_outlive_the_turn_that_launched_them(
         cx: &mut gpui::TestAppContext,
     ) {
         init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        let project = Project::test(fs, [], cx).await;
-        let connection = Rc::new(FakeAgentConnection::new());
-        let thread = cx
-            .update(|cx| {
-                connection.new_session(
-                    project.clone(),
-                    PathList::new(&[Path::new(path!("/test"))]),
-                    cx,
-                )
-            })
-            .await
-            .unwrap();
+        let thread = new_test_thread(cx).await;
 
         let reviews = [
             ("subagent-1", "Reuse review of flush cuts"),
@@ -12081,7 +11550,6 @@ mod tests {
         let (complete, request) = start_test_turn(&thread, cx);
         cx.run_until_parked();
 
-        // Launched together, as the screenshot showed them.
         thread.update(cx, |thread, cx| {
             for (session, task) in reviews {
                 thread.subagent_reported(
@@ -12093,164 +11561,29 @@ mod tests {
                     },
                     cx,
                 );
-            }
-        });
-        cx.run_until_parked();
-        thread.read_with(cx, |thread, cx| {
-            assert_eq!(thread.running_work(cx).subagents, 3);
-        });
-
-        // The `Agent` calls complete at once, which is how Claude hands a
-        // background subagent off. That must not drop the count.
-        thread.update(cx, |thread, cx| {
-            for (session, task) in reviews {
                 thread
                     .handle_session_update(
                         acp_v1::SessionUpdate::ToolCall(
                             acp_v1::ToolCall::new(session, task)
-                                .status(acp_v1::ToolCallStatus::Completed)
-                                .meta(acp_v1::Meta::from_iter([
-                                    (
-                                        CLAUDE_CODE_META_KEY.into(),
-                                        serde_json::json!({ "toolName": "Agent" }),
-                                    ),
-                                    (
-                                        SUBAGENT_SESSION_INFO_META_KEY.into(),
-                                        serde_json::json!({
-                                            "session_id": session,
-                                            "message_start_index": 0,
-                                        }),
-                                    ),
-                                ])),
+                                // Reported and still in flight: counted once.
+                                .status(if session == "subagent-1" {
+                                    acp_v1::ToolCallStatus::InProgress
+                                } else {
+                                    acp_v1::ToolCallStatus::Completed
+                                })
+                                .meta(claude_subagent_meta(Some(session))),
                         ),
                         cx,
                     )
                     .unwrap();
             }
-        });
-        cx.run_until_parked();
-        thread.read_with(cx, |thread, cx| {
-            assert_eq!(
-                thread.running_work(cx).subagents,
-                3,
-                "the calls completing is the hand-off, not the work finishing"
-            );
-            for (session, task) in reviews {
-                let state = thread
-                    .subagents()
-                    .iter()
-                    .find(|subagent| subagent.session_id == acp_v1::SessionId::new(session))
-                    .map(|subagent| subagent.state);
-                assert_eq!(
-                    state,
-                    Some(AsyncTaskState::Running),
-                    "{task} is still running, so its chip spins"
-                );
-            }
-        });
-
-        // And the turn ends while they work, which is the case that reported
-        // zero before.
-        complete
-            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
-            .expect("turn should still be running");
-        request.await.expect("turn should complete");
-        cx.run_until_parked();
-        thread.read_with(cx, |thread, cx| {
-            assert_eq!(
-                thread.running_work(cx).subagents,
-                3,
-                "a backgrounded subagent outlives the turn that launched it"
-            );
-        });
-
-        // Each drops as it reports in, and a failure is still an ending.
-        let endings = [
-            ("subagent-1", AsyncTaskState::Completed, 2),
-            ("subagent-2", AsyncTaskState::Failed, 1),
-            ("subagent-3", AsyncTaskState::Stopped, 0),
-        ];
-        for (session, state, remaining) in endings {
-            thread.update(cx, |thread, cx| {
-                thread.subagent_state_updated(&acp_v1::SessionId::new(session), state, cx);
-            });
-            cx.run_until_parked();
-            thread.read_with(cx, |thread, cx| {
-                assert_eq!(
-                    thread.running_work(cx).subagents,
-                    remaining,
-                    "{session} reported {state:?}"
-                );
-            });
-        }
-    }
-
-    /// The two ways of knowing about a subagent must not both be counted. An
-    /// agent that reports lifecycles is believed; one that does not still has
-    /// its call's status read, which is all there was before.
-    #[gpui::test]
-    async fn test_a_reported_subagent_is_counted_once(cx: &mut gpui::TestAppContext) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        let project = Project::test(fs, [], cx).await;
-        let connection = Rc::new(FakeAgentConnection::new());
-        let thread = cx
-            .update(|cx| {
-                connection.new_session(
-                    project.clone(),
-                    PathList::new(&[Path::new(path!("/test"))]),
-                    cx,
-                )
-            })
-            .await
-            .unwrap();
-
-        let (complete, request) = start_test_turn(&thread, cx);
-        cx.run_until_parked();
-
-        // One subagent, reported *and* with its call still in flight.
-        thread.update(cx, |thread, cx| {
-            thread.subagent_reported(
-                Subagent {
-                    session_id: acp_v1::SessionId::new("reported"),
-                    name: None,
-                    task: Some("Review the diff".into()),
-                    state: AsyncTaskState::Running,
-                },
-                cx,
-            );
-            thread
-                .handle_session_update(
-                    acp_v1::SessionUpdate::ToolCall(
-                        acp_v1::ToolCall::new("reported", "Review the diff")
-                            .status(acp_v1::ToolCallStatus::InProgress)
-                            .meta(acp_v1::Meta::from_iter([
-                                (
-                                    CLAUDE_CODE_META_KEY.into(),
-                                    serde_json::json!({ "toolName": "Agent" }),
-                                ),
-                                (
-                                    SUBAGENT_SESSION_INFO_META_KEY.into(),
-                                    serde_json::json!({
-                                        "session_id": "reported",
-                                        "message_start_index": 0,
-                                    }),
-                                ),
-                            ])),
-                    ),
-                    cx,
-                )
-                .unwrap();
-            // And one nobody reports on, which only its call speaks for.
+            // One nobody reports on, which only its call speaks for.
             thread
                 .handle_session_update(
                     acp_v1::SessionUpdate::ToolCall(
                         acp_v1::ToolCall::new("unreported", "Summarise the diff")
                             .status(acp_v1::ToolCallStatus::InProgress)
-                            .meta(acp_v1::Meta::from_iter([(
-                                CLAUDE_CODE_META_KEY.into(),
-                                serde_json::json!({ "toolName": "Task" }),
-                            )])),
+                            .meta(claude_subagent_meta(None)),
                     ),
                     cx,
                 )
@@ -12258,28 +11591,41 @@ mod tests {
         });
         cx.run_until_parked();
         thread.read_with(cx, |thread, cx| {
-            assert_eq!(
-                thread.running_work(cx).subagents,
-                2,
-                "one reported and one not, counted once each"
-            );
+            assert_eq!(thread.running_work(cx).subagents, 4);
+            for (session, _) in reviews {
+                let call = thread
+                    .tool_call(&acp_v1::ToolCallId::new(session))
+                    .expect("subagent call")
+                    .1;
+                assert_eq!(
+                    thread.subagent_state_for_tool_call(call),
+                    Some(AsyncTaskState::Running),
+                );
+            }
         });
 
-        // Ending the turn settles the unreported one, as it always did, and
-        // leaves the reported one alone.
         complete
             .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
             .expect("turn should still be running");
         request.await.expect("turn should complete");
         cx.run_until_parked();
         thread.read_with(cx, |thread, cx| {
-            assert_eq!(
-                thread.running_work(cx).subagents,
-                1,
-                "the reported subagent survives the turn; the one only its \
-                 call spoke for does not"
-            );
+            assert_eq!(thread.running_work(cx).subagents, 3);
         });
+
+        for (session, state, remaining) in [
+            ("subagent-1", AsyncTaskState::Completed, 2),
+            ("subagent-2", AsyncTaskState::Failed, 1),
+            ("subagent-3", AsyncTaskState::Stopped, 0),
+        ] {
+            thread.update(cx, |thread, cx| {
+                thread.subagent_state_updated(&acp_v1::SessionId::new(session), state, cx);
+            });
+            cx.run_until_parked();
+            thread.read_with(cx, |thread, cx| {
+                assert_eq!(thread.running_work(cx).subagents, remaining, "{session}");
+            });
+        }
     }
 
     #[gpui::test]
@@ -12290,25 +11636,11 @@ mod tests {
 
         init_test(cx);
         cx.executor().allow_parking();
-
-        let fs = FakeFs::new(cx.executor());
-        let project = Project::test(fs, [], cx).await;
-        let connection = Rc::new(FakeAgentConnection::new());
-        let thread = cx
-            .update(|cx| {
-                connection.new_session(
-                    project.clone(),
-                    PathList::new(&[Path::new(path!("/test"))]),
-                    cx,
-                )
-            })
-            .await
-            .unwrap();
+        let thread = new_test_thread(cx).await;
 
         let terminal_id = acp_v1::TerminalId::new(uuid::Uuid::new_v4().to_string());
         let (program, args) =
             ShellBuilder::new(&Shell::System, false).build(Some("sleep 1".to_owned()), &[]);
-        // A task terminal, the way every agent command is spawned.
         let terminal_mode = ::terminal::TerminalMode::task(task::SpawnInTerminal {
             command: Some(program.clone()),
             args: args.clone(),
@@ -12354,9 +11686,7 @@ mod tests {
             );
         });
 
-        // The command is the agent's, so what ends it here is the agent saying
-        // so. Wait for the real process first, so the duration below is the
-        // one the command actually took.
+        // Wait for the real process first, so the duration is the command's.
         let ran = cx.update(|cx| lower_terminal.read(cx).wait_for_completed_task(cx));
         ran.await;
         thread.update(cx, |thread, cx| {
@@ -12371,7 +11701,7 @@ mod tests {
         cx.run_until_parked();
 
         let (started_at, ended_at) = thread.read_with(cx, |thread, cx| {
-            let terminal = thread.terminals.get(&terminal_id).unwrap().read(cx);
+            let terminal = thread.terminals[&terminal_id].read(cx);
             let output = terminal.output().expect("the command finished");
             (terminal.started_at(), output.ended_at)
         });
@@ -12382,6 +11712,14 @@ mod tests {
         );
     }
 
+    /// Test that killing a terminal via Terminal::kill properly:
+    /// 1. Causes wait_for_exit to complete (doesn't hang forever)
+    /// 2. The underlying terminal still has the output that was written before the kill
+    ///
+    /// This test verifies that the fix to kill_active_task (which now also kills
+    /// the shell process in addition to the foreground process) properly allows
+    /// wait_for_exit to complete instead of hanging indefinitely.
+    #[cfg(unix)]
     #[gpui::test]
     async fn test_terminal_kill_allows_wait_for_exit_to_complete(cx: &mut gpui::TestAppContext) {
         assert_process_terminal_can_stop(false, cx).await;
@@ -12568,8 +11906,6 @@ mod tests {
             .await
             .unwrap();
 
-        // An external agent announces provider-native compaction as an ordinary
-        // assistant message; it becomes a compaction entry, not a loose message.
         thread.update(cx, |thread, cx| {
             thread.push_assistant_content_block(
                 "Context compacted to fit the model's context window.".into(),
@@ -12585,8 +11921,6 @@ mod tests {
             ));
         });
 
-        // A real assistant message that merely mentions compaction is untouched,
-        // and does not merge into the compaction entry.
         thread.update(cx, |thread, cx| {
             thread.push_assistant_content_block(
                 "I could compact the context window here, but let me first explain what \
@@ -15316,12 +14650,7 @@ mod tests {
             );
             assert_eq!(call.status(), ToolCallStatus::Completed);
             assert_eq!(call.local_status, None);
-            // An Execute call's label is a bash-tagged fenced code block here,
-            // so it highlights as shell rather than rendering as prose.
-            assert_eq!(
-                call.label.read(cx).source(),
-                "```bash\nupdated title\n```"
-            );
+            assert_eq!(call.label.read(cx).source(), "```bash\nupdated title\n```");
             thread
                 .update_tool_call(
                     acp_v1::ToolCallUpdate::new(
@@ -16154,8 +15483,6 @@ mod tests {
                 true,
             ),
             (
-                // A command's label is a bash-tagged fenced code block, so it
-                // highlights as shell rather than rendering as prose.
                 acp_v1::ToolCallUpdateFields::new().kind(acp_v1::ToolKind::Execute),
                 "```bash\n**Readable title**\n```",
                 false,
@@ -16760,17 +16087,9 @@ mod tests {
                     )
                     .is_err()
             );
-            assert_eq!(
-                command.read(cx).source(),
-                "```bash\noriginal command\n```"
-            );
+            assert_eq!(command.read(cx).source(), "```bash\noriginal command\n```");
             let (_, call) = thread.tool_call(&id).expect("unchanged tool");
-            // Fenced, as every Execute label is here; the point of the
-            // assertion is that the failed patch did not relabel it.
-            assert_eq!(
-                call.label.read(cx).source(),
-                "```bash\nTool caption\n```"
-            );
+            assert_eq!(call.label.read(cx).source(), "```bash\nTool caption\n```");
             assert_eq!(call.terminals().next(), Some(&terminal));
             assert_eq!(call.content().len(), 1);
             thread
@@ -16786,10 +16105,7 @@ mod tests {
                     cx,
                 )
                 .expect("valid terminal update");
-            assert_eq!(
-                command.read(cx).source(),
-                "```bash\nchanged command\n```"
-            );
+            assert_eq!(command.read(cx).source(), "```bash\nchanged command\n```");
             assert_eq!(
                 thread.tool_call(&id).expect("tool").1.terminals().next(),
                 Some(&terminal)
@@ -16987,8 +16303,6 @@ mod tests {
             let (_, tool_call) = thread
                 .tool_call(&tool_call_id)
                 .expect("tool call should exist");
-            // Execute labels are normalized into bash-tagged fenced code
-            // blocks for syntax highlighting.
             assert_eq!(
                 tool_call.label.read(cx).source(),
                 "```bash\nUpdated title\n```"
@@ -17223,8 +16537,6 @@ mod tests {
             let (_, tool_call) = thread
                 .tool_call(&tool_call_id)
                 .expect("tool call should exist");
-            // Execute labels are normalized into bash-tagged fenced code
-            // blocks for syntax highlighting.
             assert_eq!(
                 tool_call.label.read(cx).source(),
                 "```bash\nNeeds permission\n```"
@@ -17967,8 +17279,6 @@ mod tests {
 
         let fs = FakeFs::new(cx.executor());
         let project = Project::test(fs, [], cx).await;
-        // A turn that publishes a plan with work in progress and is then
-        // interrupted, which is how a cancel comes back from an agent.
         let connection = Rc::new(FakeAgentConnection::new().on_user_message(
             move |_, thread, mut cx| {
                 async move {
@@ -18017,7 +17327,6 @@ mod tests {
                 plan.stats().in_progress_entry.is_none(),
                 "a cancelled turn leaves nothing in progress"
             );
-            // The entry stays in the plan, waiting rather than running.
             assert_eq!(plan.entries.len(), 2);
             assert_eq!(
                 plan.entries[0].source.status,
@@ -19705,8 +19014,7 @@ mod tests {
                 cx,
             );
 
-            // The update should succeed (not return an error) and be dropped:
-            // a placeholder entry would render as a useless chip.
+            // The update should succeed (not return an error)
             assert!(result.is_ok());
             assert_eq!(thread.entries.len(), 0);
         });

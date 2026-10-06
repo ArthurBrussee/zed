@@ -406,64 +406,36 @@ pub(crate) async fn prepare_sandbox_wrap(
     ))
 }
 
-/// How long to keep listening after a command exits for the repository to say
-/// anything at all. The status arrives on debounced filesystem events, so the
-/// last of what a command wrote lands some time after it ends; generous enough
-/// for a large rewrite on a cold worktree.
+/// How long to wait after a command exits for the repository's first status
+/// event: statuses arrive on debounced filesystem events.
 const FIRST_CHANGE_TIMEOUT: Duration = Duration::from_secs(6);
-
-/// How long the repository has to stay silent, once a command has ended and
-/// something has been reported, before the watch ends. Short, because by then
-/// the events are already flowing.
+/// How long the repository must stay quiet, once something was reported.
 const QUIET_AFTER_CHANGE: Duration = Duration::from_millis(750);
-
-/// How many times a finished command's repository may move before the watch
-/// gives up. Only a worktree someone else is also writing to reaches this.
 const SETTLE_ROUNDS: usize = 30;
-
-/// How far outside a command's own run a write may sit and still be counted as
-/// its doing. The window is recorded around the command rather than by it, and
-/// a file's timestamp is only as fine as the filesystem keeps it.
+/// Slack around the command's run for file timestamps.
 const WRITE_WINDOW_GRACE: Duration = Duration::from_secs(2);
-
-/// How many already-dirty files a command's watch reads before it starts, and
-/// how large one may be. A file that was clean needs nothing kept (HEAD is
-/// what the command found); these are the ones whose before-text exists only
-/// on disk, and only until the command overwrites it. The caps are what keeps
-/// a worktree full of large dirty files from making every command that could
-/// write cost megabytes to start: half a megabyte is a very large source file,
-/// and a card for the sixteenth changed file is not what the reader is short
-/// of.
+/// Caps on the before-text kept for already-dirty files, so a worktree full of
+/// large dirty files does not make every command cost megabytes to start.
 const MAX_PRE_COMMAND_FILES: usize = 16;
 const MAX_PRE_COMMAND_BYTES: usize = 512 * 1024;
-
-/// How big a picture a command wrote may be before the chip declines to draw
-/// it. Screenshots and plots are well under this; a multi-gigapixel export is
-/// not something to decode on the way to painting a frame.
 const MAX_OUTPUT_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
 
-/// A file a command changed, as the repository saw it, and how much of it moved
-/// while the command ran.
+/// A file a command changed, as the repository saw it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChangedFile {
     pub path: ProjectPath,
     pub added: u32,
     pub deleted: u32,
-    /// Whether the file already carried uncommitted changes when the command
-    /// started. A hover card cannot honestly claim its whole diff is this
-    /// command's when there was already a diff to show, unless it has the
-    /// text the command found.
+    /// Whether the file already had uncommitted changes when the command
+    /// started, so its diff against HEAD is not all the command's.
     pub pre_command_dirty: bool,
-    /// What the file held when the command started, for a file that was
-    /// already dirty. `None` when it was clean — HEAD is the before-text then
-    /// — or when it was too large or unreadable to keep.
+    /// What an already-dirty file held when the command started, unless it
+    /// was too large or unreadable to keep.
     pub pre_command_text: Option<Arc<str>>,
 }
 
-/// The repository's view of its working copy: what each path's status is, and
-/// how much of it differs. The diff stat is part of the identity because a file
-/// that was already modified keeps the same status when a command changes it
-/// again, and only the amount of change moves.
+/// The diff stat is included because an already-modified file keeps its
+/// status when changed again.
 type StatusSnapshot = HashMap<RepoPath, (FileStatus, Option<DiffStat>)>;
 
 fn status_snapshot(repository: &Entity<Repository>, cx: &App) -> StatusSnapshot {
@@ -474,25 +446,19 @@ fn status_snapshot(repository: &Entity<Repository>, cx: &App) -> StatusSnapshot 
         .collect()
 }
 
-/// The state a running watch keeps: where the repository stood when the command
-/// started, and what has been reported since, so that each of the repository's
-/// updates costs only the work that update actually changed.
 struct RepositoryWatch {
     repository: Entity<Repository>,
     project: Entity<Project>,
     fs: Arc<dyn project::Fs>,
     baseline: StatusSnapshot,
-    /// What the already-dirty files held when the command started, read in the
-    /// background as the command began.
     pre_command_text: Shared<Task<Arc<HashMap<RepoPath, Arc<str>>>>>,
     started_at: SystemTime,
     candidates: Vec<(RepoPath, DiffStat)>,
     reported: Vec<ChangedFile>,
 }
 
-/// Reads what the files that were already dirty hold right now, so a card can
-/// later show what a command did to them rather than everything that differs
-/// from HEAD. A clean file needs nothing kept: HEAD is what the command found.
+/// Reads the already-dirty files before the command overwrites them; for a
+/// clean file HEAD is the before-text.
 fn capture_pre_command_text(
     baseline: &StatusSnapshot,
     repository: &Entity<Repository>,
@@ -511,8 +477,7 @@ fn capture_pre_command_text(
             })
             .collect()
     };
-    // A status is a map, so which files a cap would keep is nobody's to
-    // depend on.
+    // Sorted so the cap keeps a deterministic set.
     paths.sort_by(|(left, _), (right, _)| left.cmp(right));
     paths.truncate(MAX_PRE_COMMAND_FILES);
 
@@ -530,9 +495,7 @@ fn capture_pre_command_text(
 }
 
 impl RepositoryWatch {
-    /// Brings the terminal's account of what its command changed up to date
-    /// with the repository. `ended_at` is when the command exited, or `None`
-    /// while it is still running.
+    /// `ended_at` is `None` while the command is still running.
     async fn refresh(
         &mut self,
         ended_at: Option<SystemTime>,
@@ -551,22 +514,14 @@ impl RepositoryWatch {
                 })
                 .collect()
         });
-        // The status is a map, so its order is nobody's to depend on. Sorting
-        // gives the chips a stable order and makes this comparable with what
-        // the last update saw.
         changed.sort_by(|(left, _), (right, _)| left.cmp(right));
         if changed == self.candidates {
             return;
         }
         self.candidates = changed;
 
-        // What the command found in the files it changed, for the ones that
-        // were already dirty. The read was started when the command was, so by
-        // now it has almost always landed.
         let pre_command_text = self.pre_command_text.clone().await;
 
-        // Where on disk each candidate lives, so the filesystem can be asked
-        // when it was written.
         let project = self.project.clone();
         let candidates: Vec<(ChangedFile, PathBuf)> = cx.update(|cx| {
             let repository = repository.read(cx);
@@ -576,10 +531,6 @@ impl RepositoryWatch {
                     let path = repository.repo_path_to_project_path(repo_path, cx)?;
                     let worktree = project.read(cx).worktree_for_id(path.worktree_id, cx)?;
                     let abs_path = worktree.read(cx).absolutize(&path.path);
-                    // A file the baseline already knew was moving keeps its
-                    // history; the hover card labels itself differently for
-                    // those than for a file this command dirtied from clean,
-                    // since only the second case is the command's whole diff.
                     let pre_command_dirty = baseline
                         .get(repo_path)
                         .and_then(|(_, stat)| *stat)
@@ -600,12 +551,9 @@ impl RepositoryWatch {
                 .collect()
         });
 
-        // A repository's status is only ever as current as its last filesystem
-        // event, so edits made just before this command started can still be
-        // arriving as it runs, and edits made after it ends arrive while its
-        // status is still being watched. Neither is this command's doing, and
-        // the file's own timestamp is what separates them: what this command
-        // wrote, it wrote while it ran.
+        // Status events lag the filesystem, so edits from just before or after
+        // the command still arrive during the watch. A file's mtime tells them
+        // apart.
         let ended_at = ended_at.unwrap_or_else(SystemTime::now);
         let window = self
             .started_at
@@ -617,9 +565,7 @@ impl RepositoryWatch {
             .background_spawn(async move {
                 let mut confirmed = Vec::new();
                 for (file, abs_path) in candidates {
-                    // A file with no timestamp to read was deleted or is
-                    // unreachable; nothing vouches for it either way, and a
-                    // deletion is worth reporting.
+                    // No metadata: deleted, which is worth reporting.
                     let within = match fs.metadata(&abs_path).await {
                         Ok(Some(metadata)) => window.contains(&metadata.mtime.timestamp_for_user()),
                         _ => true,
@@ -645,9 +591,7 @@ impl RepositoryWatch {
     }
 }
 
-/// How much of a file a command moved: the growth of its unstaged diff stat
-/// while the command ran. A file that was already dirty counts only what is
-/// new, and one that just became dirty counts all of it.
+/// The growth of a file's unstaged diff stat while the command ran.
 fn stat_delta(before: Option<DiffStat>, after: Option<DiffStat>) -> DiffStat {
     let before = before.unwrap_or_default();
     let after = after.unwrap_or_default();
@@ -657,35 +601,14 @@ fn stat_delta(before: Option<DiffStat>, after: Option<DiffStat>) -> DiffStat {
     }
 }
 
-/// A terminal's command, as the markdown a chip renders.
-///
-/// The bash tag is the whole point: it gives the command shell syntax
-/// highlighting, and every command in the app is shown the same way whether
-/// Zed spawned the terminal, the agent reported one, or a later patch renamed
-/// it. It is one function because it used to be three, and the third one
-/// arrived without the tag.
+/// Tagged `bash` so every command gets shell syntax highlighting.
 fn command_markdown(command: &str) -> String {
     format!("```bash\n{command}\n```")
 }
 
-/// Whether it is worth watching the repository around this command: whether it
-/// could change anything, and whether what changed could be told apart from
-/// everything else that happened while it ran.
-///
-/// Three answers, in the order they are decided:
-///
-/// * **Unattributable.** A line that moves the branch rewrites whatever those
-///   commits touched, and nothing downstream can separate those files from the
-///   ones the rest of the line wrote, so one such segment disqualifies the
-///   whole line: `git rebase … && cargo check` is not a report about
-///   `cargo check`. Throwing the worktree away wholesale (`reset --hard`,
-///   `clean`) reads the same way. What git did is the git panel's to show.
-/// * **Only looking.** Reads, searches, listings and lookups are the bulk of
-///   what an agent runs and change nothing, so watching them would cost a
-///   subscription and a task each for an answer that is always empty.
-/// * **Might write.** Everything else, including anything the parser could not
-///   read: a script says nothing about the files it rewrites, which is the
-///   whole reason for watching rather than reading.
+/// Whether it is worth watching the repository around this command. A line
+/// that moves the branch or discards the worktree wholesale is not: its
+/// changes cannot be told apart from the rest of the line's.
 fn command_may_write(command: &str) -> bool {
     use crate::command_parse::{DestructiveOperation, GitOperation, SegmentKind};
 
@@ -696,8 +619,6 @@ fn command_may_write(command: &str) -> bool {
                 operation: GitOperation::Modify,
                 ..
             } => return false,
-            // A discard that names its files is a change with names on it and
-            // stays reportable; one that names none is the wholesale kind.
             SegmentKind::Destructive {
                 operation: DestructiveOperation::DiscardChanges,
                 paths,
@@ -741,27 +662,13 @@ pub struct Terminal {
     /// sandboxed or after it finishes. Dropping it tears down the proxy on a
     /// background thread (see `sandbox::Sandbox`'s `Drop`).
     _sandbox: Option<SandboxConfigHandle>,
-    /// Whether this command could write anything, decided once from its text.
-    /// A command that only looks around is not worth watching a repository for.
     may_write: bool,
-    /// Kept alive for as long as the watch below runs: the repository's own
-    /// account of when its status moved.
     _repository_events: Option<Subscription>,
-    /// Files this command changed, as the repository saw them rather than as
-    /// the command described itself. A script handed to an interpreter says
-    /// nothing about what it wrote; the worktree does. Empty until the command
-    /// has exited and the git status has settled.
     changed_files: Vec<ChangedFile>,
-    /// Kept alive for the duration of the watch above.
     _changed_paths_task: Option<Task<()>>,
-    /// Pictures this command's own output named and the disk vouched for.
-    /// These usually land outside the repository, so the watch above cannot
-    /// find them. Empty until the command has exited.
     output_images: Vec<PathBuf>,
-    /// Kept alive for the duration of the check above.
     _output_images_task: Option<Task<()>>,
-    /// When the command started, on the clock a file's timestamp is kept on.
-    /// `started_at` is an `Instant`, which cannot be compared with an mtime.
+    /// Comparable with file mtimes, unlike `started_at`.
     started_at_wall: SystemTime,
 }
 
@@ -823,9 +730,7 @@ pub struct TerminalOutput {
 }
 
 impl TerminalOutput {
-    /// Whether the command ended badly: a non-zero code, or a signal. A status
-    /// carrying neither is a command that ended without saying how, which is
-    /// not a failure to report.
+    /// A status with neither a code nor a signal is not a failure.
     pub fn failed(&self) -> bool {
         self.exit_status.exit_code.is_some_and(|code| code != 0)
             || self.exit_status.signal.is_some()
@@ -896,13 +801,8 @@ impl Terminal {
                         );
                         this.terminal.update(cx, |terminal, _cx| {
                             terminal.release_pty_resources();
-                            // The output is captured above, so the grid only
-                            // has to hold what it actually printed. Both
-                            // display paths already truncate here; a
-                            // process-backed command kept its whole scrollback
-                            // reservation for as long as the thread was open,
-                            // which with a few thousand commands is most of
-                            // what the app was holding.
+                            // Otherwise each finished command keeps its whole
+                            // scrollback reservation while the thread is open.
                             terminal.shrink_to_used();
                         });
                         // Free the sandbox (and its network proxy) as soon as
@@ -937,10 +837,6 @@ impl Terminal {
         Self {
             id,
             command: cx.new(|cx| {
-                // Tagged like every other command here: a terminal Zed did not
-                // spawn is still running a shell command, and
-                // `update_command_label` would have retagged it on the first
-                // title update anyway.
                 Markdown::new(
                     command_markdown(command_label.unwrap_or("Terminal")).into(),
                     Some(language_registry),
@@ -961,9 +857,7 @@ impl Terminal {
             }),
             user_stopped: Arc::new(AtomicBool::new(false)),
             _sandbox: None,
-            // A display terminal upstream has not named yet is an unread
-            // command, and an unread command might write: the label arrives
-            // later and this is decided once.
+            // An unlabelled command might write; the label arrives too late.
             may_write: command_label.is_none_or(command_may_write),
             _repository_events: None,
             changed_files: Vec::new(),
@@ -992,9 +886,7 @@ impl Terminal {
         }
     }
 
-    /// Files this command changed, once it has finished and the repository has
-    /// caught up. Empty for a command that changed nothing, that ran outside a
-    /// repository, or that has not exited yet.
+    /// Files this command changed, as the repository saw them.
     pub fn changed_files(&self) -> &[ChangedFile] {
         &self.changed_files
     }
@@ -1003,15 +895,7 @@ impl Terminal {
         &self.output_images
     }
 
-    /// Finds the pictures this command made, so the thread can show them
-    /// instead of a path and a line of `file` output.
-    ///
-    /// The command's output names the candidates and the disk decides: a path
-    /// counts only if it resolves to a file small enough to draw that was
-    /// written while the command ran. That last test is the same one that
-    /// separates a command's own writes from everything else on disk, and it
-    /// is what makes a path a result rather than a mention — the output of a
-    /// script that prints a name it never wrote to fails it.
+    /// Pictures the command's output named that were written while it ran.
     fn watch_output_images(&mut self, fs: Arc<dyn project::Fs>, cx: &mut Context<Self>) {
         let Ok(exited) = self.wait_for_exit() else {
             return;
@@ -1043,9 +927,6 @@ impl Terminal {
                     let mut found = Vec::new();
                     for name in named {
                         let path = PathBuf::from(&name);
-                        // A relative path is relative to where the command ran.
-                        // With no working directory there is nothing to resolve
-                        // it against, and guessing would draw the wrong file.
                         let path = if path.is_absolute() {
                             path
                         } else if let Some(working_dir) = working_dir.as_ref() {
@@ -1079,41 +960,19 @@ impl Terminal {
         }));
     }
 
-    /// Watches the repository around this command: what it changes is whatever
-    /// the status says changed while it ran. The watch follows the repository's
-    /// own events, so files appear as they land rather than once at the end,
-    /// and it keeps listening past the command's exit for the events its last
-    /// writes are still owed.
-    ///
-    /// This is deliberately not an attempt to read the command. A script handed
-    /// to `python3 -` describes nothing about the files it rewrites, and the
-    /// same is true of a formatter, a codegen step, or a `sed -i`. The worktree
-    /// knows regardless of what ran.
-    ///
-    /// What it cannot see: anything git ignores, anything outside the
-    /// repository, and a second edit to an already-dirty file that happens to
-    /// leave its line counts unchanged. Another process writing to the same
-    /// worktree at the same time would be misattributed to this command.
+    /// Records what the command changed, as whatever the repository status
+    /// says changed while it ran, rather than by reading the command. Cannot
+    /// see ignored files, files outside the repository, or another process
+    /// writing to the same worktree at the same time.
     pub fn watch_repository(&mut self, project: Entity<Project>, cx: &mut Context<Self>) {
-        // Most of what an agent runs is looking, not writing. Watching those
-        // would cost a subscription and a task each for an answer that is
-        // always empty.
         if !self.may_write {
             return;
         }
 
-        // A picture a command wrote is worth showing wherever it landed, which
-        // is usually outside the repository entirely, so this does not wait on
-        // finding one below.
         self.watch_output_images(project.read(cx).fs().clone(), cx);
 
-        // The working directory is a hint, not a requirement: agents often
-        // report none at all, and a command is free to `cd` somewhere else in
-        // its first breath. When it points into a repository, that repository
-        // is the one being written to (the innermost, so a command inside a
-        // submodule is watched by the one it actually changes). Otherwise the
-        // project's own repository is the thing worth watching, since a change
-        // anywhere else is one this window cannot show.
+        // The innermost repository containing the working directory, so a
+        // command in a submodule is watched by the one it changes.
         let git_store = project.read(cx).git_store().clone();
         let containing = self.working_dir.as_ref().and_then(|working_dir| {
             git_store
@@ -1150,15 +1009,10 @@ impl Terminal {
             reported: Vec::new(),
         };
 
-        // Wake on the repository's own account of itself rather than by asking
-        // it every so often. A status arrives as an event, so what a command
-        // changed can be shown the moment it lands, including while the command
-        // is still running.
         let (mut moved_tx, mut moved_rx) = futures::channel::mpsc::channel(1);
         self._repository_events = Some(cx.subscribe(&repository, move |_, _, event, _| {
             if matches!(event, RepositoryEvent::StatusesChanged) {
-                // A channel that is already full says what this would: the
-                // repository moved and has not been looked at yet.
+                // A full channel already says the repository moved.
                 moved_tx.try_send(()).ok();
             }
         }));
@@ -1167,9 +1021,6 @@ impl Terminal {
             let mut exited = exited.fuse();
             let mut ended_at = None;
 
-            // A command still running is worth reporting on as it goes: a
-            // formatter or a codegen step names its files as they land rather
-            // than all at once at the end.
             loop {
                 let listening = futures::select_biased! {
                     _ = exited => {
@@ -1187,11 +1038,7 @@ impl Terminal {
                 return;
             }
 
-            // The status arrives on debounced filesystem events, so the last of
-            // what a command wrote lands after it has already ended. Keep
-            // listening until the repository goes quiet: briefly once it has
-            // said something, and for as long as a cold status scan takes when
-            // it has not.
+            // The last writes' status events land after the command ends.
             for _ in 0..SETTLE_ROUNDS {
                 let quiet = if watch.reported.is_empty() {
                     FIRST_CHANGE_TIMEOUT
@@ -1374,10 +1221,7 @@ impl Terminal {
             if !command.is_undefined() {
                 state.command = DisplayCommand::Reported(command.take());
                 self.command.update(cx, |markdown, cx| {
-                    markdown.replace(
-                        command_markdown(state.command().unwrap_or("Terminal")),
-                        cx,
-                    );
+                    markdown.replace(command_markdown(state.command().unwrap_or("Terminal")), cx);
                 });
             }
             if !meta.is_undefined() {
@@ -1619,13 +1463,9 @@ mod tests {
             .expect("the project has a repository");
         let baseline = cx.update(|cx| status_snapshot(&repository, cx));
         let captured = cx
-            .update(|cx| {
-                capture_pre_command_text(&baseline, &repository, &project, fs.clone(), cx)
-            })
+            .update(|cx| capture_pre_command_text(&baseline, &repository, &project, fs.clone(), cx))
             .await;
 
-        // A file that was already dirty is the only one whose before-text is
-        // about to be lost: HEAD still holds what a clean file was.
         let dirty = RepoPath::new("dirty.rs").unwrap();
         assert_eq!(
             captured.get(&dirty).map(|text| text.to_string()),
@@ -1636,28 +1476,17 @@ mod tests {
 
     #[test]
     fn a_line_that_moves_the_branch_is_not_watched() {
-        // A rebase rewrites whatever those commits touched, and the check that
-        // follows it cannot be told apart from the rebase.
         assert!(!command_may_write(
             "git rebase --onto upstream/main HEAD~3 && cargo check -p acp_thread"
         ));
-        assert!(!command_may_write("git checkout main && pnpm install"));
         assert!(!command_may_write("git stash && cargo test"));
-
-        // Throwing the worktree away wholesale reads the same way.
-        assert!(!command_may_write("git reset --hard origin/main && cargo build"));
+        assert!(!command_may_write(
+            "git reset --hard origin/main && cargo build"
+        ));
         assert!(!command_may_write("git clean -fd"));
-
-        // Discarding named files is a change with names on it, so it is still
-        // worth watching.
-        assert!(command_may_write("git checkout -- src/main.rs"));
-
-        // Reading git says nothing about the worktree either way, and is
-        // already excluded.
         assert!(!command_may_write("git status --short"));
-        assert!(!command_may_write("git diff HEAD~1"));
 
-        // A line that only works is still watched.
+        assert!(command_may_write("git checkout -- src/main.rs"));
         assert!(command_may_write("cargo fmt --all"));
         assert!(command_may_write("sed -i '' 's/a/b/' src/main.rs"));
     }
@@ -1666,7 +1495,6 @@ mod tests {
     fn a_change_is_measured_from_where_the_file_already_was() {
         let stat = |added, deleted| Some(DiffStat { added, deleted });
 
-        // A file nothing had touched counts all of its change.
         assert_eq!(
             stat_delta(None, stat(7, 2)),
             DiffStat {
@@ -1675,8 +1503,6 @@ mod tests {
             }
         );
 
-        // One that was already dirty counts only what this command added to
-        // it, not how far it has drifted from HEAD in total.
         assert_eq!(
             stat_delta(stat(10, 4), stat(13, 4)),
             DiffStat {
@@ -1685,7 +1511,6 @@ mod tests {
             }
         );
 
-        // A command that put lines back is not credited with removing them.
         assert_eq!(stat_delta(stat(10, 4), stat(6, 4)), DiffStat::default());
     }
 }

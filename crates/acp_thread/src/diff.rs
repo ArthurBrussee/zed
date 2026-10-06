@@ -453,8 +453,6 @@ impl Diff {
         !self.multibuffer().read(cx).is_empty()
     }
 
-    /// The edited buffer and its diff against the tool call's base text,
-    /// e.g. for computing added/removed line stats.
     pub fn buffer_and_diff(&self, cx: &App) -> Option<(Entity<Buffer>, Entity<BufferDiff>)> {
         match self {
             Self::Pending(PendingDiff {
