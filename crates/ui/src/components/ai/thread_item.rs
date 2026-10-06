@@ -17,8 +17,7 @@ pub enum AgentThreadStatus {
     Error,
 }
 
-/// The one "agent running" glyph: sidebar rows, thread tabs, and the thread
-/// view's generating indicator all render this same rotating accent spinner.
+/// The one "agent running" glyph, shared by every surface.
 pub fn agent_running_indicator() -> AnyElement {
     Icon::new(IconName::LoadCircle)
         .size(IconSize::Small)
@@ -43,12 +42,8 @@ pub struct ThreadItemWorktreeInfo {
     pub kind: WorktreeKind,
 }
 
-/// A pull request's CI glyph: which icon, in which colour, and whether it
-/// turns.
-///
-/// Only a run still going turns. A still glyph for a run in progress reads as
-/// a control to press rather than as work happening, which is what a static
-/// arrow-in-a-circle read as: a refresh button.
+/// A pull request's CI glyph. Only a run still going turns: a still one read
+/// as a refresh button.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ChecksGlyph {
     pub icon: IconName,
@@ -57,7 +52,6 @@ pub struct ChecksGlyph {
 }
 
 impl ChecksGlyph {
-    /// A settled answer: the run is over and the glyph says what it concluded.
     pub fn settled(icon: IconName, color: Color) -> Self {
         Self {
             icon,
@@ -66,7 +60,6 @@ impl ChecksGlyph {
         }
     }
 
-    /// A run still going.
     pub fn running(icon: IconName, color: Color) -> Self {
         Self {
             icon,
@@ -75,9 +68,7 @@ impl ChecksGlyph {
         }
     }
 
-    /// `id` names the surface drawing it. The pill and its own hover card draw
-    /// the same glyph, so an id taken from the call site would be the same one
-    /// twice over while the card is up.
+    /// `id` names the surface: the pill and its hover card draw the same glyph.
     fn render(self, id: &'static str, size: IconSize) -> AnyElement {
         let icon = Icon::new(self.icon).size(size).color(self.color);
         if self.spinning {
@@ -88,11 +79,8 @@ impl ChecksGlyph {
     }
 }
 
-/// A prominent, clickable pull-request badge rendered in the row's metadata
-/// line: a pill with the PR number, a state icon/color (open, draft, merged,
-/// closed) and an optional CI/checks glyph (passing, failing, pending).
-/// Clicking it opens `url` when one is set; badges without a URL (e.g. the
-/// "no PR" indicator) are inert and rendered muted.
+/// A pull-request badge. Without a `url` (the "no PR" indicator) it is inert
+/// and muted.
 #[derive(Clone)]
 pub struct ThreadItemPrChip {
     pub label: SharedString,
@@ -101,13 +89,10 @@ pub struct ThreadItemPrChip {
     pub checks: Option<ChecksGlyph>,
     pub url: Option<SharedString>,
     pub tooltip: SharedString,
-    /// The badge's hover card. Without it the badge falls back to the plain
-    /// `tooltip` text (the inert "no PR" pill has nothing to detail).
+    /// Without it the badge falls back to the plain `tooltip` text.
     pub detail: Option<PrChipDetail>,
 }
 
-/// What a PR badge shows on hover: the pull request's title and number, its
-/// state, its checks, and its review state.
 #[derive(Clone)]
 pub struct PrChipDetail {
     pub title: SharedString,
@@ -117,23 +102,14 @@ pub struct PrChipDetail {
     pub checks: SharedString,
     pub checks_icon: Option<ChecksGlyph>,
     pub review: SharedString,
-    /// The names of failing checks the card should list under the "checks
-    /// failing" line, most useful ones first. Empty when the PR is passing or
-    /// when the check data carried no names; capped by the producer so the
-    /// card cannot grow without bound.
+    /// Capped by the producer.
     pub failing_checks: Vec<SharedString>,
-    /// How many failing checks the card is not listing. Zero when everything
-    /// failing is listed; used to draw an "and N more" line below.
+    /// Failing checks not listed, for an "and N more" line.
     pub extra_failing_checks: usize,
-    /// Why GitHub will not merge this pull request, when it will not: behind
-    /// its base, conflicting with it, or held by branch protection. `None`
-    /// when it can merge, and when mergeability is not yet known. Drawn on its
-    /// own line, since the state/checks/review row has no room for a sentence.
+    /// Why GitHub will not merge this pull request, when known.
     pub merge_blocker: Option<SharedString>,
 }
 
-/// The renderable pill for a [`ThreadItemPrChip`], shared by the sidebar rows
-/// and the agent input status bar so both read as the same badge.
 #[derive(IntoElement)]
 pub struct PrChip {
     id: ElementId,
@@ -160,14 +136,7 @@ impl PrChip {
         }
     }
 
-    /// Lets the pill be taken out of the set it is in.
-    ///
-    /// The control costs no width: while the pointer is over the chip the X
-    /// stands where the state icon does, and a chip is the one thing on the
-    /// bar whose state you can already read from its colour and its hover
-    /// card. A button of its own beside every chip made the bar wider by a
-    /// button per pull request, whether or not anyone was removing one.
-    ///
+    /// On hover the X stands where the state icon does, so it costs no width.
     /// `group` is the hover group the chip draws itself into.
     pub fn on_remove(
         mut self,
@@ -183,17 +152,12 @@ impl PrChip {
         self
     }
 
-    /// A larger label for surfaces with more space than a sidebar row (the
-    /// agent input status bar).
     pub fn large(mut self, large: bool) -> Self {
         self.large = large;
         self
     }
 
-    /// The opaque colour the pill sits on. A fill is composited over it so the
-    /// pill covers what it overlaps whatever alpha the theme's element colours
-    /// carry. Defaults to the panel background, which is where every one of
-    /// these is drawn.
+    /// The opaque colour the pill sits on. Defaults to the panel background.
     pub fn surface(mut self, surface: Hsla) -> Self {
         self.surface = Some(surface);
         self
@@ -204,17 +168,12 @@ impl RenderOnce for PrChip {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let chip = self.chip;
         let clickable = chip.url.is_some();
-        // Both fills are composited over the surface the pill sits on. A fill
-        // that keeps any alpha of its own lets a long title read straight
-        // through the pill, and `element_background` is a theme colour: the
-        // default themes make it opaque, a user's theme need not.
+        // A translucent theme fill would let a long title read through the pill.
         let surface = self
             .surface
             .unwrap_or_else(|| cx.theme().colors().panel_background);
-        // A real PR badge is filled and bordered so it reads as a control; the
-        // inert "no PR" pill keeps the same geometry (so a row does not change
-        // shape when a PR lands) and a quieter fill. Quiet is a muted fill, not
-        // no fill.
+        // The inert pill keeps the same geometry so a row does not change shape
+        // when a PR lands.
         let (label_color, label_weight, border_color, fill) = if clickable {
             (
                 Color::Default,
@@ -266,8 +225,6 @@ impl RenderOnce for PrChip {
                     tooltip,
                     handler,
                 } = remove;
-                // The two sit in the same slot rather than beside each other,
-                // so the chip is the same width with the control and without.
                 this.child(
                     div()
                         .relative()
@@ -288,7 +245,6 @@ impl RenderOnce for PrChip {
                                 .tooltip(Tooltip::text(tooltip))
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .on_click(move |event, window, cx| {
-                                    // The chip itself opens the PR on click.
                                     cx.stop_propagation();
                                     handler(event, window, cx);
                                 })
@@ -316,8 +272,6 @@ impl RenderOnce for PrChip {
                         .gap_1()
                         .w_96()
                         .child(
-                            // The title wraps within the card; the number stays
-                            // pinned beside it rather than pushing it wider.
                             h_flex()
                                 .w_full()
                                 .min_w_0()
@@ -351,10 +305,8 @@ impl RenderOnce for PrChip {
                                             .gap_0p5()
                                             .when_some(detail.checks_icon, |this, glyph| {
                                                 this.child(
-                                                    glyph.render(
-                                                        "pr-card-checks",
-                                                        IconSize::XSmall,
-                                                    ),
+                                                    glyph
+                                                        .render("pr-card-checks", IconSize::XSmall),
                                                 )
                                             })
                                             .child(
@@ -370,8 +322,6 @@ impl RenderOnce for PrChip {
                                         .color(Color::Muted),
                                 ),
                         )
-                        // Green checks and an unmergeable PR look identical on
-                        // the pill; this is where the difference gets said.
                         .when_some(detail.merge_blocker, |this, reason| {
                             this.child(
                                 h_flex()
@@ -388,8 +338,6 @@ impl RenderOnce for PrChip {
                                     ),
                             )
                         })
-                        // Names the failing checks, so the card answers the
-                        // question a reader would open a browser to answer.
                         .when(!detail.failing_checks.is_empty(), |this| {
                             let extra = detail.extra_failing_checks;
                             this.child(
@@ -425,11 +373,8 @@ impl RenderOnce for PrChip {
     }
 }
 
-/// A glyph and a number for work a thread has in flight: the commands still
-/// running, the subagents still out. The number carries it; the glyph says
-/// which kind of work it counts. The number sits in a slot wide enough for the
-/// counts it could hold rather than the one it shows, so a thread going from
-/// one command to two does not shuffle what it sits in.
+/// The number sits in a fixed-width slot so a changing count does not shuffle
+/// what it sits in.
 fn running_work_count(
     id: impl Into<ElementId>,
     icon: IconName,
@@ -450,14 +395,8 @@ fn running_work_count(
         .tooltip(Tooltip::text(tooltip))
 }
 
-/// What a working thread is doing, as one thing: it is spinning, and with it
-/// the commands still running and the subagents still out. Zero is silent — a
-/// thread with neither shows the spinner alone — so the pill only ever says
-/// something it knows.
-///
-/// Drawn as a pill: a fully rounded container with a solid fill of its own, so
-/// what the thread is doing reads as one object sitting on the row rather than
-/// as loose glyphs on whatever happens to be behind them.
+/// The spinner plus the commands still running and the subagents still out;
+/// a zero count is not drawn.
 pub fn agent_activity_pill(
     id: impl Into<SharedString>,
     work: RunningWorkCounts,
@@ -500,14 +439,11 @@ pub fn agent_activity_pill(
         .into_any_element()
 }
 
-/// The work a thread has in flight, as the pill draws it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RunningWorkCounts {
     pub terminals: usize,
     pub subagents: usize,
-    /// Commands the agent detached and is still running. They have no terminal
-    /// of ours behind them, but they are commands running, so they are counted
-    /// with the rest.
+    /// Commands the agent detached and is still running.
     pub async_tasks: usize,
 }
 
@@ -535,8 +471,6 @@ pub struct ThreadItem {
     title_generating: bool,
     highlight_positions: Vec<usize>,
     timestamp: SharedString,
-    /// The disk this row's worktree occupies, when it is worth saying. Empty
-    /// for a row that is not a worktree of its own, or whose worktree is small.
     size: SharedString,
     notified: bool,
     status: AgentThreadStatus,
@@ -547,8 +481,6 @@ pub struct ThreadItem {
     is_truncated: bool,
     added: Option<usize>,
     removed: Option<usize>,
-    /// Commands this thread has running right now, and subagents it has out.
-    /// Zero for either means the count is not drawn.
     running_terminals: usize,
     running_async_tasks: usize,
     running_subagents: usize,
@@ -776,30 +708,21 @@ impl ThreadItem {
     }
 }
 
-/// The opaque colour a row paints in each of its three states. A
-/// `GradientFade` dissolves the title into the row by painting the row's own
-/// colour over it, so it has to be given the colour the row actually paints:
-/// anything else reads as a rectangle of a slightly different shade.
+/// The opaque colour a row paints in each state, which the title's
+/// `GradientFade` has to match exactly.
 struct RowBackgrounds {
     rest: Hsla,
     hover: Hsla,
     active: Hsla,
 }
 
-/// Works out those three colours from exactly the layers the row paints.
-/// The row sets one background per state rather than stacking them, so a
-/// selected row shows no running wash and a hovered row shows neither — a
-/// fade computed by blending all of them together is a colour the row is
-/// never painted in, which is what put a block of the wrong blue next to the
-/// activity pill.
+/// The row sets one background per state rather than stacking them.
 fn row_backgrounds(
     color: &ThemeColors,
     raw_bg: Hsla,
     selected: bool,
     running: bool,
 ) -> RowBackgrounds {
-    // What lies under the row. Every state paints one translucent layer on
-    // top of this, never two.
     let surface = color.background.blend(raw_bg);
     let rest = if selected {
         surface.blend(color.ghost_element_selected)
@@ -825,21 +748,12 @@ impl RenderOnce for ThreadItem {
         let opaque_window = cx.theme().window_background_appearance()
             == WindowBackgroundAppearance::Opaque
             && raw_bg.a >= 1.0;
-        // A working row has to be findable from across the list, so the signal
-        // is the ROW: an accent wash across it, and an accent edge down its
-        // leading side. Both are paint over space the row already occupies, so
-        // nothing moves or resizes when a thread starts or stops working, and a
-        // list with several running threads stays readable — a wash marks all
-        // of them without any one of them shouting.
         let running_work = RunningWorkCounts {
             terminals: self.running_terminals,
             subagents: self.running_subagents,
             async_tasks: self.running_async_tasks,
         };
-        // A turn can end with commands still running, and often does: the
-        // agent detaches a build or a test run and hands control back. The row
-        // counts as working while anything of its is still going, or a thread
-        // doing minutes of work reads as idle.
+        // A turn can end with detached commands still running.
         let running = self.status == AgentThreadStatus::Running || !running_work.is_empty();
         let accent = color.text_accent;
         let RowBackgrounds {
@@ -848,11 +762,6 @@ impl RenderOnce for ThreadItem {
             active: active_bg,
         } = row_backgrounds(color, raw_bg, self.selected, running);
 
-        // Sized and placed to dissolve the end of the title inside the
-        // title's own box. It used to be a sibling of the status slot,
-        // overhanging to the right of the row, which put the fade underneath
-        // the activity pill — a visible horizontal gradient behind the
-        // spinner and its counts.
         let gradient_overlay = GradientFade::new(base_bg, hover_bg, active_bg)
             .width(px(64.0))
             .right(px(0.0))
@@ -881,9 +790,6 @@ impl RenderOnce for ThreadItem {
                 .when(!icon_visible, |this| this.invisible())
         };
         let icon_color = self.icon_color.unwrap_or(Color::Muted);
-        // An archived thread wears the archive glyph in place of its agent
-        // logo: the row is otherwise identical to a live one, and this is the
-        // only thing that marks the state.
         let agent_icon = if self.archived {
             Icon::new(IconName::Archive)
                 .color(icon_color)
@@ -906,9 +812,6 @@ impl RenderOnce for ThreadItem {
                 .into_any_element()
         };
 
-        // Read-state glyph: nothing when read, a dot when updated since last
-        // viewed, a stronger amber dot when the thread needs action
-        // (confirmation, elicitation, or error; the tooltip disambiguates).
         let status_icon = if matches!(
             self.status,
             AgentThreadStatus::Error | AgentThreadStatus::WaitingForConfirmation
@@ -928,14 +831,9 @@ impl RenderOnce for ThreadItem {
             None
         };
 
-        // The agent glyph keeps the leading slot. Which model is working is
-        // worth seeing while it works, and the status used to sit on top of it.
         let icon = icon_container().child(agent_icon).into_any_element();
 
-        // ...so the status goes to the right end of the title row instead. The
-        // slot is always drawn, empty or not, so the row does not change shape
-        // when a thread starts or stops. A running thread draws the pill there:
-        // spinning, and with it what it is spinning on.
+        // Always drawn so the row does not change shape when a thread starts.
         let status_indicator = if running {
             Some(agent_activity_pill(
                 format!("status-{}", self.id),
@@ -955,7 +853,6 @@ impl RenderOnce for ThreadItem {
 
         let title = self.title;
         let highlight_positions = self.highlight_positions;
-        let title_label_color = self.title_label_color;
 
         let title_label = if let Some(title_slot) = self.title_slot {
             title_slot
@@ -973,12 +870,12 @@ impl RenderOnce for ThreadItem {
                 .into_any_element()
         } else if highlight_positions.is_empty() {
             Label::new(title)
-                .when_some(title_label_color, |label, color| label.color(color))
+                .when_some(self.title_label_color, |label, color| label.color(color))
                 .when(!opaque_window, |label| label.truncate())
                 .into_any_element()
         } else {
             HighlightedLabel::new(title, highlight_positions)
-                .when_some(title_label_color, |label, color| label.color(color))
+                .when_some(self.title_label_color, |label, color| label.color(color))
                 .when(!opaque_window, |label| label.truncate())
                 .into_any_element()
         };
@@ -1071,8 +968,6 @@ impl RenderOnce for ThreadItem {
                                 move || id
                             })
                             .relative()
-                            // Definite, so the fade below is as tall as the
-                            // row rather than as tall as the label.
                             .h_full()
                             .min_w_0()
                             .flex_1()
@@ -1083,12 +978,6 @@ impl RenderOnce for ThreadItem {
                             }),
                     )
                     .child(status_slot)
-                    // The slot holds the row's buttons, hover-gated by whoever
-                    // fills it. The PR chips are not in here: the title row
-                    // cannot hold several of anything, and a row can carry
-                    // several chips, so they get the metadata line below where
-                    // there is always room. The fade keeps a long title
-                    // dissolving under the buttons instead of colliding.
                     .when_some(self.action_slot, |this, slot| {
                         this.child(
                             h_flex()
@@ -1113,14 +1002,8 @@ impl RenderOnce for ThreadItem {
                         )
                     }),
             )
-            // The second line always draws, because the agent icon lives on it
-            // now and every row has to be the same height for the icons to
-            // stay in one column. A row with nothing else to say shows the
-            // icon alone — beside a zero-width label of the same size as the
-            // metadata text, which holds the line to the height the text
-            // would have given it at whatever the UI font is. It shares the
-            // icon's slot rather than taking one of its own, so the icon
-            // still starts where the title does.
+            // Always drawn so every row is the same height; the zero-width
+            // label holds the line to the metadata text's height.
             .child(
                 h_flex()
                     .gap_1p5()
@@ -1208,9 +1091,6 @@ impl RenderOnce for ThreadItem {
                     .when(has_diff_stats && (has_size || has_timestamp), |this| {
                         this.child(dot_separator())
                     })
-                    // What the worktree costs to keep, next to how old it
-                    // is: a row that stands in for its own worktree has no
-                    // header to carry this.
                     .when(has_size, |this| {
                         this.child(
                             Label::new(size.clone())
@@ -1574,77 +1454,6 @@ impl Component for ThreadItem {
                     .into_any_element(),
             ),
             single_example(
-                "PR Chips",
-                container()
-                    .child(
-                        ThreadItem::new("ti-5m", "Thread with pull request status")
-                            .icon(IconName::AiClaude)
-                            .worktrees(vec![ThreadItemWorktreeInfo {
-                                worktree_name: Some("jade-glen".into()),
-                                full_path: "/worktrees/jade-glen/zed".into(),
-                                highlight_positions: Vec::new(),
-                                kind: WorktreeKind::Linked,
-                                branch_name: Some("fix-scrolling".into()),
-                            }])
-                            .pr_chips(vec![
-                                ThreadItemPrChip {
-                                    label: "#10461".into(),
-                                    state_icon: IconName::PullRequest,
-                                    state_color: Color::Success,
-                                    checks: Some(ChecksGlyph::settled(
-                                        IconName::Check,
-                                        Color::Success,
-                                    )),
-                                    url: Some("https://example.com/pull/10461".into()),
-                                    tooltip: "Fix things (checks passing)".into(),
-                                    detail: Some(PrChipDetail {
-                                        title: "Fix things".into(),
-                                        number: 10461,
-                                        state: "open".into(),
-                                        state_color: Color::Success,
-                                        checks: "checks passing".into(),
-                                        checks_icon: Some(ChecksGlyph::settled(
-                                            IconName::Check,
-                                            Color::Success,
-                                        )),
-                                        review: "approved".into(),
-                                        failing_checks: Vec::new(),
-                                        extra_failing_checks: 0,
-                                        merge_blocker: None,
-                                    }),
-                                },
-                                ThreadItemPrChip {
-                                    label: "#10502".into(),
-                                    state_icon: IconName::PullRequest,
-                                    state_color: Color::Muted,
-                                    checks: Some(ChecksGlyph::running(
-                                        IconName::LoadCircle,
-                                        Color::Warning,
-                                    )),
-                                    url: Some("https://example.com/pull/10502".into()),
-                                    tooltip: "Follow-up (checks pending)".into(),
-                                    detail: Some(PrChipDetail {
-                                        title: "Follow-up".into(),
-                                        number: 10502,
-                                        state: "draft".into(),
-                                        state_color: Color::Muted,
-                                        checks: "checks pending".into(),
-                                        checks_icon: Some(ChecksGlyph::running(
-                                            IconName::LoadCircle,
-                                            Color::Warning,
-                                        )),
-                                        review: "review required".into(),
-                                        failing_checks: Vec::new(),
-                                        extra_failing_checks: 0,
-                                        merge_blocker: Some("behind base branch".into()),
-                                    }),
-                                },
-                            ])
-                            .timestamp("2h"),
-                    )
-                    .into_any_element(),
-            ),
-            single_example(
                 "Focused Item (Keyboard Selection)",
                 container()
                     .child(
@@ -1712,10 +1521,6 @@ mod tests {
 
     #[gpui::test]
     fn test_agent_icon_leads_the_second_line(cx: &mut TestAppContext) {
-        // The sidebar is narrow, so the title gets the whole first line and
-        // the agent icon moves under it. Every row draws the second line, so
-        // a row with nothing to say there is still the same height as its
-        // neighbours and the icons stay in one column.
         cx.update(|cx| {
             let settings_store = settings::SettingsStore::test(cx);
             cx.set_global(settings_store);
@@ -1800,19 +1605,8 @@ mod tests {
         }
     }
 
-    /// Every `GradientFade` on a row paints the row's own colour over the end
-    /// of the title, so it has to be handed the colour the row actually paints.
-    /// The row sets one background per state rather than stacking them: a
-    /// selected row shows no running wash, and a hovered or active row shows
-    /// neither, because `.bg()` in those styles replaces the base. The fades
-    /// were computed by blending all of the layers together, which is a colour
-    /// the row is never painted in — the block of a slightly different blue
-    /// beside the activity pill.
-    ///
-    /// The ghost colours are given translucent here on purpose. Every real
-    /// theme has them so, but the test theme's are fully opaque, and an opaque
-    /// layer discards whatever it is blended onto — which makes both the right
-    /// and the wrong composition agree and the bug invisible.
+    /// The ghost colours are translucent on purpose: the test theme's are
+    /// opaque, which would hide a wrong composition.
     #[gpui::test]
     fn test_row_fade_colours_are_the_colours_the_row_paints(cx: &mut TestAppContext) {
         let color = cx.update(|cx| {
@@ -1837,9 +1631,6 @@ mod tests {
         let selected_idle = for_row(true, false);
         let selected_running = for_row(true, true);
 
-        // `.when(running && !self.selected, ..)` means a selected row paints no
-        // running wash, so its fade carries none either and a selected row
-        // reads the same whether or not it is working.
         assert_eq!(
             selected_running.rest, selected_idle.rest,
             "a selected row paints no running wash, so neither does its fade"
@@ -1849,8 +1640,6 @@ mod tests {
             surface.blend(color.ghost_element_selected),
             "a selected row is the surface plus one selection layer"
         );
-        // The wash is matched rather than dropped: an unselected running row
-        // still carries it.
         assert_eq!(
             running.rest,
             surface.blend(color.text_accent.opacity(0.08)),
@@ -1862,8 +1651,6 @@ mod tests {
         );
         assert_eq!(idle.rest, surface, "a plain row is just the surface");
 
-        // Hover and active replace the row's background outright, wash and
-        // selection included, so neither depends on either.
         for (name, state) in [
             ("idle", &idle),
             ("running", &running),

@@ -1,20 +1,188 @@
-//! The fork's own sidebar tests.
-//!
-//! These live beside `sidebar_tests.rs` rather than in it so that upstream's
-//! file keeps upstream's shape: its tests append at the end, and so did these,
-//! which made an append/append conflict out of every rebase. A child module
-//! sees the parent's imports and helpers through `use super::*`, so nothing
-//! had to be made public to move them here.
+//! The fork's own sidebar tests, kept beside upstream's file so rebases do not
+//! conflict on appends.
 
 use super::*;
-// `super`'s glob brings in `pretty_assertions::assert_eq`, which is ambiguous
-// against the prelude's through a second glob; naming it here settles it.
+// `super`'s glob makes `assert_eq` ambiguous against the prelude's.
 use pretty_assertions::assert_eq;
 
-/// Nothing in a sidebar changes four times a second, but it was being asked
-/// to rebuild at that rate all session. A rebuild that produces the list that
-/// is already there now stops before paying for anything downstream of it —
-/// the draft passes, the list's measurements, the repaint.
+fn test_thread_entry(title: &str, folder: &str, updated_at: DateTime<Utc>) -> ThreadEntry {
+    ThreadEntry {
+        metadata: Arc::new(ThreadMetadata {
+            thread_id: ThreadId::new(),
+            session_id: Some(acp::SessionId::new(title.to_string())),
+            agent_id: agent::ZED_AGENT_ID.clone(),
+            title: Some(title.to_string().into()),
+            title_override: None,
+            updated_at,
+            created_at: None,
+            interacted_at: None,
+            worktree_paths: WorktreePaths::default(),
+            remote_connection: None,
+            archived: false,
+        }),
+        icon: ui::IconName::ZedAgent,
+        icon_from_external_svg: None,
+        status: ui::AgentThreadStatus::Completed,
+        workspace: ThreadEntryWorkspace::Closed {
+            folder_paths: PathList::new(&[Path::new(folder)]),
+            project_group_key: ProjectGroupKey::new(None, PathList::new(&[Path::new("/repo")])),
+        },
+        is_live: false,
+        is_title_generating: false,
+        draft: None,
+        highlight_positions: Vec::new(),
+        worktrees: Vec::new(),
+        diff_stats: DiffStats::default(),
+        running_work: RunningWork::default(),
+        solo_worktree: None,
+        under_worktree_header: false,
+    }
+}
+
+fn archived(mut entry: ThreadEntry) -> ThreadEntry {
+    Arc::make_mut(&mut entry.metadata).archived = true;
+    entry
+}
+
+fn open_sent_thread(panel: &Entity<AgentPanel>, cx: &mut gpui::VisualTestContext) -> ThreadId {
+    let connection = StubAgentConnection::new();
+    connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+        acp::ContentChunk::new("Done".into()),
+    )]);
+    open_thread_with_connection(panel, connection, cx);
+    send_message(panel, cx);
+    cx.run_until_parked();
+    active_thread_id(panel, cx)
+}
+
+async fn add_workspace_with_panel(
+    path: &str,
+    multi_workspace: &Entity<MultiWorkspace>,
+    cx: &mut gpui::VisualTestContext,
+) -> (Entity<Workspace>, Entity<AgentPanel>) {
+    let fs = cx.update(|_, cx| <dyn fs::Fs>::global(cx));
+    fs.as_fake()
+        .insert_tree(path, serde_json::json!({ "src": {} }))
+        .await;
+    let project = project::Project::test(fs, [path.as_ref()], cx).await;
+    let workspace = multi_workspace.update_in(cx, |mw, window, cx| {
+        mw.test_add_workspace(project, window, cx)
+    });
+    let panel = add_agent_panel(&workspace, cx);
+    cx.run_until_parked();
+    (workspace, panel)
+}
+
+fn active_row_ids(sidebar: &Entity<Sidebar>, cx: &mut gpui::VisualTestContext) -> Vec<ThreadId> {
+    sidebar.read_with(cx, |sidebar, _cx| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(ix, _)| sidebar.section_of_entry(*ix) == Some(SidebarSection::OpenInZed))
+            .filter_map(|(_, entry)| match entry {
+                ListEntry::Thread(thread) => Some(thread.metadata.thread_id),
+                _ => None,
+            })
+            .collect()
+    })
+}
+
+fn row_of(
+    sidebar: &Entity<Sidebar>,
+    thread_id: ThreadId,
+    cx: &mut gpui::VisualTestContext,
+) -> usize {
+    sidebar.read_with(cx, |sidebar, _cx| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .position(|entry| {
+                matches!(entry, ListEntry::Thread(thread) if thread.metadata.thread_id == thread_id)
+            })
+            .expect("the thread should have a row")
+    })
+}
+
+/// A project at `/project` with one linked worktree that Zed made, and a thread
+/// saved in that worktree.
+async fn setup_worktree_thread(
+    cx: &mut TestAppContext,
+) -> (
+    Arc<FakeFs>,
+    Entity<project::Project>,
+    Entity<MultiWorkspace>,
+    Entity<Sidebar>,
+    &mut gpui::VisualTestContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/project",
+        serde_json::json!({
+            ".git": {
+                "worktrees": {
+                    "feature-a": {
+                        "commondir": "../../",
+                        "HEAD": "ref: refs/heads/feature-a",
+                    },
+                },
+            },
+            "src": {},
+        }),
+    )
+    .await;
+    fs.insert_tree(
+        "/worktrees/project/feature-a/project",
+        serde_json::json!({
+            ".git": "gitdir: /project/.git/worktrees/feature-a",
+            "src": {},
+        }),
+    )
+    .await;
+    fs.add_linked_worktree_for_repo(
+        Path::new("/project/.git"),
+        false,
+        git::repository::Worktree {
+            path: PathBuf::from("/worktrees/project/feature-a/project"),
+            ref_name: Some("refs/heads/feature-a".into()),
+            sha: "aaa".into(),
+            is_main: false,
+            is_bare: false,
+        },
+    )
+    .await;
+    agent_ui::test_support::record_zed_created_worktree(
+        fs.as_ref(),
+        Path::new("/worktrees/project/feature-a/project"),
+        None,
+        cx,
+    )
+    .await;
+    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+
+    let main_project = project::Project::test(fs.clone(), ["/project".as_ref()], cx).await;
+    main_project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(main_project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    save_thread_metadata_with_main_paths(
+        "worktree-thread",
+        "Worktree Thread",
+        PathList::new(&[PathBuf::from("/worktrees/project/feature-a/project")]),
+        PathList::new(&[PathBuf::from("/project")]),
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 0).unwrap(),
+        cx,
+    );
+    (fs, main_project, multi_workspace, sidebar, cx)
+}
+
 #[gpui::test]
 async fn test_a_rebuild_that_changes_nothing_stops_early(cx: &mut TestAppContext) {
     let (_fs, project) = init_multi_project_test(&["/project-a"], cx).await;
@@ -33,7 +201,6 @@ async fn test_a_rebuild_that_changes_nothing_stops_early(cx: &mut TestAppContext
     );
     cx.run_until_parked();
 
-    // A rebuild asked for when nothing has moved.
     sidebar.update(cx, |sidebar, cx| {
         sidebar.skipped_rebuilds = 0;
         sidebar.update_entries(cx);
@@ -43,9 +210,7 @@ async fn test_a_rebuild_that_changes_nothing_stops_early(cx: &mut TestAppContext
         );
     });
 
-    // The comparison must never swallow a real change. A rename moves the
-    // row's title, which the comparison looks at, so the rebuild it causes
-    // has to run all the way through.
+    // The comparison must never swallow a real change.
     sidebar.update(cx, |sidebar, _| sidebar.skipped_rebuilds = 0);
     save_thread_metadata(
         acp::SessionId::new(Arc::from("a-thread")),
@@ -69,7 +234,6 @@ async fn test_a_rebuild_that_changes_nothing_stops_early(cx: &mut TestAppContext
         );
     });
 
-    // And once it has landed, asking again is a no-op once more.
     sidebar.update(cx, |sidebar, cx| {
         sidebar.skipped_rebuilds = 0;
         sidebar.update_entries(cx);
@@ -77,11 +241,6 @@ async fn test_a_rebuild_that_changes_nothing_stops_early(cx: &mut TestAppContext
     });
 }
 
-/// Subscribing to a workspace happens more than once — at startup for the
-/// ones already open, and again when `WorkspaceAdded` names one — and a
-/// detached duplicate is invisible: every event it watches asks for the same
-/// rebuild twice from then on, and gpui walks the longer list on every flush
-/// for the rest of the session.
 #[gpui::test]
 async fn test_subscribing_to_a_workspace_twice_costs_one_set(cx: &mut TestAppContext) {
     let (_fs, project) = init_multi_project_test(&["/project-a"], cx).await;
@@ -117,9 +276,6 @@ async fn test_subscribing_to_a_workspace_twice_costs_one_set(cx: &mut TestAppCon
 }
 
 #[gpui::test]
-// Rewritten for the merged history model: sticky project headers are gone,
-// but a same-shape metadata update must still preserve the measured bounds
-// of unrelated rows.
 async fn test_thread_metadata_update_preserves_list_measurements(cx: &mut TestAppContext) {
     let (fs, project_a) = init_multi_project_test(&["/project-a", "/project-b"], cx).await;
     let (multi_workspace, cx) =
@@ -152,8 +308,7 @@ async fn test_thread_metadata_update_preserves_list_measurements(cx: &mut TestAp
     );
     cx.run_until_parked();
 
-    // The last row is the oldest thread (Project A Thread); its measurement
-    // must survive a same-shape rename of that thread.
+    // The last row is the oldest thread (Project A Thread).
     let last_row_ix = sidebar.read_with(cx, |sidebar, _| sidebar.contents.entries.len() - 1);
 
     let bounds_before = sidebar.read_with(cx, |sidebar, _| {
@@ -183,8 +338,6 @@ async fn test_thread_metadata_update_preserves_list_measurements(cx: &mut TestAp
 }
 
 #[gpui::test]
-// Rewritten for the merged history model: collapsing is gone, so the shape
-// change trigger is removing a thread from the list.
 async fn test_thread_removal_changes_entry_shape(cx: &mut TestAppContext) {
     let project = init_test_project("/my-project", cx).await;
     let (multi_workspace, cx) =
@@ -276,8 +429,6 @@ async fn test_stored_rows_share_the_store_allocation(cx: &mut TestAppContext) {
         "a row should share the store's metadata rather than copy it"
     );
 
-    // The cost this guards is per-rebuild, so the second one matters more
-    // than the first: rebuilding must not deep-copy every stored row again.
     multi_workspace.update_in(cx, |_, _window, cx| cx.notify());
     cx.run_until_parked();
 
@@ -288,8 +439,6 @@ async fn test_stored_rows_share_the_store_allocation(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-// Rewritten for the merged history model: project groups (and collapsing)
-// are gone. Archiving now keeps the thread in the list, rendered muted.
 async fn test_archived_thread_stays_in_list(cx: &mut TestAppContext) {
     let project = init_test_project("/my-project", cx).await;
     let (multi_workspace, cx) =
@@ -335,9 +484,6 @@ async fn test_archived_thread_stays_in_list(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-// Rewritten for the merged history model: there is no per-group collapse
-// state anymore. The invariant that remains is that threads stay visible
-// when the project's group key changes (a worktree is added).
 async fn test_threads_survive_worktree_key_change(cx: &mut TestAppContext) {
     let (_fs, project) = init_multi_project_test(&["/project-a", "/project-b"], cx).await;
     let (multi_workspace, cx) =
@@ -353,8 +499,7 @@ async fn test_threads_survive_worktree_key_change(cx: &mut TestAppContext) {
         vec!["  Thread 2", "  Thread 1"]
     );
 
-    // Add a second worktree; the project group key changes from [/project-a]
-    // to [/project-a, /project-b].
+    // The project group key changes from [/project-a] to [/project-a, /project-b].
     project
         .update(cx, |project, cx| {
             project.find_or_create_worktree("/project-b", true, cx)
@@ -373,8 +518,6 @@ async fn test_threads_survive_worktree_key_change(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-// Rewritten for the merged history model: bucket headers replaced project
-// headers and are inert, so Confirm on one is a no-op.
 async fn test_keyboard_confirm_on_bucket_header_is_noop(cx: &mut TestAppContext) {
     let project = init_test_project("/my-project", cx).await;
     let (multi_workspace, cx) =
@@ -387,7 +530,6 @@ async fn test_keyboard_confirm_on_bucket_header_is_noop(cx: &mut TestAppContext)
 
     assert_eq!(visible_entries_as_strings(&sidebar, cx), vec!["  Thread 1"]);
 
-    // Force the selection onto the bucket header (index 0) and confirm.
     focus_sidebar(&sidebar, cx);
     sidebar.update_in(cx, |sidebar, _window, _cx| {
         sidebar.selection = Some(0);
@@ -400,9 +542,6 @@ async fn test_keyboard_confirm_on_bucket_header_is_noop(cx: &mut TestAppContext)
 }
 
 #[gpui::test]
-// Rewritten for the merged history model: there are no collapsible groups,
-// so the SelectParent/SelectChild expand/collapse actions are no longer
-// handled and the list stays unchanged when they are dispatched.
 async fn test_keyboard_expand_and_collapse_are_noops(cx: &mut TestAppContext) {
     let project = init_test_project("/my-project", cx).await;
     let (multi_workspace, cx) =
@@ -437,10 +576,7 @@ async fn test_keyboard_expand_and_collapse_are_noops(cx: &mut TestAppContext) {
     );
 }
 
-/// Only a spare is reclaimed. A worktree a `+` made belongs to the thread that
-/// click also created, whether or not a message was ever sent in it, and it
-/// stays until that thread is archived — which is how a `+` worktree someone
-/// left files in stops being thrown away behind them.
+/// A `+` worktree belongs to its thread, sent or not, until that is archived.
 #[gpui::test]
 async fn test_only_a_spare_worktree_is_reclaimed(cx: &mut TestAppContext) {
     init_test(cx);
@@ -507,8 +643,6 @@ async fn test_only_a_spare_worktree_is_reclaimed(cx: &mut TestAppContext) {
         .update(cx, |project, cx| project.git_scans_complete(cx))
         .await;
 
-    // One worktree holds a thread nothing was ever sent in, one holds a real
-    // thread, and one is a spare nobody was ever handed.
     let unsent_paths = PathList::new(&[PathBuf::from("/worktrees/reclaim/unsent/reclaim")]);
     let unsent_thread_id = save_draft_metadata_with_main_paths(
         None,
@@ -534,7 +668,8 @@ async fn test_only_a_spare_worktree_is_reclaimed(cx: &mut TestAppContext) {
     }
 
     assert!(
-        !fs.is_dir(Path::new("/worktrees/reclaim/spare/reclaim")).await,
+        !fs.is_dir(Path::new("/worktrees/reclaim/spare/reclaim"))
+            .await,
         "a spare from an earlier session, which nobody was handed, is reclaimed"
     );
     assert!(
@@ -559,82 +694,16 @@ async fn test_only_a_spare_worktree_is_reclaimed(cx: &mut TestAppContext) {
     );
 }
 
-/// Archiving is a flag on metadata and has to feel like one. It used to build
-/// the thread's closed workspace first — worktree scan, repositories, language
-/// servers — because the disk plan needs a live project, and only moved the row
-/// once that finished. The row moves first now, and the worktree still comes
-/// off disk behind it.
+/// Archiving is a flag on metadata: the row moves before the worktree's closed
+/// workspace is built to plan the removal.
 #[gpui::test]
 async fn test_archiving_a_closed_worktree_thread_does_not_wait_for_its_workspace(
     cx: &mut TestAppContext,
 ) {
-    init_test(cx);
-
-    let fs = FakeFs::new(cx.executor());
-    fs.insert_tree(
-        "/project",
-        serde_json::json!({
-            ".git": {
-                "worktrees": {
-                    "feature-a": {
-                        "commondir": "../../",
-                        "HEAD": "ref: refs/heads/feature-a",
-                    },
-                },
-            },
-            "src": {},
-        }),
-    )
-    .await;
-    fs.insert_tree(
-        "/worktrees/project/feature-a/project",
-        serde_json::json!({
-            ".git": "gitdir: /project/.git/worktrees/feature-a",
-            "src": {},
-        }),
-    )
-    .await;
-    fs.add_linked_worktree_for_repo(
-        Path::new("/project/.git"),
-        false,
-        git::repository::Worktree {
-            path: PathBuf::from("/worktrees/project/feature-a/project"),
-            ref_name: Some("refs/heads/feature-a".into()),
-            sha: "aaa".into(),
-            is_main: false,
-            is_bare: false,
-        },
-    )
-    .await;
-    agent_ui::test_support::record_zed_created_worktree(
-        fs.as_ref(),
-        Path::new("/worktrees/project/feature-a/project"),
-        None,
-        cx,
-    )
-    .await;
-    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
-
-    let main_project = project::Project::test(fs.clone(), ["/project".as_ref()], cx).await;
-    main_project
-        .update(cx, |project, cx| project.git_scans_complete(cx))
-        .await;
-
-    let (multi_workspace, cx) =
-        cx.add_window_view(|window, cx| MultiWorkspace::test_new(main_project.clone(), window, cx));
-    let sidebar = setup_sidebar(&multi_workspace, cx);
-
+    let (fs, main_project, multi_workspace, sidebar, cx) = setup_worktree_thread(cx).await;
     let worktree_session_id = acp::SessionId::new(Arc::from("worktree-thread"));
     let worktree_folder_paths =
         PathList::new(&[PathBuf::from("/worktrees/project/feature-a/project")]);
-    save_thread_metadata_with_main_paths(
-        "worktree-thread",
-        "Worktree Thread",
-        worktree_folder_paths.clone(),
-        PathList::new(&[PathBuf::from("/project")]),
-        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 0).unwrap(),
-        cx,
-    );
     save_thread_metadata(
         acp::SessionId::new(Arc::from("main-thread")),
         Some("Main Thread".into()),
@@ -647,9 +716,7 @@ async fn test_archiving_a_closed_worktree_thread_does_not_wait_for_its_workspace
     sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
     cx.run_until_parked();
 
-    // Archive without letting anything run afterwards, which is the whole
-    // point: the workspace has not been opened at this instant and the row has
-    // already moved.
+    // Nothing runs after this, so the workspace cannot have been opened yet.
     sidebar.update_in(cx, |sidebar, window, cx| {
         sidebar.archive_thread_by_session(&worktree_session_id, window, cx);
     });
@@ -673,7 +740,6 @@ async fn test_archiving_a_closed_worktree_thread_does_not_wait_for_its_workspace
         "the worktree's workspace should not be open yet"
     );
 
-    // And the slow half still happens, behind the flag.
     for _ in 0..8 {
         cx.run_until_parked();
     }
@@ -691,90 +757,15 @@ async fn test_archiving_a_closed_worktree_thread_does_not_wait_for_its_workspace
     );
 }
 
-/// The worktree belongs to a live thread again, so it must stay on disk: the
-/// user can unarchive while the workspace that plans the removal is still
-/// being built.
 #[gpui::test]
 async fn test_unarchiving_during_the_deferred_plan_leaves_the_worktree_alone(
     cx: &mut TestAppContext,
 ) {
-    init_test(cx);
-
-    let fs = FakeFs::new(cx.executor());
-    fs.insert_tree(
-        "/project",
-        serde_json::json!({
-            ".git": {
-                "worktrees": {
-                    "feature-a": {
-                        "commondir": "../../",
-                        "HEAD": "ref: refs/heads/feature-a",
-                    },
-                },
-            },
-            "src": {},
-        }),
-    )
-    .await;
-    fs.insert_tree(
-        "/worktrees/project/feature-a/project",
-        serde_json::json!({
-            ".git": "gitdir: /project/.git/worktrees/feature-a",
-            "src": {},
-        }),
-    )
-    .await;
-    fs.add_linked_worktree_for_repo(
-        Path::new("/project/.git"),
-        false,
-        git::repository::Worktree {
-            path: PathBuf::from("/worktrees/project/feature-a/project"),
-            ref_name: Some("refs/heads/feature-a".into()),
-            sha: "aaa".into(),
-            is_main: false,
-            is_bare: false,
-        },
-    )
-    .await;
-    agent_ui::test_support::record_zed_created_worktree(
-        fs.as_ref(),
-        Path::new("/worktrees/project/feature-a/project"),
-        None,
-        cx,
-    )
-    .await;
-    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
-
-    let main_project = project::Project::test(fs.clone(), ["/project".as_ref()], cx).await;
-    main_project
-        .update(cx, |project, cx| project.git_scans_complete(cx))
-        .await;
-
-    let (multi_workspace, cx) =
-        cx.add_window_view(|window, cx| MultiWorkspace::test_new(main_project.clone(), window, cx));
-    let sidebar = setup_sidebar(&multi_workspace, cx);
-
+    let (fs, _main_project, _multi_workspace, sidebar, cx) = setup_worktree_thread(cx).await;
     let worktree_session_id = acp::SessionId::new(Arc::from("worktree-thread"));
-    let worktree_folder_paths =
-        PathList::new(&[PathBuf::from("/worktrees/project/feature-a/project")]);
-    save_thread_metadata_with_main_paths(
-        "worktree-thread",
-        "Worktree Thread",
-        worktree_folder_paths.clone(),
-        PathList::new(&[PathBuf::from("/project")]),
-        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 0).unwrap(),
-        cx,
-    );
     sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
     cx.run_until_parked();
-
-    let thread_id = cx.update(|_, cx| {
-        ThreadMetadataStore::global(cx)
-            .read(cx)
-            .entry_by_session(&worktree_session_id)
-            .expect("thread metadata should exist")
-            .thread_id
-    });
+    let thread_id = thread_id_for(&worktree_session_id, cx);
 
     sidebar.update_in(cx, |sidebar, window, cx| {
         sidebar.archive_thread_by_session(&worktree_session_id, window, cx);
@@ -794,8 +785,6 @@ async fn test_unarchiving_during_the_deferred_plan_leaves_the_worktree_alone(
 }
 
 #[gpui::test]
-// Rewritten for the merged history model: there are no collapsed groups
-// anymore; search simply matches against all rows.
 async fn test_search_finds_threads(cx: &mut TestAppContext) {
     let project = init_test_project("/my-project", cx).await;
     let (multi_workspace, cx) =
@@ -815,7 +804,6 @@ async fn test_search_finds_threads(cx: &mut TestAppContext) {
 
     focus_sidebar(&sidebar, cx);
 
-    // User types a search; the thread is matched by title.
     type_in_search(&sidebar, "important", cx);
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
@@ -834,28 +822,9 @@ async fn test_closing_a_thread_clears_its_selection(cx: &mut TestAppContext) {
     let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
     cx.run_until_parked();
 
-    let connection = StubAgentConnection::new();
-    open_thread_with_connection(&panel, connection, cx);
-    send_message(&panel, cx);
-    let session_id = active_session_id(&panel, cx);
-    save_test_thread_metadata(&session_id, &project, cx).await;
-    cx.run_until_parked();
-
-    let thread_id = cx.update(|_window, cx| {
-        ThreadMetadataStore::global(cx)
-            .read(cx)
-            .entry_by_session(&session_id)
-            .expect("thread metadata should exist")
-            .thread_id
-    });
-
-    // Select the open thread's row, the way clicking or arrowing to it does.
-    sidebar.update(cx, |sidebar, _cx| {
-        sidebar.selection = sidebar.contents.entries.iter().position(|entry| {
-            matches!(entry, ListEntry::Thread(thread) if thread.metadata.thread_id == thread_id)
-        });
-        assert!(sidebar.selection.is_some(), "the open thread is listed");
-    });
+    let thread_id = open_sent_thread(&panel, cx);
+    let ix = row_of(&sidebar, thread_id, cx);
+    sidebar.update(cx, |sidebar, _cx| sidebar.selection = Some(ix));
 
     panel.update_in(cx, |panel, window, cx| {
         panel.test_close_thread_tab(thread_id, window, cx);
@@ -872,10 +841,7 @@ async fn test_closing_a_thread_clears_its_selection(cx: &mut TestAppContext) {
     });
 }
 
-// Clicking a thread in the sidebar whose tab has been closed must reopen it.
-// The stale-active_entry fast path used to trust that active_entry still
-// pointed at an open tab and early-return without loading anything, so the
-// thread never reopened.
+// The stale-active_entry fast path used to early-return without reopening.
 #[gpui::test]
 async fn test_reopen_closed_thread_from_history(cx: &mut TestAppContext) {
     let project = init_test_project_with_agent_panel("/my-project", cx).await;
@@ -884,7 +850,6 @@ async fn test_reopen_closed_thread_from_history(cx: &mut TestAppContext) {
     let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
     cx.run_until_parked();
 
-    // Open a real thread and persist its metadata so it appears in history.
     let connection = StubAgentConnection::new();
     open_thread_with_connection(&panel, connection, cx);
     send_message(&panel, cx);
@@ -908,8 +873,6 @@ async fn test_reopen_closed_thread_from_history(cx: &mut TestAppContext) {
         );
     });
 
-    // Close its tab: the metadata stays on disk but no tab hosts the thread,
-    // the same shape the sidebar sees right after a session restore.
     panel.update_in(cx, |panel, window, cx| {
         panel.test_close_thread_tab(thread_id, window, cx);
     });
@@ -924,11 +887,7 @@ async fn test_reopen_closed_thread_from_history(cx: &mut TestAppContext) {
         );
     });
 
-    // Force the stale precondition the fix targets: active_entry still points
-    // at the (now tab-less) thread. This is the shape of a restored session
-    // (active_entry persisted, no ConversationView rehydrated) or a
-    // stuck-pending activation, which the auto-created draft otherwise papers
-    // over in a single-window test.
+    // The shape of a restored session: active_entry still points at the thread.
     let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
     sidebar.update(cx, |sidebar, _cx| {
         sidebar.set_stale_thread_active_entry_for_test(
@@ -938,7 +897,6 @@ async fn test_reopen_closed_thread_from_history(cx: &mut TestAppContext) {
         );
     });
 
-    // Click the now-closed thread in the sidebar: it must reopen as a tab.
     sidebar.update_in(cx, |sidebar, window, cx| {
         sidebar.activate_thread(Arc::new(metadata.clone()), &workspace, false, window, cx);
     });
@@ -957,217 +915,9 @@ async fn test_reopen_closed_thread_from_history(cx: &mut TestAppContext) {
     });
 }
 
-// Dragging one Active row onto another arranges the list by moving the thread's
-// tab. There is one order, held by the tabs, and the row moves because the tab
-// did — never alongside it.
-#[gpui::test]
-async fn test_drag_active_row_reorders_its_tab(cx: &mut TestAppContext) {
-    let project = init_test_project_with_agent_panel("/my-project", cx).await;
-    let (multi_workspace, cx) =
-        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
-    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
-    cx.run_until_parked();
-
-    let mut thread_ids = Vec::new();
-    for _ in 0..2 {
-        open_thread_with_connection(&panel, StubAgentConnection::new(), cx);
-        send_message(&panel, cx);
-        let session_id = active_session_id(&panel, cx);
-        save_test_thread_metadata(&session_id, &project, cx).await;
-        thread_ids.push(cx.update(|_window, cx| {
-            ThreadMetadataStore::global(cx)
-                .read(cx)
-                .entry_by_session(&session_id)
-                .expect("thread metadata should exist")
-                .thread_id
-        }));
-    }
-    cx.run_until_parked();
-    sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
-    cx.run_until_parked();
-
-    let (first, second) = (thread_ids[0], thread_ids[1]);
-    #[track_caller]
-    fn position_of(ids: &[ThreadId], target: ThreadId, what: &str) -> usize {
-        ids.iter()
-            .position(|id| *id == target)
-            .unwrap_or_else(|| panic!("{what} should be present"))
-    }
-    let tabs = |cx: &mut gpui::VisualTestContext| {
-        panel.read_with(cx, |panel, cx| panel.open_thread_tab_ids(cx))
-    };
-    let rows = |cx: &mut gpui::VisualTestContext| {
-        sidebar.read_with(cx, |sidebar, _cx| {
-            sidebar
-                .contents
-                .entries
-                .iter()
-                .filter_map(|entry| match entry {
-                    ListEntry::Thread(thread) => Some(thread.metadata.thread_id),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-        })
-    };
-
-    let tabs_before = tabs(cx);
-    assert!(
-        position_of(&tabs_before, first, "the first thread's tab")
-            < position_of(&tabs_before, second, "the second thread's tab"),
-        "the thread opened first starts in front"
-    );
-
-    // Pick up the second row and drop it on the first.
-    let target_ix = sidebar.read_with(cx, |sidebar, _cx| {
-        sidebar
-            .contents
-            .entries
-            .iter()
-            .position(|entry| {
-                matches!(entry, ListEntry::Thread(thread) if thread.metadata.thread_id == first)
-            })
-            .expect("the first thread's row should be present")
-    });
-    let dragged = sidebar.read_with(cx, |sidebar, _cx| {
-        let ix = sidebar
-            .contents
-            .entries
-            .iter()
-            .position(|entry| {
-                matches!(entry, ListEntry::Thread(thread) if thread.metadata.thread_id == second)
-            })
-            .expect("the second thread's row should be present");
-        let ListEntry::Thread(thread) = &sidebar.contents.entries[ix] else {
-            unreachable!()
-        };
-        sidebar
-            .draggable_thread_row(ix, thread)
-            .expect("an Active row hosting a tab can be picked up")
-    });
-
-    sidebar.update_in(cx, |sidebar, window, cx| {
-        sidebar.handle_thread_row_drop(&dragged, target_ix, window, cx);
-    });
-    cx.run_until_parked();
-
-    let tabs_after = tabs(cx);
-    assert!(
-        position_of(&tabs_after, second, "the second thread's tab")
-            < position_of(&tabs_after, first, "the first thread's tab"),
-        "dropping a row on the one above it moves its tab in front of that one"
-    );
-
-    let rows_after = rows(cx);
-    assert!(
-        position_of(&rows_after, second, "the second thread's row")
-            < position_of(&rows_after, first, "the first thread's row"),
-        "the row follows its tab without the sidebar keeping an order of its own"
-    );
-}
-
-// The same reorder as the test above, but taken the way a user takes it:
-// through the row's own `on_drag` and `on_drop`. The direct call proves the
-// move; only the rendered path proves that a row can be picked up at all.
-#[gpui::test]
-async fn test_dragging_a_row_with_the_mouse_reorders_its_tab(cx: &mut TestAppContext) {
-    let project = init_test_project_with_agent_panel("/my-project", cx).await;
-    let (multi_workspace, cx) =
-        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
-    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
-    cx.run_until_parked();
-
-    let mut thread_ids = Vec::new();
-    for _ in 0..2 {
-        open_thread_with_connection(&panel, StubAgentConnection::new(), cx);
-        send_message(&panel, cx);
-        let session_id = active_session_id(&panel, cx);
-        save_test_thread_metadata(&session_id, &project, cx).await;
-        thread_ids.push(cx.update(|_window, cx| {
-            ThreadMetadataStore::global(cx)
-                .read(cx)
-                .entry_by_session(&session_id)
-                .expect("thread metadata should exist")
-                .thread_id
-        }));
-    }
-    cx.run_until_parked();
-    sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
-    cx.run_until_parked();
-
-    let (first, second) = (thread_ids[0], thread_ids[1]);
-    let row_of = |thread_id: ThreadId, cx: &mut gpui::VisualTestContext| {
-        sidebar.read_with(cx, |sidebar, _cx| {
-            sidebar
-                .contents
-                .entries
-                .iter()
-                .position(
-                    |entry| matches!(entry, ListEntry::Thread(thread) if thread.metadata.thread_id == thread_id),
-                )
-                .expect("both threads should have a row")
-        })
-    };
-    let tab_position = |thread_id: ThreadId, cx: &mut gpui::VisualTestContext| {
-        panel.read_with(cx, |panel, cx| {
-            panel
-                .open_thread_tab_ids(cx)
-                .iter()
-                .position(|id| *id == thread_id)
-                .expect("both threads should have a tab")
-        })
-    };
-    assert!(
-        tab_position(first, cx) < tab_position(second, cx),
-        "the thread opened first starts in front"
-    );
-
-    let draw = |cx: &mut gpui::VisualTestContext| {
-        cx.draw(
-            gpui::point(px(0.), px(0.)),
-            gpui::size(px(400.), px(600.)),
-            |_, _| sidebar.clone().into_any_element(),
-        );
-    };
-    let bounds_of = |ix: usize, cx: &mut gpui::VisualTestContext| {
-        sidebar.read_with(cx, |sidebar, _cx| {
-            sidebar
-                .list_state
-                .bounds_for_item(ix)
-                .expect("sidebar row should be measured")
-        })
-    };
-
-    draw(cx);
-    let from = bounds_of(row_of(second, cx), cx).center();
-    let to = bounds_of(row_of(first, cx), cx).center();
-
-    cx.simulate_mouse_down(from, gpui::MouseButton::Left, gpui::Modifiers::none());
-    draw(cx);
-    // Two moves: the first crosses the threshold that starts the drag, the
-    // second carries it over the target so the drop has somewhere to land.
-    cx.simulate_mouse_move(from + gpui::point(px(0.), px(8.)), gpui::MouseButton::Left, gpui::Modifiers::none());
-    draw(cx);
-    cx.simulate_mouse_move(to, gpui::MouseButton::Left, gpui::Modifiers::none());
-    draw(cx);
-    cx.simulate_mouse_up(to, gpui::MouseButton::Left, gpui::Modifiers::none());
-    cx.run_until_parked();
-
-    assert!(
-        tab_position(second, cx) < tab_position(first, cx),
-        "dragging a row onto the one above it moves its tab in front"
-    );
-}
-
-// Arthur's setup, which is the one this feature never worked in: one thread per
-// worktree, so every row a drag can reach belongs to a different workspace. The
-// drop used to be confined to the dragged row's own workspace, so no row ever
-// accepted it and the drag did nothing at all. Across worktrees the whole group
-// moves, because the list groups by worktree and cannot show one thread sitting
-// inside another group's rows.
-//
-// The drag here is a real one — mouse down, move, move, up, over the rendered
-// rows. A test that called the drop handler would have passed while the drag
-// stayed broken, which is how this was missed twice.
+// One thread per worktree, so every row a drag can reach belongs to another
+// workspace. A real mouse drag: calling the drop handler passed while the drag
+// stayed broken.
 #[gpui::test]
 async fn test_dragging_a_row_across_worktrees_moves_its_whole_group(cx: &mut TestAppContext) {
     let project_a = init_test_project_with_agent_panel("/project-a", cx).await;
@@ -1176,48 +926,15 @@ async fn test_dragging_a_row_across_worktrees_moves_its_whole_group(cx: &mut Tes
     let (sidebar, panel_a) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
     cx.run_until_parked();
 
-    let fs = cx.update(|_, cx| <dyn fs::Fs>::global(cx));
-
     // Three worktrees with one thread each, and one with two.
-    let open_thread = async |panel: &Entity<AgentPanel>,
-                                 project: &Entity<project::Project>,
-                                 cx: &mut gpui::VisualTestContext| {
-        open_thread_with_connection(panel, StubAgentConnection::new(), cx);
-        send_message(panel, cx);
-        cx.run_until_parked();
-        let session_id = active_session_id(panel, cx);
-        save_test_thread_metadata(&session_id, project, cx).await;
-        cx.update(|_window, cx| {
-            ThreadMetadataStore::global(cx)
-                .read(cx)
-                .entry_by_session(&session_id)
-                .expect("thread metadata should exist")
-                .thread_id
-        })
-    };
-
-    let add_worktree = async |path: &str, cx: &mut gpui::VisualTestContext| {
-        fs.as_fake()
-            .insert_tree(path, serde_json::json!({ "src": {} }))
-            .await;
-        let project =
-            project::Project::test(fs.clone(), [std::path::Path::new(path)], cx).await;
-        let workspace = multi_workspace.update_in(cx, |mw, window, cx| {
-            mw.test_add_workspace(project.clone(), window, cx)
-        });
-        let panel = add_agent_panel(&workspace, cx);
-        cx.run_until_parked();
-        (project, panel)
-    };
-
-    let thread_a = open_thread(&panel_a, &project_a, cx).await;
-    let (project_b, panel_b) = add_worktree("/project-b", cx).await;
-    let thread_b = open_thread(&panel_b, &project_b, cx).await;
-    let (project_c, panel_c) = add_worktree("/project-c", cx).await;
-    let thread_c = open_thread(&panel_c, &project_c, cx).await;
-    let (project_d, panel_d) = add_worktree("/project-d", cx).await;
-    let thread_d1 = open_thread(&panel_d, &project_d, cx).await;
-    let thread_d2 = open_thread(&panel_d, &project_d, cx).await;
+    let thread_a = open_sent_thread(&panel_a, cx);
+    let (_, panel_b) = add_workspace_with_panel("/project-b", &multi_workspace, cx).await;
+    let thread_b = open_sent_thread(&panel_b, cx);
+    let (_, panel_c) = add_workspace_with_panel("/project-c", &multi_workspace, cx).await;
+    let thread_c = open_sent_thread(&panel_c, cx);
+    let (_, panel_d) = add_workspace_with_panel("/project-d", &multi_workspace, cx).await;
+    let thread_d1 = open_sent_thread(&panel_d, cx);
+    let thread_d2 = open_sent_thread(&panel_d, cx);
 
     sidebar.update_in(cx, |sidebar, _window, cx| sidebar.update_entries(cx));
     cx.run_until_parked();
@@ -1238,22 +955,7 @@ async fn test_dragging_a_row_across_worktrees_moves_its_whole_group(cx: &mut Tes
         }
     };
     let active_rows = |cx: &mut gpui::VisualTestContext| {
-        sidebar
-            .read_with(cx, |sidebar, _cx| {
-                sidebar
-                    .contents
-                    .entries
-                    .iter()
-                    .enumerate()
-                    .filter(|(ix, _)| {
-                        sidebar.section_of_entry(*ix) == Some(SidebarSection::OpenInZed)
-                    })
-                    .filter_map(|(_, entry)| match entry {
-                        ListEntry::Thread(thread) => Some(thread.metadata.thread_id),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-            })
+        active_row_ids(&sidebar, cx)
             .into_iter()
             .map(name)
             .collect::<Vec<_>>()
@@ -1265,20 +967,7 @@ async fn test_dragging_a_row_across_worktrees_moves_its_whole_group(cx: &mut Tes
             .map(name)
             .collect::<Vec<_>>()
     };
-    let row_of = |thread_id: ThreadId, cx: &mut gpui::VisualTestContext| {
-        sidebar.read_with(cx, |sidebar, _cx| {
-            sidebar
-                .contents
-                .entries
-                .iter()
-                .position(
-                    |entry| matches!(entry, ListEntry::Thread(thread) if thread.metadata.thread_id == thread_id),
-                )
-                .expect("every open thread should have a row")
-        })
-    };
-    // Tall enough that every row is measured: an unmeasured row has no bounds to
-    // aim a drag at.
+    // Tall enough that every row is measured.
     let draw = |cx: &mut gpui::VisualTestContext| {
         cx.draw(
             gpui::point(px(0.), px(0.)),
@@ -1294,12 +983,10 @@ async fn test_dragging_a_row_across_worktrees_moves_its_whole_group(cx: &mut Tes
                 .expect("sidebar row should be measured")
         })
     };
-    let drag_row = |from_thread: ThreadId,
-                    onto_thread: ThreadId,
-                    cx: &mut gpui::VisualTestContext| {
+    let drag_ix = |from_ix: usize, onto_ix: usize, cx: &mut gpui::VisualTestContext| {
         draw(cx);
-        let from = bounds_of(row_of(from_thread, cx), cx).center();
-        let to = bounds_of(row_of(onto_thread, cx), cx).center();
+        let from = bounds_of(from_ix, cx).center();
+        let to = bounds_of(onto_ix, cx).center();
         cx.simulate_mouse_down(from, gpui::MouseButton::Left, gpui::Modifiers::none());
         draw(cx);
         // The first move crosses the threshold that starts the drag, the second
@@ -1315,6 +1002,12 @@ async fn test_dragging_a_row_across_worktrees_moves_its_whole_group(cx: &mut Tes
         cx.simulate_mouse_up(to, gpui::MouseButton::Left, gpui::Modifiers::none());
         cx.run_until_parked();
     };
+    let drag_row =
+        |from_thread: ThreadId, onto_thread: ThreadId, cx: &mut gpui::VisualTestContext| {
+            let from_ix = row_of(&sidebar, from_thread, cx);
+            let onto_ix = row_of(&sidebar, onto_thread, cx);
+            drag_ix(from_ix, onto_ix, cx);
+        };
 
     assert_eq!(
         active_rows(cx),
@@ -1366,9 +1059,7 @@ async fn test_dragging_a_row_across_worktrees_moves_its_whole_group(cx: &mut Tes
     );
     assert_eq!(strip(&panel_c, cx), vec!["c", "d2", "d1", "a", "b"]);
 
-    // The two-thread worktree has a header, and the header is the handle for the
-    // whole group: dragging it down onto the last row moves the group, not one
-    // thread out of it.
+    // A worktree header is the handle for its whole group.
     let header_row = sidebar.read_with(cx, |sidebar, _cx| {
         sidebar
             .contents
@@ -1377,21 +1068,8 @@ async fn test_dragging_a_row_across_worktrees_moves_its_whole_group(cx: &mut Tes
             .position(|entry| matches!(entry, ListEntry::WorkspaceHeader(_)))
             .expect("the worktree with two threads should have a header")
     });
-    draw(cx);
-    let from = bounds_of(header_row, cx).center();
-    let to = bounds_of(row_of(thread_b, cx), cx).center();
-    cx.simulate_mouse_down(from, gpui::MouseButton::Left, gpui::Modifiers::none());
-    draw(cx);
-    cx.simulate_mouse_move(
-        from + gpui::point(px(0.), px(8.)),
-        gpui::MouseButton::Left,
-        gpui::Modifiers::none(),
-    );
-    draw(cx);
-    cx.simulate_mouse_move(to, gpui::MouseButton::Left, gpui::Modifiers::none());
-    draw(cx);
-    cx.simulate_mouse_up(to, gpui::MouseButton::Left, gpui::Modifiers::none());
-    cx.run_until_parked();
+    let onto_ix = row_of(&sidebar, thread_b, cx);
+    drag_ix(header_row, onto_ix, cx);
     assert_eq!(
         active_rows(cx),
         vec!["c", "a", "b", "d2", "d1"],
@@ -1399,9 +1077,6 @@ async fn test_dragging_a_row_across_worktrees_moves_its_whole_group(cx: &mut Tes
     );
 }
 
-// A row with no tab is not draggable: the drag moves a tab, and All Threads and
-// Archived rows have none. A manual order for rows that are only history would
-// be the second, disagreeing order this feature exists to avoid.
 #[gpui::test]
 async fn test_rows_without_a_tab_are_not_draggable(cx: &mut TestAppContext) {
     let project = init_test_project_with_agent_panel("/my-project", cx).await;
@@ -1475,18 +1150,10 @@ async fn test_typing_a_rename_does_not_end_it(cx: &mut TestAppContext) {
     });
 
     sidebar.update_in(cx, |sidebar, window, cx| {
-        sidebar.start_renaming_entry(
-            entry_ix,
-            RenameTarget::Thread(thread_id),
-            title,
-            window,
-            cx,
-        );
+        sidebar.start_renaming_entry(entry_ix, RenameTarget::Thread(thread_id), title, window, cx);
     });
     cx.run_until_parked();
 
-    // One character, as though typed. The rename is still in progress: the
-    // editor keeps the focus, and nothing has been written yet.
     sidebar.update_in(cx, |sidebar, window, cx| {
         sidebar.rename_editor.update(cx, |editor, cx| {
             editor.set_text("F", window, cx);
@@ -1529,15 +1196,8 @@ async fn test_typing_a_rename_does_not_end_it(cx: &mut TestAppContext) {
 
 #[gpui::test]
 async fn test_every_open_empty_draft_keeps_its_sidebar_row(cx: &mut TestAppContext) {
-    // The sidebar surfaces an empty-draft placeholder row only for the
-    // draft that the *active workspace's panel* is currently viewing.
-    // Specifically:
-    //   1. Empty ephemeral drafts in non-active workspaces (e.g. a
-    //      sibling linked-worktree panel) are hidden.
-    //   2. An empty ephemeral that is parked in its slot while the user
-    //      is viewing a real thread is hidden (it's not the active view).
-    //   3. When the active workspace switches, the placeholder follows
-    //      the new active panel's current view.
+    // An open thread keeps its row whatever state it is in: the sidebar is the
+    // only tab strip there is.
     agent_ui::test_support::init_test(cx);
     cx.update(|cx| {
         ThreadStore::init_global(cx);
@@ -1581,9 +1241,6 @@ async fn test_every_open_empty_draft_keeps_its_sidebar_row(cx: &mut TestAppConte
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(main_project.clone(), window, cx));
     let (sidebar, main_panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
-    // `mw.workspace()` returns the *currently active* workspace, so we
-    // capture the main one here before adding the worktree workspace
-    // (which would make it the active one).
     let main_workspace = multi_workspace.read_with(cx, |mw, _cx| mw.workspace().clone());
     let worktree_workspace = multi_workspace.update_in(cx, |mw, window, cx| {
         mw.test_add_workspace(worktree_project.clone(), window, cx)
@@ -1591,23 +1248,11 @@ async fn test_every_open_empty_draft_keeps_its_sidebar_row(cx: &mut TestAppConte
     let worktree_panel = add_agent_panel(&worktree_workspace, cx);
     cx.run_until_parked();
 
-    // Give the main panel a real thread we can park the draft behind
-    // later. Send a message to promote the draft→real thread.
-    let real_connection = StubAgentConnection::new();
-    real_connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-        acp::ContentChunk::new("done".into()),
-    )]);
-    agent_ui::test_support::open_thread_with_connection(&main_panel, real_connection, cx);
-    agent_ui::test_support::send_message(&main_panel, cx);
-    let main_real_thread_id =
-        main_panel.read_with(cx, |panel, cx| panel.active_thread_id(cx).unwrap());
-    cx.run_until_parked();
-
-    // Now open a fresh ephemeral draft in the main panel.
+    // A sent thread and an empty draft in the main panel, and a draft in the
+    // worktree panel.
+    let main_real_thread_id = open_sent_thread(&main_panel, cx);
     agent_ui::test_support::open_draft_with_connection(&main_panel, StubAgentConnection::new(), cx);
     cx.run_until_parked();
-
-    // And an ephemeral draft in the worktree panel as well.
     agent_ui::test_support::open_draft_with_connection(
         &worktree_panel,
         StubAgentConnection::new(),
@@ -1615,22 +1260,12 @@ async fn test_every_open_empty_draft_keeps_its_sidebar_row(cx: &mut TestAppConte
     );
     cx.run_until_parked();
 
-    // `open_draft_with_connection` focuses the panel it's called on,
-    // which makes that workspace active. Explicitly re-activate the main
-    // workspace so the baseline assertions below describe the
-    // "main-workspace-is-active" case independently of call order above.
+    // `open_draft_with_connection` activated the worktree workspace.
     multi_workspace.update_in(cx, |mw, window, cx| {
         mw.activate(main_workspace.clone(), None, window, cx);
     });
     cx.run_until_parked();
 
-    // The invariant under test is the one the tab bar's removal set: an open
-    // thread keeps its row whatever state it is in, empty drafts included.
-    // The sidebar is the only tab strip there is, so a draft dropped from the
-    // list the moment it stopped being active would be open with nowhere to be
-    // found. Counting `is_empty_draft` rows is more robust than tracking
-    // specific thread_ids because draft creation flows can leave behind orphan
-    // ephemeral metadata.
     let empty_draft_rows =
         |sidebar: &Entity<Sidebar>, cx: &mut gpui::VisualTestContext| -> Vec<ThreadId> {
             sidebar.read_with(cx, |sidebar, _| {
@@ -1656,8 +1291,6 @@ async fn test_every_open_empty_draft_keeps_its_sidebar_row(cx: &mut TestAppConte
             })
         };
 
-    // Baseline: both panels have an empty draft open, and both are listed —
-    // one per workspace, because each is a thread someone can type into.
     let main_active_draft =
         active_panel_draft_id(&main_panel, cx).expect("main panel should be viewing a draft");
     let worktree_draft = worktree_panel
@@ -1669,8 +1302,6 @@ async fn test_every_open_empty_draft_keeps_its_sidebar_row(cx: &mut TestAppConte
         "both workspaces' empty drafts should be listed, got {visible:?}"
     );
 
-    // Navigate the main panel away from its draft to the real thread. The
-    // draft is still open, so it keeps its row.
     main_panel.update_in(cx, |panel, window, cx| {
         panel.load_agent_thread(
             agent_ui::Agent::NativeAgent,
@@ -1697,8 +1328,6 @@ async fn test_every_open_empty_draft_keeps_its_sidebar_row(cx: &mut TestAppConte
         "the draft the main panel navigated away from is still open, so it keeps its row"
     );
 
-    // Switching the active workspace changes which draft is active, and
-    // changes nothing about which are listed.
     multi_workspace.update_in(cx, |mw, window, cx| {
         mw.activate(worktree_workspace.clone(), None, window, cx);
     });
@@ -1715,35 +1344,13 @@ async fn test_every_open_empty_draft_keeps_its_sidebar_row(cx: &mut TestAppConte
 
 #[gpui::test]
 async fn test_close_selected_thread_closes_the_row_under_the_selection(cx: &mut TestAppContext) {
-    // cmd-w with the sidebar focused used to walk past `ThreadsSidebar` to
-    // the workspace and close a file in the editor pane, leaving the thread
-    // the user was looking straight at open.
     let project = init_test_project_with_agent_panel("/my-project", cx).await;
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
     let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
 
-    let connection = StubAgentConnection::new();
-    connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-        acp::ContentChunk::new("done".into()),
-    )]);
-    agent_ui::test_support::open_thread_with_connection(&panel, connection, cx);
-    agent_ui::test_support::send_message(&panel, cx);
-    cx.run_until_parked();
-    let thread_id = panel
-        .read_with(cx, |panel, cx| panel.active_thread_id(cx))
-        .expect("the sent thread is open");
-
-    let ix = sidebar
-        .read_with(cx, |sidebar, _| {
-            sidebar
-                .contents
-                .entries
-                .iter()
-                .position(|entry| matches!(entry, ListEntry::Thread(thread)
-                    if thread.metadata.thread_id == thread_id))
-        })
-        .expect("the thread has a row");
+    let thread_id = open_sent_thread(&panel, cx);
+    let ix = row_of(&sidebar, thread_id, cx);
     sidebar.update(cx, |sidebar, _| sidebar.selection = Some(ix));
     focus_sidebar(&sidebar, cx);
 
@@ -1770,10 +1377,6 @@ async fn test_close_selected_thread_closes_the_row_under_the_selection(cx: &mut 
 
 #[gpui::test]
 async fn test_every_thread_row_offers_a_way_out(cx: &mut TestAppContext) {
-    // With no tab bar, the row's context menu is the only place a thread can
-    // be closed or archived from, and middle-click on the row is the other.
-    // A row kind that offers neither is a thread that cannot be got rid of,
-    // which is what every draft row was.
     agent_ui::test_support::init_test(cx);
     cx.update(|cx| {
         ThreadStore::init_global(cx);
@@ -1814,8 +1417,7 @@ async fn test_every_thread_row_offers_a_way_out(cx: &mut TestAppContext) {
         .update(cx, |p, cx| p.git_scans_complete(cx))
         .await;
 
-    // A thread in a workspace that is not open, an archived one, and a draft
-    // with content: three row kinds that no panel is hosting.
+    // Three row kinds no panel is hosting.
     save_thread_metadata(
         acp::SessionId::new(Arc::from("closed-workspace-thread")),
         Some("Closed Workspace Thread".into()),
@@ -1835,13 +1437,10 @@ async fn test_every_thread_row_offers_a_way_out(cx: &mut TestAppContext) {
         &worktree_project,
         cx,
     );
+    let archived_thread = thread_id_for(&archived_session_id, cx);
     cx.update(|cx| {
-        let archived = ThreadMetadataStore::global(cx)
-            .read(cx)
-            .entry_by_session(&archived_session_id)
-            .expect("archived thread metadata should exist")
-            .thread_id;
-        ThreadMetadataStore::global(cx).update(cx, |store, cx| store.archive(archived, None, cx));
+        ThreadMetadataStore::global(cx)
+            .update(cx, |store, cx| store.archive(archived_thread, None, cx));
     });
     let worktree_paths = PathList::new(&[PathBuf::from("/wt-feature-a")]);
     let typed_draft = save_draft_metadata_with_main_paths(
@@ -1870,15 +1469,8 @@ async fn test_every_thread_row_offers_a_way_out(cx: &mut TestAppContext) {
     add_agent_panel(&worktree_workspace, cx);
     cx.run_until_parked();
 
-    // A sent thread, so one row is a real conversation rather than a draft.
-    let connection = StubAgentConnection::new();
-    connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-        acp::ContentChunk::new("done".into()),
-    )]);
-    agent_ui::test_support::open_thread_with_connection(&main_panel, connection, cx);
-    agent_ui::test_support::send_message(&main_panel, cx);
-    cx.run_until_parked();
-    // And an empty draft beside it.
+    // A sent thread, and an empty draft beside it.
+    open_sent_thread(&main_panel, cx);
     agent_ui::test_support::open_draft_with_connection(&main_panel, StubAgentConnection::new(), cx);
     cx.run_until_parked();
 
@@ -1909,12 +1501,11 @@ async fn test_every_thread_row_offers_a_way_out(cx: &mut TestAppContext) {
             "every row offers a way out; {title:?} offered none"
         );
     }
-    // Middle-click is carried by the same wrapper the drag uses, so an open
-    // row having one is what makes middle-click reach it.
+    // Middle-click is carried by the drag's wrapper.
     assert!(
-        rows.iter()
-            .any(|(_, disposals, draggable)| disposals.contains(&ThreadRowDisposal::Close)
-                && *draggable),
+        rows.iter().any(
+            |(_, disposals, draggable)| disposals.contains(&ThreadRowDisposal::Close) && *draggable
+        ),
         "an open row closes from its menu and from middle-click, got {rows:?}"
     );
     assert!(
@@ -1925,8 +1516,6 @@ async fn test_every_thread_row_offers_a_way_out(cx: &mut TestAppContext) {
             ]),
         "the archived row keeps its own pair, got {rows:?}"
     );
-    // A thread with nothing typed into it is archived like any other: there is
-    // no "discard" any more, because there is nothing disposable about it.
     assert!(
         rows.iter().any(|(_, disposals, _)| disposals
             .contains(&ThreadRowDisposal::ArchiveWorktree)
@@ -1937,26 +1526,13 @@ async fn test_every_thread_row_offers_a_way_out(cx: &mut TestAppContext) {
 
 #[gpui::test]
 async fn test_only_open_threads_are_watched_on_github(cx: &mut TestAppContext) {
-    // Every watched branch and PR is its own `gh` process and its own
-    // request, so the number of them is what spends GitHub's hourly budget.
-    // Watching every thread the store has ever kept made that number the size
-    // of the history rather than the size of what is open.
     let project = init_test_project_with_agent_panel("/my-project", cx).await;
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
     let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
 
     // One thread open in the panel, and one only in history.
-    let connection = StubAgentConnection::new();
-    connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-        acp::ContentChunk::new("done".into()),
-    )]);
-    agent_ui::test_support::open_thread_with_connection(&panel, connection, cx);
-    agent_ui::test_support::send_message(&panel, cx);
-    cx.run_until_parked();
-    let open_thread = panel
-        .read_with(cx, |panel, cx| panel.active_thread_id(cx))
-        .expect("the sent thread is open");
+    let open_thread = open_sent_thread(&panel, cx);
 
     save_thread_metadata(
         acp::SessionId::new(Arc::from("history-thread")),
@@ -2000,12 +1576,6 @@ async fn test_only_open_threads_are_watched_on_github(cx: &mut TestAppContext) {
 
 #[gpui::test]
 async fn test_an_unsent_thread_keeps_its_row_and_survives_a_restart(cx: &mut TestAppContext) {
-    // A thread exists from the moment the user asks for one. Nothing is
-    // disposable about one that has not been typed into: it keeps its row and
-    // it survives the load, so a worktree made by a `+` that was then left
-    // alone can still be found and still be archived. What used to fill the
-    // store was threads nobody created — a workspace restoring with no tab
-    // was handed one — and that is gone instead.
     agent_ui::test_support::init_test(cx);
     cx.update(|cx| {
         ThreadStore::init_global(cx);
@@ -2117,8 +1687,6 @@ async fn test_an_unsent_thread_keeps_its_row_and_survives_a_restart(cx: &mut Tes
 }
 
 #[gpui::test]
-// Rewritten for the merged history model: archived threads stay in the
-// sidebar list (rendered muted) instead of being hidden.
 async fn test_archive_thread_keeps_metadata_and_stays_listed(cx: &mut TestAppContext) {
     let project = init_test_project("/my-project", cx).await;
     let (multi_workspace, cx) =
@@ -2174,9 +1742,6 @@ async fn test_archive_thread_keeps_metadata_and_stays_listed(cx: &mut TestAppCon
     });
 }
 
-// Rewritten from test_archive_thread_drops_retained_conversation_view:
-// there is no retained cache anymore; archiving must close the thread's
-// tab, which is what "open in Zed" means.
 #[gpui::test]
 async fn test_archive_thread_closes_its_tab(cx: &mut TestAppContext) {
     let project = init_test_project_with_agent_panel("/project-a", cx).await;
@@ -2185,15 +1750,8 @@ async fn test_archive_thread_closes_its_tab(cx: &mut TestAppContext) {
     let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
     cx.run_until_parked();
 
-    let connection = acp_thread::StubAgentConnection::new();
-    connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-        acp::ContentChunk::new("Done".into()),
-    )]);
-    open_thread_with_connection(&panel, connection, cx);
-    send_message(&panel, cx);
+    let thread_id = open_sent_thread(&panel, cx);
     let session_id = active_session_id(&panel, cx);
-    let thread_id = active_thread_id(&panel, cx);
-    cx.run_until_parked();
 
     sidebar.read_with(cx, |sidebar, _| {
         assert!(
@@ -2216,143 +1774,6 @@ async fn test_archive_thread_closes_its_tab(cx: &mut TestAppContext) {
     });
 }
 
-/// The sidebar is the only tab strip there is, so a thread that is open shows
-/// in it whatever state it is in. An empty draft used to drop out of the list
-/// the moment something else became active, which with no tab bar would leave
-/// it open and unreachable.
-#[gpui::test]
-async fn test_an_empty_draft_keeps_its_row_once_something_else_is_active(
-    cx: &mut TestAppContext,
-) {
-    let project = init_test_project_with_agent_panel("/my-project", cx).await;
-    let (multi_workspace, cx) =
-        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
-    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
-    cx.run_until_parked();
-
-    let connection = acp_thread::StubAgentConnection::new();
-    connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-        acp::ContentChunk::new("Hello".into()),
-    )]);
-    agent_ui::test_support::open_thread_with_connection(&panel, connection, cx);
-    agent_ui::test_support::send_message(&panel, cx);
-    let sent_thread = panel
-        .read_with(cx, |panel, cx| panel.active_thread_id(cx))
-        .expect("the sent thread is active");
-    cx.run_until_parked();
-
-    agent_ui::test_support::open_draft_with_connection(
-        &panel,
-        acp_thread::StubAgentConnection::new(),
-        cx,
-    );
-    let draft_id = panel
-        .read_with(cx, |panel, cx| panel.active_thread_id(cx))
-        .expect("the draft is the active thread");
-    cx.run_until_parked();
-
-    let listed = |cx: &mut gpui::VisualTestContext| {
-        sidebar.read_with(cx, |sidebar, _| {
-            sidebar.contents.entries.iter().any(|entry| {
-                matches!(entry, ListEntry::Thread(thread) if thread.metadata.thread_id == draft_id)
-            })
-        })
-    };
-    assert!(listed(cx), "the draft is listed while it is active");
-
-    // Go back to the thread that has actually been sent.
-    panel.update_in(cx, |panel, window, cx| {
-        panel.activate_thread_tab(sent_thread, true, window, cx);
-    });
-    cx.run_until_parked();
-
-    assert_eq!(
-        panel.read_with(cx, |panel, cx| panel.active_thread_id(cx)),
-        Some(sent_thread),
-        "the sent thread is active again"
-    );
-    assert!(
-        listed(cx),
-        "and the draft keeps its row, because closing it is the only way out"
-    );
-}
-
-#[gpui::test]
-// Rewritten for the merged history model: archived threads are included in
-// the sidebar list, marked archived, instead of being excluded.
-async fn test_archived_threads_included_in_sidebar_entries(cx: &mut TestAppContext) {
-    let project = init_test_project("/my-project", cx).await;
-    let (multi_workspace, cx) =
-        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
-    let sidebar = setup_sidebar(&multi_workspace, cx);
-
-    save_thread_metadata(
-        acp::SessionId::new(Arc::from("visible-thread")),
-        Some("Visible Thread".into()),
-        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 2, 0, 0, 0).unwrap(),
-        None,
-        None,
-        &project,
-        cx,
-    );
-
-    let archived_thread_session_id = acp::SessionId::new(Arc::from("archived-thread"));
-    save_thread_metadata(
-        archived_thread_session_id.clone(),
-        Some("Archived Thread".into()),
-        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 0).unwrap(),
-        None,
-        None,
-        &project,
-        cx,
-    );
-
-    cx.update(|_, cx| {
-        ThreadMetadataStore::global(cx).update(cx, |store, cx| {
-            let thread_id = store
-                .entries()
-                .find(|e| e.session_id.as_ref() == Some(&archived_thread_session_id))
-                .map(|e| e.thread_id)
-                .unwrap();
-            store.archive(thread_id, None, cx)
-        })
-    });
-    cx.run_until_parked();
-
-    multi_workspace.update_in(cx, |_, _window, cx| cx.notify());
-    cx.run_until_parked();
-
-    let entries = visible_entries_as_strings(&sidebar, cx);
-    assert!(
-        entries.iter().any(|e| e.contains("Visible Thread")),
-        "expected visible thread in sidebar, got: {entries:?}"
-    );
-    assert!(
-        entries
-            .iter()
-            .any(|e| e.contains("Archived Thread") && e.contains("(archived)")),
-        "expected archived thread to stay listed (archived), got: {entries:?}"
-    );
-
-    cx.update(|_, cx| {
-        let store = ThreadMetadataStore::global(cx);
-        let all: Vec<_> = store.read(cx).entries().collect();
-        assert_eq!(
-            all.len(),
-            2,
-            "expected 2 total entries in the store, got: {}",
-            all.len()
-        );
-
-        let archived: Vec<_> = store.read(cx).archived_entries().collect();
-        assert_eq!(archived.len(), 1);
-        assert_eq!(
-            archived[0].session_id.as_ref().unwrap().0.as_ref(),
-            "archived-thread"
-        );
-    });
-}
-
 #[gpui::test]
 async fn test_toggle_from_inside_the_sidebar_closes_it(cx: &mut TestAppContext) {
     let project = init_test_project("/project", cx).await;
@@ -2361,8 +1782,6 @@ async fn test_toggle_from_inside_the_sidebar_closes_it(cx: &mut TestAppContext) 
     let sidebar = setup_sidebar(&multi_workspace, cx);
     assert!(multi_workspace.read_with(cx, |mw, _| mw.sidebar_open()));
 
-    // The header's toggle button dispatches the action from wherever focus
-    // happens to be, which is inside the sidebar once it has been opened.
     cx.update(|window, cx| {
         let handle = sidebar.read(cx).focus_handle(cx);
         handle.focus(window, cx);
@@ -2432,8 +1851,6 @@ async fn test_header_toggle_is_present_without_open_projects(cx: &mut TestAppCon
 
 #[gpui::test]
 async fn test_sidebar_plus_opens_draft_thread_tab(cx: &mut TestAppContext) {
-    // The sidebar's new-thread button must reliably produce a draft
-    // ThreadTab in the panel's thread pane with the message editor focused.
     let project = init_test_project_with_agent_panel("/my-project", cx).await;
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
@@ -2451,10 +1868,6 @@ async fn test_sidebar_plus_opens_draft_thread_tab(cx: &mut TestAppContext) {
 
 #[gpui::test]
 async fn test_sidebar_new_thread_waits_for_panel_load(cx: &mut TestAppContext) {
-    // Freshly opened workspaces load their agent panel asynchronously. A
-    // new-thread request that arrives before the panel is registered must
-    // be parked and fulfilled once the panel lands, instead of silently
-    // doing nothing and leaving the panel empty.
     let project_a = init_test_project_with_agent_panel("/project-a", cx).await;
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a.clone(), window, cx));
@@ -2485,8 +1898,6 @@ async fn test_sidebar_new_thread_waits_for_panel_load(cx: &mut TestAppContext) {
         );
     });
 
-    // The panel registers (as it would after its async load); the parked
-    // request is fulfilled.
     let panel_b = add_agent_panel(&workspace_b, cx);
     cx.run_until_parked();
 
@@ -2501,9 +1912,6 @@ async fn test_sidebar_new_thread_waits_for_panel_load(cx: &mut TestAppContext) {
 
 #[gpui::test]
 async fn test_thread_tabs_span_workspaces(cx: &mut TestAppContext) {
-    // Each panel's thread pane mirrors the other workspaces' open threads
-    // as foreign tabs; activating a foreign tab switches to its workspace
-    // and focuses the real thread there.
     use agent_ui::thread_tab::{ForeignThreadTab, ThreadTab};
 
     let project_a = init_test_project_with_agent_panel("/project-a", cx).await;
@@ -2513,38 +1921,10 @@ async fn test_thread_tabs_span_workspaces(cx: &mut TestAppContext) {
     let workspace_a = multi_workspace.read_with(cx, |mw, _cx| mw.workspace().clone());
     cx.run_until_parked();
 
-    // A thread in workspace A.
-    let connection_a = StubAgentConnection::new();
-    connection_a.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-        acp::ContentChunk::new("Done A".into()),
-    )]);
-    open_thread_with_connection(&panel_a, connection_a, cx);
-    send_message(&panel_a, cx);
-    let thread_a = panel_a.read_with(cx, |panel, cx| panel.active_thread_id(cx).unwrap());
+    let thread_a = open_sent_thread(&panel_a, cx);
+    let (workspace_b, panel_b) = add_workspace_with_panel("/project-b", &multi_workspace, cx).await;
+    let thread_b = open_sent_thread(&panel_b, cx);
 
-    // A second workspace with its own panel and thread.
-    let fs = cx.update(|_, cx| <dyn fs::Fs>::global(cx));
-    fs.as_fake()
-        .insert_tree("/project-b", serde_json::json!({ "src": {} }))
-        .await;
-    let project_b = project::Project::test(fs, ["/project-b".as_ref()], cx).await;
-    let workspace_b = multi_workspace.update_in(cx, |mw, window, cx| {
-        mw.test_add_workspace(project_b.clone(), window, cx)
-    });
-    let panel_b = add_agent_panel(&workspace_b, cx);
-    cx.run_until_parked();
-
-    let connection_b = StubAgentConnection::new();
-    connection_b.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-        acp::ContentChunk::new("Done B".into()),
-    )]);
-    open_thread_with_connection(&panel_b, connection_b, cx);
-    send_message(&panel_b, cx);
-    let thread_b = panel_b.read_with(cx, |panel, cx| panel.active_thread_id(cx).unwrap());
-    cx.run_until_parked();
-
-    // Both panes show both threads: their own as a real tab, the other
-    // workspace's as a foreign proxy, in global insertion order.
     let tab_kinds = |panel: &Entity<AgentPanel>, cx: &mut gpui::VisualTestContext| {
         panel.read_with(cx, |panel, cx| {
             panel
@@ -2644,32 +2024,9 @@ async fn test_closing_foreign_tab_closes_real_tab_in_home_workspace(cx: &mut Tes
     let (_sidebar, panel_a) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
     cx.run_until_parked();
 
-    let connection_a = StubAgentConnection::new();
-    connection_a.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-        acp::ContentChunk::new("Done A".into()),
-    )]);
-    open_thread_with_connection(&panel_a, connection_a, cx);
-    send_message(&panel_a, cx);
-    let thread_a = panel_a.read_with(cx, |panel, cx| panel.active_thread_id(cx).unwrap());
-
-    let fs = cx.update(|_, cx| <dyn fs::Fs>::global(cx));
-    fs.as_fake()
-        .insert_tree("/project-b", serde_json::json!({ "src": {} }))
-        .await;
-    let project_b = project::Project::test(fs, ["/project-b".as_ref()], cx).await;
-    let workspace_b = multi_workspace.update_in(cx, |mw, window, cx| {
-        mw.test_add_workspace(project_b.clone(), window, cx)
-    });
-    let panel_b = add_agent_panel(&workspace_b, cx);
-    cx.run_until_parked();
-
-    let connection_b = StubAgentConnection::new();
-    connection_b.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-        acp::ContentChunk::new("Done B".into()),
-    )]);
-    open_thread_with_connection(&panel_b, connection_b, cx);
-    send_message(&panel_b, cx);
-    cx.run_until_parked();
+    let thread_a = open_sent_thread(&panel_a, cx);
+    let (workspace_b, panel_b) = add_workspace_with_panel("/project-b", &multi_workspace, cx).await;
+    open_sent_thread(&panel_b, cx);
 
     // From workspace B (active), close A's thread via its foreign tab.
     let proxy_item_id = panel_b.read_with(cx, |panel, cx| {
@@ -2736,39 +2093,10 @@ async fn test_thread_pr_chips_always_show_pr_state_for_branches(cx: &mut TestApp
     init_test(cx);
 
     let make_entry = |worktrees: Vec<ui::ThreadItemWorktreeInfo>| ThreadEntry {
-        metadata: Arc::new(ThreadMetadata {
-            thread_id: ThreadId::new(),
-            session_id: Some(acp::SessionId::new("session")),
-            agent_id: agent::ZED_AGENT_ID.clone(),
-            title: Some("Thread".into()),
-            title_override: None,
-            updated_at: Utc::now(),
-            created_at: None,
-            interacted_at: None,
-            worktree_paths: WorktreePaths::default(),
-            remote_connection: None,
-            archived: false,
-        }),
-        icon: ui::IconName::ZedAgent,
-        icon_from_external_svg: None,
-        status: ui::AgentThreadStatus::Completed,
-        workspace: ThreadEntryWorkspace::Closed {
-            folder_paths: PathList::new(&[Path::new("/repo/wt")]),
-            project_group_key: ProjectGroupKey::new(None, PathList::new(&[Path::new("/repo")])),
-        },
-        is_live: false,
-        is_title_generating: false,
-        draft: None,
-        highlight_positions: Vec::new(),
         worktrees,
-        diff_stats: DiffStats::default(),
-        running_work: RunningWork::default(),
-        solo_worktree: None,
-                under_worktree_header: false,
+        ..test_thread_entry("Thread", "/repo/wt", Utc::now())
     };
 
-    // A row with a branch but no known PR always shows a muted, inert
-    // "no PR" indicator.
     let entry_with_branch = make_entry(vec![ui::ThreadItemWorktreeInfo {
         worktree_name: Some("wt".into()),
         branch_name: Some("feature".into()),
@@ -2783,8 +2111,7 @@ async fn test_thread_pr_chips_always_show_pr_state_for_branches(cx: &mut TestApp
         assert!(chips[0].url.is_none(), "the no-PR chip should be inert");
     });
 
-    // A row without any branch still shows the absent PR state, so rows never
-    // change shape when a branch and a PR appear.
+    // Rows never change shape when a branch and a PR appear.
     let entry_without_branch = make_entry(vec![ui::ThreadItemWorktreeInfo {
         worktree_name: Some("wt".into()),
         branch_name: None,
@@ -2807,39 +2134,12 @@ async fn test_thread_pr_chips_always_show_pr_state_for_branches(cx: &mut TestApp
     });
 }
 
-// A draft has no worktree branch of its own: its paths still resolve to the
-// project's current branch, and the old code surfaced that branch's PRs on the
-// draft row. A draft must resolve no branches at all, so it never adopts the
-// project branch's PRs (nor watches or snapshots them).
 #[gpui::test]
 async fn test_draft_row_suppresses_project_branch_prs(cx: &mut TestAppContext) {
     init_test(cx);
 
     let make_entry = |draft: Option<DraftKind>| ThreadEntry {
-        metadata: Arc::new(ThreadMetadata {
-            thread_id: ThreadId::new(),
-            session_id: Some(acp::SessionId::new("session")),
-            agent_id: agent::ZED_AGENT_ID.clone(),
-            title: Some("Thread".into()),
-            title_override: None,
-            updated_at: Utc::now(),
-            created_at: None,
-            interacted_at: None,
-            worktree_paths: WorktreePaths::default(),
-            remote_connection: None,
-            archived: false,
-        }),
-        icon: ui::IconName::ZedAgent,
-        icon_from_external_svg: None,
-        status: ui::AgentThreadStatus::Completed,
-        workspace: ThreadEntryWorkspace::Closed {
-            folder_paths: PathList::new(&[Path::new("/repo")]),
-            project_group_key: ProjectGroupKey::new(None, PathList::new(&[Path::new("/repo")])),
-        },
-        is_live: false,
-        is_title_generating: false,
         draft,
-        highlight_positions: Vec::new(),
         // The project branch a draft would otherwise inherit.
         worktrees: vec![ui::ThreadItemWorktreeInfo {
             worktree_name: Some("repo".into()),
@@ -2848,10 +2148,7 @@ async fn test_draft_row_suppresses_project_branch_prs(cx: &mut TestAppContext) {
             highlight_positions: Vec::new(),
             kind: ui::WorktreeKind::Main,
         }],
-        diff_stats: DiffStats::default(),
-        running_work: RunningWork::default(),
-        solo_worktree: None,
-                under_worktree_header: false,
+        ..test_thread_entry("Thread", "/repo", Utc::now())
     };
 
     let draft_entry = make_entry(Some(DraftKind::WithContent));
@@ -2875,86 +2172,13 @@ async fn test_draft_row_suppresses_project_branch_prs(cx: &mut TestAppContext) {
     });
 }
 
-// Sidebar rows no longer carry a branch chip (or the "no branch" pill): the row
-// renders through the branch-free worktree metadata path and is still measured.
-#[gpui::test]
-async fn test_sidebar_row_renders_without_branch_chip(cx: &mut TestAppContext) {
-    let project = init_test_project("/my-project", cx).await;
-    let (multi_workspace, cx) =
-        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
-    let sidebar = setup_sidebar(&multi_workspace, cx);
-
-    save_thread_metadata(
-        acp::SessionId::new(Arc::from("branchless-thread")),
-        Some("Threaded work".into()),
-        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 0).unwrap(),
-        None,
-        None,
-        &project,
-        cx,
-    );
-    cx.run_until_parked();
-
-    cx.draw(
-        gpui::point(px(0.), px(0.)),
-        gpui::size(px(400.), px(240.)),
-        |_, _| sidebar.clone().into_any_element(),
-    );
-    cx.run_until_parked();
-
-    let row_ix = sidebar.read_with(cx, |sidebar, _| {
-        sidebar
-            .contents
-            .entries
-            .iter()
-            .position(|entry| matches!(entry, ListEntry::Thread(_)))
-            .expect("the thread row should be present")
-    });
-    let bounds = sidebar.read_with(cx, |sidebar, _| sidebar.list_state.bounds_for_item(row_ix));
-    assert!(
-        bounds.is_some(),
-        "the thread row should render and be measured"
-    );
-}
-
 #[gpui::test]
 async fn test_archived_thread_keeps_its_persisted_pr_badge(cx: &mut TestAppContext) {
     init_test(cx);
 
-    // An archived thread: its worktree is gone from disk, so it has no branch
-    // to resolve and gh_status has nothing to query.
-    let thread_id = ThreadId::new();
-    let entry = ThreadEntry {
-        metadata: Arc::new(ThreadMetadata {
-            thread_id,
-            session_id: Some(acp::SessionId::new("archived")),
-            agent_id: agent::ZED_AGENT_ID.clone(),
-            title: Some("Archived".into()),
-            title_override: None,
-            updated_at: Utc::now(),
-            created_at: None,
-            interacted_at: None,
-            worktree_paths: WorktreePaths::default(),
-            remote_connection: None,
-            archived: true,
-        }),
-        icon: ui::IconName::ZedAgent,
-        icon_from_external_svg: None,
-        status: ui::AgentThreadStatus::Completed,
-        workspace: ThreadEntryWorkspace::Closed {
-            folder_paths: PathList::new(&[Path::new("/repo/wt")]),
-            project_group_key: ProjectGroupKey::new(None, PathList::new(&[Path::new("/repo")])),
-        },
-        is_live: false,
-        is_title_generating: false,
-        draft: None,
-        highlight_positions: Vec::new(),
-        worktrees: Vec::new(),
-        diff_stats: DiffStats::default(),
-        running_work: RunningWork::default(),
-        solo_worktree: None,
-                under_worktree_header: false,
-    };
+    // Its worktree is gone from disk, so gh_status has no branch to query.
+    let entry = archived(test_thread_entry("Archived", "/repo/wt", Utc::now()));
+    let thread_id = entry.metadata.thread_id;
 
     // Without a persisted snapshot the row degrades to the inert "no PR" pill.
     cx.update(|cx| {
@@ -3013,38 +2237,9 @@ async fn test_archived_thread_keeps_its_persisted_pr_badge(cx: &mut TestAppConte
 
 #[gpui::test]
 fn test_a_worktree_archive_stops_once_nothing_is_left_to_archive(_cx: &mut TestAppContext) {
-    let make_entry = |title: &str, archived: bool| {
-        Arc::new(ThreadEntry {
-            metadata: Arc::new(ThreadMetadata {
-                thread_id: ThreadId::new(),
-                session_id: Some(acp::SessionId::new(title.to_string())),
-                agent_id: agent::ZED_AGENT_ID.clone(),
-                title: Some(title.to_string().into()),
-                title_override: None,
-                updated_at: Utc::now(),
-                created_at: None,
-                interacted_at: None,
-                worktree_paths: WorktreePaths::default(),
-                remote_connection: None,
-                archived,
-            }),
-            icon: ui::IconName::ZedAgent,
-            icon_from_external_svg: None,
-            status: ui::AgentThreadStatus::Completed,
-            workspace: ThreadEntryWorkspace::Closed {
-                folder_paths: PathList::new(&[Path::new("/repo/wt-a")]),
-                project_group_key: ProjectGroupKey::new(None, PathList::new(&[Path::new("/repo")])),
-            },
-            is_live: false,
-            is_title_generating: false,
-            draft: None,
-            highlight_positions: Vec::new(),
-            worktrees: Vec::new(),
-            diff_stats: DiffStats::default(),
-            running_work: RunningWork::default(),
-            solo_worktree: None,
-                under_worktree_header: false,
-        })
+    let make_entry = |title: &str, is_archived: bool| {
+        let entry = test_thread_entry(title, "/repo/wt-a", Utc::now());
+        Arc::new(if is_archived { archived(entry) } else { entry })
     };
 
     let header_sessions = |rows: Vec<Arc<ThreadEntry>>| {
@@ -3082,40 +2277,11 @@ fn test_a_worktree_archive_stops_once_nothing_is_left_to_archive(_cx: &mut TestA
 fn test_a_live_thread_does_not_pull_its_worktree_siblings_into_active(_cx: &mut TestAppContext) {
     let make_entry = |title: &str, folder: &str, is_live: bool| {
         Arc::new(ThreadEntry {
-            metadata: Arc::new(ThreadMetadata {
-                thread_id: ThreadId::new(),
-                session_id: Some(acp::SessionId::new(title.to_string())),
-                agent_id: agent::ZED_AGENT_ID.clone(),
-                title: Some(title.to_string().into()),
-                title_override: None,
-                updated_at: Utc::now(),
-                created_at: None,
-                interacted_at: None,
-                worktree_paths: WorktreePaths::default(),
-                remote_connection: None,
-                archived: false,
-            }),
-            icon: ui::IconName::ZedAgent,
-            icon_from_external_svg: None,
-            status: ui::AgentThreadStatus::Completed,
-            workspace: ThreadEntryWorkspace::Closed {
-                folder_paths: PathList::new(&[Path::new(folder)]),
-                project_group_key: ProjectGroupKey::new(None, PathList::new(&[Path::new("/repo")])),
-            },
             is_live,
-            is_title_generating: false,
-            draft: None,
-            highlight_positions: Vec::new(),
-            worktrees: Vec::new(),
-            diff_stats: DiffStats::default(),
-            running_work: RunningWork::default(),
-            solo_worktree: None,
-                under_worktree_header: false,
+            ..test_thread_entry(title, folder, Utc::now())
         })
     };
 
-    // Two threads in one worktree, one of them running, plus a thread of a
-    // worktree nobody is working in.
     let threads = vec![
         make_entry("running", "/repo/wt-a", true),
         make_entry("quiet sibling", "/repo/wt-a", false),
@@ -3136,15 +2302,8 @@ fn test_a_live_thread_does_not_pull_its_worktree_siblings_into_active(_cx: &mut 
     assert_eq!(
         entry_shape_strings(&entries),
         vec![
-            // Only the live thread is Active; its quiet worktree sibling
-            // does not come along just for sharing a worktree. Alone in the
-            // section, it is its own worktree's row and needs no header.
             "section: Active",
             "thread: running",
-            // All Threads is what Active left behind, so the live thread is
-            // not repeated here: only its quiet sibling and the unrelated
-            // worktree's thread. That leaves one row in each worktree, and one
-            // row is not what a header is for.
             "section: All Threads",
             "thread: elsewhere",
             "thread: quiet sibling",
@@ -3155,43 +2314,13 @@ fn test_a_live_thread_does_not_pull_its_worktree_siblings_into_active(_cx: &mut 
 
 #[gpui::test]
 fn test_archived_threads_go_to_their_own_bottom_section(_cx: &mut TestAppContext) {
-    let make_entry = |title: &str, archived: bool, updated_at: DateTime<Utc>| {
-        Arc::new(ThreadEntry {
-            metadata: Arc::new(ThreadMetadata {
-                thread_id: ThreadId::new(),
-                session_id: Some(acp::SessionId::new(title.to_string())),
-                agent_id: agent::ZED_AGENT_ID.clone(),
-                title: Some(title.to_string().into()),
-                title_override: None,
-                updated_at,
-                created_at: None,
-                interacted_at: None,
-                worktree_paths: WorktreePaths::default(),
-                remote_connection: None,
-                archived,
-            }),
-            icon: ui::IconName::ZedAgent,
-            icon_from_external_svg: None,
-            status: ui::AgentThreadStatus::Completed,
-            workspace: ThreadEntryWorkspace::Closed {
-                folder_paths: PathList::new(&[Path::new("/repo/wt")]),
-                project_group_key: ProjectGroupKey::new(None, PathList::new(&[Path::new("/repo")])),
-            },
-            is_live: false,
-            is_title_generating: false,
-            draft: None,
-            highlight_positions: Vec::new(),
-            worktrees: Vec::new(),
-            diff_stats: DiffStats::default(),
-            running_work: RunningWork::default(),
-            solo_worktree: None,
-                under_worktree_header: false,
-        })
+    let make_entry = |title: &str, is_archived: bool, updated_at: DateTime<Utc>| {
+        let entry = test_thread_entry(title, "/repo/wt", updated_at);
+        Arc::new(if is_archived { archived(entry) } else { entry })
     };
 
     let now = Utc::now();
-    // The archived thread is the most recent, so a single merged list would
-    // have sorted it to the top of the history.
+    // The archived thread is the most recent.
     let threads = vec![
         make_entry("archived", true, now),
         make_entry("live", false, now - chrono::Duration::hours(1)),
@@ -3211,11 +2340,8 @@ fn test_archived_threads_go_to_their_own_bottom_section(_cx: &mut TestAppContext
     assert_eq!(
         entry_shape_strings(&entries),
         vec![
-            // Active always renders: it carries the new-thread button.
             "section: Active",
             "section: All Threads",
-            // Every section groups by worktree, history included, but a
-            // worktree holding one thread is that thread's own row.
             "thread: live",
             "section: Archived",
             "thread: archived",
@@ -3228,45 +2354,18 @@ fn test_archived_threads_go_to_their_own_bottom_section(_cx: &mut TestAppContext
 #[gpui::test]
 fn test_active_rows_follow_the_tab_order(_cx: &mut TestAppContext) {
     let make_entry = |title: &str, folder: &str, minutes_old: i64| {
-        Arc::new(ThreadEntry {
-            metadata: Arc::new(ThreadMetadata {
-                thread_id: ThreadId::new(),
-                session_id: Some(acp::SessionId::new(title.to_string())),
-                agent_id: agent::ZED_AGENT_ID.clone(),
-                title: Some(title.to_string().into()),
-                title_override: None,
-                updated_at: Utc::now() - chrono::Duration::minutes(minutes_old),
-                created_at: None,
-                interacted_at: None,
-                worktree_paths: WorktreePaths::default(),
-                remote_connection: None,
-                archived: false,
-            }),
-            icon: ui::IconName::ZedAgent,
-            icon_from_external_svg: None,
-            status: ui::AgentThreadStatus::Completed,
-            workspace: ThreadEntryWorkspace::Closed {
-                folder_paths: PathList::new(&[Path::new(folder)]),
-                project_group_key: ProjectGroupKey::new(None, PathList::new(&[Path::new("/repo")])),
-            },
-            is_live: false,
-            is_title_generating: false,
-            draft: None,
-            highlight_positions: Vec::new(),
-            worktrees: Vec::new(),
-            diff_stats: DiffStats::default(),
-            running_work: RunningWork::default(),
-            solo_worktree: None,
-            under_worktree_header: false,
-        })
+        Arc::new(test_thread_entry(
+            title,
+            folder,
+            Utc::now() - chrono::Duration::minutes(minutes_old),
+        ))
     };
 
-    // Three tabs in one worktree, arranged in an order the timestamps
-    // disagree with: the oldest thread sits in the first tab.
+    // A tab order the timestamps disagree with.
     let oldest = make_entry("oldest", "/repo/wt", 30);
     let middle = make_entry("middle", "/repo/wt", 20);
     let newest = make_entry("newest", "/repo/wt", 10);
-    // Live, but in a workspace that is not showing it, so it has no tab.
+    // Live, but with no tab.
     let untabbed = Arc::new(ThreadEntry {
         is_live: true,
         ..(*make_entry("untabbed", "/repo/wt", 40)).clone()
@@ -3310,63 +2409,28 @@ fn test_active_rows_follow_the_tab_order(_cx: &mut TestAppContext) {
         vec![
             "section: Active",
             "workspace: Workspace",
-            // Tab order, not newest-first: the tabs are the order the user
-            // arranged.
             "thread: oldest",
             "thread: middle",
             "thread: newest",
-            // No tab of its own, so it falls to the back and sorts by time
-            // with anything else that has none.
             "thread: untabbed",
         ],
         "Active rows sit in the order their tabs do"
     );
 
-    // Every thread here is open, so All Threads has nothing left to list and
-    // the section goes away entirely rather than standing empty.
     assert!(
         !entry_shape_strings(&entries).contains(&"section: All Threads".to_string()),
         "with everything open, All Threads has no rows and no header"
     );
 }
 
-/// Active and All Threads are two halves of one set, not two views of it: a
-/// thread is in exactly one of them, and closing it moves it from the first to
-/// the second at the position its age gives it.
 #[gpui::test]
 fn test_a_thread_is_in_active_or_in_all_threads_but_not_both(_cx: &mut TestAppContext) {
     let make_entry = |title: &str, minutes_old: i64| {
-        Arc::new(ThreadEntry {
-            metadata: Arc::new(ThreadMetadata {
-                thread_id: ThreadId::new(),
-                session_id: Some(acp::SessionId::new(title.to_string())),
-                agent_id: agent::ZED_AGENT_ID.clone(),
-                title: Some(title.to_string().into()),
-                title_override: None,
-                updated_at: Utc::now() - chrono::Duration::minutes(minutes_old),
-                created_at: None,
-                interacted_at: None,
-                worktree_paths: WorktreePaths::default(),
-                remote_connection: None,
-                archived: false,
-            }),
-            icon: ui::IconName::ZedAgent,
-            icon_from_external_svg: None,
-            status: ui::AgentThreadStatus::Completed,
-            workspace: ThreadEntryWorkspace::Closed {
-                folder_paths: PathList::new(&[Path::new("/repo/wt")]),
-                project_group_key: ProjectGroupKey::new(None, PathList::new(&[Path::new("/repo")])),
-            },
-            is_live: false,
-            is_title_generating: false,
-            draft: None,
-            highlight_positions: Vec::new(),
-            worktrees: Vec::new(),
-            diff_stats: DiffStats::default(),
-            running_work: RunningWork::default(),
-            solo_worktree: None,
-            under_worktree_header: false,
-        })
+        Arc::new(test_thread_entry(
+            title,
+            "/repo/wt",
+            Utc::now() - chrono::Duration::minutes(minutes_old),
+        ))
     };
 
     let newest = make_entry("newest", 10);
@@ -3375,8 +2439,10 @@ fn test_a_thread_is_in_active_or_in_all_threads_but_not_both(_cx: &mut TestAppCo
     let threads = vec![newest.clone(), middle.clone(), oldest.clone()];
 
     let shape = |open: &[&Arc<ThreadEntry>]| {
-        let open_thread_ids: HashSet<agent_ui::ThreadId> =
-            open.iter().map(|thread| thread.metadata.thread_id).collect();
+        let open_thread_ids: HashSet<agent_ui::ThreadId> = open
+            .iter()
+            .map(|thread| thread.metadata.thread_id)
+            .collect();
         let tab_positions: HashMap<agent_ui::ThreadId, usize> = open
             .iter()
             .enumerate()
@@ -3394,8 +2460,6 @@ fn test_a_thread_is_in_active_or_in_all_threads_but_not_both(_cx: &mut TestAppCo
         ))
     };
 
-    // One thread open. It is listed under Active and nowhere else; the two
-    // still-closed threads keep All Threads to themselves, newest first.
     assert_eq!(
         shape(&[&middle]),
         vec![
@@ -3409,8 +2473,6 @@ fn test_a_thread_is_in_active_or_in_all_threads_but_not_both(_cx: &mut TestAppCo
         "an open thread appears under Active instead of twice"
     );
 
-    // Close it. It comes back to All Threads between the two it is older and
-    // newer than, rather than at the top of the section.
     assert_eq!(
         shape(&[]),
         vec![
@@ -3424,9 +2486,6 @@ fn test_a_thread_is_in_active_or_in_all_threads_but_not_both(_cx: &mut TestAppCo
         "closing a thread returns it to All Threads at its age"
     );
 
-    // Open all three and All Threads has nothing to show. The section drops
-    // out; Active keeps its header either way, since that is where the
-    // new-thread button lives.
     assert_eq!(
         shape(&[&oldest, &middle, &newest]),
         vec![
@@ -3449,7 +2508,6 @@ async fn test_collapsed_section_hides_its_rows(cx: &mut TestAppContext) {
         vec![
             "section: Active",
             "section: All Threads",
-            // One thread in the worktree, so the thread's own row is it.
             "thread: History Thread",
             "section: Archived",
             "thread: Archived Thread",
@@ -3489,7 +2547,6 @@ async fn test_collapsed_section_hides_its_rows(cx: &mut TestAppContext) {
         vec![
             "section: Active",
             "section: All Threads",
-            // One thread in the worktree, so the thread's own row is it.
             "thread: History Thread",
             "section: Archived",
             "thread: Archived Thread",
@@ -3562,8 +2619,6 @@ async fn test_collapse_state_round_trips_through_serialization(cx: &mut TestAppC
         .read_with(cx, |sidebar, cx| sidebar.serialized_state(cx))
         .expect("sidebar state should serialize");
 
-    // A restart starts from a sidebar with nothing collapsed and replays the
-    // persisted blob into it.
     sidebar.update_in(cx, |sidebar, _window, cx| {
         sidebar.collapsed_sections.clear();
         sidebar.update_entries(cx);
@@ -3656,51 +2711,18 @@ fn test_age_label_formats(_cx: &mut TestAppContext) {
     assert_eq!(format_age(now, now + chrono::Duration::hours(1)), "1m");
 }
 
-/// A worktree with one thread has no header, so nothing told a collapsed group
-/// above it where to stop: collapsing one worktree hid every solo row that
-/// followed it.
 #[gpui::test]
 fn test_collapsing_a_worktree_leaves_the_rows_after_it_alone(cx: &mut TestAppContext) {
     let entry = |title: &str, solo: bool| {
-        let mut thread = ThreadEntry {
-            metadata: Arc::new(ThreadMetadata {
-                thread_id: ThreadId::new(),
-                session_id: Some(acp::SessionId::new(Arc::from(title))),
-                agent_id: AgentId::new("zed-agent"),
-                worktree_paths: WorktreePaths::default(),
-                title: Some(title.into()),
-                title_override: None,
-                updated_at: Utc::now(),
-                created_at: Some(Utc::now()),
-                interacted_at: None,
-                archived: false,
-                remote_connection: None,
-            }),
-            icon: IconName::ZedAgent,
-            icon_from_external_svg: None,
-            status: AgentThreadStatus::Completed,
-            workspace: ThreadEntryWorkspace::Closed {
-                folder_paths: PathList::default(),
-                project_group_key: ProjectGroupKey::from_worktree_paths(&WorktreePaths::default(), None),
-            },
-            is_live: false,
-            is_title_generating: false,
-            draft: None,
-            highlight_positions: Vec::new(),
-            worktrees: Vec::new(),
-            diff_stats: DiffStats::default(),
-            running_work: RunningWork::default(),
-            solo_worktree: None,
+        ListEntry::Thread(Arc::new(ThreadEntry {
             under_worktree_header: !solo,
-        };
-        if solo {
-            thread.solo_worktree = Some(SoloWorktree {
+            solo_worktree: solo.then_some(SoloWorktree {
                 workspace: None,
                 is_linked_worktree: true,
                 path: None,
-            });
-        }
-        ListEntry::Thread(Arc::new(thread))
+            }),
+            ..test_thread_entry(title, "/repo/wt", Utc::now())
+        }))
     };
 
     let entries = vec![
@@ -3721,7 +2743,8 @@ fn test_collapsing_a_worktree_leaves_the_rows_after_it_alone(cx: &mut TestAppCon
     ];
 
     let collapsed: HashSet<String> = ["mapper".to_string()].into_iter().collect();
-    let visible = cx.update(|_| Sidebar::visible_entries(&entries, &HashSet::default(), &collapsed));
+    let visible =
+        cx.update(|_| Sidebar::visible_entries(&entries, &HashSet::default(), &collapsed));
 
     let titles: Vec<String> = visible
         .iter()
@@ -3740,62 +2763,23 @@ fn test_collapsing_a_worktree_leaves_the_rows_after_it_alone(cx: &mut TestAppCon
 
 #[gpui::test]
 async fn test_active_worktree_groups_follow_the_tab_strip(cx: &mut TestAppContext) {
-    // A group sits where its earliest tab sits, and inside it the rows sit in
-    // their tab order. Workspace A's threads are opened first and B's last, so
-    // A's group leads even though B's thread is the most recent one — which is
-    // what the group order used to be decided by.
     let project_a = init_test_project_with_agent_panel("/project-a", cx).await;
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a.clone(), window, cx));
     let (sidebar, panel_a) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
     cx.run_until_parked();
 
-    let open_thread = |panel: &Entity<AgentPanel>, cx: &mut gpui::VisualTestContext| {
-        let connection = StubAgentConnection::new();
-        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-            acp::ContentChunk::new("Done".into()),
-        )]);
-        open_thread_with_connection(panel, connection, cx);
-        send_message(panel, cx);
-        cx.run_until_parked();
-        panel.read_with(cx, |panel, cx| panel.active_thread_id(cx).unwrap())
-    };
-
-    let thread_a1 = open_thread(&panel_a, cx);
-    let thread_a2 = open_thread(&panel_a, cx);
-
-    let fs = cx.update(|_, cx| <dyn fs::Fs>::global(cx));
-    fs.as_fake()
-        .insert_tree("/project-b", serde_json::json!({ "src": {} }))
-        .await;
-    let project_b = project::Project::test(fs, ["/project-b".as_ref()], cx).await;
-    let workspace_b = multi_workspace.update_in(cx, |mw, window, cx| {
-        mw.test_add_workspace(project_b.clone(), window, cx)
-    });
-    let panel_b = add_agent_panel(&workspace_b, cx);
-    cx.run_until_parked();
-
-    let thread_b = open_thread(&panel_b, cx);
+    let thread_a1 = open_sent_thread(&panel_a, cx);
+    let thread_a2 = open_sent_thread(&panel_a, cx);
+    let (_workspace_b, panel_b) =
+        add_workspace_with_panel("/project-b", &multi_workspace, cx).await;
+    let thread_b = open_sent_thread(&panel_b, cx);
 
     sidebar.update_in(cx, |sidebar, _window, cx| sidebar.update_entries(cx));
     cx.run_until_parked();
 
-    let active_thread_ids = sidebar.read_with(cx, |sidebar, _cx| {
-        sidebar
-            .contents
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(ix, _)| sidebar.section_of_entry(*ix) == Some(SidebarSection::OpenInZed))
-            .filter_map(|(_, entry)| match entry {
-                ListEntry::Thread(thread) => Some(thread.metadata.thread_id),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-    });
-
     assert_eq!(
-        active_thread_ids,
+        active_row_ids(&sidebar, cx),
         vec![thread_a1, thread_a2, thread_b],
         "the worktree opened first leads, and its rows keep their tab order, \
          even though the other worktree's thread is the newest"
@@ -3804,41 +2788,17 @@ async fn test_active_worktree_groups_follow_the_tab_strip(cx: &mut TestAppContex
 
 #[gpui::test]
 async fn test_dragging_a_tab_reorders_every_pane_and_the_sidebar(cx: &mut TestAppContext) {
-    // Dragging a tab creates nothing, destroys nothing and activates nothing,
-    // so the sidebar has to hear about it some other way; and the order it
-    // lands in has to be the same one whichever worktree the drag happened in.
     let project_a = init_test_project_with_agent_panel("/project-a", cx).await;
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a.clone(), window, cx));
     let (sidebar, panel_a) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
     cx.run_until_parked();
 
-    let open_thread = |panel: &Entity<AgentPanel>, cx: &mut gpui::VisualTestContext| {
-        let connection = StubAgentConnection::new();
-        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-            acp::ContentChunk::new("Done".into()),
-        )]);
-        open_thread_with_connection(panel, connection, cx);
-        send_message(panel, cx);
-        cx.run_until_parked();
-        panel.read_with(cx, |panel, cx| panel.active_thread_id(cx).unwrap())
-    };
-
-    let thread_a1 = open_thread(&panel_a, cx);
-    let thread_a2 = open_thread(&panel_a, cx);
-
-    let fs = cx.update(|_, cx| <dyn fs::Fs>::global(cx));
-    fs.as_fake()
-        .insert_tree("/project-b", serde_json::json!({ "src": {} }))
-        .await;
-    let project_b = project::Project::test(fs, ["/project-b".as_ref()], cx).await;
-    let workspace_b = multi_workspace.update_in(cx, |mw, window, cx| {
-        mw.test_add_workspace(project_b.clone(), window, cx)
-    });
-    let panel_b = add_agent_panel(&workspace_b, cx);
-    cx.run_until_parked();
-
-    let thread_b = open_thread(&panel_b, cx);
+    let thread_a1 = open_sent_thread(&panel_a, cx);
+    let thread_a2 = open_sent_thread(&panel_a, cx);
+    let (_workspace_b, panel_b) =
+        add_workspace_with_panel("/project-b", &multi_workspace, cx).await;
+    let thread_b = open_sent_thread(&panel_b, cx);
     sidebar.update_in(cx, |sidebar, _window, cx| sidebar.update_entries(cx));
     cx.run_until_parked();
 
@@ -3861,39 +2821,20 @@ async fn test_dragging_a_tab_reorders_every_pane_and_the_sidebar(cx: &mut TestAp
             .collect::<Vec<_>>()
     };
     let active_rows = |cx: &mut gpui::VisualTestContext| {
-        sidebar
-            .read_with(cx, |sidebar, _cx| {
-                sidebar
-                    .contents
-                    .entries
-                    .iter()
-                    .enumerate()
-                    .filter(|(ix, _)| {
-                        sidebar.section_of_entry(*ix) == Some(SidebarSection::OpenInZed)
-                    })
-                    .filter_map(|(_, entry)| match entry {
-                        ListEntry::Thread(thread) => Some(thread.metadata.thread_id),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-            })
+        active_row_ids(&sidebar, cx)
             .into_iter()
             .map(name)
             .collect::<Vec<_>>()
     };
-    // The drag itself: the tab at `from` lands at `to`, and nothing rebuilds
-    // the sidebar by hand afterwards.
-    let drag_tab = |panel: &Entity<AgentPanel>,
-                    from: usize,
-                    to: usize,
-                    cx: &mut gpui::VisualTestContext| {
-        let pane = panel.read_with(cx, |panel, _cx| panel.thread_pane().clone());
-        let item_id = pane.read_with(cx, |pane, _cx| pane.items().nth(from).unwrap().item_id());
-        cx.update(|window, cx| {
-            workspace::move_item(&pane, &pane, item_id, to, false, window, cx);
-        });
-        cx.run_until_parked();
-    };
+    let drag_tab =
+        |panel: &Entity<AgentPanel>, from: usize, to: usize, cx: &mut gpui::VisualTestContext| {
+            let pane = panel.read_with(cx, |panel, _cx| panel.thread_pane().clone());
+            let item_id = pane.read_with(cx, |pane, _cx| pane.items().nth(from).unwrap().item_id());
+            cx.update(|window, cx| {
+                workspace::move_item(&pane, &pane, item_id, to, false, window, cx);
+            });
+            cx.run_until_parked();
+        };
 
     assert_eq!(
         strip(&panel_a, cx),

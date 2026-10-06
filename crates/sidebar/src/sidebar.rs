@@ -9,8 +9,7 @@ use agent_ui::terminal_thread_metadata_store::{
     TerminalThreadMetadata, TerminalThreadMetadataStore, terminal_title_prefix,
 };
 use agent_ui::thread_metadata_store::{
-    ThreadMetadata, ThreadMetadataStore, WorktreePaths,
-    worktree_info_from_thread_paths,
+    ThreadMetadata, ThreadMetadataStore, WorktreePaths, worktree_info_from_thread_paths,
 };
 use agent_ui::threads_archive_view::{format_history_entry_timestamp, fuzzy_match_positions};
 use agent_ui::{
@@ -33,9 +32,7 @@ use language_model::LanguageModelRegistry;
 use menu::{Cancel, Confirm, SelectFirst, SelectLast, SelectNext, SelectPrevious};
 use notifications::status_toast::StatusToast;
 use platform_title_bar::apply_title_bar_insets;
-use project::{
-    AgentId, AgentRegistryStore, Event as ProjectEvent, WorktreeId,
-};
+use project::{AgentId, AgentRegistryStore, Event as ProjectEvent, WorktreeId};
 use recent_projects::sidebar_recent_projects::SidebarRecentProjects;
 use remote::{RemoteConnectionOptions, same_remote_connection_identity};
 use ui::utils::platform_title_bar_height;
@@ -56,15 +53,11 @@ use unicode_segmentation::UnicodeSegmentation as _;
 use util::ResultExt as _;
 use util::path_list::PathList;
 
-/// A sidebar rebuild costing more than a frame at 60Hz is one the user can feel
-/// between two keystrokes. Rebuilds under it are counted, not logged.
+/// A frame at 60Hz.
 const SLOW_REBUILD: std::time::Duration = std::time::Duration::from_millis(16);
-/// Foreground time in rebuilds that is worth a line of its own, however fast
-/// the individual rebuilds were.
 const REPORTABLE_REBUILD_TIME: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Repositories already swept for abandoned worktrees this launch, so the
-/// second window opened over the same project does not sweep it again.
+/// So a second window over the same project does not sweep it again.
 #[derive(Default)]
 struct SweptRepositories(HashSet<PathBuf>);
 
@@ -189,15 +182,9 @@ impl ActiveEntry {
     }
 }
 
-#[derive(Clone, Debug)]
-/// Everything an agent panel contributes to the sidebar's rows, which is the
-/// whole of what one of its events can have moved. Taken from every read of a
-/// panel in `rebuild_contents`: its threads' live state, which of its terminals
-/// are ringing, and which threads it holds open. A row's other inputs — the
-/// metadata stores, the read state, the tab registry, git — each have an
-/// observer of their own that asks for a rebuild directly, so they are not
-/// this comparison's business.
-#[derive(PartialEq)]
+/// Everything an agent panel's events can move in the sidebar's rows; the
+/// other inputs each have their own observer.
+#[derive(Clone, Debug, PartialEq)]
 struct LivePanelState {
     threads: Vec<ActiveThreadInfo>,
     notified_terminals: HashSet<TerminalId>,
@@ -347,9 +334,7 @@ enum DraftKind {
     Empty,
 }
 
-/// What a thread row's context menu offers for getting the thread out of the
-/// way. Every row has at least one of these; a row that offered none had no
-/// menu at all, which is what the draft rows were.
+/// What a thread row's context menu offers for getting the thread out of the way.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ThreadRowDisposal {
     /// Close the tab. The thread stays in history.
@@ -366,8 +351,7 @@ enum ThreadRowDisposal {
 
 #[derive(Clone, PartialEq)]
 struct ThreadEntry {
-    /// Shared with the store rather than copied out of it: a rebuild reads
-    /// every stored thread, and only live rows and drafts rewrite what they read.
+    /// Shared with the store: a rebuild reads every stored thread.
     metadata: Arc<ThreadMetadata>,
     icon: IconName,
     icon_from_external_svg: Option<SharedString>,
@@ -379,54 +363,26 @@ struct ThreadEntry {
     highlight_positions: Vec<usize>,
     worktrees: Vec<ThreadItemWorktreeInfo>,
     diff_stats: DiffStats,
-    /// What a live thread is running right now. Empty for a stored row, which
-    /// is running nothing by definition.
     running_work: RunningWork,
-    /// Set when this thread is the only one in its worktree, in which case it
-    /// is drawn as the worktree: the header would have said the same thing
-    /// twice, so the row wears what the header carried instead.
+    /// Set when this thread is the only one in its worktree, so the row stands
+    /// in for the worktree header.
     solo_worktree: Option<SoloWorktree>,
-    /// Set when this thread is one of several under a worktree header, which is
-    /// what the row is indented by.
     under_worktree_header: bool,
 }
 
-/// What a worktree header carries that a thread row does not, for a worktree
-/// whose single thread stands in for it.
 #[derive(Clone, PartialEq)]
 struct SoloWorktree {
-    /// The worktree's workspace when open, so the row's + can start a second
-    /// thread in it. Doing so gives the worktree a header again.
     workspace: Option<Entity<Workspace>>,
-    /// Whether archiving this thread takes a worktree with it, which is what
-    /// the archive button says it will do.
     is_linked_worktree: bool,
-    /// The worktree's own directory, so the row can show what it costs to keep
-    /// the way a header does. These are the throwaway worktrees worth watching:
-    /// a header only appears once a second thread joins one.
     path: Option<PathBuf>,
 }
 
-/// An Active row picked up to be reordered.
-///
-/// The sidebar keeps no order of its own: the drag ends in the thread's tab
-/// moving, and the row follows because Active is sorted by the tab strip. So the
-/// payload carries only what it takes to find that tab: the thread. Which pane
-/// to move it in is not a property of the dragged row — it is this window's own
-/// strip, where every thread is a tab or a proxy for one.
-///
-/// A drop is not confined to the dragged row's own workspace. It used to be,
-/// and that is what made this feature do nothing for anyone working one thread
-/// per worktree: every row they could reach belonged to a different workspace,
-/// so no row ever accepted the drop. Landing on another worktree's row moves
-/// the dragged thread's whole worktree group instead, because the list groups by
-/// worktree and cannot show one thread sitting inside another group's rows.
+/// An Active row picked up to be reordered. The sidebar keeps no order of its
+/// own: the drop moves the thread's tab and the row follows the tab strip.
 #[derive(Clone)]
 struct DraggedThreadRow {
     thread_id: agent_ui::ThreadId,
     title: SharedString,
-    /// Where the row was picked up from, so a row being hovered can say which
-    /// of its edges the dragged row would land on.
     ix: usize,
 }
 
@@ -444,14 +400,12 @@ impl Render for DraggedThreadRow {
     }
 }
 
-/// What a selection points at, stable across list rebuilds.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EntryIdentity {
     Thread(crate::ThreadId),
     Terminal(TerminalId),
 }
 
-/// The worktree a row belongs to, which is what groups the list.
 fn entry_folder_paths(entry: &ListEntry) -> Option<&PathList> {
     match entry {
         ListEntry::Thread(thread) => Some(thread.metadata.folder_paths()),
@@ -497,10 +451,6 @@ impl ThreadEntry {
     }
 }
 
-/// The three top-level sections of the sidebar list: threads that are currently
-/// open in Zed (a tab in any workspace's panel; tabs are the definition of
-/// open), the flat history of everything else, and the archived threads. Each
-/// is collapsible, and the collapsed set is persisted.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum SidebarSection {
@@ -522,9 +472,6 @@ impl SidebarSection {
 #[derive(Clone, PartialEq)]
 enum ListEntry {
     SectionHeader(SidebarSection),
-    /// A quiet grouping row above the Active-section threads of one
-    /// workspace, shown once a workspace holds more than one row: several
-    /// agents can share a worktree, and the rows say which.
     WorkspaceHeader(Arc<WorkspaceHeaderEntry>),
     Thread(Arc<ThreadEntry>),
     Terminal(TerminalEntry),
@@ -557,25 +504,13 @@ struct WorkspaceHeaderEntry {
     label: SharedString,
     /// The group's newest thread, whose entry supplies the header's PR chips.
     lead_thread: Option<Arc<ThreadEntry>>,
-    /// The group's workspace when open, so the header's + can start a thread
-    /// in this worktree.
     workspace: Option<Entity<Workspace>>,
-    /// Session ids of the group's unarchived threads, newest first. The
-    /// header's hover archive button archives them all; the last one's archival
-    /// tears the linked worktree down. Empty once there is nothing left to
-    /// archive, which is what keeps the button off an archived group.
+    /// The group's unarchived threads, newest first.
     member_sessions: Vec<acp::SessionId>,
-    /// Only linked worktrees archive; the main project's header offers no
-    /// archive button.
     is_linked_worktree: bool,
-    /// The worktree's root on disk, for measuring what it costs to keep.
     path: Option<PathBuf>,
-    /// The group's own key, which is what a collapsed group is remembered by:
-    /// the rows come and go as threads are opened and archived, and the header
-    /// itself is rebuilt every update.
+    /// What a collapsed group is remembered by.
     key: String,
-    /// How many rows the group holds, so a collapsed one can say what it is
-    /// hiding.
     member_count: usize,
 }
 
@@ -649,23 +584,14 @@ impl From<TerminalEntry> for ListEntry {
 
 #[derive(Default)]
 struct SidebarContents {
-    /// The rendered list: [`Self::all_entries`] minus the rows of collapsed
-    /// sections. Selection, activation and neighbor lookup all index into
-    /// this, so a collapsed section's rows are skipped by keyboard navigation
-    /// and by neighbor activation for free.
+    /// [`Self::all_entries`] minus the rows of collapsed sections.
     entries: Vec<ListEntry>,
-    /// Every row, collapsed or not. Passes that must not depend on what is
-    /// currently drawn (gh watches, PR snapshots, draft tracking, the thread
-    /// switcher) read this.
     all_entries: Vec<ListEntry>,
     notified_threads: HashSet<agent_ui::ThreadId>,
     notified_terminals: HashSet<TerminalId>,
-    /// Threads hosted by a tab somewhere, so a rebuild can tell which ones the
-    /// user closed since the last one. Narrower than the Active section, which
-    /// also counts a panel's current view (a draft has no tab yet).
+    /// So a rebuild can tell which threads were closed since the last one.
     tabbed_threads: HashSet<agent_ui::ThreadId>,
-    /// The Active section's membership: every tabbed thread plus whatever
-    /// each panel is currently showing. What "open" means for a draft.
+    /// Every tabbed thread plus whatever each panel is currently showing.
     open_threads: HashSet<agent_ui::ThreadId>,
     has_open_projects: bool,
 }
@@ -691,9 +617,7 @@ impl SidebarContents {
     }
 }
 
-/// A directory's size on disk, via `du`, which walks in C rather than in a
-/// future and is the fastest thing available without an index. `None` when the
-/// path is gone or `du` could not read it.
+/// Via `du`: the fastest walk available without an index.
 #[cfg(not(test))]
 async fn directory_size(path: PathBuf) -> Option<u64> {
     let output = util::command::new_command("du")
@@ -707,21 +631,14 @@ async fn directory_size(path: PathBuf) -> Option<u64> {
     Some(kilobytes * 1024)
 }
 
-/// `du` is a real subprocess with its own OS thread for I/O, which the test
-/// scheduler cannot make deterministic (`Detected activity on thread
-/// "async-process" ... Your test is not deterministic`): any sidebar test
-/// that rebuilds entries with a worktree header on screen — nearly all of
-/// them — spawned one and broke every test after it in the same binary. The
-/// size is a display-only hint (see `worktree_size_label`) that no test
-/// asserts on, so tests skip the real measurement entirely.
+/// A `du` subprocess's I/O thread makes the test scheduler non-deterministic,
+/// and no test asserts on the size.
 #[cfg(test)]
 async fn directory_size(_path: PathBuf) -> Option<u64> {
     None
 }
 
-/// A size worth reading at a glance: whole gigabytes, and nothing below one.
-/// A worktree's own source is megabytes; what makes it expensive is build
-/// output, and that is always gigabytes.
+/// Whole gigabytes only: what makes a worktree expensive is build output.
 fn worktree_size_label(bytes: u64) -> Option<SharedString> {
     const GIGABYTE: u64 = 1024 * 1024 * 1024;
     (bytes >= GIGABYTE).then(|| format!("{} GB", bytes / GIGABYTE).into())
@@ -784,8 +701,6 @@ pub struct Sidebar {
     rename_editor: Entity<Editor>,
     list_state: ListState,
     contents: SidebarContents,
-    /// Sections the user has collapsed. Persisted through the sidebar's
-    /// serialized state.
     collapsed_sections: HashSet<SidebarSection>,
     /// The index of the list item that currently has the keyboard focus
     ///
@@ -806,8 +721,7 @@ pub struct Sidebar {
     thread_switcher: Option<Entity<ThreadSwitcher>>,
     _thread_switcher_subscriptions: Vec<gpui::Subscription>,
     pending_thread_activation: Option<agent_ui::ThreadId>,
-    /// Workspace where a new thread was requested before its agent panel
-    /// finished loading; fulfilled from the `PanelAdded` handler.
+    /// A new thread requested before the workspace's agent panel loaded.
     pending_new_thread_workspace: Option<WeakEntity<Workspace>>,
     /// Remembers whether each draft last rendered as empty or with content so
     /// that when a draft that was empty gains content again, we refresh
@@ -817,60 +731,28 @@ pub struct Sidebar {
     draft_typing_task: Option<Task<()>>,
     restoring_tasks: HashMap<agent_ui::ThreadId, Task<()>>,
     recent_projects_popover_handle: PopoverMenuHandle<SidebarRecentProjects>,
-    /// Branches currently watched in the [`GhStatusStore`], keyed by
-    /// (repo path, branch). Kept in sync with the visible thread entries.
+    /// (repo path, branch) pairs watched in the [`GhStatusStore`].
     gh_watched_branches: HashSet<(PathBuf, String)>,
-    /// Pull requests watched by number rather than by branch: the ones the
-    /// threads named themselves, or were given by hand. Keyed by the working
-    /// directory `gh` runs in, the repository when one was named, and the
-    /// number.
+    /// PRs watched by number: (working directory, repository, number).
     gh_watched_prs: HashSet<(PathBuf, Option<String>, u64)>,
-    /// Worktree groups the user has folded shut, by group key. A worktree with
-    /// a dozen threads is a wall of rows between you and the next worktree,
-    /// and most of the time only its newest thread is interesting.
     collapsed_worktrees: HashSet<String>,
-    /// What each worktree costs on disk, measured once per session.
-    ///
-    /// A worktree of a Rust project is mostly build output: one `target` is
-    /// six figures of files, and a dozen worktrees is most of a disk. Nothing
-    /// else in the app knows that, so the number is worth showing next to the
-    /// thing that would delete it. Measuring means walking the tree, which is
-    /// exactly the work the file scanner was taught to avoid, so it happens
-    /// once per worktree per session, one at a time, in the background.
+    /// Measured once per worktree per session: walking the tree is the work
+    /// the file scanner avoids.
     worktree_sizes: HashMap<PathBuf, u64>,
     worktree_size_task: Option<Task<()>>,
     worktree_sizes_pending: Vec<PathBuf>,
-    /// Rebuilds since the last one slow enough to log, so a logged one says how
-    /// many it stands for.
+    /// Rebuilds since the last logged one.
     quiet_rebuilds: usize,
-    /// How many of those rebuilds produced the list that was already there,
-    /// and so stopped before paying for anything downstream of it.
+    /// Rebuilds that produced the list already there.
     skipped_rebuilds: usize,
-    /// What asked for those rebuilds, by call site. A rebuild is asked for from
-    /// forty places and the log only ever said how many there had been, never
-    /// which of them, so the noisy one could not be named without this.
     rebuild_triggers: HashMap<&'static std::panic::Location<'static>, usize>,
-    /// Foreground time spent rebuilding since the last logged line, the
-    /// rebuilds under the slow threshold included. Only the ones over it were
-    /// ever reported, so what the quiet thousands cost between them was never a
-    /// number.
     rebuild_time: std::time::Duration,
-    /// What each workspace's agent panel last contributed to the rows. A thread
-    /// entry changing is the most frequent reason a rebuild is asked for — once
-    /// per streamed chunk, for every thread in every open window — and when
-    /// none of it moved the 365-row rebuild behind it had nothing to say.
+    /// So a thread entry change (once per streamed chunk) that moved nothing
+    /// skips the rebuild.
     live_panel_state: HashMap<EntityId, LivePanelState>,
     _subscriptions: Vec<gpui::Subscription>,
-    /// What this sidebar watches in each open workspace, keyed by the
-    /// workspace it belongs to.
-    ///
-    /// Kept rather than detached because subscribing to a workspace happens
-    /// more than once: at startup for every workspace already open, and again
-    /// whenever `MultiWorkspaceEvent::WorkspaceAdded` names one. A detached
-    /// duplicate is invisible and permanent — every event it watches then
-    /// asks for the same rebuild twice, and gpui walks a longer list on every
-    /// flush for the rest of the session. Keyed, re-subscribing replaces, and
-    /// a closed workspace's subscriptions go with it.
+    /// Keyed rather than detached because a workspace is subscribed to more
+    /// than once (at startup and on `WorkspaceAdded`); re-subscribing replaces.
     workspace_subscriptions: HashMap<EntityId, WorkspaceSubscriptions>,
     _draft_editor_observations: Vec<gpui::Subscription>,
     update_task: Option<Task<()>>,
@@ -885,10 +767,8 @@ pub struct Sidebar {
     cross_channel_import_channels: Vec<SharedString>,
 }
 
-/// What the sidebar watches in one workspace. Two fields rather than one
-/// list, because the workspace's own subscriptions and its agent panel's are
-/// made at different times and each has to be replaceable without disturbing
-/// the other.
+/// Two fields because the workspace's and its agent panel's subscriptions are
+/// made at different times and each is replaced on its own.
 #[derive(Default)]
 struct WorkspaceSubscriptions {
     workspace: Vec<gpui::Subscription>,
@@ -973,11 +853,7 @@ impl Sidebar {
         })
         .detach();
 
-        // Reordering a pane's tabs creates nothing, destroys nothing and
-        // activates nothing, so none of the agent panel's events fire and the
-        // rows would keep the order they were built with. The registry is
-        // where a reorder lands, so watch that instead — in any window, since
-        // this list shows every window's threads.
+        // A tab reorder fires no agent panel event; it lands in the registry.
         let thread_tabs_registry = agent_ui::ThreadTabsRegistry::global(cx);
         cx.observe(&thread_tabs_registry, |this, _registry, cx| {
             this.schedule_update_entries(false, cx);
@@ -992,17 +868,12 @@ impl Sidebar {
         )
         .detach();
 
-        // Unread markers live in the shared read state; rebuild rows when it
-        // changes so the sidebar and thread tabs stay in sync.
         let thread_read_state = agent_ui::ThreadReadState::global(cx);
         cx.observe(&thread_read_state, |this, _state, cx| {
             this.schedule_update_entries(false, cx);
         })
         .detach();
 
-        // PR data is read from the store at render time, so a re-render is
-        // enough when it changes; the snapshot each live thread persists is
-        // refreshed at the same time.
         if let Some(gh_store) = GhStatusStore::try_global(cx) {
             cx.observe(&gh_store, |this, _store, cx| {
                 this.persist_pr_snapshots(cx);
@@ -1011,8 +882,6 @@ impl Sidebar {
             .detach();
         }
 
-        // Coming back to the window is exactly when the chips get looked at,
-        // and it is usually after doing something elsewhere that changed them.
         cx.observe_window_activation(window, |this, window, cx| {
             if window.is_window_active() {
                 this.refresh_pr_status(cx);
@@ -1096,12 +965,6 @@ impl Sidebar {
             .map_or(false, |mw| mw.read(cx).workspace() == workspace)
     }
 
-    /// Watches one workspace: its project's worktrees, its git store, the
-    /// workspace itself, its docks, and its agent panel once there is one.
-    ///
-    /// Everything this makes is stored under the workspace rather than
-    /// detached, so asking twice for the same workspace costs one set of
-    /// subscriptions and not two.
     fn subscribe_to_workspace(
         &mut self,
         workspace: &Entity<Workspace>,
@@ -1147,16 +1010,12 @@ impl Sidebar {
                     )
                 ) {
                     this.schedule_update_entries(false, cx);
-                    // The repositories a spare would be made from are only
-                    // known once they have been scanned, which is after the
-                    // window opens. Asking again here costs a map lookup once
-                    // there is one.
+                    // Repositories are only known once scanned, after the
+                    // window opens.
                     this.ensure_spare_worktree(window, cx);
                 }
-                // A branch's upstream tracking lives in the branch list, so a
-                // push (or a fetch that moves the base) changes it. That means
-                // the world the PR chips describe has changed, which is worth
-                // asking about now rather than waiting out the poll interval.
+                // A push or fetch changes the branch list; refresh PR chips now
+                // rather than waiting out the poll interval.
                 if matches!(
                     event,
                     project::git_store::GitStoreEvent::RepositoryUpdated(
@@ -1179,8 +1038,6 @@ impl Sidebar {
                         this.subscribe_to_agent_panel(workspace, &agent_panel, window, cx);
                         this.schedule_update_entries(false, cx);
 
-                        // Fulfill a thread creation that was requested
-                        // before this workspace's panel finished loading.
                         let pending = this
                             .pending_new_thread_workspace
                             .as_ref()
@@ -1197,9 +1054,10 @@ impl Sidebar {
 
         subscriptions.extend(self.dock_observations(workspace, cx));
 
-        // The panel's own subscription is kept separately: it arrives later,
-        // with `PanelAdded`, and replacing this set must not take it away.
-        let watched = self.workspace_subscriptions.entry(workspace_id).or_default();
+        let watched = self
+            .workspace_subscriptions
+            .entry(workspace_id)
+            .or_default();
         watched.workspace = subscriptions;
 
         if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
@@ -1288,11 +1146,7 @@ impl Sidebar {
                 }
                 AgentPanelEvent::EntryChanged => {
                     this.sync_active_entry_from_panel(agent_panel, cx);
-                    // Once per streamed chunk, for every thread in every open
-                    // window. A row carries only what `apply_active_info`
-                    // writes into it, so when none of that moved the rebuild
-                    // behind this walked every stored thread and every open
-                    // workspace to produce the list it already had.
+                    // Once per streamed chunk; skip when nothing a row shows moved.
                     if let Some(workspace) = workspace.upgrade()
                         && !this.live_panel_state_changed(&workspace, cx)
                     {
@@ -1312,9 +1166,6 @@ impl Sidebar {
                 }
             },
         );
-        // `PanelAdded` can name the agent panel more than once over a
-        // workspace's life, and the panel that already existed is subscribed
-        // to at startup as well. One per workspace, replaced.
         self.workspace_subscriptions
             .entry(workspace_id)
             .or_default()
@@ -1521,9 +1372,6 @@ impl Sidebar {
 
         self.contents = SidebarContents::default();
 
-        // Unread markers come from the shared read state (written by the
-        // conversation views when a turn completes unviewed, cleared when the
-        // thread's tab is viewed), so tabs and sidebar rows always agree.
         let mut notified_threads: HashSet<agent_ui::ThreadId> =
             agent_ui::ThreadReadState::try_global(cx)
                 .map(|state| state.read(cx).unread_threads().iter().copied().collect())
@@ -1581,10 +1429,8 @@ impl Sidebar {
             }
         }
 
-        // Workspace resolution across all open workspaces, matching both the
-        // stored path list and the remote identity. Keyed by path list rather
-        // than scanned: every stored thread and terminal resolves through here,
-        // so a scan is quadratic in the thing that grows.
+        // Keyed by path list rather than scanned: every stored row resolves
+        // through here.
         let mut open_workspace_locations: HashMap<
             PathList,
             Vec<(Option<RemoteConnectionOptions>, Entity<Workspace>)>,
@@ -1651,8 +1497,6 @@ impl Sidebar {
                 .then_some(terminal.metadata.terminal_id)
         }));
 
-        // All stored threads, archived included: the sidebar is the single
-        // history surface.
         let thread_store = ThreadMetadataStore::global(cx);
         let mut threads: Vec<Arc<ThreadEntry>> = thread_store
             .read(cx)
@@ -1664,9 +1508,6 @@ impl Sidebar {
                     resolve_workspace(&row.worktree_paths, row.remote_connection.as_ref());
                 let worktrees =
                     worktree_info_from_thread_paths(&row.worktree_paths, &branch_by_path);
-                // Start drafts as `WithContent`; the post-processing pass
-                // below downgrades them to `Empty` if no draft label can be
-                // derived.
                 let draft = row.is_draft().then_some(DraftKind::WithContent);
                 Arc::new(ThreadEntry {
                     metadata: row,
@@ -1709,15 +1550,7 @@ impl Sidebar {
             }
         }
 
-        // Every thread open as a tab in some workspace's panel, plus whatever
-        // that panel is currently showing, belongs in the Active section.
-        // Live-session matching alone misses drafts, which have no session id
-        // yet.
-        //
-        // A panel's view of a closed tab can outlive the tab (it is dropped
-        // when the last handle goes, not when the tab closes), so open tabs are
-        // asked for by name rather than inferred from which views are still
-        // alive. Otherwise closing a thread leaves it sitting in Active.
+        // Open tabs are asked for by name: a closed tab's view can outlive it.
         let mut open_thread_ids: HashSet<agent_ui::ThreadId> = HashSet::new();
         let mut tabbed_threads: HashSet<agent_ui::ThreadId> = HashSet::new();
         for workspace in &workspaces {
@@ -1734,28 +1567,8 @@ impl Sidebar {
             }
         }
 
-        // Every thread shows here, typed into or not. A thread exists from the
-        // moment the user asks for one, so there is nothing to hide: the row
-        // that used to be dropped was the row for a worktree someone had just
-        // made and could no longer find. What filled the store with months of
-        // "New thread" rows was threads nobody created — a workspace
-        // restoring with no tab was handed one — and that is gone instead.
-
-        // Where each tabbed thread sits in the tab strip. The Active section is
-        // sorted by this so a row is where its tab is: the tabs are the order
-        // the user arranged, and reading the list to find the row for the tab
-        // in front of you is work the sidebar can do instead.
-        //
-        // The order is the registry's, not any one pane's. Every pane mirrors
-        // the registry, so it is the same strip the user is looking at, and it
-        // spans every workspace of every window — which is what stops a thread
-        // taking a different number depending on which worktree the list is
-        // read from. Reading the panes instead meant each window numbered from
-        // its own workspace list, first pane to claim a thread winning, so the
-        // groups ordered differently in each window. Numbering only a pane's
-        // own real tabs is the other wrong answer: every pane's first tab is
-        // position 0, so the worktree groups tie and fall back to the time
-        // sort.
+        // The registry's order rather than any one pane's, so every window
+        // numbers threads the same way.
         let tab_positions: HashMap<agent_ui::ThreadId, usize> =
             agent_ui::ThreadTabsRegistry::try_global(cx)
                 .map(|registry| {
@@ -1767,8 +1580,6 @@ impl Sidebar {
                 })
                 .unwrap_or_default();
 
-        // Merge live info into threads and mask the unread marker on the
-        // thread the user is actively viewing.
         for thread in &mut threads {
             if let Some(session_id) = thread.metadata.session_id.clone() {
                 if let Some(info) = live_info_by_session.get(&session_id) {
@@ -1789,9 +1600,6 @@ impl Sidebar {
         }
 
         if !query.is_empty() {
-            // A thread matches on its title, its worktree names, or the
-            // basename of any of its folder paths (so typing a project name
-            // surfaces its threads).
             let mut matched_threads: Vec<Arc<ThreadEntry>> = Vec::new();
             for mut thread in threads {
                 let mut worktree_matched = false;
@@ -1881,8 +1689,6 @@ impl Sidebar {
         };
     }
 
-    /// Drops the rows of collapsed sections; headers always render, since they
-    /// carry the disclosure that expands the section again.
     fn visible_entries(
         entries: &[ListEntry],
         collapsed_sections: &HashSet<SidebarSection>,
@@ -1890,8 +1696,6 @@ impl Sidebar {
     ) -> Vec<ListEntry> {
         let mut visible = Vec::with_capacity(entries.len());
         let mut hiding_section = false;
-        // A worktree's rows run until the next header of either kind, so the
-        // group's own header is what turns the hiding off again.
         let mut hiding_worktree = false;
         for entry in entries {
             match entry {
@@ -1906,9 +1710,7 @@ impl Sidebar {
                         visible.push(entry.clone());
                     }
                 }
-                // A worktree with one thread has no header, so the row is
-                // both the group and its own end: a collapsed group above it
-                // stops here rather than swallowing it.
+                // A solo row is its own group: a collapsed group above stops here.
                 ListEntry::Thread(thread) if thread.solo_worktree.is_some() => {
                     hiding_worktree = false;
                     if !hiding_section {
@@ -1925,20 +1727,6 @@ impl Sidebar {
         visible
     }
 
-    /// Whether the row at `ix` can be picked up, and what to carry if it can.
-    ///
-    /// Only Active rows with a tab in an open workspace: the drag moves the
-    /// tab, so a row without one has nothing to move, and All Threads and
-    /// Archived have no tabs at all. A manual order for rows that are only
-    /// history would be a second order with its own storage, which is the one
-    /// thing this feature is built to avoid.
-    /// What the row at `ix` offers for getting rid of its thread, in menu
-    /// order.
-    ///
-    /// The rules live here rather than inline in the menu so that every row
-    /// kind can be asked what it offers. The regression this replaces was a
-    /// row kind — every draft — that returned before a menu was built at all,
-    /// which with no tab bar left it with no way to be closed.
     fn thread_row_disposals(&self, ix: usize, thread: &ThreadEntry) -> Vec<ThreadRowDisposal> {
         if thread.metadata.archived {
             return vec![
@@ -1948,8 +1736,6 @@ impl Sidebar {
         }
 
         let mut disposals = Vec::new();
-        // Only a thread with a tab has one to close; the same test the row's
-        // drag uses.
         if self.section_of_entry(ix) == Some(SidebarSection::OpenInZed) {
             disposals.push(ThreadRowDisposal::Close);
         }
@@ -1957,9 +1743,6 @@ impl Sidebar {
             .solo_worktree
             .as_ref()
             .is_some_and(|solo| solo.is_linked_worktree);
-        // Whether a message has been sent makes no difference to how a thread
-        // is disposed of: the only thread in a linked worktree takes the
-        // worktree with it, and the entry says so.
         if takes_worktree {
             disposals.push(ThreadRowDisposal::ArchiveWorktree);
         } else {
@@ -1976,8 +1759,6 @@ impl Sidebar {
         if !self.contents.tabbed_threads.contains(&thread_id) {
             return None;
         }
-        // A thread with no open workspace has no pane to be a tab in, whatever
-        // the tabbed set says.
         let ThreadEntryWorkspace::Open(_) = &thread.workspace else {
             return None;
         };
@@ -1988,10 +1769,6 @@ impl Sidebar {
         })
     }
 
-    /// Lands a dragged row on the row at `target_ix` by moving its tab to where
-    /// the target's tab sits. The row moves because the tab moved: the panel
-    /// republishes its strip, the registry notifies, and the Active section —
-    /// which is sorted by that strip — rebuilds around the new order.
     fn handle_thread_row_drop(
         &mut self,
         dragged: &DraggedThreadRow,
@@ -1999,8 +1776,6 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // The target is a row, or the header that stands for a whole group. A
-        // header names no thread, so it can only be landed against as a group.
         if self.section_of_entry(target_ix) != Some(SidebarSection::OpenInZed) {
             return;
         }
@@ -2018,10 +1793,8 @@ impl Sidebar {
             return;
         }
 
-        // The move happens on this window's own strip, where every thread is a
-        // tab or a proxy for one. Reaching for the target's workspace instead
-        // would pick a pane that holds only its own worktree's threads, which is
-        // the other half of why a drop across worktrees went nowhere.
+        // This window's own strip: the target's workspace pane holds only its
+        // own worktree's threads.
         let Some(panel) = self
             .active_workspace(cx)
             .and_then(|workspace| workspace.read(cx).panel::<AgentPanel>(cx))
@@ -2037,8 +1810,6 @@ impl Sidebar {
 
         let thread_id = dragged.thread_id;
         if same_group {
-            // Inside one group only a row says where to land; its header is the
-            // group's own handle and means nothing against itself.
             if let Some(target_thread) = target_thread {
                 panel.update(cx, |panel, cx| {
                     panel.move_thread_tab_to(thread_id, target_thread, window, cx);
@@ -2057,9 +1828,7 @@ impl Sidebar {
         });
     }
 
-    /// A worktree header is the handle for its whole group: dragging it drags the
-    /// group, and dropping on it lands against the group. The group is carried as
-    /// its first thread, since that is what the strip knows about.
+    /// A worktree header drags its whole group, carried as its first thread.
     fn wrap_group_drag(
         &self,
         ix: usize,
@@ -2083,8 +1852,6 @@ impl Sidebar {
             .id(("workspace-header-drag", ix))
             .on_drag(dragged_row, |row, _, _, cx| cx.new(|_| row.clone()))
             .drag_over::<DraggedThreadRow>(move |style, dragged, _, cx| {
-                // A group does not offer to take its own rows: there is nowhere
-                // inside it for them to land that a header could name.
                 if members.contains(&dragged.thread_id) {
                     return style;
                 }
@@ -2106,8 +1873,6 @@ impl Sidebar {
             .into_any_element()
     }
 
-    /// Which worktree group a thread's Active row belongs to, by the same key the
-    /// grouping uses.
     fn workspace_group_of_thread(&self, thread_id: agent_ui::ThreadId) -> Option<String> {
         self.contents
             .entries
@@ -2122,8 +1887,7 @@ impl Sidebar {
             })
     }
 
-    /// The threads of one worktree group, in the order Active shows them, which
-    /// is their tab order. That order is what a group move has to preserve.
+    /// In tab order, which a group move has to preserve.
     fn group_members(&self, key: Option<&str>) -> Vec<agent_ui::ThreadId> {
         let Some(key) = key else {
             return Vec::new();
@@ -2144,9 +1908,6 @@ impl Sidebar {
             .collect()
     }
 
-    /// Which workspace a thread belongs to, for grouping. A draft is an
-    /// ordinary thread in the worktree it was composed in, so it groups there
-    /// like any other.
     fn thread_workspace_key(thread: &ThreadEntry) -> Option<String> {
         Some(match &thread.workspace {
             ThreadEntryWorkspace::Open(workspace) => {
@@ -2158,23 +1919,10 @@ impl Sidebar {
         })
     }
 
-    /// Clusters a section's rows by workspace, inserting a header above each
-    /// workspace's rows. A cluster is emitted where its first row appears, so
-    /// it takes the order of whatever the rows were sorted by: the earliest
-    /// tab in Active, the newest row in the time-sorted sections.
-    ///
-    /// Tabs from two worktrees can interleave (A, B, A) and a grouped list
-    /// cannot show that without splitting a group in two. Grouping wins:
-    /// keeping a worktree's threads together is worth more than reproducing an
-    /// interleaving exactly.
+    /// A cluster is emitted where its first row appears. Tabs interleaved
+    /// across worktrees (A, B, A) are grouped anyway.
     fn group_rows_by_workspace(rows: Vec<ListEntry>) -> Vec<ListEntry> {
-        // (Terminal rows keep their flat placement: they are transient and
-        // carry their own worktree chip.)
-
-        // One key per row, derived once. Deriving it inside the member scan
-        // meant formatting an entity id for every row of every group — a list
-        // of twenty worktrees paid two thousand allocations to be grouped, and
-        // it is grouped again on every rebuild.
+        // Derived once: inside the member scan it was quadratic in allocations.
         let keys: Vec<Option<String>> = rows
             .iter()
             .map(|entry| match entry {
@@ -2210,9 +1958,6 @@ impl Sidebar {
                 .and_then(|info| info.worktree_name.clone())
                 .unwrap_or_else(|| SharedString::from("Workspace"));
             let is_linked_worktree = info.is_some_and(|info| info.kind == ui::WorktreeKind::Linked);
-            // What the header's archive would take. An already-archived thread
-            // is not part of that, which is what keeps the button off a group
-            // with nothing left to archive.
             let member_sessions: Vec<acp::SessionId> = members
                 .iter()
                 .filter_map(|member| match member {
@@ -2228,11 +1973,7 @@ impl Sidebar {
                     ThreadEntryWorkspace::Open(workspace) => Some(workspace.clone()),
                     ThreadEntryWorkspace::Closed { .. } => None,
                 });
-            // A worktree with one thread in it is one row. The header would
-            // only repeat what the row already says (a thread's title is what
-            // its worktree is for), so the row takes the header's chrome: the
-            // PR chips, the + that starts a second thread here, and the archive
-            // that takes the worktree with it.
+            // A worktree with one thread is one row wearing the header's chrome.
             if let [ListEntry::Thread(thread)] = members.as_slice() {
                 let mut solo = (**thread).clone();
                 solo.solo_worktree = Some(SoloWorktree {
@@ -2254,8 +1995,6 @@ impl Sidebar {
                 key: key.clone(),
                 member_count: members.len(),
             })));
-            // A row under a header is indented, so the group reads as a group
-            // rather than as a header that happens to sit above some threads.
             out.extend(members.into_iter().map(|member| match member {
                 ListEntry::Thread(thread) => {
                     let mut grouped = (*thread).clone();
@@ -2268,19 +2007,9 @@ impl Sidebar {
         out
     }
 
-    /// Lays the list out as three sections: "Active" (threads that are open
-    /// right now — a tab, or the thread a panel is currently showing, or a
-    /// still-running session) on top, then "All Threads", the flat history
-    /// of everything unarchived that is not open, then "Archived". Active and
-    /// All Threads partition the unarchived set rather than overlapping it, so
-    /// every thread is listed exactly once. All Threads and Archived are
-    /// sorted most-recent-first
-    /// (title breaks ties); Active follows the tabs, since those are the
-    /// order the user arranged, and falls back to the same time sort for a
-    /// row with no tab (a thread whose session is still running in a
-    /// workspace that is not showing it). Empty drafts pin to the top of
-    /// every section, tabs included. A section with rows always gets its
-    /// header, which is what the user collapses it by.
+    /// Active (open or still running), All Threads (the rest, unarchived) and
+    /// Archived; every thread is listed exactly once. Active follows the tab
+    /// order, the others are newest first.
     fn sectioned_entries(
         terminals: Vec<TerminalEntry>,
         threads: Vec<Arc<ThreadEntry>>,
@@ -2291,9 +2020,7 @@ impl Sidebar {
     ) -> Vec<ListEntry> {
         fn display_time(entry: &ListEntry) -> DateTime<Utc> {
             match entry {
-                // A thread with nothing sent in it yet sits at the top: it is
-                // the one you are about to use, and its own timestamps say
-                // nothing useful about where to look for it.
+                // An unsent thread is the one you are about to use.
                 ListEntry::Thread(thread) if thread.draft == Some(DraftKind::Empty) => {
                     DateTime::<Utc>::MAX_UTC
                 }
@@ -2303,8 +2030,7 @@ impl Sidebar {
             }
         }
 
-        // Title as tiebreaker keeps the order deterministic for equal
-        // timestamps (store iteration order is not).
+        // Store iteration order is not deterministic.
         fn title(entry: &ListEntry) -> SharedString {
             match entry {
                 ListEntry::Thread(thread) => thread.metadata.display_title(),
@@ -2330,18 +2056,6 @@ impl Sidebar {
             .into_iter()
             .partition(|thread| thread.metadata.archived);
 
-        // Active is what is open right now: a thread with a tab, or one whose
-        // session is still running. Nothing else qualifies. A thread does not
-        // become active by sharing a worktree with one that is, and closing a
-        // thread takes it out of here even though its neighbours stay.
-        //
-        // All threads is everything else. The two sections partition the
-        // unarchived set instead of overlapping it, so a thread is in one or
-        // the other and never both. Closing a thread hands it straight to All
-        // threads, where the time sort places it at its age rather than at the
-        // top; a workspace with everything open leaves that section empty,
-        // which drops its header entirely, since only Active keeps one with no
-        // rows. Archiving is still what takes a thread out of both.
         let (open_threads, history_threads): (Vec<_>, Vec<_>) =
             unarchived_threads.into_iter().partition(|thread| {
                 thread.is_live || open_thread_ids.contains(&thread.metadata.thread_id)
@@ -2353,15 +2067,8 @@ impl Sidebar {
                 .collect::<Vec<_>>()
         };
 
-        // Active follows the tab strip. Positions span every workspace, so a
-        // group sits where its earliest tab sits and its rows sit in their tab
-        // order. A row with no tab sorts after every row that has one, by
-        // time.
-        //
-        // An empty draft stays pinned above all of it. Its tab is wherever the
-        // pane happened to put it, which for a draft the user just asked for is
-        // usually the end, and the row for the thread you are about to start is
-        // not one to go looking for.
+        // A row with no tab sorts after every row that has one, by time. An
+        // unsent thread stays pinned above all of it.
         let sort_by_tab = |rows: Vec<ListEntry>| {
             rows.into_iter()
                 .sorted_by_key(|entry| {
@@ -2415,8 +2122,7 @@ impl Sidebar {
 
         let mut entries: Vec<ListEntry> = Vec::new();
         for (section, rows) in sections {
-            // The Active header always renders: it carries the new-thread
-            // button, which must exist even (especially) with nothing active.
+            // The Active header carries the new-thread button.
             if rows.is_empty() && !matches!(section, SidebarSection::OpenInZed) {
                 continue;
             }
@@ -2430,8 +2136,6 @@ impl Sidebar {
         entries
     }
 
-    /// Queues the worktrees now on screen for measurement, skipping the ones
-    /// already measured or already queued.
     fn measure_worktree_sizes(&mut self, cx: &mut Context<Self>) {
         let paths: Vec<PathBuf> = self
             .contents
@@ -2439,8 +2143,6 @@ impl Sidebar {
             .iter()
             .filter_map(|entry| match entry {
                 ListEntry::WorkspaceHeader(header) => header.path.clone(),
-                // A worktree with one thread has no header, so its row is the
-                // only place its size can be said.
                 ListEntry::Thread(thread) => thread
                     .solo_worktree
                     .as_ref()
@@ -2459,10 +2161,7 @@ impl Sidebar {
         self.measure_next_worktree(cx);
     }
 
-    /// Measures one worktree, then the next. Sequential on purpose: a dozen
-    /// concurrent walks of a build directory is the kind of IO storm that made
-    /// the whole app feel slow before `file_scan_exclusions` learned about
-    /// `target`.
+    /// Sequential on purpose: concurrent walks of build directories are an IO storm.
     fn measure_next_worktree(&mut self, cx: &mut Context<Self>) {
         if self.worktree_size_task.is_some() {
             return;
@@ -2485,10 +2184,7 @@ impl Sidebar {
         }));
     }
 
-    /// A draft's row shows the text being typed into it, so typing does change
-    /// the list. It does not need to change it once per keystroke: rebuilding
-    /// walks every stored thread and every open workspace, which is a lot of
-    /// work to redo between two characters.
+    /// An unsent thread's row shows what is typed; rebuild once typing settles.
     fn rebuild_after_typing(&mut self, cx: &mut Context<Self>) {
         const SETTLE: std::time::Duration = std::time::Duration::from_millis(200);
         self.draft_typing_task = Some(cx.spawn(async move |this, cx| {
@@ -2499,8 +2195,6 @@ impl Sidebar {
 
     #[track_caller]
     fn schedule_update_entries(&mut self, select_first_after_update: bool, cx: &mut Context<Self>) {
-        // Recorded here rather than inside the task: by the time that runs the
-        // caller is this function's own closure, which names nothing.
         let trigger = std::panic::Location::caller();
         if self.update_task.is_some() && !select_first_after_update {
             return;
@@ -2519,15 +2213,8 @@ impl Sidebar {
         }));
     }
 
-    /// Whether what a workspace's agent panel contributes to its rows has moved
-    /// since the last time it was looked at. Reading it costs a status, a title
-    /// and a walk of each open thread's entries for its running work — a few
-    /// microseconds against the tens of milliseconds of a rebuild — so it is
-    /// worth asking before paying for one.
-    ///
-    /// Only this path consults and updates the snapshot, so a rebuild asked for
-    /// by anything else can leave it stale. That costs one extra rebuild on the
-    /// next event and never a stale row, which is the safe direction.
+    /// Only this path updates the snapshot, so a stale one costs an extra
+    /// rebuild, never a stale row.
     fn live_panel_state_changed(&mut self, workspace: &Entity<Workspace>, cx: &App) -> bool {
         let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) else {
             return true;
@@ -2582,28 +2269,17 @@ impl Sidebar {
             return;
         }
 
-        // A rebuild walks every stored thread and every open workspace, and it
-        // is asked for from forty places. Neither the cost of one nor how many
-        // of them there are has ever been a number, so the slow ones say so and
-        // carry the count of the quiet ones they follow.
         let rebuild_started = std::time::Instant::now();
         *self.rebuild_triggers.entry(trigger).or_insert(0) += 1;
         let had_notifications = self.has_notifications(cx);
         let previous_shapes: Vec<EntryShape> = self.entry_shapes().collect();
-        // What the list already says. A rebuild that produces exactly this is
-        // a rebuild nobody can see, and everything after it — the draft
-        // passes, the list's measurements, the repaint — is work for a list
-        // that changed. Rows are `Arc`s, so keeping a copy to compare against
-        // costs two vectors of pointers rather than the rows themselves.
+        // A rebuild that reproduces this list stops early. Rows are `Arc`s.
         let previous_entries = self.contents.entries.clone();
         let previous_all_entries = self.contents.all_entries.clone();
         let previously_notified_threads = self.contents.notified_threads.clone();
         let previously_notified_terminals = self.contents.notified_terminals.clone();
         let previously_had_open_projects = self.contents.has_open_projects;
-        // Selection is index-based, and a rebuild reshuffles indices (a
-        // confirmed thread moves to Active, rows appear and vanish). Remember
-        // WHICH row is selected so it can be re-anchored afterwards; a stale
-        // index silently selects a different row.
+        // Selection is index-based and a rebuild reshuffles indices.
         let selected_identity = self
             .selection
             .and_then(|ix| self.contents.entries.get(ix))
@@ -2619,11 +2295,7 @@ impl Sidebar {
             && self.contents.has_open_projects == previously_had_open_projects
             && self.contents.tabbed_threads == previously_tabbed;
         if unchanged {
-            // The watch set is the one pass that answers to something other
-            // than the rows — a thread's watched pull requests are not drawn
-            // into its row — and it has its own guard, so it stays. The PR
-            // snapshot does not: the gh store's own observer writes it when
-            // the data it comes from changes.
+            // A thread's watched PRs are not drawn into its row.
             self.contents.tabbed_threads = previously_tabbed;
             self.sync_gh_watches(cx);
             self.quiet_rebuilds += 1;
@@ -2640,9 +2312,6 @@ impl Sidebar {
         self.refresh_draft_editor_observations(cx);
 
         if let Some(identity) = selected_identity {
-            // Selecting a row is how the user says which thread they are
-            // looking at. Closing that thread answers the question, so the
-            // selection goes with it rather than pointing at a shut tab.
             let was_closed = matches!(identity, EntryIdentity::Thread(thread_id)
                 if previously_tabbed.contains(&thread_id)
                     && !self.contents.tabbed_threads.contains(&thread_id));
@@ -2655,8 +2324,6 @@ impl Sidebar {
                 })
                 .flatten();
         }
-        // Clamp a selection that points past the rebuilt list (or whose row is
-        // gone entirely).
         if let Some(ix) = self.selection
             && ix >= self.contents.entries.len()
         {
@@ -2685,26 +2352,20 @@ impl Sidebar {
         cx.notify();
     }
 
-    /// Says what the rebuilds have cost and what asked for them. Reported when
-    /// one rebuild is slow enough to feel, and also once the quiet ones have
-    /// added up to [`REPORTABLE_REBUILD_TIME`] of foreground between lines —
-    /// without which a thousand rebuilds of 2ms each were invisible and a
-    /// thousand of 15ms each looked the same.
+    /// Logged when one rebuild is slow, or once the quiet ones add up to
+    /// [`REPORTABLE_REBUILD_TIME`].
     fn log_rebuild_cost(&mut self, slow: Option<std::time::Duration>) {
         let felt = slow.is_some_and(|elapsed| elapsed >= SLOW_REBUILD);
         if !felt && self.rebuild_time < REPORTABLE_REBUILD_TIME {
             return;
         }
         let mut triggers: Vec<_> = self.rebuild_triggers.drain().collect();
-        triggers.sort_unstable_by_key(|&(location, count)| {
-            (std::cmp::Reverse(count), location.line())
-        });
+        triggers
+            .sort_unstable_by_key(|&(location, count)| (std::cmp::Reverse(count), location.line()));
         let triggers = triggers
             .iter()
             .take(4)
-            .map(|(location, count)| {
-                format!("{}:{} {count}", location.file(), location.line())
-            })
+            .map(|(location, count)| format!("{}:{} {count}", location.file(), location.line()))
             .collect::<Vec<_>>()
             .join(", ");
         log::info!(
@@ -2725,10 +2386,6 @@ impl Sidebar {
         self.rebuild_time = std::time::Duration::ZERO;
     }
 
-    /// Ask gh about every watched branch now. The chips are read often enough
-    /// that a minute of lag is noticed, and the moments worth asking again are
-    /// the ones where something just changed: a push, and the window coming
-    /// back to the front (which is when someone is about to look at them).
     fn refresh_pr_status(&mut self, cx: &mut Context<Self>) {
         let Some(store) = GhStatusStore::try_global(cx) else {
             return;
@@ -2736,21 +2393,13 @@ impl Sidebar {
         store.update(cx, |store, cx| store.refresh_now(cx));
     }
 
-    /// Keeps the [`GhStatusStore`] watch set in sync with the branches of the
-    /// listed thread entries (collapsed rows included: the thread view's PR
-    /// badges read the store the sidebar keeps watched). Watches are
-    /// refcounted, so each branch is watched exactly once by the sidebar and
-    /// released when its thread disappears from the list.
+    /// Collapsed rows included: the thread view's PR badges read this store.
     fn sync_gh_watches(&mut self, cx: &mut Context<Self>) {
         let Some(store) = GhStatusStore::try_global(cx) else {
             return;
         };
-        // Only the threads that are open. Every thread the store has ever
-        // kept is not a set anyone is looking at, and asking about all of
-        // them is what spends GitHub's hourly budget in one burst at launch:
-        // the count is the multiplier, and a hundred watched PRs is a hundred
-        // `gh` processes. A thread nobody has open gets its chips from the PR
-        // snapshot until it is opened, which is what that snapshot is for.
+        // Only open threads: watching every stored one spends GitHub's hourly
+        // budget at launch. The rest show their PR snapshot.
         let watchable = |thread: &&Arc<ThreadEntry>| {
             !thread.metadata.archived
                 && self
@@ -2777,9 +2426,6 @@ impl Sidebar {
                 })
             })
             .collect();
-        // The PRs the threads watch by number. A branch answers where `gh`
-        // should run; the repository, when the thread knows it, is what lets a
-        // PR nobody has checked out be asked about at all.
         let metadata_store = ThreadMetadataStore::try_global(cx);
         let desired_prs: HashSet<(PathBuf, Option<String>, u64)> = metadata_store
             .as_ref()
@@ -2802,9 +2448,9 @@ impl Sidebar {
                             .pr_snapshot(thread.metadata.thread_id)
                             .map(|snapshot| snapshot.watched.clone())
                             .unwrap_or_default();
-                        watched.into_iter().filter_map(move |pr| {
-                            Some((cwd.clone()?, pr.repo.clone(), pr.number))
-                        })
+                        watched
+                            .into_iter()
+                            .filter_map(move |pr| Some((cwd.clone()?, pr.repo.clone(), pr.number)))
                     })
                     .collect()
             })
@@ -2831,9 +2477,6 @@ impl Sidebar {
         self.gh_watched_prs = desired_prs;
     }
 
-    /// The section a rendered row belongs to, found by the nearest preceding
-    /// section header. Rows in [`SidebarSection::OpenInZed`] are open as tabs,
-    /// so only they expose a close-the-tab affordance.
     fn section_of_entry(&self, ix: usize) -> Option<SidebarSection> {
         self.contents
             .entries
@@ -2848,9 +2491,8 @@ impl Sidebar {
 
     /// The branches of a thread's worktrees, as `(repo path, branch)`.
     fn thread_branches(thread: &ThreadEntry) -> Vec<(&Path, &str)> {
-        // A draft has no worktree of its own yet; its paths still resolve to the
-        // project's current branch, so treating it as branchless keeps the
-        // project branch's PRs (and gh watches, and snapshots) off the draft row.
+        // An unsent thread's paths resolve to the project's current branch,
+        // whose PRs are not its own.
         if thread.draft.is_some() {
             return Vec::new();
         }
@@ -2864,17 +2506,17 @@ impl Sidebar {
             .collect()
     }
 
-    /// PR chips for a thread row: the union of the PRs of all its worktree
-    /// branches, deduplicated by URL. Rows with a branch but no PR get a
-    /// muted "no PR" indicator so PR state is always visible.
     fn thread_pr_chips(thread: &ThreadEntry, cx: &App) -> Vec<ThreadItemPrChip> {
         let store = GhStatusStore::try_global(cx);
         let store = store.as_ref().map(|store| store.read(cx));
         let snapshot = ThreadMetadataStore::try_global(cx)
-            .and_then(|metadata| metadata.read(cx).pr_snapshot(thread.metadata.thread_id).cloned())
+            .and_then(|metadata| {
+                metadata
+                    .read(cx)
+                    .pr_snapshot(thread.metadata.thread_id)
+                    .cloned()
+            })
             .unwrap_or_default();
-        // The PRs this thread watches by number, which is how one on another
-        // branch (or in a repository nobody checked out) reaches the row.
         let cwd = thread
             .worktrees
             .first()
@@ -2905,9 +2547,7 @@ impl Sidebar {
         )
     }
 
-    /// Persists the PR state of every live thread whose branches gh has
-    /// answered for, so the badge survives archiving (which deletes the
-    /// worktree, and with it the branch the PR was queried by).
+    /// So the badge survives archiving, which deletes the branch it was queried by.
     fn persist_pr_snapshots(&mut self, cx: &mut Context<Self>) {
         let (Some(gh_store), Some(metadata_store)) = (
             GhStatusStore::try_global(cx),
@@ -2916,8 +2556,6 @@ impl Sidebar {
             return;
         };
 
-        // What each thread already watches, read before the gh store is
-        // borrowed so both can be consulted at once.
         let watched_by_thread: HashMap<ThreadId, Vec<agent_ui::thread_metadata_store::WatchedPr>> =
             metadata_store.read_with(cx, |metadata_store, _cx| {
                 self.contents
@@ -2955,8 +2593,6 @@ impl Sidebar {
                     .collect();
                 let branch_prs = gh_status::fetched_prs_for_branches(branches, gh_store);
 
-                // A PR watched by number answers for itself, so a thread with
-                // no branch at all still has something to persist.
                 let cwd = thread
                     .worktrees
                     .first()
@@ -2992,16 +2628,11 @@ impl Sidebar {
         }
         metadata_store.update(cx, |store, cx| {
             for (thread_id, branches, prs) in snapshots {
-                // Edited in place: the watched and dismissed sets are the
-                // thread's own and must outlive every poll that rewrites what
-                // gh last said.
+                // In place: the watched and dismissed sets outlive every poll.
                 store.update_pr_snapshot(
                     thread_id,
                     |snapshot| {
-                        // The branch's own PRs are not copied into the watched
-                        // set: the branch watch already asks about them, and a
-                        // second watch by number would ask again for every one
-                        // of them. The set is for PRs no branch here supplies.
+                        // The branch watch already asks about the branch's own PRs.
                         if snapshot.branches == branches && snapshot.prs == prs {
                             return false;
                         }
@@ -3172,9 +2803,6 @@ impl Sidebar {
         }
     }
 
-    /// A quiet worktree label above one workspace's rows, presentation only.
-    /// The extra top padding is the gap between worktrees; rows within a
-    /// worktree sit tighter than that.
     fn render_workspace_header(
         &self,
         ix: usize,
@@ -3183,13 +2811,6 @@ impl Sidebar {
     ) -> AnyElement {
         let group = SharedString::from(format!("workspace-header-{ix}"));
         let is_collapsed = self.collapsed_worktrees.contains(&header.key);
-        // PR state belongs to the worktree (PR == branch == worktree), and the
-        // header says so whether or not the group is open: a header that drops
-        // half its contents when you open it takes information away, and the
-        // size beside it never did that. The rows' own chips used to sit in the
-        // title row, where the header's copy would have stacked a second
-        // identical chip on top; they moved to their own line under the title,
-        // so the two no longer compete for the space.
         let pr_chips = header
             .lead_thread
             .as_ref()
@@ -3206,11 +2827,6 @@ impl Sidebar {
             .pb_0p5()
             .gap_1()
             .items_center()
-            // The whole header folds its group: a worktree with a dozen
-            // threads is otherwise a wall of rows between you and the next
-            // one. The chevron replaces the branch glyph rather than crowding
-            // it, both because a folded group has to say so at a glance and
-            // because the glyph was decoration on a row that is now a control.
             .cursor_pointer()
             .tooltip(Tooltip::text(if is_collapsed {
                 "Show This Worktree's Threads"
@@ -3242,9 +2858,6 @@ impl Sidebar {
                     .color(Color::Default)
                     .truncate(),
             )
-            // How much the group is holding, open or folded: the count is what
-            // the header is for, and it did not stop being true when the rows
-            // came into view.
             .child(
                 Label::new(format!(
                     "{} thread{}",
@@ -3254,8 +2867,6 @@ impl Sidebar {
                 .size(LabelSize::XSmall)
                 .color(Color::Muted),
             )
-            // What this worktree costs to keep. Only shown once measured, and
-            // only when it is enough to matter.
             .children(
                 header
                     .path
@@ -3291,9 +2902,6 @@ impl Sidebar {
                         })),
                 )
             })
-            // Archiving belongs to the worktree, not its threads: the hover
-            // button archives every thread in the group, and the last one's
-            // archival tears the linked worktree down.
             .when(
                 header.is_linked_worktree && !member_sessions.is_empty(),
                 |this| {
@@ -3321,8 +2929,6 @@ impl Sidebar {
         ix: usize,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // The history section sits below the Active group; a full-width top
-        // divider plus extra spacing sets the two apart while staying quiet.
         let is_history = matches!(
             section,
             SidebarSection::AllThreads | SidebarSection::Archived
@@ -3344,8 +2950,7 @@ impl Sidebar {
             .child(
                 Disclosure::new(("section-disclosure", ix), is_open).on_click(cx.listener(
                     move |this, _, _window, cx| {
-                        // The whole header row toggles too; without this the
-                        // click would bubble and toggle a second time.
+                        // Or the header row's own click toggles it back.
                         cx.stop_propagation();
                         this.toggle_section(section, cx);
                     },
@@ -3380,13 +2985,8 @@ impl Sidebar {
         cx.notify();
     }
 
-    /// The sidebar's plus button. One click opens a draft; the draft screen
-    /// is where the worktree, agent, and model are chosen.
     fn render_new_thread_button(&self, cx: &mut Context<Self>) -> AnyElement {
         let focus_handle = self.focus_handle.clone();
-        // The top plus starts a thread in a brand-new worktree, created right
-        // away. A thread in an existing worktree comes from that worktree
-        // header's own plus.
         IconButton::new("sidebar-new-thread", IconName::Plus)
             .icon_size(IconSize::Small)
             .tooltip(move |_, cx| {
@@ -3535,10 +3135,8 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) {
         let _ = title_editor;
-        // Only the end of a rename is a rename. Applying every keystroke wrote
-        // a title per character, and each write rebuilt the sidebar's entries
-        // underneath the editor receiving them, which is how a rename ended
-        // itself on its first letter and left the focus in the search field.
+        // Writing per keystroke rebuilt the entries under the editor and ended
+        // the rename on its first letter.
         if matches!(event, editor::EditorEvent::Blurred) {
             self.finish_entry_rename(window, cx);
         }
@@ -3604,16 +3202,12 @@ impl Sidebar {
         }
     }
 
-    /// Ends a rename, keeping what was typed. Nothing has been applied until
-    /// now: the title is written once, here.
     fn finish_entry_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(target) = self.rename_target.take() else {
             return false;
         };
         let title = self.rename_editor.read(cx).text(cx);
         let title = title.trim();
-        // An empty title is not a rename, it is a mistake; the entry keeps the
-        // name it had.
         if !title.is_empty() {
             let title = SharedString::from(title.to_string());
             match target {
@@ -3855,8 +3449,6 @@ impl Sidebar {
             }
         });
 
-        // Threads live as tabs in the agent panel's own pane, so opening one
-        // also reveals (or focuses) the panel dock.
         if let Some(agent_panel) = existing_panel {
             load_thread(agent_panel, metadata, focus, window, cx);
             workspace.update(cx, |workspace, cx| {
@@ -4071,9 +3663,6 @@ impl Sidebar {
             })
     }
 
-    /// Test-only: forces `active_entry` to point at a thread, reproducing the
-    /// stale state (a restored or stuck-pending activation whose tab no longer
-    /// exists) that the `activate_thread_locally` fast path must not trust.
     #[cfg(test)]
     pub(crate) fn set_stale_thread_active_entry_for_test(
         &mut self,
@@ -4101,12 +3690,8 @@ impl Sidebar {
         };
 
         if self.is_thread_active_in_workspace(&metadata.thread_id, workspace, cx) {
-            // "Active" here trusts a possibly-stale active_entry: it can still
-            // point at a thread whose tab was closed, or one from a restored
-            // session whose view hasn't rehydrated. activate_thread_tab reports
-            // whether a tab actually hosts the thread; when it doesn't, fall
-            // through to the load path below so the thread reopens instead of
-            // silently no-op'ing.
+            // active_entry can be stale (its tab closed); fall through to the
+            // load path when no tab hosts the thread.
             let thread_id = metadata.thread_id;
             let activated = workspace.update(cx, |workspace, cx| {
                 workspace.focus_panel::<AgentPanel>(window, cx);
@@ -4495,23 +4080,15 @@ impl Sidebar {
         self.restoring_tasks.insert(thread_id, restore_task);
     }
 
-    /// Find the neighbor thread in the sidebar (by display position).
-    /// Look below first, then above, for the nearest thread that isn't
-    /// the one being archived. We capture both the neighbor's metadata
-    /// (for activation) and its workspace paths (for the workspace
-    /// removal fallback).
+    /// The nearest other thread by display position, below first, then above.
     fn neighboring_activatable_entry(
         &self,
         current_position: usize,
         remote_connection: Option<&RemoteConnectionOptions>,
         exclude: Option<EntryIdentity>,
     ) -> Option<ActivatableEntry> {
-        // The worktree the removed row belonged to. Its own rows are tried
-        // first: the list is grouped by worktree and an empty draft sorts to
-        // the top of its group, so scanning the flat list downwards walks out
-        // of the group before it reaches the draft sitting just above — and
-        // lands the user in a different worktree while this one still has a
-        // thread to show.
+        // The removed row's own worktree first: an unsent thread sorts to the
+        // top of its group, above where a downward scan starts.
         let own_paths = self
             .contents
             .entries
@@ -4529,12 +4106,7 @@ impl Sidebar {
         });
         in_own_worktree
             .chain(ordered())
-            // Archived rows stay in the list but are not activation targets,
-            // and neighbors must share the removed entry's remote identity.
-            // An open thread now appears in both Active and All Threads, so
-            // its other occurrence can be right next to the one being
-            // removed — exclude it explicitly rather than picking the same
-            // thread as its own "neighbor".
+            // Neighbors must share the removed entry's remote identity.
             .filter(|entry| exclude.is_none_or(|exclude| entry_identity(entry) != Some(exclude)))
             .filter(|entry| match entry {
                 ListEntry::Thread(thread) => {
@@ -4775,9 +4347,7 @@ impl Sidebar {
 
         let archive_workspaces = self.archive_workspaces(cx);
 
-        // No workspace load is needed when a folder path is already a root
-        // of an open workspace with a matching remote identity: archive root
-        // planning can inspect repositories through that workspace.
+        // Root planning can inspect repositories through an open workspace.
         let any_path_open = folder_paths.ordered_paths().any(|path| {
             archive_workspaces.iter().any(|workspace| {
                 let project = workspace.read(cx).project().read(cx);
@@ -4830,8 +4400,6 @@ impl Sidebar {
         cx: &App,
     ) -> bool {
         let _ = (archive_workspaces, cx);
-        // Every thread the user made blocks its worktree's archival, whether
-        // or not a message was ever sent in it.
         thread_store.path_is_referenced_by_unarchived_threads_matching(
             except_thread_id,
             path,
@@ -4953,27 +4521,10 @@ impl Sidebar {
         (group_key.path_list() != folder_paths).then_some(workspace)
     }
 
-    /// Take the spare worktrees of earlier sessions off disk.
-    ///
-    /// A spare is the one worktree with no thread behind it: made before
-    /// anyone pressed `+`, and left over when the session that made it quit
-    /// before handing it to anyone. Everything else a `+` creates belongs to
-    /// the thread that click also created, and goes when that thread is
-    /// archived.
-    ///
-    /// This runs once per repository per launch rather than when the window
-    /// closes. Closing is the moment a worktree becomes abandoned, but it is
-    /// also the moment its project and repositories are being torn down, and a
-    /// removal racing that teardown is one that can half happen. A worktree
-    /// still here from the last session is abandoned by definition, and
-    /// nothing is in flight to race.
-    ///
-    /// Nothing is persisted first, because by construction there is nothing to
-    /// persist: `git worktree remove` without `--force` refuses a worktree
-    /// carrying any uncommitted change, and a removed worktree's branch and
-    /// its commits stay in the repository. That is also why this says nothing:
-    /// it can only ever remove a directory that `git worktree add` would put
-    /// back from the branch it was on.
+    /// Takes the spare worktrees of earlier sessions off disk, once per
+    /// repository per launch: at window close the repositories are being torn
+    /// down. Nothing is persisted first since `git worktree remove` without
+    /// `--force` refuses a worktree with uncommitted changes.
     fn reclaim_abandoned_worktrees(&mut self, cx: &mut Context<Self>) {
         let Some(multi_workspace) = self.multi_workspace.upgrade() else {
             return;
@@ -5010,9 +4561,7 @@ impl Sidebar {
         let threads_loaded = ThreadMetadataStore::global(cx).read(cx).reload_task();
 
         cx.spawn(async move |this, cx| {
-            // Reading the store before its rows are back from disk sees an
-            // empty store, which is the one state where every worktree looks
-            // abandoned.
+            // An unloaded store makes every worktree look abandoned.
             threads_loaded.await;
             let worktrees = worktrees.await??;
             let abandoned = this.update(cx, |this, cx| {
@@ -5031,8 +4580,6 @@ impl Sidebar {
                     .await;
                 match removed {
                     Ok(Ok(())) => reclaimed.push(path),
-                    // A worktree that will not come off cleanly has something
-                    // in it, which means it was not abandoned after all.
                     Ok(Err(error)) => {
                         log::info!("leaving worktree {} in place: {error:#}", path.display());
                     }
@@ -5065,10 +4612,6 @@ impl Sidebar {
         .detach_and_log_err(cx);
     }
 
-    /// Keep a worktree ready for the next `+`. The checkout `+` pays for is git
-    /// writing files, and the only way to stop waiting for it is to have it
-    /// already done; one spare per repository set is made in the background and
-    /// handed over whole when `+` is pressed.
     fn ensure_spare_worktree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(multi_workspace) = self.multi_workspace.upgrade() else {
             return;
@@ -5077,9 +4620,6 @@ impl Sidebar {
         git_ui_core::worktree_service::ensure_spare_worktree(&workspace, window, cx);
     }
 
-    /// The repository's linked worktrees that nothing is using: Zed made them,
-    /// they sit under the directory Zed manages, no window has them open, and
-    /// no thread that would block their archival refers to them.
     fn abandoned_worktrees(
         &self,
         worktrees: &[git::repository::Worktree],
@@ -5096,8 +4636,6 @@ impl Sidebar {
         let archive_workspaces = self.archive_workspaces(cx);
         let store = ThreadMetadataStore::global(cx);
         let store = store.read(cx);
-        // A spare this launch is still holding is not abandoned, it is waiting
-        // to be handed over.
         let ready_spares: HashSet<PathBuf> =
             git_ui_core::worktree_spares::SpareWorktrees::ready_paths(cx)
                 .into_iter()
@@ -5115,13 +4653,7 @@ impl Sidebar {
             })
             .filter(|path| !ready_spares.contains(path.as_path()))
             .filter(|path| {
-                // Only a spare. A spare is a worktree Zed made with no thread
-                // beside it, so one still marked as such is one a previous
-                // session made and never handed over; it is the only worktree
-                // nobody asked for. A worktree a `+` made belongs to the
-                // thread the same click created, and it stays until that
-                // thread is archived — which is the whole of why this used to
-                // reclaim it and no longer does.
+                // A `+` worktree belongs to its thread until that is archived.
                 git_ui_core::created_worktrees::recorded_as_spare(path, remote_connection, cx)
             })
             .filter(|path| {
@@ -5350,12 +4882,6 @@ impl Sidebar {
         let terminal_id = metadata.terminal_id;
         let defer_draft_activation = activate_panel_draft && is_active && neighbor.is_some();
 
-        // Fallback to a neighbor entry instead of a panel draft when the
-        // closed terminal was the active entry. Under the tabs model a
-        // panel draft opens a workspace tab (with a visible sidebar row),
-        // so it must only be created when there is nothing else to show.
-        let activate_panel_draft = activate_panel_draft && !(is_active && neighbor.is_some());
-
         // Closing from the sidebar must not steal focus, since the row's
         // workspace may not be the active workspace.
         if let ThreadEntryWorkspace::Open(workspace) = workspace {
@@ -5521,8 +5047,7 @@ impl Sidebar {
         close_item_tasks
     }
 
-    /// Deletes the selected thread from the history list. Only archived
-    /// threads can be deleted; archive is the first step for live ones.
+    /// Only archived threads can be deleted.
     fn remove_selected_thread(
         &mut self,
         _: &RemoveSelectedThread,
@@ -5540,9 +5065,6 @@ impl Sidebar {
         self.delete_thread(&metadata, cx);
     }
 
-    /// Permanently deletes a thread: removes its metadata row, cleans up any
-    /// archived worktree snapshots, and asks the owning agent to delete the
-    /// underlying session.
     fn delete_thread(&mut self, metadata: &ThreadMetadata, cx: &mut Context<Self>) {
         let thread_id = metadata.thread_id;
         let session_id = metadata.session_id.clone();
@@ -5589,11 +5111,12 @@ impl Sidebar {
         .detach_and_log_err(cx);
     }
 
-    /// Closes an open thread without archiving it: the tab goes, the thread
-    /// stays in history and its row moves out of the Active section. With the
-    /// tab bar gone this is the only way to close a thread that is not the
-    /// active one, so the row's menu and a middle-click both reach it.
-    fn close_thread(&mut self, thread_id: agent_ui::ThreadId, window: &mut Window, cx: &mut Context<Self>) {
+    fn close_thread(
+        &mut self,
+        thread_id: agent_ui::ThreadId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(workspace) = self.workspace_hosting_thread(thread_id, cx) else {
             return;
         };
@@ -5607,9 +5130,7 @@ impl Sidebar {
         cx.notify();
     }
 
-    /// The workspace whose panel has this thread open as a tab of its own,
-    /// which is the one that can close it; a thread showing in another
-    /// window's strip is there as a proxy.
+    /// Other windows' strips hold only proxies of the tab.
     fn workspace_hosting_thread(
         &self,
         thread_id: agent_ui::ThreadId,
@@ -5623,9 +5144,6 @@ impl Sidebar {
         })
     }
 
-    /// Archives the thread of a live ACP session. The session id is what the
-    /// action handlers and the thread switcher carry; the archive itself is
-    /// keyed on the thread.
     fn archive_thread_by_session(
         &mut self,
         session_id: &acp::SessionId,
@@ -5649,11 +5167,7 @@ impl Sidebar {
         }
     }
 
-    /// Archives the thread a row stands for, whatever the row is.
-    ///
-    /// Keyed on the thread id rather than the session id: a draft has no
-    /// session, and a draft row's menu archives its worktree the same way a
-    /// sessioned row's does.
+    /// Keyed on the thread id: an unsent thread has no session.
     fn archive_thread(
         &mut self,
         thread_id: agent_ui::ThreadId,
@@ -5690,15 +5204,8 @@ impl Sidebar {
             });
         let thread_entry_workspace = thread_entry.map(|thread| thread.workspace.clone());
 
-        // Archiving is a flag on the thread's metadata, and the row can move
-        // the moment it is set. Working out whether the thread's linked
-        // worktree can come off disk is the slow half — `build_root_plan`
-        // needs live project and repository entities, so a closed workspace
-        // has to be built first, worktree scan and language servers and all —
-        // and it has nothing to say about the flag. The two are separated
-        // here: archive now, settle the disk behind it. A load that fails, or
-        // an unarchive that beats it, leaves the worktree where it is, which
-        // is the safe way for this to fail.
+        // Archive now and settle the disk behind it: `build_root_plan` needs a
+        // loaded workspace, which is slow for a closed one.
         let deferred_worktree_archive = match (metadata.as_ref(), &thread_entry_workspace) {
             (
                 Some(metadata),
@@ -5825,22 +5332,8 @@ impl Sidebar {
         );
     }
 
-    /// Take the thread's linked worktree off disk once the workspace that
-    /// holds it has loaded. The thread is already archived by the time this
-    /// runs; nothing here is needed for it to read that way.
-    ///
-    /// Opening the workspace is in service of `build_root_plan` alone, which
-    /// needs a live project and a live repository entity to persist the
-    /// worktree's git state before anything is deleted. That is the part worth
-    /// being slow and careful about, so it keeps the whole existing pipeline —
-    /// it has just stopped standing in front of the archive.
-    ///
-    /// Every way this can go wrong ends with the worktree still on disk: the
-    /// load fails, the plan comes back empty, or the user unarchives the
-    /// thread while the workspace is still building, in which case the
-    /// worktree belongs to a live thread again and must not be touched. The
-    /// workspace opened along the way is left open in that last case, since
-    /// the thread that is live again is the thing that would be using it.
+    /// Every failure, including an unarchive while the workspace loads, leaves
+    /// the worktree on disk.
     fn archive_worktree_after_workspace_loads(
         &mut self,
         thread_id: ThreadId,
@@ -5874,9 +5367,7 @@ impl Sidebar {
                     cx,
                 );
 
-                // An empty plan is not nothing to do: the workspace opened to
-                // build it still has to go, and with it the empty drafts that
-                // were only ever holding it open.
+                // The workspace opened to build an empty plan still has to go.
                 let mut workspaces_to_remove = this
                     .linked_worktree_workspace_to_remove(
                         &thread_folder_paths,
@@ -6019,7 +5510,6 @@ impl Sidebar {
             return None;
         }
 
-
         let (cancel_tx, cancel_rx) = async_channel::bounded::<()>(1);
         let task = cx.spawn(async move |_this, cx| {
             match Self::archive_worktree_roots(roots, cancel_rx, cx).await {
@@ -6053,7 +5543,6 @@ impl Sidebar {
         if roots.is_empty() {
             return;
         }
-
 
         let (cancel_tx, cancel_rx) = async_channel::bounded::<()>(1);
         cx.spawn(async move |_this, cx| {
@@ -6161,13 +5650,7 @@ impl Sidebar {
         }
     }
 
-    /// cmd-w with the sidebar focused.
-    ///
-    /// The sidebar is the tab list, so the row under the selection is the tab
-    /// cmd-w is about. Without this the key walks past `ThreadsSidebar` to the
-    /// workspace and closes a file in the editor pane instead — a thread the
-    /// user was looking straight at stays open, and something they were not
-    /// looking at closes.
+    /// cmd-w with the sidebar focused; otherwise it closes an editor tab.
     fn close_selected_thread(
         &mut self,
         _: &CloseSelectedThread,
@@ -6270,10 +5753,7 @@ impl Sidebar {
             (!names.is_empty()).then(|| SharedString::from(names))
         }
 
-        // Collapsing a section hides its rows, not its threads: the switcher
-        // lists every thread regardless. An open thread appears in both
-        // Active and All Threads now, so dedupe by thread_id to keep the
-        // switcher itself a proper set of distinct threads.
+        // Every thread, collapsed sections included.
         let mut seen_thread_ids: HashSet<agent_ui::ThreadId> = HashSet::default();
         let mut entries: Vec<ThreadSwitcherEntry> = self
             .contents
@@ -6282,9 +5762,6 @@ impl Sidebar {
             .filter_map(|entry| match entry {
                 ListEntry::SectionHeader(_) | ListEntry::WorkspaceHeader(_) => None,
                 ListEntry::Thread(thread) => {
-                    // Ctrl-tab is for switching between the things you are
-                    // working in. A thread with nothing sent in it yet is real
-                    // and keeps its row, but it is not something to switch to.
                     if thread.draft == Some(DraftKind::Empty) {
                         return None;
                     }
@@ -6643,10 +6120,6 @@ impl Sidebar {
         if !thread.under_worktree_header {
             return row;
         }
-        // A row that belongs to a worktree stands in from the edge, so the
-        // header above it reads as holding the rows under it rather than as a
-        // label that happens to precede them. A worktree with one thread is not
-        // a group and stays flush.
         div().pl_2().child(row).into_any_element()
     }
 
@@ -6661,27 +6134,14 @@ impl Sidebar {
         let has_notification = self.contents.is_thread_notified(&thread.metadata.thread_id);
 
         let title: SharedString = thread.metadata.display_title();
-        // The row's own entry, shared with the closures below rather than
-        // copied into each of them. Handing them the metadata by value meant a
-        // `ThreadMetadata` — strings, path list, PR snapshot — was cloned twice
-        // per row on every frame the sidebar drew, for handlers that only run
-        // when someone clicks.
+        // Shared with the closures below rather than cloned per frame.
         let entry = thread.clone();
         let thread_workspace = thread.workspace.clone();
 
         let is_hovered = self.hovered_thread_index == Some(ix);
         let is_selected = is_active;
         let is_draft = thread.draft.is_some();
-        // Every thread row carries its own PR chip. Hiding it on rows under a
-        // header meant the header alone reported PR state for its threads,
-        // which read fine when a worktree held one branch and one CI story but
-        // was hostile the moment the row was where you were looking to decide
-        // which thread had the failing PR. The header keeps its chip only when
-        // it is collapsed and the rows are not visible.
-        // A draft has done nothing yet: it has no branch of its own and no PR
-        // could have come from it. The "no PR" pill it inherited from its
-        // worktree said only that the worktree has none, which the worktree's
-        // own header already says.
+        // An unsent thread has no PR of its own.
         let row_pr_chips = if thread.draft.is_some() {
             Vec::new()
         } else {
@@ -6720,9 +6180,6 @@ impl Sidebar {
         let thread_item = ThreadItem::new(id, title.clone())
             .base_bg(sidebar_bg)
             .icon(icon)
-            // A subtle brand tint tells Claude and Codex threads apart. An
-            // archived thread reads the same as an active one (only its small
-            // archive glyph marks the state), so the tint applies regardless.
             .when_some(
                 agent_ui::agent_brand_color(&thread.metadata.agent_id).filter(|_| !is_draft),
                 |this, color| this.icon_color(Color::Custom(color)),
@@ -6737,18 +6194,10 @@ impl Sidebar {
             .when_some(icon_svg, |this, svg| {
                 this.custom_icon_from_external_svg(svg)
             })
-            // Every thread row reads the same, in every section: the title on
-            // one line and the row's state on the one below it. Under a
-            // workspace header that header names the worktree, branch, and PR
-            // state; elsewhere the row's hover card carries them.
             .worktrees(Vec::new())
             .timestamp(format_history_entry_timestamp(Self::thread_display_time(
                 &thread.metadata,
             )))
-            // What this worktree costs to keep, from the same measurement and
-            // the same gigabyte floor a header uses. A row that is its own
-            // worktree has no header to say it, and those are exactly the
-            // throwaway worktrees that quietly fill the disk.
             .when_some(
                 thread
                     .solo_worktree
@@ -6759,15 +6208,10 @@ impl Sidebar {
                     .and_then(worktree_size_label),
                 |this, size| this.size(size),
             )
-            // Chips go under the title rather than into it. Several of them
-            // are supported and the title row cannot hold several of anything,
-            // so the line beneath the title is where there is always room.
             .pr_chips(row_pr_chips)
             .highlight_positions(thread.highlight_positions.to_vec())
             .title_generating(title_generating)
             .notified(has_notification)
-            // What the thread is working on, not just that it is: commands
-            // still running and subagents still out.
             .running_terminals(thread.running_work.terminals)
             .running_async_tasks(thread.running_work.async_tasks)
             .running_subagents(thread.running_work.subagents)
@@ -6792,9 +6236,6 @@ impl Sidebar {
                 this.is_truncated(false).title_slot(title_editor)
             })
             .when(is_hovered && !is_renaming, |this| {
-                // Renaming lives on the row's context menu, and stopping a turn
-                // lives in the thread's message bar; rows keep only the action
-                // that belongs to their state.
                 let contextual_action: Option<AnyElement> = if is_restoring {
                     Some(
                         IconButton::new("cancel-restore", IconName::Close)
@@ -6814,8 +6255,6 @@ impl Sidebar {
                         IconButton::new("delete-thread", IconName::Trash)
                             .icon_size(IconSize::Small)
                             .icon_color(Color::Muted)
-                            // Deleting the record of a thread, which also cleans
-                            // up any worktree archived away with it.
                             .tooltip(Tooltip::text("Delete Thread"))
                             .on_click({
                                 let entry = entry.clone();
@@ -6826,19 +6265,7 @@ impl Sidebar {
                             .into_any_element(),
                     )
                 } else {
-                    match thread.draft {
-                        // A thread with nothing typed into it is an ordinary
-                        // thread: archiving and starting a thread in this
-                        // worktree live on its context menu like any other
-                        // row's.
-                        Some(_) => None,
-                        // Archiving and starting a thread in this worktree live
-                        // on the row's context menu: a button that appears
-                        // under the pointer covers the row it is about, on a
-                        // row the pointer was only passing over. Closing lives
-                        // on the tab, which is the thing being closed.
-                        None => None,
-                    }
+                    None
                 };
 
                 this.when_some(contextual_action, |this, action| this.action_slot(action))
@@ -6851,8 +6278,6 @@ impl Sidebar {
                     if is_restoring {
                         return;
                     }
-                    // Opening an archived thread unarchives it (restoring its
-                    // worktrees if they were snapshotted away).
                     if is_archived {
                         this.open_thread_from_archive(entry.metadata.clone(), window, cx);
                         return;
@@ -6883,19 +6308,12 @@ impl Sidebar {
                 })
             });
 
-        // Every row gets a menu, drafts included. With no tab bar there is
-        // nothing else to right-click, so a row without one is a thread with
-        // no way to be closed or archived — which is what a draft row was.
-        // The entries a session is needed for are the ones that skip.
         let session_id = thread.metadata.session_id.clone();
 
         let context_menu_id = SharedString::from(format!("thread-context-menu-{}", ix));
         let sidebar = cx.weak_entity();
 
         let active_workspace = self.active_workspace(cx);
-        // Discarding a draft needs the row's workspace whether it is open or
-        // closed, so the enum is kept beside the handle the rest of the menu
-        // uses.
         let thread_workspace = match &thread_workspace {
             ThreadEntryWorkspace::Open(workspace) => Some(workspace.clone()),
             ThreadEntryWorkspace::Closed { .. } => None,
@@ -6904,17 +6322,11 @@ impl Sidebar {
         let is_zed_thread = thread.metadata.agent_id.as_ref() == ZED_AGENT_ID.as_ref();
         let can_open_as_markdown = thread.is_live || is_zed_thread;
 
-        // A row that stands in for its own worktree carries the worktree's own
-        // actions: starting another thread in it, and — through
-        // `thread_row_disposals` — an archive that takes the worktree with
-        // the thread.
         let solo_workspace = thread
             .solo_worktree
             .as_ref()
             .and_then(|solo| solo.workspace.clone());
 
-        // Hovering a row says where the thread lives: worktree and branch,
-        // with the full path underneath.
         let hover_worktrees: Vec<(SharedString, SharedString)> = thread
             .worktrees
             .iter()
@@ -6956,8 +6368,6 @@ impl Sidebar {
                     .child(thread_item)
             })
             .menu({
-                // Only a thread that is open has a tab to close; the same test
-                // the row's drag uses.
                 let disposals = self.thread_row_disposals(ix, thread);
                 let thread_id = thread.metadata.thread_id;
                 let markdown_title = Some(thread.metadata.display_title());
@@ -6975,9 +6385,6 @@ impl Sidebar {
                     let menu_metadata = menu_entry.metadata.clone();
                     let solo_workspace = solo_workspace.clone();
                     ContextMenu::build(_window, cx, move |mut menu, _window, _cx| {
-                        // A thread of its own worktree has no header to carry
-                        // the worktree's +, so the row carries it: this is an
-                        // action on the worktree, which is why it reads first.
                         if let Some(workspace) = solo_workspace.clone() {
                             menu = menu.entry("New Thread in This Worktree", None, {
                                 let sidebar = sidebar.clone();
@@ -6991,25 +6398,23 @@ impl Sidebar {
                             });
                         }
 
-                        // A draft's title is whatever has been typed into
-                        // it so far, so there is nothing to rename yet.
                         if !is_draft {
                             menu = menu.entry("Rename Title", None, {
-                            let sidebar = sidebar.clone();
-                            let rename_title = rename_title.clone();
-                            move |window, cx| {
-                                sidebar
-                                    .update(cx, |sidebar, cx| {
-                                        sidebar.start_renaming_entry(
-                                            ix,
-                                            RenameTarget::Thread(thread_id),
-                                            rename_title.clone(),
-                                            window,
-                                            cx,
-                                        );
-                                    })
-                                    .ok();
-                            }
+                                let sidebar = sidebar.clone();
+                                let rename_title = rename_title.clone();
+                                move |window, cx| {
+                                    sidebar
+                                        .update(cx, |sidebar, cx| {
+                                            sidebar.start_renaming_entry(
+                                                ix,
+                                                RenameTarget::Thread(thread_id),
+                                                rename_title.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        })
+                                        .ok();
+                                }
                             });
                         }
 
@@ -7141,9 +6546,6 @@ impl Sidebar {
             })
             .into_any_element();
 
-        // Active rows are draggable: the drag moves the thread's tab, and the
-        // row moves because the tab did. The wrapper is what carries it, so the
-        // row's own click, hover and context menu are untouched.
         let row = match self.draggable_thread_row(ix, thread) {
             Some(dragged) => {
                 let thread_id = dragged.thread_id;
@@ -7151,17 +6553,12 @@ impl Sidebar {
                     .id(("thread-row-drag", ix))
                     .on_drag(dragged, |row, _, _, cx| cx.new(|_| row.clone()))
                     .drag_over::<DraggedThreadRow>(move |style, dragged, _, cx| {
-                        // Every row but the dragged one offers to take the drop,
-                        // including the rows of other worktrees: what lands there
-                        // is the whole group, and a row that lit up and then
-                        // swallowed the drop is what read as the drag breaking.
+                        // Other worktrees' rows too: the whole group lands there.
                         if dragged.thread_id == thread_id {
                             return style;
                         }
                         let color = cx.theme().colors();
                         let style = style.bg(color.drop_target_background);
-                        // The edge the row would land on: a row dragged from
-                        // below lands above this one, and the reverse.
                         match ix.cmp(&dragged.ix) {
                             Ordering::Less => style.border_t_2(),
                             Ordering::Greater => style.border_b_2(),
@@ -7174,9 +6571,6 @@ impl Sidebar {
                             this.handle_thread_row_drop(dragged, ix, window, cx);
                         }),
                     )
-                    // Middle-click closes, the way it did on the tab this row
-                    // replaced. Only a draggable row is an open one, which is
-                    // the only kind with a tab to close.
                     .on_mouse_down(
                         gpui::MouseButton::Middle,
                         cx.listener(move |this, _, window, cx| {
@@ -7190,9 +6584,6 @@ impl Sidebar {
             None => row,
         };
 
-        // A header used to set one worktree apart from the next. A row that
-        // stands in for its worktree keeps that gap itself, so a list of solo
-        // worktrees does not read as one undivided run of threads.
         if thread.solo_worktree.is_some() {
             return div().pt_2().child(row).into_any_element();
         }
@@ -7208,6 +6599,7 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = ElementId::from(format!("terminal-{}", terminal.metadata.terminal_id));
+        let timestamp = format_history_entry_timestamp(terminal.metadata.created_at);
         let is_hovered = self.hovered_thread_index == Some(ix);
         let color = cx.theme().colors();
         let sidebar_bg = color.surface_background;
@@ -7216,8 +6608,6 @@ impl Sidebar {
         let metadata = terminal.metadata.clone();
         let workspace = terminal.workspace.clone();
         let focus_handle = self.focus_handle.clone();
-        // Rows never show the workspace name; the branch chip and title
-        // identify the worktree.
         let mut worktrees = terminal.worktrees.clone();
         for worktree in &mut worktrees {
             worktree.worktree_name = None;
@@ -7240,7 +6630,7 @@ impl Sidebar {
             .when_some(icon_char, |this, icon_char| this.icon_char(icon_char))
             .is_remote(is_remote)
             .worktrees(worktrees)
-            .timestamp(format_history_entry_timestamp(terminal.metadata.created_at))
+            .timestamp(timestamp)
             .notified(terminal.has_notification)
             .highlight_positions(highlight_positions)
             .selected(is_active)
@@ -7375,8 +6765,6 @@ impl Sidebar {
         self.create_new_thread(workspace, window, cx);
     }
 
-    /// Starts a draft pinned to `workspace`'s worktree (the sidebar's
-    /// per-worktree +), rather than the default new worktree.
     fn new_thread_in_worktree(
         &mut self,
         workspace: &Entity<Workspace>,
@@ -7404,8 +6792,7 @@ impl Sidebar {
             multi_workspace.activate(workspace.clone(), None, window, cx);
         });
 
-        // A freshly opened workspace loads its agent panel asynchronously;
-        // park the request and fulfill it from the `PanelAdded` handler.
+        // Fulfilled from the `PanelAdded` handler.
         if workspace.read(cx).panel::<AgentPanel>(cx).is_none() {
             self.pending_new_thread_workspace = Some(workspace.downgrade());
             return;
@@ -7693,8 +7080,6 @@ impl Sidebar {
             .when(traffic_lights, |this| {
                 this.child(Divider::vertical().color(ui::DividerColor::Border))
             })
-            // The toggle is the only way back out of the sidebar, so it stays
-            // even when there is nothing to list.
             .child(
                 IconButton::new(
                     "toggle-workspace-sidebar",
@@ -7713,9 +7098,7 @@ impl Sidebar {
                         cx,
                     )
                 })
-                // Dispatched as an action: updating the MultiWorkspace
-                // from inside this listener would re-enter the sidebar
-                // entity and panic.
+                // Updating the MultiWorkspace from here would re-enter the sidebar.
                 .on_click(|_, window, cx| {
                     window.dispatch_action(workspace::ToggleWorkspaceSidebar.boxed_clone(), cx);
                 }),
