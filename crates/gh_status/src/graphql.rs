@@ -1,17 +1,6 @@
-//! The one batched question, in place of a request per watched thing.
-//!
-//! Every watched branch and pull request used to be its own `gh` invocation
-//! and so its own GitHub request: a session with a hundred of them spent a
-//! hundred of an hourly five thousand on every poll, which is how the budget
-//! went. GraphQL answers about as many as are asked in one request, so one
-//! query carries an alias per subject, grouped under a `repository` alias
-//! each, and `rateLimit` beside them says what the poll actually cost rather
-//! than leaving the count to be inferred from invocations.
-//!
-//! Everything here is pure: building the query text and reading the answer
-//! back. What runs `gh` and what decides who to ask about live in
-//! `gh_status.rs`, and the answer is lowered to the same [`GhPr`] the
-//! `gh pr list` path produces, so the chip semantics have one home.
+//! The batched `gh api graphql` poll: one alias per subject, grouped under a `repository` alias
+//! each. The answer is lowered to the [`GhPr`] the `gh pr list` path produces, so what a check
+//! amounts to is decided in one place.
 
 use std::fmt::Write as _;
 
@@ -21,21 +10,12 @@ use serde::Deserialize;
 
 use crate::{GhCheck, GhPr};
 
-/// How many pull requests one branch alias asks for.
-///
-/// This is the number of pull requests that share a head branch, which is one
-/// in almost every case and a handful in the worst; `gh pr list` defaults to
-/// thirty, and asking for thirty per branch across a batch of fifty is a node
-/// count worth not spending. Surfaces deduplicate by URL anyway.
+/// PRs sharing one head branch; `gh pr list` defaults to thirty, which is a node count worth not
+/// spending across a batch of fifty.
 const PRS_PER_BRANCH: usize = 10;
 
-/// How many of a commit's checks one alias asks for. Zed's own pull requests
-/// carry a few dozen; the hover card lists far fewer than that and counts the
-/// rest.
 const CHECKS_PER_PR: usize = 100;
 
-/// The repository a question is about. GraphQL has no notion of "the
-/// repository this directory is in", so the batched query has to name it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct RepoId {
     pub owner: String,
@@ -43,8 +23,7 @@ pub(crate) struct RepoId {
 }
 
 impl RepoId {
-    /// Reads the `owner/name` spelling `gh repo view` reports and a PR mention
-    /// in a thread carries.
+    /// Reads `owner/name`, as `gh repo view` reports it and a PR mention carries it.
     pub(crate) fn parse(name_with_owner: &str) -> Result<Self> {
         let trimmed = name_with_owner.trim();
         let Some((owner, name)) = trimmed.split_once('/') else {
@@ -58,32 +37,16 @@ impl RepoId {
             name: name.to_string(),
         })
     }
-
-    /// Where a pull request of this repository lives, for an answer that
-    /// reported a number without a URL.
-    fn pr_url(&self, number: u64) -> String {
-        format!(
-            "https://github.com/{}/{}/pull/{number}",
-            self.owner, self.name
-        )
-    }
 }
 
-/// What one alias asks about.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Ask {
-    /// Every pull request whose head is this branch. This is how a number is
-    /// discovered in the first place.
     Branch(String),
-    /// One pull request, by number.
     Number(u64),
 }
 
 impl Ask {
-    /// The alias this ask's answer comes back on. The prefix says which shape
-    /// to expect — a connection for a branch, a single pull request for a
-    /// number — and the index keeps it unique even when two watches land on
-    /// the same repository and number.
+    /// The index keeps the alias unique when two watches land on the same repository and number.
     pub(crate) fn alias(&self, index: usize) -> String {
         match self {
             Ask::Branch(_) => format!("b{index}"),
@@ -92,22 +55,18 @@ impl Ask {
     }
 }
 
-/// Builds the one query asking about every `(repository, alias, ask)` given.
-///
-/// Repositories are grouped and emitted in sorted order so the same batch
-/// always produces the same query text, which is what makes this testable.
-pub(crate) fn build_query(asks: &[(RepoId, String, Ask)]) -> String {
-    let mut by_repo: Vec<(&RepoId, Vec<(&String, &Ask)>)> = Vec::new();
-    for (repo, alias, ask) in asks {
-        match by_repo.iter_mut().find(|(known, _)| *known == repo) {
-            Some((_, subjects)) => subjects.push((alias, ask)),
-            None => by_repo.push((repo, vec![(alias, ask)])),
-        }
-    }
-    by_repo.sort_by_key(|(repo, _)| *repo);
+/// Repository aliases are positional (`r0`, `r1`, ...), so building the query and reading the
+/// answer back both number repositories in this order.
+fn sorted_repos(asks: &[(RepoId, String, Ask)]) -> Vec<&RepoId> {
+    let mut repos = asks.iter().map(|(repo, _, _)| repo).collect::<Vec<_>>();
+    repos.sort();
+    repos.dedup();
+    repos
+}
 
+pub(crate) fn build_query(asks: &[(RepoId, String, Ask)]) -> String {
     let mut query = String::from("query {\n");
-    for (index, (repo, subjects)) in by_repo.iter().enumerate() {
+    for (index, repo) in sorted_repos(asks).into_iter().enumerate() {
         writeln!(
             query,
             "  r{index}: repository(owner: \"{}\", name: \"{}\") {{",
@@ -115,7 +74,7 @@ pub(crate) fn build_query(asks: &[(RepoId, String, Ask)]) -> String {
             escape(&repo.name)
         )
         .ok();
-        for (alias, ask) in subjects {
+        for (_, alias, ask) in asks.iter().filter(|(other, _, _)| other == repo) {
             match ask {
                 Ask::Branch(branch) => {
                     writeln!(
@@ -127,24 +86,24 @@ pub(crate) fn build_query(asks: &[(RepoId, String, Ask)]) -> String {
                     .ok();
                 }
                 Ask::Number(number) => {
-                    writeln!(query, "    {alias}: pullRequest(number: {number}) {{ ...pr }}").ok();
+                    writeln!(
+                        query,
+                        "    {alias}: pullRequest(number: {number}) {{ ...pr }}"
+                    )
+                    .ok();
                 }
             }
         }
         query.push_str("  }\n");
     }
-    // Free to ask for, and it is the only thing that says what the poll spent.
     query.push_str("  rateLimit { cost remaining resetAt }\n}\n");
-    // `$checks` is spelled as a GraphQL variable on purpose: if this
-    // substitution is ever lost, GitHub refuses the query by name rather than
+    // Spelled as a GraphQL variable so that a lost substitution is refused by name rather than
     // quietly asking for a different number of checks.
     query.push_str(&PR_FRAGMENT.replace("$checks", &CHECKS_PER_PR.to_string()));
     query
 }
 
-/// The fields every alias wants, named once. A fragment rather than a hundred
-/// copies: the query goes out on the command line, and the copies are what
-/// would make its size the thing that broke.
+/// A fragment rather than a copy per alias: the query goes out on the command line.
 const PR_FRAGMENT: &str = "\
 fragment pr on PullRequest {
   number
@@ -181,9 +140,6 @@ fragment pr on PullRequest {
 }
 ";
 
-/// A GraphQL string literal's escaping. Branch names cannot hold a quote and
-/// a repository name cannot hold anything interesting, but a query that is
-/// merely malformed costs a whole poll, so neither is taken on trust.
 fn escape(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for ch in value.chars() {
@@ -199,41 +155,30 @@ fn escape(value: &str) -> String {
     escaped
 }
 
-/// What the batched answer said about one alias.
 #[derive(Debug)]
 pub(crate) enum Answer {
-    /// The pull requests this alias asked about. An empty list is an answer:
-    /// the branch has no pull request.
+    /// An empty list is an answer: the branch has no pull request.
     Prs(Vec<GhPr>),
     /// GitHub answered, and there is no such pull request.
     Missing,
-    /// Nothing usable came back for this alias — its repository was null, the
-    /// alias was absent, or its own fields would not parse. The caller asks
-    /// again the old way rather than blanking a chip on it.
+    /// Nothing usable came back, so the caller asks again per subject rather than blanking a chip.
     Unanswered(String),
 }
 
-/// Everything one batched answer carries.
 #[derive(Debug, Default)]
 pub(crate) struct Batch {
-    /// One entry per alias that was asked about, whatever came back.
     pub answers: HashMap<String, Answer>,
     pub rate_limit: Option<RateLimit>,
-    /// The query-level errors GitHub reported, if any. Partial data is still
-    /// used: one unreadable repository should not cost every other alias its
-    /// answer.
+    /// Query-level errors GitHub reported alongside partial data.
     pub errors: Vec<String>,
 }
 
-/// What the poll cost and what is left, straight from GitHub rather than
-/// inferred from how many invocations this app made.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub(crate) struct RateLimit {
     #[serde(default)]
     pub cost: u32,
     #[serde(default)]
     pub remaining: u32,
-    /// When the budget refills, as GitHub's own RFC 3339 timestamp.
     #[serde(rename = "resetAt", default)]
     pub reset_at: Option<String>,
 }
@@ -256,19 +201,13 @@ struct ResponseError {
 struct ResponseData {
     #[serde(rename = "rateLimit", default)]
     rate_limit: Option<RateLimit>,
-    /// Everything else in `data` is a repository alias holding that
-    /// repository's own subject aliases. A repository `gh` cannot see comes
-    /// back as a null.
+    /// A repository `gh` cannot see comes back as null.
     #[serde(flatten)]
     repositories: HashMap<String, Option<HashMap<String, serde_json::Value>>>,
 }
 
-/// Reads the answer back, against the aliases that were asked for.
-///
-/// Driven by the asks rather than by what the response happens to hold, so an
-/// alias GitHub left out is reported as unanswered instead of silently
-/// vanishing — a missing answer has to become a question asked the old way,
-/// and nothing else here would notice it was missing.
+/// Driven by the asks rather than by the response, so an alias GitHub left out is reported as
+/// unanswered instead of silently vanishing.
 pub(crate) fn parse_batch(json: &str, asks: &[(RepoId, String, Ask)]) -> Result<Batch> {
     let response: Response =
         serde_json::from_str(json).context("failed to parse gh api graphql output")?;
@@ -285,41 +224,23 @@ pub(crate) fn parse_batch(json: &str, asks: &[(RepoId, String, Ask)]) -> Result<
         bail!("gh api graphql answered without data");
     };
 
-    // The repository aliases are positional: `build_query` sorts the
-    // repositories and numbers them, so the same ordering finds each ask's
-    // own repository again.
-    let mut repos: Vec<&RepoId> = Vec::new();
-    for (repo, _, _) in asks {
-        if !repos.contains(&repo) {
-            repos.push(repo);
-        }
-    }
-    repos.sort();
-
+    let repos = sorted_repos(asks);
     let mut answers = HashMap::default();
     for (repo, alias, ask) in asks {
-        let repo_index = repos.iter().position(|known| known == &repo);
-        let subjects = repo_index
+        let subjects = repos
+            .iter()
+            .position(|known| *known == repo)
             .and_then(|index| data.repositories.get(&format!("r{index}")))
             .and_then(|repo| repo.as_ref());
-        let Some(subjects) = subjects else {
-            answers.insert(
-                alias.clone(),
-                Answer::Unanswered(format!(
-                    "{}/{} was not in the answer",
-                    repo.owner, repo.name
-                )),
-            );
-            continue;
+        let answer = match subjects.map(|subjects| subjects.get(alias)) {
+            None => Answer::Unanswered(format!(
+                "{}/{} was not in the answer",
+                repo.owner, repo.name
+            )),
+            Some(None) => Answer::Unanswered(format!("alias {alias} was not in the answer")),
+            Some(Some(value)) => read_answer(value, repo, ask),
         };
-        let Some(value) = subjects.get(alias) else {
-            answers.insert(
-                alias.clone(),
-                Answer::Unanswered(format!("alias {alias} was not in the answer")),
-            );
-            continue;
-        };
-        answers.insert(alias.clone(), read_answer(value, repo, ask));
+        answers.insert(alias.clone(), answer);
     }
 
     Ok(Batch {
@@ -356,26 +277,9 @@ struct Connection<T> {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct PrNode {
-    number: u64,
-    /// Asked for on every alias, so absent only from an answer that left it
-    /// out; the number and the repository are enough to say where it lives.
-    #[serde(default)]
-    url: Option<String>,
-    #[serde(default)]
-    title: Option<String>,
-    /// Load-bearing: `OPEN`, `CLOSED`, `MERGED`. An answer without it is one
-    /// to ask again rather than guess at.
-    state: String,
-    #[serde(default)]
-    is_draft: bool,
-    #[serde(default)]
-    review_decision: Option<String>,
-    #[serde(default)]
-    mergeable: Option<String>,
-    #[serde(default)]
-    merge_state_status: Option<String>,
+    #[serde(flatten)]
+    pr: GhPr,
     #[serde(default)]
     commits: Option<Connection<CommitNode>>,
 }
@@ -401,135 +305,57 @@ struct Rollup {
     contexts: Option<Connection<ContextNode>>,
 }
 
-/// One entry of the check rollup. GitHub reports two shapes under one list and
-/// says which by `__typename`: a check run carries a job name, a workflow and
-/// a conclusion, a commit status carries a context and a state.
+/// A check run or a commit status. A shape GitHub adds later reads as a check with nothing set,
+/// which is pending, so it cannot make a PR look greener than it is.
 #[derive(Debug, Deserialize)]
-#[serde(tag = "__typename")]
-enum ContextNode {
-    CheckRun {
-        #[serde(default)]
-        name: Option<String>,
-        #[serde(default)]
-        conclusion: Option<String>,
-        #[serde(default, rename = "checkSuite")]
-        check_suite: Option<CheckSuite>,
-    },
-    StatusContext {
-        #[serde(default)]
-        context: Option<String>,
-        #[serde(default)]
-        state: Option<String>,
-    },
-    /// A shape GitHub has added since. Kept rather than dropped: an entry
-    /// nothing can read is still an entry that has not passed, and dropping it
-    /// would report a pull request greener than it is.
-    #[serde(other)]
-    Unknown,
-}
-
-#[derive(Debug, Deserialize)]
-struct CheckSuite {
-    #[serde(default, rename = "workflowRun")]
-    workflow_run: Option<WorkflowRun>,
-}
-
-#[derive(Debug, Deserialize)]
-struct WorkflowRun {
+#[serde(rename_all = "camelCase")]
+struct ContextNode {
+    #[serde(flatten)]
+    check: GhCheck,
     #[serde(default)]
-    workflow: Option<Workflow>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Workflow {
-    #[serde(default)]
-    name: Option<String>,
-}
-
-impl ContextNode {
-    /// Lowered to the shape the `gh pr list` path produces, which is where
-    /// every judgement about what a check amounts to already lives.
-    fn into_gh_check(self) -> GhCheck {
-        match self {
-            ContextNode::CheckRun {
-                name,
-                conclusion,
-                check_suite,
-            } => GhCheck {
-                state: None,
-                conclusion,
-                name,
-                workflow_name: check_suite
-                    .and_then(|suite| suite.workflow_run)
-                    .and_then(|run| run.workflow)
-                    .and_then(|workflow| workflow.name),
-                context: None,
-            },
-            ContextNode::StatusContext { context, state } => GhCheck {
-                state,
-                conclusion: None,
-                name: None,
-                workflow_name: None,
-                context,
-            },
-            // Nothing known about it, which `GhCheck::outcome` reads as
-            // pending — the same bias the rest of this file takes.
-            ContextNode::Unknown => GhCheck {
-                state: None,
-                conclusion: None,
-                name: None,
-                workflow_name: None,
-                context: None,
-            },
-        }
-    }
+    check_suite: Option<serde_json::Value>,
 }
 
 impl PrNode {
     fn into_gh_pr(self, repo: &RepoId) -> GhPr {
+        let mut pr = self.pr;
+        if pr.url.is_empty() {
+            pr.url = format!(
+                "https://github.com/{}/{}/pull/{}",
+                repo.owner, repo.name, pr.number
+            );
+        }
         let rollup = self
             .commits
             .and_then(|commits| commits.nodes.into_iter().next())
             .and_then(|node| node.commit)
             .and_then(|commit| commit.status_check_rollup);
-        // A rollup that is absent is not an empty one: the distinction is what
-        // tells "this pull request has no CI" from "nobody has said yet", and
-        // the `gh pr list` path draws it the same way.
-        let status_check_rollup = rollup.map(|rollup| match rollup.contexts {
+        pr.status_check_rollup = rollup.map(|rollup| match rollup.contexts {
             Some(contexts) => contexts
                 .nodes
                 .into_iter()
-                .map(ContextNode::into_gh_check)
+                .map(|node| GhCheck {
+                    workflow_name: node
+                        .check_suite
+                        .as_ref()
+                        .and_then(|suite| suite.pointer("/workflowRun/workflow/name"))
+                        .and_then(|name| name.as_str())
+                        .map(str::to_string),
+                    ..node.check
+                })
                 .collect(),
-            // A rollup that reported its own state and no contexts still says
-            // whether CI passed. Read it as the one unnamed check it amounts
-            // to rather than as a pull request without CI.
+            // A rollup that reports only its own state is one unnamed check, not a PR without CI.
             None => rollup
                 .state
                 .filter(|state| !state.is_empty())
                 .map(|state| GhCheck {
                     state: Some(state),
-                    conclusion: None,
-                    name: None,
-                    workflow_name: None,
-                    context: None,
+                    ..GhCheck::default()
                 })
                 .into_iter()
                 .collect(),
         });
-        GhPr {
-            number: self.number,
-            url: self
-                .url
-                .unwrap_or_else(|| repo.pr_url(self.number)),
-            title: self.title.unwrap_or_default(),
-            state: self.state,
-            is_draft: self.is_draft,
-            review_decision: self.review_decision,
-            status_check_rollup,
-            mergeable: self.mergeable,
-            merge_state_status: self.merge_state_status,
-        }
+        pr
     }
 }
 
@@ -538,13 +364,7 @@ mod tests {
     use super::*;
     use crate::{ChecksState, MergeState, PrState, PrStatus, ReviewState};
 
-    /// The response the Work queue entry carries, from Arthur's own `gh`,
-    /// under the alias names [`build_query`] generates: `r0` for the
-    /// repository it asked about, `p0` and `p1` for the two pull requests it
-    /// asked about by number. Everything inside those two pull requests is the
-    /// entry's own, down to the bytes — `a`, an open pull request with CI
-    /// running, and `b`, a merged one whose rollup reports a state and no
-    /// contexts at all.
+    /// A real `gh api graphql` answer, re-keyed to the aliases `build_query` generates.
     const SAMPLE: &str = r#"{
  "data": {
   "r0": {
@@ -698,8 +518,6 @@ mod tests {
         let mut batch = parse_batch(SAMPLE, &asks).expect("the entry's own answer parses");
         assert!(batch.errors.is_empty());
 
-        // One query, two pull requests, and GitHub charged one for it: the
-        // whole reason the entry asks for this.
         assert_eq!(
             batch.rate_limit,
             Some(RateLimit {
@@ -720,25 +538,16 @@ mod tests {
             "Remove descriptive comments in default settings"
         );
         assert_eq!(open.state, PrState::Open);
-        // Two checks queued and two in progress against five skipped and one
-        // successful commit status: running, which is what the rollup's own
-        // `PENDING` says too.
         assert_eq!(open.checks, ChecksState::Pending);
         assert_eq!(open.review, ReviewState::None);
-        // Mergeable and blocked at once, which is the pair of fields this
-        // chip exists to read together.
         assert_eq!(open.merge, MergeState::Blocked);
         assert!(open.failing_checks.is_empty());
 
         let merged = only_pr(batch.answers.remove("p1").expect("the merged pull request"));
         assert_eq!(merged.number, 65043);
         assert_eq!(merged.state, PrState::Merged);
-        // A rollup that reported its own state and no contexts still says CI
-        // passed; reading it as a pull request without CI would lose that.
         assert_eq!(merged.checks, ChecksState::Passing);
         assert_eq!(merged.merge, MergeState::Unknown);
-        // Nothing in the answer said where it lives, so the repository and
-        // the number say it instead.
         assert_eq!(
             merged.url.as_ref(),
             "https://github.com/zed-industries/zed/pull/65043"
@@ -746,8 +555,6 @@ mod tests {
         assert_eq!(merged.title.as_ref(), "");
     }
 
-    /// The workflow name is why the query reaches through `checkSuite` at all:
-    /// without it a hover card shows two identical `clippy` lines.
     #[test]
     fn a_check_run_is_named_by_its_workflow_and_its_job() {
         let asks = vec![(zed(), "p0".to_string(), Ask::Number(65077))];
@@ -757,18 +564,17 @@ mod tests {
         };
         let checks = prs[0].status_check_rollup.as_ref().expect("the rollup");
         assert_eq!(checks.len(), 10);
-        assert_eq!(checks[0].label().as_deref(), Some("Community PR Board / route-pr"));
-        // A job whose workflow carries the same name says it once.
+        assert_eq!(
+            checks[0].label().as_deref(),
+            Some("Community PR Board / route-pr")
+        );
         assert_eq!(checks[1].label().as_deref(), Some("danger"));
-        // A commit status has a context in place of both.
         assert_eq!(
             checks[9].label().as_deref(),
             Some("verification/cla-signed")
         );
     }
 
-    /// A branch alias answers with a connection rather than a pull request,
-    /// and an empty one is an answer: the branch has no pull request.
     #[test]
     fn a_branch_alias_answers_with_every_pull_request_on_it() {
         let asks = vec![
@@ -790,7 +596,6 @@ mod tests {
             prs.iter().map(|pr| pr.number).collect::<Vec<_>>(),
             vec![7, 8]
         );
-        // No rollup at all is not an empty rollup: nobody has said yet.
         assert_eq!(
             PrStatus::from_gh(prs.into_iter().next().unwrap()).checks,
             ChecksState::Unknown
@@ -801,7 +606,6 @@ mod tests {
         assert!(none.is_empty());
     }
 
-    /// What has to become a question asked the old way, and what must not.
     #[test]
     fn an_answer_that_says_nothing_is_told_from_one_that_says_no() {
         let asks = vec![
@@ -809,8 +613,6 @@ mod tests {
             (zed(), "p1".to_string(), Ask::Number(2)),
             (zed(), "p2".to_string(), Ask::Number(3)),
             (
-                // Sorts after `zed`, so it is the second repository block and
-                // the one that comes back null below.
                 RepoId {
                     owner: "zed-industries".into(),
                     name: "zed-private".into(),
@@ -819,8 +621,6 @@ mod tests {
                 Ask::Number(4),
             ),
         ];
-        // `p0` answered, `p1` is explicitly no such pull request, `p2` was
-        // left out of the answer, and `p3`'s whole repository came back null.
         let json = r#"{"data": {
             "r0": {"p0": {"number": 1, "url": "u", "title": "t", "state": "OPEN"}, "p1": null},
             "r1": null
@@ -831,10 +631,7 @@ mod tests {
             vec!["Could not resolve to a Repository".to_string()]
         );
         assert!(matches!(batch.answers.remove("p0"), Some(Answer::Prs(_))));
-        // GitHub answered. Asking again one at a time would only collect the
-        // same nothing.
         assert!(matches!(batch.answers.remove("p1"), Some(Answer::Missing)));
-        // These two have to be asked again, and only these two.
         assert!(matches!(
             batch.answers.remove("p2"),
             Some(Answer::Unanswered(_))
@@ -845,8 +642,6 @@ mod tests {
         ));
     }
 
-    /// A pull request without the one field that cannot be guessed at is a
-    /// question to ask again, not a chip to draw from a default.
     #[test]
     fn a_pull_request_with_no_state_is_unanswered_rather_than_assumed_open() {
         let asks = vec![(zed(), "p0".to_string(), Ask::Number(1))];
@@ -858,8 +653,6 @@ mod tests {
         ));
     }
 
-    /// A shape GitHub adds later must not make a pull request read greener
-    /// than it is.
     #[test]
     fn a_check_of_an_unknown_shape_still_counts_as_unfinished() {
         let asks = vec![(zed(), "p0".to_string(), Ask::Number(1))];
@@ -873,11 +666,12 @@ mod tests {
             }}}]}
         }}}}"#;
         let mut batch = parse_batch(json, &asks).unwrap();
-        assert_eq!(only_pr(batch.answers.remove("p0").unwrap()).checks, ChecksState::Pending);
+        assert_eq!(
+            only_pr(batch.answers.remove("p0").unwrap()).checks,
+            ChecksState::Pending
+        );
     }
 
-    /// Neither a refusal nor an answer: nothing to read at all, which is the
-    /// whole batch's failure and sends every subject back the old way.
     #[test]
     fn an_answer_with_no_data_is_the_whole_querys_failure() {
         let asks = vec![(zed(), "p0".to_string(), Ask::Number(1))];
@@ -901,13 +695,9 @@ mod tests {
         ];
         let query = build_query(&asks);
 
-        // One repository block each, sorted, so the same batch always
-        // produces the same query — and so reading the answer back can find
-        // each subject's repository by the same ordering.
         assert_eq!(query.matches("repository(owner:").count(), 2);
         assert!(query.contains("r0: repository(owner: \"arthurbrussee\", name: \"zed\")"));
         assert!(query.contains("r1: repository(owner: \"zed-industries\", name: \"zed\")"));
-        // The two subjects of one repository share its block.
         let zed_block = query
             .split("r1: repository")
             .nth(1)
@@ -916,11 +706,7 @@ mod tests {
         assert!(zed_block.contains("p2: pullRequest(number: 65077)"));
         assert!(query.contains("p1: pullRequest(number: 42)"));
 
-        // What the poll cost, which is the other half of the entry.
         assert!(query.contains("rateLimit { cost remaining resetAt }"));
-        // The fields are named once however many aliases ask for them, and
-        // the check limit is substituted rather than left as a variable
-        // nothing declares.
         assert_eq!(query.matches("fragment pr on PullRequest").count(), 1);
         assert!(query.contains("contexts(first: 100)"));
         assert!(!query.contains("$checks"));
@@ -928,11 +714,7 @@ mod tests {
 
     #[test]
     fn a_branch_name_cannot_end_the_string_it_sits_in() {
-        let asks = vec![(
-            zed(),
-            "b0".to_string(),
-            Ask::Branch("od\"d\\name".into()),
-        )];
+        let asks = vec![(zed(), "b0".to_string(), Ask::Branch("od\"d\\name".into()))];
         let query = build_query(&asks);
         assert!(query.contains(r#"headRefName: "od\"d\\name""#));
     }
