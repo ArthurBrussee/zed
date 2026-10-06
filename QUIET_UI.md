@@ -181,6 +181,22 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**A long sidebar title runs under the activity pill.**
+
+Arthur's screenshot (2026-10-06): "Backdrops auto/fixed dis… ce model". The fade sits mid-title
+and the rest of the title ("ce model") is painted over the pill. In `ThreadItem::render`
+(`crates/ui/src/components/ai/thread_item.rs`), the title box (`id("content")`, `relative`,
+`h_full`, `min_w_0`, `flex_1`) has no `overflow_hidden`. In an opaque window the label is
+deliberately not truncated (`.when(!opaque_window, |label| label.truncate())`), so the fade
+(10-04 moved it inside this box, `right(0)`) is the only thing hiding the end of a long title.
+The label's text overflows the box to the right, under the status slot. The fade covers the
+box's last 64px, and everything past the box stays visible.
+
+Fix: clip the title box (`overflow_hidden`) so the label ends at the box's edge, with the fade
+dissolving its last 64px, and keep the status slot `flex_none` so the box ends where the pill
+begins. Test: a row with a title much wider than the sidebar and a running pill. The title's
+painted bounds end at or before the pill's left edge, in an opaque and a transparent window.
+
 **Command chips: more room for the label, and no blank space inside or between them.**
 
 Arthur, 2026-10-06: too many command chips are cut off, and there is a strange amount of
