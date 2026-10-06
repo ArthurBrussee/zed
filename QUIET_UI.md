@@ -10,6 +10,20 @@ stands**), what to build next (**Work queue**), what still needs its tests run (
 queue**), and the rebase procedure plus the last ten nights (**Rebase log**). Function and file
 names are the stable anchors; line numbers drift with every rebase and are not used.
 
+## Never bail on time (from 2026-10-06)
+
+Arthur's rule: **the clock is never a reason to leave work undone.** The 00:45 build is not a
+deadline. A branch pushed after it starts is simply bundled by the next build, which costs a day
+of latency and nothing else. Build every item in the queue, gate it, and push when the gate is
+green, however late that is.
+
+The one deadline is the gate: a branch that has not passed `cargo test` and `./script/clippy`
+never gets pushed, because there is no way to compile a fix from the laptop. So the rule is
+"finish, then gate, then push", and if that runs past the build, say so in the report and push
+anyway. On 2026-10-05 the routine stopped at three of five items "to leave time to gate before
+the build"; Arthur had it finish the other two the same night, and both landed in the 00:45 build
+regardless.
+
 ## Upstream first (from 2026-10-01)
 
 The fork stands at +45.8k / -11.4k lines across 109 files against upstream (+40.9k / -9.4k
@@ -160,9 +174,9 @@ laptop any more.
 
 The nightly routine builds them. It reads the code first, decides what the fix actually is, and
 where an entry disagrees with the code the code wins. An entry it decides is a bad idea once it
-can see the code gets said so in that night's report rather than built. Items are built in order
-for as much of the night as the runway allows; what does not fit stays here for tomorrow, and what
-does is removed as it lands.
+can see the code gets said so in that night's report rather than built. Items are built in order,
+all of them, and each is removed as it lands; the build time is not a reason to stop (see **Never
+bail on time**).
 
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
