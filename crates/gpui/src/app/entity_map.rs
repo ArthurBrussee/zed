@@ -55,10 +55,7 @@ impl Display for EntityId {
 
 pub(crate) struct EntityMap {
     entities: SecondaryMap<EntityId, Box<dyn Any>>,
-    /// The name of every entity type ever inserted. A count taken from the
-    /// map's `TypeId`s can say nothing about what it is looking at, because
-    /// there is no way back from a `TypeId` to a name, so the name is recorded
-    /// the first time the type is seen.
+    /// A `TypeId` can't be turned back into a name, so names are recorded on insert.
     type_names: FxHashMap<TypeId, &'static str>,
     pub accessed_entities: RefCell<FxHashSet<EntityId>>,
     ref_counts: Arc<RwLock<EntityRefCounts>>,
@@ -72,9 +69,7 @@ pub(crate) struct EntityRefCounts {
     leak_detector: LeakDetector,
 }
 
-/// A type's name without its module path, which is what makes a line of twenty
-/// of them readable. A generic type keeps its full name: both halves of it are
-/// long, and the last segment alone would not say which one it is.
+/// Generic types keep their full name, since the last segment alone would be ambiguous.
 fn short_type_name(name: &'static str) -> &'static str {
     if name.contains('<') {
         name
@@ -153,12 +148,7 @@ impl EntityMap {
         handle
     }
 
-    /// How many live entities there are of each concrete type, largest first.
-    ///
-    /// Walks the whole map, so ask on a timer rather than on a frame. An
-    /// entity currently leased for an update is out of the map and so is not
-    /// counted; updates nest only a few deep, so the undercount is a handful
-    /// against a population this is asked about in thousands.
+    /// Entities currently leased for an update are out of the map and not counted.
     pub fn counts_by_type(&self) -> Vec<(&'static str, usize)> {
         let mut by_type: FxHashMap<TypeId, usize> = FxHashMap::default();
         for (_, entity) in self.entities.iter() {
@@ -1266,8 +1256,6 @@ mod test {
 
     #[test]
     fn counts_by_type_names_what_is_holding_the_entities() {
-        // The counts are what a leaking type is found by, so they have to say
-        // which type, and put the largest first.
         let mut entity_map = EntityMap::new();
         assert!(entity_map.counts_by_type().is_empty());
 
@@ -1284,8 +1272,6 @@ mod test {
             vec![("TestEntity", 3), ("OtherTestEntity", 1)]
         );
 
-        // A type nothing holds any more drops out of the counts, rather than
-        // lingering as a zero that reads like a leak that stopped.
         drop(other);
         entity_map.take_dropped();
         assert_eq!(entity_map.counts_by_type(), vec![("TestEntity", 3)]);

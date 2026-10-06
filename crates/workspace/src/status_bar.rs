@@ -188,8 +188,6 @@ impl Render for StatusBar {
 }
 
 impl StatusBar {
-    /// Whether this status bar draws the open-sidebar toggle. Off for a
-    /// window whose title bar carries it instead.
     pub fn set_show_sidebar_toggle(&mut self, show: bool) {
         self.show_sidebar_toggle = show;
     }

@@ -46225,7 +46225,6 @@ async fn test_diff_review_button_auto_enabled_on_plain_editor(cx: &mut TestAppCo
         .unwrap();
     let cx = &mut VisualTestContext::from_window(*window, cx);
 
-    // A plain project file editor: never a diff, never explicitly enabled.
     let editor = workspace
         .update_in(cx, |workspace, window, cx| {
             workspace.open_abs_path(
@@ -46247,7 +46246,6 @@ async fn test_diff_review_button_auto_enabled_on_plain_editor(cx: &mut TestAppCo
         );
     });
 
-    // A mini editor (auto-height, no project file) does not.
     let mini = cx.new_window_entity(|window, cx| Editor::auto_height(1, 4, window, cx));
     mini.update(cx, |editor, cx| {
         assert!(

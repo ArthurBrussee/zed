@@ -1981,8 +1981,7 @@ impl Workspace {
         let status_bar = cx.new(|cx| {
             let mut status_bar =
                 StatusBar::new(&center_pane.clone(), multi_workspace.clone(), window, cx);
-            // The title bar carries the open-sidebar toggle in this build, so
-            // the status bar does not draw a second one.
+            // The title bar carries the open-sidebar toggle.
             status_bar.set_show_sidebar_toggle(false);
             status_bar.add_left_item(left_dock_buttons, window, cx);
             status_bar.add_right_item(right_dock_buttons, window, cx);
@@ -2677,11 +2676,7 @@ impl Workspace {
         .detach_and_log_err(cx);
     }
 
-    /// Hands a globally-sized panel's new size to every other open workspace.
-    /// The stored value is only read when a panel is added, which happens once
-    /// as a window is built, so without this a resize reaches the workspaces
-    /// opened afterwards and none of the ones already on screen — which is
-    /// every worktree the user is actually switching between.
+    /// The stored size is only read when a panel is added, so already-open workspaces need it pushed.
     fn share_global_panel_size(
         &self,
         panel_key: &str,
@@ -2695,8 +2690,7 @@ impl Workspace {
             .workspaces
             .iter()
             .map(|(_, workspace)| workspace.clone())
-            // The workspace being resized already has the size, and pushing it
-            // back mid-drag would fight the drag.
+            // Pushing it back to the workspace being resized would fight the drag.
             .filter(|workspace| workspace != &self.weak_self)
             .collect();
 
@@ -2932,12 +2926,7 @@ impl Workspace {
         StatusBarSettings::get_global(cx).show
     }
 
-    /// The status bar, when it is showing. It is a child of the CENTER column
-    /// rather than a full-width row under the whole workspace: what it reports
-    /// — diagnostics, language servers, the active buffer — belongs to the
-    /// worktree, not to the window, and the docks beside the centre (the
-    /// threads sidebar, the agent panel) have none of it. They run to the
-    /// window bottom instead.
+    /// Rendered in the center column so the docks beside it run to the window bottom.
     fn render_status_bar(&self, cx: &App) -> Option<AnyElement> {
         self.status_bar_visible(cx)
             .then(|| self.status_bar.clone().into_any_element())
@@ -15983,8 +15972,6 @@ mod tests {
             flex: None,
         };
 
-        // One workspace writes a width. Every worktree of a project is its own
-        // workspace with its own id, so this is the one that gets resized.
         {
             let project = Project::test(fs.clone(), [], cx).await;
             let (multi_workspace, cx) =
@@ -15999,8 +15986,6 @@ mod tests {
             cx.run_until_parked();
         }
 
-        // A different workspace reads it back. A global size is a preference
-        // and follows the user; a per-workspace one stays where it was set.
         {
             let project = Project::test(fs.clone(), [], cx).await;
             let (multi_workspace, cx) =
@@ -16033,16 +16018,10 @@ mod tests {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
 
-        // One AppState, as the running app has: its workspace store is the
-        // registry every open workspace lands in, and the thing a shared size
-        // has to travel through. `Workspace::test_new` builds a private
-        // AppState per workspace, so it cannot express two workspaces that
-        // know about each other.
+        // A shared AppState, since `Workspace::test_new` gives each workspace its own store.
         let app_state = cx.update(|cx| AppState::test(cx));
 
-        // Two worktree windows, both open before either is resized. Reading
-        // the stored value back in a workspace opened afterwards passes with
-        // or without the sharing, which is why both exist up front here.
+        // Both open before the resize: a workspace opened afterwards would pass without sharing.
         let project_a = Project::test(fs.clone(), [], cx).await;
         let project_b = Project::test(fs.clone(), [], cx).await;
         let window_a = cx.add_window(|window, cx| {

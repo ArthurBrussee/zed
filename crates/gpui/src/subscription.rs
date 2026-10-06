@@ -105,12 +105,7 @@ where
             })
     }
 
-    /// How many subscribers this set holds, across every emitter, and how
-    /// many emitters they are spread over.
-    ///
-    /// For diagnostics only: it walks the set. A count that climbs while
-    /// nothing is happening is a subscription nobody dropped, and every
-    /// notification from then on walks the longer list.
+    /// `(subscribers, emitters)`. For diagnostics only: it walks the set.
     pub fn counts(&self) -> (usize, usize) {
         let lock = self.0.borrow();
         let subscribers = lock

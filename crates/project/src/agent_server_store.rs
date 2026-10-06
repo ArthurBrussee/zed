@@ -1398,12 +1398,7 @@ impl ExternalAgentServer for LocalRegistryNpxAgent {
             if let Err(error) =
                 install_npm_agent_package(&node_runtime, &install_dir, &package_spec).await
             {
-                // An install that failed has not necessarily left nothing
-                // behind: the common failure is a version bump racing itself,
-                // and the package that is already unpacked runs. Launching the
-                // version on disk is worth more than a card that says Retry,
-                // and the version bound is a ceiling rather than a pin, so a
-                // launch that is behind is a launch, not a wrong answer.
+                // The version bound is a ceiling, so an already-unpacked older copy still runs.
                 let installed =
                     node_runtime::read_package_executable(node_modules.clone(), package_name).await;
                 if installed.is_err() {
@@ -1446,14 +1441,10 @@ impl ExternalAgentServer for LocalRegistryNpxAgent {
     }
 }
 
-/// The npm installs that are already running, keyed by the directory they are
-/// running in. See [`install_npm_agent_package`].
 static IN_FLIGHT_NPM_INSTALLS: LazyLock<
     parking_lot::Mutex<HashMap<PathBuf, Shared<BoxFuture<'static, Result<(), Arc<anyhow::Error>>>>>>,
 > = LazyLock::new(Default::default);
 
-/// Installs an agent's npm package, joining the install already running in the
-/// same directory rather than starting a second one.
 async fn install_npm_agent_package(
     node_runtime: &NodeRuntime,
     install_dir: &Path,
@@ -1474,20 +1465,8 @@ async fn install_npm_agent_package(
     .await
 }
 
-/// Runs `start` unless an install is already running in `install_dir`, in
-/// which case that one's result is awaited and returned instead.
-///
-/// `npm install` unpacks into a temporary directory and renames it over what
-/// is already there. Two runs in the same directory race, and the loser fails
-/// with `ENOTEMPTY` renaming over a tree the winner has not finished writing.
-/// That is what several threads launching the same agent at once looks like,
-/// and it lands on every version bump, when there is something to unpack. The
-/// directory is per agent and shared by every project in the process, so the
-/// gate has to be process-wide rather than per store.
-///
-/// Only concurrent installs are joined. Once one finishes its entry is
-/// dropped, so the next launch installs again and still picks up a new
-/// version.
+/// Joins an install already running in `install_dir`: two concurrent `npm install`s in one
+/// directory race on a rename and the loser fails with `ENOTEMPTY`.
 async fn install_once_per_directory(
     install_dir: &Path,
     start: impl FnOnce() -> BoxFuture<'static, Result<()>>,
@@ -1505,10 +1484,7 @@ async fn install_once_per_directory(
 
     let result = install.clone().await;
 
-    // Whoever finishes waiting clears the entry, not whoever created it: the
-    // task that started an install can be dropped while another is still
-    // waiting on it, and an entry left behind would let a later launch join an
-    // install that has already finished and skip its own.
+    // Cleared by any waiter, since the starter may have been dropped.
     let mut in_flight = IN_FLIGHT_NPM_INSTALLS.lock();
     if in_flight
         .get(install_dir)
@@ -1945,10 +1921,6 @@ mod tests {
         );
     }
 
-    /// Opening several threads on the same agent at once ran several
-    /// `npm install`s in one directory, and the ones that lost the rename race
-    /// died with `ENOTEMPTY` and a "Failed to Launch" card. The ones that
-    /// arrive while an install is running wait on it instead.
     #[test]
     fn concurrent_launches_share_one_install_per_directory() {
         use futures::channel::oneshot;
@@ -1991,8 +1963,7 @@ mod tests {
             "the second launch of the same agent started its own install"
         );
 
-        // A launch that arrives after the install has finished still installs,
-        // which is how a version bump is picked up at all.
+        // A later launch installs again, which is how a version bump is picked up.
         let installs = Arc::new(AtomicUsize::new(0));
         let after = futures::executor::block_on(install_once_per_directory(codex, {
             let installs = installs.clone();

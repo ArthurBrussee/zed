@@ -18,46 +18,19 @@ use crate::{
     worktree_store::WorktreeStore,
 };
 
-/// How long a directory's shell may take to print its environment before the
-/// capture gives up on it. The answer is cached for the life of the process,
-/// so a login shell that never returns is not one slow launch: it is every
-/// later one joining a task that will never finish, with nothing in the log to
-/// say so.
+/// The capture is cached for the process, so a shell that never answers would hang every later
+/// asker silently.
 const SHELL_ENVIRONMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
-/// How many directories may have their shell environment captured at once,
-/// across the whole process.
-///
-/// A capture runs a login shell in the directory, and a direnv that evaluates
-/// a nix flake turns that into a full flake evaluation. Restoring fourteen
-/// worktree windows ran fourteen of those at once through the nix daemon: a
-/// load average of 188 on a 15-core machine, a `git fetch` to GitHub timing
-/// out, and an agent's own startup call failing because its process had
-/// starved. They were competing for the same cores either way, so taking
-/// turns costs them nothing between them and leaves the machine usable while
-/// they finish.
-///
-/// Process-wide rather than per project, because each window has its own
-/// [`ProjectEnvironment`]: a cap that each one kept for itself would bound
-/// nothing at all in the case that hurt.
+/// Process-wide, since each window has its own [`ProjectEnvironment`]: restoring many worktrees
+/// ran a direnv/nix evaluation per window at once and starved the machine.
 const CONCURRENT_SHELL_ENVIRONMENT_CAPTURES: usize = 2;
 
 static SHELL_ENVIRONMENT_CAPTURES: LazyLock<Semaphore> =
     LazyLock::new(|| Semaphore::new(CONCURRENT_SHELL_ENVIRONMENT_CAPTURES));
 
-/// The local directory captures this app has already paid for, shared by every
-/// project in it rather than kept per project.
-///
-/// A directory's environment is a property of the directory, not of the window
-/// looking at it, and every window has a [`ProjectEnvironment`] of its own: two
-/// of them opening the same checkout captured it twice, at the same moment, and
-/// for a checkout whose shell takes seven seconds that is seven seconds twice
-/// over. The in-flight task is what is shared, so the second asker joins the
-/// first capture rather than starting another.
-///
-/// One consequence worth knowing: the capture reports a failure to whichever
-/// project started it, so a shell that fails to answer names its error in that
-/// project's window and not in the one that joined.
+/// App-wide so two windows on the same checkout share one capture. Errors are reported only to the
+/// project that started the capture.
 #[derive(Default)]
 struct SharedLocalEnvironments(
     HashMap<(Shell, Arc<Path>), Shared<Task<Option<HashMap<String, String>>>>>,
@@ -213,16 +186,8 @@ impl ProjectEnvironment {
         .unwrap_or_else(|| Task::ready(None).shared())
     }
 
-    /// The environment a directory inside the project should use, which is the
-    /// one its worktree root has.
-    ///
-    /// A submodule is its own git repository but not its own environment: it
-    /// sits inside the superproject's checkout and a shell started in it reads
-    /// the same `.envrc` and the same flake inputs. Capturing one per
-    /// repository meant a checkout with a submodule paid for two captures of
-    /// several seconds each, again for every worktree made from it. A path
-    /// outside every worktree keeps its own capture, since there is no
-    /// superproject to borrow from.
+    /// The environment of the worktree containing `abs_path`, so submodules don't pay for their own
+    /// capture.
     pub fn containing_worktree_environment(
         &mut self,
         abs_path: Arc<Path>,
@@ -292,9 +257,7 @@ impl ProjectEnvironment {
                 let shell = shell.clone();
                 let tx = self.environment_error_messages_tx.clone();
                 cx.spawn(async move |cx| {
-                    // Take a turn before starting the clock: the timeout is
-                    // for a shell that will not answer, not for one that has
-                    // not been given a turn yet.
+                    // The timeout starts after queueing for a permit.
                     let queued_at = Instant::now();
                     let permit = SHELL_ENVIRONMENT_CAPTURES.acquire().await;
                     let queued_for = queued_at.elapsed();

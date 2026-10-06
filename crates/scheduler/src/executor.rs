@@ -243,10 +243,7 @@ impl BackgroundExecutor {
     }
 
     /// Like [`Self::spawn_with_priority`], but attributed to a call site the
-    /// caller names rather than to this one. A fan-out spawns its tasks from
-    /// inside the helper that opened it, so `#[track_caller]` alone reports
-    /// every one of them as that helper and the work that asked for them goes
-    /// unnamed.
+    /// caller names rather than to this one.
     pub fn spawn_with_priority_at<F>(
         &self,
         priority: Priority,

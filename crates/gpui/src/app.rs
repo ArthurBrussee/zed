@@ -2919,15 +2919,8 @@ impl App {
             .expect("asset cache entries are keyed by their asset type")
     }
 
-    /// What gpui is holding callbacks and handles for, right now.
-    ///
-    /// Every observer and every event listener is walked when the entity it
-    /// watches notifies or emits, and every focus handle is walked when one
-    /// is released, so these counts are what a flush costs. They should sit
-    /// still while the app does: one that climbs is a subscription or a
-    /// handle nobody dropped, and the freezes get longer with it.
-    ///
-    /// Walks the sets, so ask on a timer rather than on a frame.
+    /// Counts that climbing while idle indicate leaked subscriptions or focus handles. Walks the
+    /// sets, so call it on a timer rather than per frame.
     pub fn callback_counts(&self) -> CallbackCounts {
         let (observers, observed_entities) = self.observers.counts();
         let (event_listeners, emitting_entities) = self.event_listeners.counts();
@@ -2944,12 +2937,7 @@ impl App {
         }
     }
 
-    /// How many live entities there are of each concrete type, largest first.
-    ///
-    /// The counts above say how much a flush costs; this says what is holding
-    /// the handles, which is the only way to name a type that is leaking.
-    ///
-    /// Walks the entity map, so ask on a timer rather than on a frame.
+    /// Live entities per concrete type, largest first. Walks the entity map, so call it on a timer.
     pub fn entity_counts_by_type(&self) -> Vec<(&'static str, usize)> {
         self.entities.counts_by_type()
     }
@@ -3134,23 +3122,22 @@ impl App {
     }
 }
 
-/// How many callbacks and focus handles gpui is holding, by kind. See
-/// [`App::callback_counts`].
+/// See [`App::callback_counts`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CallbackCounts {
     /// Live `observe` callbacks.
     pub observers: usize,
-    /// How many entities those observers are spread over.
+    /// Entities those observers watch.
     pub observed_entities: usize,
     /// Live `subscribe` callbacks.
     pub event_listeners: usize,
-    /// How many entities those listeners are spread over.
+    /// Entities those listeners watch.
     pub emitting_entities: usize,
     /// Live `observe_release` callbacks.
     pub release_listeners: usize,
     /// Live `observe_global` callbacks.
     pub global_observers: usize,
-    /// Live focus handles, which are swept whenever one is let go.
+    /// Live focus handles.
     pub focus_handles: usize,
 }
 

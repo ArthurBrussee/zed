@@ -1,18 +1,5 @@
-//! Which worktrees run language servers.
-//!
-//! Off is the default, everywhere. Starting a server in a worktree costs a
-//! full index of a copy of the repository into its own target directory, and
-//! a machine that restores fourteen worktree windows pays that fourteen times
-//! over at once: one launch measured a load average of 188 on a 15-core
-//! machine, with eighteen compiler processes, and took ten minutes to become
-//! usable. Almost none of those worktrees wanted a language server — an agent
-//! does not use one — so the worktree that does asks for it, through the
-//! status-bar switch, and is remembered.
-//!
-//! This is a switch rather than a setting: nothing is written to the worktree,
-//! so the checkout stays clean. What is remembered across restarts is
-//! remembered by whoever installed the switch, which hands the paths back
-//! through [`WorktreeLanguageServers::restore`].
+//! Which worktrees run language servers. Off by default: restoring many worktree windows otherwise
+//! starts a server indexing a copy of the same repository in each.
 
 use std::{
     path::{Path, PathBuf},
@@ -24,9 +11,6 @@ use gpui::{App, AppContext as _, Context, Entity, Global};
 
 use crate::worktree_store::WorktreeStore;
 
-/// The worktrees whose language servers are switched on, by absolute path.
-/// A worktree that is not named here runs none, whoever created it and
-/// whatever its settings ask for.
 #[derive(Default)]
 pub struct WorktreeLanguageServers {
     enabled: HashSet<Arc<Path>>,
@@ -36,7 +20,6 @@ struct GlobalWorktreeLanguageServers(Entity<WorktreeLanguageServers>);
 
 impl Global for GlobalWorktreeLanguageServers {}
 
-/// Install the global store. Idempotent.
 pub fn init(cx: &mut App) {
     if cx.has_global::<GlobalWorktreeLanguageServers>() {
         return;
@@ -59,9 +42,7 @@ impl WorktreeLanguageServers {
         self.enabled.contains(abs_path)
     }
 
-    /// Switches one worktree's language servers on or off. Returns whether
-    /// this changed anything, so a caller can skip the work of starting or
-    /// stopping servers that are already in the state asked for.
+    /// Returns whether anything changed.
     pub fn set_enabled(&mut self, abs_path: &Path, enabled: bool, cx: &mut Context<Self>) -> bool {
         let changed = if enabled {
             self.enabled.insert(abs_path.into())
@@ -74,7 +55,6 @@ impl WorktreeLanguageServers {
         changed
     }
 
-    /// The worktrees switched on, for whoever is persisting them.
     pub fn enabled_paths(&self) -> Vec<PathBuf> {
         self.enabled
             .iter()
@@ -82,9 +62,6 @@ impl WorktreeLanguageServers {
             .collect()
     }
 
-    /// Puts back what was remembered from a previous run. Anything switched
-    /// on in this one stays on: a worktree that asked before the restore
-    /// landed has already made its choice.
     pub fn restore(&mut self, paths: impl IntoIterator<Item = PathBuf>, cx: &mut Context<Self>) {
         let before = self.enabled.len();
         self.enabled
@@ -95,15 +72,7 @@ impl WorktreeLanguageServers {
     }
 }
 
-/// Whether the worktree with this id runs language servers. False for every
-/// worktree nobody switched on.
-///
-/// The two escapes are deliberate. Without the global — a test, a headless
-/// run, anything that did not install the switch — the answer is yes, because
-/// a switch that was never installed must not be what stops a server. And a
-/// worktree whose path cannot be resolved is a worktree the switch has no way
-/// to name, so it cannot be the one that was turned on; it reads as off along
-/// with everything else.
+/// True when the switch isn't installed (tests, headless), so only an installed switch stops servers.
 pub fn worktree_runs_language_servers(
     worktree_store: &Entity<WorktreeStore>,
     worktree_id: worktree::WorktreeId,
@@ -127,10 +96,6 @@ mod tests {
     use super::*;
     use gpui::TestAppContext;
 
-    /// Off is the default, and the switch is what makes an exception of one
-    /// worktree. The old store worked the other way round — every worktree on
-    /// unless it was named — which is what had fourteen restored windows
-    /// starting eighteen compiler processes between them.
     #[gpui::test]
     fn test_a_worktree_runs_no_language_servers_until_it_is_switched_on(cx: &mut TestAppContext) {
         let store = cx.new(|_| WorktreeLanguageServers::default());
@@ -157,8 +122,6 @@ mod tests {
         });
     }
 
-    /// What the last run remembered is what is switched on again, and a
-    /// worktree switched on before the restore lands keeps its answer.
     #[gpui::test]
     fn test_restore_puts_back_the_worktrees_that_asked(cx: &mut TestAppContext) {
         let store = cx.new(|_| WorktreeLanguageServers::default());

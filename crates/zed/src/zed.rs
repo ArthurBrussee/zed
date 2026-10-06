@@ -614,7 +614,6 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             cx.new(|cx| which_key::PendingKeystrokesIndicator::new(window, cx));
         let image_info = cx.new(|_cx| ImageInfo::new(workspace));
 
-        // Beside the LSP state, since it is what decides whether there is any.
         let worktree_language_servers = cx.new(|cx| {
             git_ui_core::worktree_language_server_switch::WorktreeLanguageServerSwitch::new(
                 workspace, cx,
@@ -3016,10 +3015,7 @@ mod tests {
         });
     }
 
-    /// A status item that reads the workspace from `set_active_pane_item` is a
-    /// double lease, and gpui panics on the first frame rather than deadlocking.
-    /// No other suite builds a real status bar inside a live workspace update,
-    /// so this is the one place that failure is visible before the morning.
+    /// A status item reading the workspace from `set_active_pane_item` panics on the first frame.
     #[gpui::test]
     async fn test_a_fresh_window_renders_its_status_bar(cx: &mut TestAppContext) {
         let app_state = init_test(cx);
@@ -3039,12 +3035,6 @@ mod tests {
         );
         cx.run_until_parked();
 
-        // The fork's own status item, which is what makes the frame worth
-        // drawing here: it is the one that speaks for the active pane's
-        // worktree, so it exercises the callback the panic came from. It
-        // wears the outlined bolt because language servers are off in every
-        // worktree until one is switched on, which is what a fresh window's
-        // worktree is.
         assert!(
             cx.debug_bounds("ICON-BoltOutlined").is_some(),
             "the worktree language-server switch should be in the status bar"

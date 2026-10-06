@@ -1,16 +1,9 @@
 use anyhow::Result;
 use std::process::Stdio;
 
-/// A spawn failure that says why it failed, not just what it failed to run.
-///
-/// The reason is the OS error's own message ("Too many open files", "No such
-/// file or directory"), which is the whole answer and only prints under
-/// `{:#}` — and not every surface an error reaches shows it that way. Naming
-/// it in the message itself means the reason survives the trip.
+/// Puts the OS error in the message itself, since not every surface prints errors with `{:#}`.
 fn spawn_error(error: std::io::Error, command: &str) -> anyhow::Error {
     let command = crate::redact::redact_command(command);
-    // Running out of file handles looks like the program being broken from
-    // every angle except this one, which is why it is worth naming.
     let reason = if out_of_file_handles(&error) {
         format!("out of file handles ({error})")
     } else {
@@ -327,8 +320,6 @@ mod tests {
             Err(error) => error,
         };
 
-        // The command, so the reader knows which launch failed, and the
-        // reason, which is the part that used to print only under `{:#}`.
         let message = error.to_string();
         assert!(message.contains("/nonexistent/program"), "{message}");
         assert!(

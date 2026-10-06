@@ -2300,9 +2300,7 @@ mod tests {
         );
         cx.run_until_parked();
 
-        // Hand-written code first, whatever it sorts as alphabetically. The
-        // protobuf output is spotted by its name, the markdown file only by the
-        // marker in its first line.
+        // `notes.md` is only recognised by its header marker.
         let paths = diff.read_with(cx, |diff, cx| diff.excerpt_file_paths(cx));
         assert_eq!(paths, vec!["src/main.rs", "api/service.pb.go", "notes.md"]);
 
@@ -2335,7 +2333,6 @@ mod tests {
         });
         cx.run_until_parked();
 
-        // The generated file matches HEAD, so the view opens without it.
         fs.set_head_and_index_for_repo(
             path!("/project/.git").as_ref(),
             &[
@@ -2347,8 +2344,6 @@ mod tests {
         let paths = diff.read_with(cx, |diff, cx| diff.excerpt_file_paths(cx));
         assert_eq!(paths, vec!["src/main.rs"]);
 
-        // Now the generator runs, and the file joins a view that is already
-        // open rather than being there when it was built.
         fs.insert_file(path!("/project/api/service.pb.go"), b"pb regenerated\n".to_vec())
             .await;
         cx.run_until_parked();

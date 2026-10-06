@@ -37,14 +37,7 @@ const NAMESPACE: &str = "created_git_worktrees";
 struct CreatedWorktreeRecord {
     created_at_seconds: u64,
     created_at_subsec_nanos: u32,
-    /// A worktree made before anyone asked for one, and not yet claimed. It
-    /// has no thread and no draft beside it, which is how everything else
-    /// recognizes a worktree still in use, so the sweep that reclaims what an
-    /// abandoned `+` left behind needs this to see it at all. Cleared when the
-    /// spare is claimed: from then on it is an ordinary worktree.
-    ///
-    /// Defaulted rather than required, so records written before spares
-    /// existed still parse.
+    /// An unclaimed spare, which has no thread to mark it as in use.
     #[serde(default)]
     spare: bool,
 }
@@ -84,9 +77,6 @@ pub fn record_created_worktree(
     async move { store.scoped(NAMESPACE).write(key, value?).await }
 }
 
-/// Whether Zed recorded this worktree as a spare it made before anyone asked
-/// for one. A spare that is still marked has never been claimed, so nothing is
-/// using it.
 pub fn recorded_as_spare(
     worktree_path: &Path,
     remote: Option<&RemoteConnectionOptions>,
@@ -170,10 +160,6 @@ pub async fn record_created_worktree_for_repo(
     }
 }
 
-/// Takes the spare mark off a worktree that has just been claimed, leaving the
-/// rest of its record (the creation time archival verifies against) alone. A
-/// worktree with no record is left without one: it was not Zed's to begin
-/// with.
 pub fn clear_spare_mark(
     worktree_path: &Path,
     remote: Option<&RemoteConnectionOptions>,

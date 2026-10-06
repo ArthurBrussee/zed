@@ -772,9 +772,7 @@ impl LocalRepositoryState {
     ) -> anyhow::Result<Self> {
         let environment = project_environment
                 .update(cx, |project_environment, cx| {
-                    // The worktree's environment, not this repository's: a
-                    // submodule shares its superproject's checkout, and all
-                    // this is used for is finding a `git` on PATH.
+                    // Only used to find `git`, so submodules share their worktree's capture.
                     project_environment.containing_worktree_environment(work_directory_abs_path.clone(), cx)
                 })?
                 .await

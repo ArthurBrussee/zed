@@ -3703,9 +3703,6 @@ async fn test_max_buffer_line_length_can_be_overridden(cx: &mut gpui::TestAppCon
     );
 }
 
-/// A worktree can be switched out of language servers entirely, which is what
-/// an agent's worktree starts as. Nothing is written to the worktree to say
-/// so, and the switch is per worktree rather than per language.
 #[gpui::test]
 async fn test_a_worktree_switched_off_runs_no_language_server(cx: &mut gpui::TestAppContext) {
     use project::worktree_language_servers::WorktreeLanguageServers;
@@ -3746,8 +3743,6 @@ async fn test_a_worktree_switched_off_runs_no_language_server(cx: &mut gpui::Tes
         "a worktree switched off started a language server anyway"
     );
 
-    // Switching it back on is what the status bar control does: the buffers
-    // open in that worktree get their servers.
     cx.update(|cx| {
         WorktreeLanguageServers::global(cx).update(cx, |store, cx| {
             store.set_enabled(Path::new(path!("/dir")), true, cx);

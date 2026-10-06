@@ -1,10 +1,4 @@
-//! The switch that says whether a worktree runs language servers, and the
-//! memory of which worktrees were switched on.
-//!
-//! The switch itself is [`project::worktree_language_servers`], which is
-//! where the answer is read when servers are resolved. This module is
-//! everything around it: remembering the choice across restarts, and the
-//! status bar control that flips it.
+//! Persistence and the status bar control for [`project::worktree_language_servers`].
 
 use std::path::{Path, PathBuf};
 
@@ -16,14 +10,9 @@ use util::ResultExt as _;
 use workspace::{HideStatusItem, StatusItemView, Workspace, item::ItemHandle};
 
 const NAMESPACE: &str = "worktree_language_servers";
-/// The worktrees switched on. A different key from the `disabled` list the
-/// switch kept while off was the exception rather than the rule: that list
-/// says which worktrees were the unusual ones under the old default, which
-/// is not an answer to the question this one asks. It is left where it is
-/// and not read.
+/// Not the old `disabled` key, which recorded exceptions under the opposite default.
 const ENABLED_KEY: &str = "enabled";
 
-/// Installs the switch and puts back what the last run remembered.
 pub fn init(cx: &mut App) {
     project::worktree_language_servers::init(cx);
     let remembered = read_enabled(cx);
@@ -57,8 +46,6 @@ fn remember(cx: &App) -> Task<()> {
     })
 }
 
-/// Flips one worktree's switch, and moves the servers to match: the buffers
-/// open in that worktree lose theirs, or get them.
 pub fn set_enabled(project: &Entity<Project>, worktree_path: &Path, enabled: bool, cx: &mut App) {
     let Some(store) = WorktreeLanguageServers::try_global(cx) else {
         return;
@@ -107,9 +94,6 @@ fn buffers_in_worktree(
         .collect()
 }
 
-/// The status bar's switch: whether the worktree the active file lives in
-/// runs language servers. Absent when the window has no worktree to speak
-/// for, which is every window showing nothing but threads.
 pub struct WorktreeLanguageServerSwitch {
     project: Entity<Project>,
     worktree: Option<(PathBuf, SharedString)>,
@@ -127,10 +111,7 @@ impl WorktreeLanguageServerSwitch {
     }
 
     fn update_worktree(&mut self, item: Option<&dyn ItemHandle>, cx: &mut Context<Self>) {
-        // The status bar calls `set_active_pane_item` from inside the
-        // workspace's own update, so reading the workspace here is a double
-        // lease and gpui panics. The project is its own entity and the active
-        // item carries its path, which is all this needs.
+        // Called from inside the workspace's update, so reading the workspace here would panic.
         let worktree = {
             let project = self.project.read(cx);
             item.and_then(|item| item.project_path(cx))

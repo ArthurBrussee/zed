@@ -133,13 +133,8 @@ pub struct MarkdownStyle {
     pub prevent_mouse_interaction: bool,
     pub table_columns_min_size: bool,
     pub soft_break_as_hard_break: bool,
-    /// A definite height for an inline image whose source did not declare one.
-    /// A `ListState` measures an entry once and paints it at that height, so an
-    /// entry that grows after its image loads paints over the entries below.
-    /// A caller that renders markdown inside such a list can name a height
-    /// here, and the wrapper will hold it whether the image has loaded or not.
-    /// `None` leaves images at their intrinsic size, which is what a document
-    /// or preview wants.
+    /// A fixed height for inline images that don't declare one, for markdown inside a `ListState`,
+    /// which would otherwise paint an image that loads late over the entries below.
     pub inline_image_height: Option<AbsoluteLength>,
 }
 
@@ -1076,8 +1071,6 @@ impl Markdown {
         &self.parsed_markdown
     }
 
-    /// Whether this entity renders fenced `mermaid` blocks as diagrams rather
-    /// than as plain code.
     #[cfg(any(test, feature = "test-support"))]
     pub fn renders_mermaid_diagrams(&self) -> bool {
         self.options.render_mermaid_diagrams
@@ -1951,9 +1944,6 @@ impl MarkdownElement {
             .map(|link| link.destination_url.clone());
         let fallback_opens_image_url = enclosing_link_url.is_none();
 
-        // Only fall back to the style's fixed height when the markdown source
-        // did not declare a height of its own. A source that names one
-        // (`![](x.png =200x150)`) is respected as before.
         let inline_image_height = self.style.inline_image_height.filter(|_| height.is_none());
         let image_element = {
             let image_start = range.start;
@@ -2007,17 +1997,10 @@ impl MarkdownElement {
                         .min_w_0()
                         .max_w_full()
                         .rounded_md()
-                        // Margins on a `size_full` image add to its outer box,
-                        // so inside a definite wrapper they are exactly the
-                        // amount it overflows by. The wrapper carries them
-                        // instead when it is the one holding the height.
+                        // Margins on a `size_full` image would overflow a fixed-height wrapper.
                         .when(inline_image_height.is_none(), |this| this.mr_1().mb_1())
                         .when_some(height, |this, height| this.h(height))
                         .when_some(width, |this, width| this.w(width))
-                        // The wrapper holds a definite height; the image fits
-                        // inside it while preserving its aspect ratio. Without
-                        // this, an image would either stretch to the wrapper
-                        // or overflow past its neighbours.
                         .when_some(inline_image_height, |this, _| {
                             this.size_full().object_fit(ObjectFit::Contain)
                         })

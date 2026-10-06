@@ -36,11 +36,7 @@ pub use proto::PanelId;
 pub trait Panel: Focusable + EventEmitter<PanelEvent> + Render + Sized {
     fn persistent_name() -> &'static str;
     fn panel_key() -> &'static str;
-    /// Whether this panel's size is a preference about how the user works
-    /// rather than a property of the checkout they happen to have open. A panel
-    /// that says yes keeps one size across every workspace, so moving between
-    /// the worktrees of a project — each its own workspace, each with its own
-    /// id — does not resize it underneath you.
+    /// Keep one size across every workspace, so switching worktrees doesn't resize the panel.
     fn size_is_global() -> bool {
         false
     }
@@ -1070,10 +1066,6 @@ impl Dock {
         }
     }
 
-    /// Applies a size to whichever panel in this dock carries `panel_key`,
-    /// rather than to a panel handle we already have. A globally-sized panel is
-    /// resized in one workspace and has to land in all the others, where the
-    /// panel is a different entity with the same key.
     pub fn set_size_state_for_panel_key(
         &mut self,
         panel_key: &str,
@@ -1292,10 +1284,6 @@ impl Dock {
         }
     }
 
-    /// Where a panel's size is stored. Per workspace by default; under one
-    /// shared key for a panel whose size is a preference rather than a property
-    /// of the checkout. `global` cannot collide with the alternative, which is
-    /// always either a workspace row id or a session id.
     pub(crate) fn panel_size_scope_key(
         workspace: &Workspace,
         panel_key: &str,

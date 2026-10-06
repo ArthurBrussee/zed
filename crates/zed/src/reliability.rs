@@ -167,12 +167,6 @@ fn start_memory_usage_logging(
     .detach();
 }
 
-/// What gpui is holding, beside the memory line that prompted the question.
-///
-/// A freeze in steady state looks like a flush walking something very large,
-/// and the only way to tell which list is growing is to watch the counts
-/// over a session: they should sit still while the app does. This is the
-/// line to read first the next time the main thread spins.
 fn log_callback_counts(cx: &App) {
     let counts = cx.callback_counts();
     log::info!(
@@ -189,19 +183,10 @@ fn log_callback_counts(cx: &App) {
     log_entity_counts(cx);
 }
 
-/// How many types the line names, at each end of it.
 const ENTITY_TYPES_LOGGED: usize = 10;
 
-/// How many of each kind of entity are alive, and which kinds grew since the
-/// last line.
-///
-/// The counts above say how much a flush costs without saying what is holding
-/// the handles. A leak names itself here: the type whose count climbs while
-/// the app sits still is the one nobody is releasing, and the largest types
-/// are the baseline a window pays for before anything happens at all.
 fn log_entity_counts(cx: &App) {
     thread_local! {
-        /// The previous line's counts, so this one can say what moved.
         static PREVIOUS: RefCell<HashMap<&'static str, usize>> = RefCell::new(HashMap::new());
     }
 

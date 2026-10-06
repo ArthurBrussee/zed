@@ -278,7 +278,7 @@ impl Render for WorktreeFetchFailedToast {
                                 focused_dock,
                                 RemoteBranchFetchMode::UseLocal,
                                 // User-initiated retry of a foreground create.
-                                WorktreeWorkspaceActivation::Immediate,
+                                true,
                                 cx,
                             );
                             task.detach_and_log_err(cx);
@@ -412,24 +412,15 @@ fn create_worktree_askpass_delegate(
     )
 }
 
-/// A base fetch that was moved off the creation's critical path, and what the
-/// base pointed at before it ran, so a base that moved can be reported.
 struct DeferredBaseFetch {
     remote_name: String,
-    /// `remote/branch`, as the user would name the base.
     base_display: String,
     work_directories: Vec<PathBuf>,
     base_before: Vec<Option<SharedString>>,
 }
 
-/// Repositories whose last fetch behind a creation failed.
-///
-/// A fetch that runs behind the new window is not allowed to ask for
-/// credentials, so on a remote that wants them it fails every time — and a
-/// base that is already in the clone would then never be refreshed by anything
-/// again. Recording the failure makes the next creation pay for a fetch in
-/// front of it, prompt and all, exactly as it did before; a fetch that
-/// succeeds clears the record.
+/// A background fetch can't prompt for credentials, so after one fails the next
+/// creation fetches in front of itself (prompt and all) rather than never refreshing.
 static REPOS_OWED_A_FETCH: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Default::default);
 
 fn repos_owed_a_fetch(work_directories: &[PathBuf]) -> bool {
@@ -473,14 +464,7 @@ fn start_base_ref_scan(git_repos: &[Entity<Repository>], cx: &mut App) -> Vec<Br
         .collect()
 }
 
-/// What `base_ref` points at in each repository, in `git_repos` order, or
-/// `None` when any of them does not have that ref at all.
-///
-/// `None` is the answer that forces a fetch before anything is created: `git
-/// worktree add` is handed this ref as its starting point, so a repository
-/// that has never fetched it cannot make a worktree from it. A repository that
-/// has it but reports no commit for it is still a repository that can be
-/// created from, so it answers `Some(None)` rather than failing the lot.
+/// `None` when any repository lacks `base_ref`, which means it must be fetched before creating.
 async fn base_ref_commits(
     scans: Vec<BranchScan>,
     base_ref: &str,
@@ -498,16 +482,8 @@ async fn base_ref_commits(
     Some(commits)
 }
 
-/// Runs the base fetch that creation skipped, behind the new worktree's
-/// window, and says so once if the base moved while the worktree was being
-/// made from where it used to be.
-///
-/// Nothing here can fail the creation: the worktree exists and its window is
-/// open before this starts. The fetch is not allowed to ask for credentials —
-/// a password prompt for an operation the user did not ask for, on a window
-/// that has just appeared, is worse than a base that stays where it is — so a
-/// remote that wants one leaves the answer unknown and the next creation
-/// fetches in front of itself again.
+/// Never prompts for credentials: a password prompt for a fetch the user didn't ask for is worse
+/// than a stale base.
 fn fetch_base_behind_creation(
     git_repos: Vec<Entity<Repository>>,
     base_ref: String,
@@ -527,11 +503,8 @@ fn fetch_base_behind_creation(
             let mut cx = cx.to_async();
             git_repos
                 .iter()
-                .map(|_| {
-                    // Dropping the sender is how this says "no password", which
-                    // fails the fetch rather than prompting for one.
-                    AskPassDelegate::new(&mut cx, |_prompt, _password, _cx| {})
-                })
+                // Dropping the sender fails the fetch instead of prompting.
+                .map(|_| AskPassDelegate::new(&mut cx, |_prompt, _password, _cx| {}))
                 .collect::<Vec<_>>()
         })?;
 
@@ -675,10 +648,7 @@ fn start_worktree_creations(
     Ok((creation_infos, path_remapping))
 }
 
-/// The base a new worktree gets when nobody asks for another: the repository's
-/// default branch when one resolves, and the current branch when it does not.
-/// `+` asks for this, so a spare has to be made from it too — the two have to
-/// agree or the spare is never the one being asked for.
+/// `+` and the spare pool both use this, so a spare is made at the base `+` will ask for.
 pub fn default_worktree_branch_target(
     project: &Entity<Project>,
     cx: &mut gpui::App,
@@ -700,10 +670,6 @@ pub fn default_worktree_branch_target(
     })
 }
 
-/// Starts a spare worktree for this workspace's repositories, unless they
-/// already have one or are already making one. Called where a project settles
-/// rather than where `+` is pressed: the whole point is that the checkout is
-/// behind us before anyone asks.
 pub fn ensure_spare_worktree(
     workspace: &Entity<Workspace>,
     window: &mut gpui::Window,
@@ -717,8 +683,7 @@ pub fn ensure_spare_worktree(
     let Some(key) = spare_key_for_repos(&git_repos, cx) else {
         return;
     };
-    // Asked before the default branch is resolved, which is a git call: a set
-    // that already has its spare should cost nothing to leave alone.
+    // Checked before resolving the default branch, which is a git call.
     if !SpareWorktrees::needs_one(&key, cx) {
         return;
     }
@@ -732,28 +697,15 @@ pub fn ensure_spare_worktree(
         .detach();
 }
 
-/// The name a spare's key is computed under. No worktree is ever created with
-/// it: it is a probe, so that two projects backed by the same repositories
-/// compute the same key. `path_for_new_linked_worktree` resolves through each
-/// repository's main checkout, so a project opened on a linked worktree keys to
-/// the same spare as the checkout it came from.
-const SPARE_KEY_PROBE_NAME: &str = "zed-spare-probe";
-
-/// Where a new worktree of these repositories would be created, one path per
-/// underlying repository. Repositories that resolve to the same path are the
-/// same underlying repository, and are counted once, exactly as creation
-/// counts them.
-fn new_worktree_paths(
-    git_repos: &[Entity<Repository>],
-    worktree_name: &str,
-    worktree_directory_setting: &str,
-    cx: &App,
-) -> Vec<PathBuf> {
+/// Keyed by where a probe-named worktree would go, which resolves through each repository's
+/// main checkout, so projects on linked worktrees of the same repositories share a spare.
+fn spare_key_for_repos(git_repos: &[Entity<Repository>], cx: &App) -> Option<SpareKey> {
+    let worktree_directory_setting = &ProjectSettings::get_global(cx).git.worktree_directory;
     let mut paths: Vec<PathBuf> = Vec::new();
     for repo in git_repos {
         let Some(path) = repo
             .read(cx)
-            .path_for_new_linked_worktree(worktree_name, worktree_directory_setting)
+            .path_for_new_linked_worktree("zed-spare-probe", worktree_directory_setting)
             .log_err()
         else {
             continue;
@@ -762,33 +714,9 @@ fn new_worktree_paths(
             paths.push(path);
         }
     }
-    paths
-}
-
-/// The key these repositories' spare is filed under, or `None` when they have
-/// nowhere to put a worktree at all.
-fn spare_key_for_repos(git_repos: &[Entity<Repository>], cx: &App) -> Option<SpareKey> {
-    if git_repos.is_empty() {
-        return None;
-    }
-    let worktree_directory_setting = ProjectSettings::get_global(cx)
-        .git
-        .worktree_directory
-        .clone();
-    let paths = new_worktree_paths(
-        git_repos,
-        SPARE_KEY_PROBE_NAME,
-        &worktree_directory_setting,
-        cx,
-    );
     (!paths.is_empty()).then_some(paths)
 }
 
-/// The half of a creation that makes directories: the names already taken, a
-/// name for the new one, one `git worktree add` per underlying repository, and
-/// the record that Zed made them. What comes back are the worktree directories
-/// and the `(old work dir, new worktree)` pairs, one per source repository, so
-/// a caller can see when two of them resolved to one worktree.
 #[allow(clippy::too_many_arguments)]
 async fn create_worktree_directories(
     git_repos: &[Entity<Repository>],
@@ -847,8 +775,6 @@ async fn create_worktree_directories(
     Ok((created_paths, path_remapping))
 }
 
-/// The worktree names and paths these repositories already have, which a new
-/// worktree's name must not collide with.
 async fn existing_worktrees(
     receivers: Vec<
         futures::channel::oneshot::Receiver<anyhow::Result<Vec<git::repository::Worktree>>>,
@@ -880,16 +806,7 @@ async fn existing_worktrees(
     (existing_worktree_names, existing_worktree_paths)
 }
 
-/// Starts this repository set's spare worktree, unless it already has one or
-/// is already making one. The work happens behind whatever the user is doing;
-/// a spare that cannot be made is simply not made, and the next `+` pays for
-/// its own checkout as it always did.
-///
-/// A spare is never allowed to fetch. A base that is not in the clone can only
-/// be created from after a `git fetch`, and a fetch nobody asked for, with no
-/// window to report it, is not what this is for: the spare is skipped and the
-/// creation that wants that base does its own fetch, visibly, as before.
-pub fn start_spare_worktree(
+fn start_spare_worktree(
     git_repos: Vec<Entity<Repository>>,
     branch_target: NewWorktreeBranchTarget,
     remote_connection_options: Option<RemoteConnectionOptions>,
@@ -932,8 +849,8 @@ pub fn start_spare_worktree(
     .detach();
 }
 
-/// Makes one spare, or says why there is none to make: `Ok(None)` is a base
-/// this clone would have to fetch for, which a spare never does.
+/// `Ok(None)` when the base would have to be fetched: a spare never fetches, since nothing could
+/// report a fetch nobody asked for.
 async fn build_spare_worktree(
     git_repos: &[Entity<Repository>],
     branch_target: NewWorktreeBranchTarget,
@@ -1170,9 +1087,6 @@ pub fn handle_create_worktree(
     task.detach_and_log_err(cx);
 }
 
-/// Same as [`handle_create_worktree`], but returns a `Task` resolving to the
-/// new (foregrounded) workspace so the caller can continue setup there, e.g.
-/// spawning an agent thread in it.
 pub fn create_worktree_workspace_foreground(
     workspace: &mut Workspace,
     action: &zed_actions::CreateWorktree,
@@ -1187,27 +1101,9 @@ pub fn create_worktree_workspace_foreground(
         fallback_focused_dock,
         RemoteBranchFetchMode::Fetch,
         // The user explicitly asked to create a worktree, so foreground it.
-        WorktreeWorkspaceActivation::Immediate,
+        true,
         cx,
     )
-}
-
-/// How a newly created worktree workspace is brought into the window.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum WorktreeWorkspaceActivation {
-    /// Switch to it as soon as it opens, inheriting the source workspace's
-    /// open files and dock layout.
-    Immediate,
-    /// Keep the user where they are; the workspace is a clean checkout.
-    Background,
-}
-
-impl WorktreeWorkspaceActivation {
-    /// Whether the new workspace inherits the source workspace's open files
-    /// and dock layout, as opposed to opening as a clean checkout.
-    fn transfers_state(self) -> bool {
-        matches!(self, Self::Immediate)
-    }
 }
 
 /// Outcome of [`create_worktree_workspace`].
@@ -1252,7 +1148,7 @@ pub fn create_worktree_workspace(
         fallback_focused_dock,
         RemoteBranchFetchMode::Fetch,
         // Agent-created worktree workspaces open in the background.
-        WorktreeWorkspaceActivation::Background,
+        false,
         cx,
     )
 }
@@ -1263,7 +1159,7 @@ fn create_worktree_workspace_inner(
     window: &mut gpui::Window,
     fallback_focused_dock: Option<DockPosition>,
     remote_branch_fetch_mode: RemoteBranchFetchMode,
-    activation: WorktreeWorkspaceActivation,
+    activate: bool,
     cx: &mut gpui::Context<Workspace>,
 ) -> Task<anyhow::Result<CreatedWorktreeWorkspace>> {
     let project = workspace.project().clone();
@@ -1366,7 +1262,7 @@ fn create_worktree_workspace_inner(
             workspace_handle.clone(),
             window_handle,
             remote_connection_options,
-            activation,
+            activate,
             &mut cx,
         )
         .await;
@@ -1480,17 +1376,13 @@ async fn do_create_worktree(
     workspace: WeakEntity<Workspace>,
     window_handle: Option<gpui::WindowHandle<MultiWorkspace>>,
     remote_connection_options: Option<RemoteConnectionOptions>,
-    activation: WorktreeWorkspaceActivation,
+    activate: bool,
     cx: &mut AsyncWindowContext,
 ) -> anyhow::Result<CreatedWorktreeWorkspace> {
-    // Nothing else may start a spare's checkout until this creation's window is
-    // open, whichever way this returns.
+    // Holds off spare checkouts until this creation's window is open.
     let creating = crate::worktree_spares::CreationInFlight::begin();
 
-    // A worktree made before anyone pressed `+` is this creation's checkout,
-    // already done — as long as it was made for these repositories, at the
-    // base being asked for, and under the generated name a `+` uses rather
-    // than one this caller chose. It is handed out once: claiming removes it.
+    // Only a generated-name creation can take a spare.
     let claimed = if worktree_name.is_none() {
         let claimed = cx.update(|_, cx| {
             spare_key_for_repos(&git_repos, cx).and_then(|key| {
@@ -1501,9 +1393,7 @@ async fn do_create_worktree(
                 )
             })
         })?;
-        // A spare is a directory on disk, and disks are shared with the user:
-        // one that has been removed since it was made is not a checkout this
-        // creation can open, so it is dropped and the checkout happens.
+        // The user may have deleted the spare's directory since it was made.
         match claimed {
             Some(spare) => {
                 let fs = cx.update(|_, cx| <dyn Fs>::global(cx))?;
@@ -1538,10 +1428,7 @@ async fn do_create_worktree(
             .clone()
     })?;
 
-    // Both of these are local git calls whose answers are wanted a few lines
-    // apart, so they run at once rather than one behind the other: whether the
-    // base ref is already in this clone decides whether the fetch below has to
-    // happen before the worktree can be made at all.
+    // Started alongside the worktree listing so the two git calls overlap.
     let base_ref = resolve_worktree_branch_target(&branch_target);
     let (work_directories, base_ref_scans) = if remote_branch_fetch_mode.should_fetch()
         && remote_branch_to_fetch(&branch_target).is_some()
@@ -1560,17 +1447,8 @@ async fn do_create_worktree(
     let (existing_worktree_names, existing_worktree_paths) =
         existing_worktrees(worktree_receivers).await;
 
-    // The three phases of making a worktree, each of which the user waits
-    // through before the window appears: fetching the base branch, checking the
-    // tree out, and opening the workspace over it.
-    //
-    // The fetch is the only one that talks to the network, and it used to be
-    // paid on every creation whether or not the base had moved. It is only
-    // *required* when the base ref is not in this clone at all: a branch that
-    // has never been fetched here cannot be created from. When it is already
-    // here the worktree is made from it straight away and the fetch happens
-    // behind the new window, which says so if the base turns out to have
-    // moved.
+    // The fetch only has to block creation when the base isn't in the clone yet; otherwise it
+    // runs behind the new window.
     let fetch_started = std::time::Instant::now();
     let mut fetch_behind_creation = None;
     if remote_branch_fetch_mode.should_fetch()
@@ -1623,9 +1501,6 @@ async fn do_create_worktree(
     );
 
     let (created_paths, path_remapping, consolidated_worktrees) = match claimed {
-        // A spare is the whole checkout, already done: what is left of this
-        // creation is opening a window over it. It stops being a spare here,
-        // since from now on it is the worktree of a thread.
         Some(spare) => {
             log::info!("quiet-ui perf: worktree claimed from the spare, not checked out");
             for path in &spare.paths {
@@ -1663,16 +1538,7 @@ async fn do_create_worktree(
         }
     };
 
-    // The next `+` wants a spare too, and starting it is deferred until the
-    // window this one was spared for is open: a checkout running against the
-    // open would spend what it just saved. Asked for whether or not a spare was
-    // claimed — a creation that found none is exactly a repository set with no
-    // spare — since `start_building` already refuses when there is one.
-    let refill = (
-        git_repos.clone(),
-        branch_target.clone(),
-        remote_connection_options.clone(),
-    );
+    let spare_remote_connection_options = remote_connection_options.clone();
 
     let mut all_paths = created_paths;
     let has_non_git = !non_git_paths.is_empty();
@@ -1689,7 +1555,7 @@ async fn do_create_worktree(
         window_handle,
         remote_connection_options,
         WorktreeOperation::Create,
-        activation,
+        activate,
         cx,
     )
     .await?;
@@ -1698,11 +1564,13 @@ async fn do_create_worktree(
         open_started.elapsed().as_secs_f64() * 1000.
     );
 
-    // The window is up, so the gap this guard covers is over and the spare
-    // below is free to start.
     drop(creating);
-    let (spare_repos, spare_branch_target, spare_remote) = refill;
-    start_spare_worktree(spare_repos, spare_branch_target, spare_remote, cx);
+    start_spare_worktree(
+        git_repos.clone(),
+        branch_target,
+        spare_remote_connection_options,
+        cx,
+    );
 
     if let Some(deferred) = fetch_behind_creation
         && let Some(base_ref) = base_ref
@@ -1746,7 +1614,7 @@ async fn do_switch_worktree(
         remote_connection_options,
         WorktreeOperation::Switch,
         // Switching is always an explicit, foreground user action.
-        WorktreeWorkspaceActivation::Immediate,
+        true,
         cx,
     )
     .await
@@ -1757,9 +1625,7 @@ async fn do_switch_worktree(
 /// work (e.g., the `create_thread` agent tool spawns a thread inside it).
 async fn open_worktree_workspace(
     all_paths: Vec<PathBuf>,
-    // Kept in the signature, and unused: upstream remaps the source
-    // workspace's open files into the new worktree with these, which this fork
-    // does not do. Keeping the parameters keeps the call sites upstream's.
+    // Unused since open files aren't carried over; kept so call sites stay upstream's.
     _path_remapping: Vec<(PathBuf, PathBuf)>,
     _non_git_paths: Vec<PathBuf>,
     has_non_git: bool,
@@ -1768,26 +1634,24 @@ async fn open_worktree_workspace(
     window_handle: Option<gpui::WindowHandle<MultiWorkspace>>,
     remote_connection_options: Option<RemoteConnectionOptions>,
     operation: WorktreeOperation,
-    activation: WorktreeWorkspaceActivation,
+    activate: bool,
     cx: &mut AsyncWindowContext,
 ) -> anyhow::Result<Entity<Workspace>> {
     let window_handle = window_handle
         .ok_or_else(|| anyhow!("No window handle available for workspace creation"))?;
 
-    // Measured from the same point as the caller's "workspace opened" line, so
-    // the two together say how much of the open phase the user actually waits
-    // through and how much of it settles behind the window.
     let open_started = std::time::Instant::now();
 
     let focused_dock = previous_state.focused_dock;
 
     let is_creating_new_worktree = matches!(operation, WorktreeOperation::Create);
 
-    // A background open (e.g. the agent's `create_thread` tool) is a clean
-    // checkout rather than an inheritance of the source workspace's open files
-    // and dock layout; the transfer only makes sense when the user is being
-    // moved into the new worktree.
-    let transfer_state = is_creating_new_worktree && activation.transfers_state();
+    // When `activate` is false the new workspace is opened in the background
+    // (e.g. the agent's `create_thread` tool), so it should be a clean
+    // checkout rather than inheriting the source workspace's open files and
+    // dock layout. The state transfer only applies when we're foregrounding
+    // a freshly-created worktree for the user.
+    let transfer_state = is_creating_new_worktree && activate;
 
     let source_for_transfer = if transfer_state {
         Some(workspace.clone())
@@ -1869,12 +1733,8 @@ async fn open_worktree_workspace(
                     );
                 }
 
-                // Upstream reopens every file the source workspace had open,
-                // remapped into the new worktree, so a branch switch continues
-                // where you were. Here a new worktree is a new thread's
-                // workspace: it starts on an empty editor, and the agent opens
-                // what it needs. Twenty inherited tabs are twenty things to
-                // close.
+                // A new worktree is a new thread's workspace, so the source's open files aren't
+                // reopened in it.
                 if focused_dock.is_none() {
                     workspace.focus_center_pane(window, cx);
                 }
@@ -1890,14 +1750,9 @@ async fn open_worktree_workspace(
         })
         .ok();
 
-    // Show the window here rather than after the project has settled. The
-    // scan below is the phase that measured worst — it walks the whole
-    // checkout, which on a large repository is most of the wait — and none of
-    // it is anything the user is looking at. Zed opens a folder this way
-    // everywhere else: the window comes up and fills in.
-    let activate_now = activation == WorktreeWorkspaceActivation::Immediate;
+    // Shown before the initial scan below, which is most of the wait on a large repository.
     window_handle.update(cx, |multi_workspace, window, cx| {
-        if activate_now {
+        if activate {
             multi_workspace.activate(new_workspace.clone(), source_for_transfer, window, cx);
         } else {
             // Background open: register the new workspace as a retained tab
@@ -1905,7 +1760,7 @@ async fn open_worktree_workspace(
             multi_workspace.add(new_workspace.clone(), window, cx);
         }
 
-        if activate_now
+        if activate
             && is_creating_new_worktree
             && let Some(dock_position) = focused_dock
         {
@@ -1923,10 +1778,7 @@ async fn open_worktree_workspace(
         open_started.elapsed().as_secs_f64() * 1000.
     );
 
-    // The caller is handed a workspace whose project has finished scanning and
-    // whose repositories have reported in — the agent's `create_thread` tool
-    // opens a thread against them the moment this returns — so the waits stay,
-    // they just no longer stand between the user and the window.
+    // Callers like `create_thread` still need a scanned project when this returns.
     new_workspace
         .update(cx, |workspace, cx| {
             workspace.project().read(cx).wait_for_initial_scan(cx)
@@ -1951,8 +1803,8 @@ async fn open_worktree_workspace(
         .await;
 
     if is_creating_new_worktree {
-        // Setup hooks run against a scanned project, foreground or background:
-        // the worktree was created either way.
+        // Run create-worktree setup hooks regardless of foreground vs
+        // background — the worktree was created either way.
         window_handle.update(cx, |_multi_workspace, window, cx| {
             new_workspace.update(cx, |workspace, cx| {
                 workspace.run_create_worktree_tasks(window, cx);
@@ -2286,11 +2138,6 @@ mod tests {
         );
     }
 
-    /// Every creation used to fetch its base branch first, 1.5 to 3 seconds of
-    /// the wait on `+`, whether or not the base had moved. A base that is
-    /// already in the clone can be created from as it stands, so the fetch
-    /// happens behind the new window instead — and the creation stops
-    /// depending on the network at all.
     #[gpui::test]
     async fn test_a_base_already_in_the_clone_is_not_fetched_before_creating(
         cx: &mut TestAppContext,
@@ -2353,9 +2200,6 @@ mod tests {
             "the fetch should still have happened, behind the creation"
         );
 
-        // That fetch failed, so the base is no longer being refreshed by
-        // anything. The next creation pays for a fetch in front of itself
-        // again rather than building on a base nothing is updating.
         let second = main_workspace
             .update_in(cx, |workspace, window, cx| {
                 create_worktree_workspace(
@@ -2379,9 +2223,6 @@ mod tests {
         );
     }
 
-    /// The other half: a base that has never been fetched into this clone
-    /// cannot be created from, so that creation still waits for the fetch and
-    /// fails with it.
     #[gpui::test]
     async fn test_a_base_missing_from_the_clone_is_fetched_first(cx: &mut TestAppContext) {
         init_test(cx);
@@ -2437,8 +2278,6 @@ mod tests {
         );
     }
 
-    /// Every directory under the managed worktrees root, which is where a
-    /// creation and a spare both put one.
     fn worktree_directories(fs: &Arc<FakeFs>, managed_root: &str) -> Vec<PathBuf> {
         let managed_root = PathBuf::from(managed_root);
         let mut dirs: Vec<PathBuf> = fs
@@ -2450,9 +2289,6 @@ mod tests {
         dirs
     }
 
-    /// `+` gets the worktree that was already made for it, and the next one is
-    /// started as soon as it does: the checkout is behind the user rather than
-    /// in front of them.
     #[gpui::test]
     async fn test_a_spare_worktree_is_handed_over_and_replaced(cx: &mut TestAppContext) {
         init_test(cx);
@@ -2497,8 +2333,6 @@ mod tests {
         );
         let spare = spares[0].clone();
 
-        // The base `+` asks for, resolved the way `+` resolves it, so the
-        // spare is the one being asked for.
         let branch_target = main_workspace
             .update(cx, |workspace, cx| {
                 default_worktree_branch_target(&workspace.project().clone(), cx)
@@ -2545,9 +2379,6 @@ mod tests {
         );
     }
 
-    /// A spare is only the creation's if it was made from the base being asked
-    /// for. One at another base is left standing and the creation does its own
-    /// checkout.
     #[gpui::test]
     async fn test_a_spare_at_another_base_is_not_claimed(cx: &mut TestAppContext) {
         init_test(cx);

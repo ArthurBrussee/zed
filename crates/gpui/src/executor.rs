@@ -181,13 +181,8 @@ impl BackgroundExecutor {
         self.scoped_at(priority, core::panic::Location::caller(), scheduler)
     }
 
-    /// A scope's tasks are reported at the call site that opened the scope.
-    ///
-    /// They used to be reported where they are spawned, which is inside here,
-    /// so a burst of slow background tasks named this file and said nothing
-    /// about the scan that asked for them. The two public entry points are not
-    /// `async fn` for the same reason: `#[track_caller]` on an `async fn` is a
-    /// no-op, so the location has to be taken before the future is built.
+    /// Attributes a scope's tasks to the caller that opened it. The public entry points aren't
+    /// `async fn` because `#[track_caller]` is a no-op on one.
     #[cfg(not(target_family = "wasm"))]
     fn scoped_at<'scope, F>(
         &self,

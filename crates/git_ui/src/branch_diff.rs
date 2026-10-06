@@ -67,8 +67,6 @@ impl Addon for BranchDiffAddon {
             .status_for_buffer_id(buffer_id, cx)
     }
 
-    /// Generated files are sorted last and folded shut, so their header is all
-    /// a reader sees of them; the tag says why.
     fn render_buffer_header_controls(
         &self,
         _: &multi_buffer::ExcerptBoundaryInfo,

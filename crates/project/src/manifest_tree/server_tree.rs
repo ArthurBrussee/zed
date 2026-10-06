@@ -250,10 +250,6 @@ impl LanguageServerTree {
         if !settings.enable_language_server {
             return Default::default();
         }
-        // A worktree runs language servers only if it was switched on. Off
-        // is the default everywhere: a machine restoring a dozen worktree
-        // windows would otherwise start a dozen servers indexing copies of
-        // the same repository, and almost none of them are wanted.
         if !crate::worktree_language_servers::worktree_runs_language_servers(
             &self.manifest_tree.read(cx).worktree_store,
             manifest_location.worktree_id,

@@ -166,8 +166,6 @@ pub(super) struct DiffHunkKey {
     pub(super) hunk_start_anchor: Anchor,
 }
 
-/// A review comment taken out of the editor for sending, with its location
-/// resolved against the multibuffer it was created in.
 pub struct TakenReviewComment {
     pub file_path: Arc<util::rel_path::RelPath>,
     pub range: Range<Anchor>,
@@ -222,8 +220,7 @@ impl DiffReviewDragState {
     }
 }
 
-/// Marks the diff review overlay's input editor so the keymap can bind enter
-/// to submit while shift-enter keeps inserting newlines.
+/// Lets the keymap bind enter to submit while shift-enter inserts a newline.
 struct DiffReviewPromptAddon;
 
 impl crate::Addon for DiffReviewPromptAddon {
@@ -645,9 +642,7 @@ impl Editor {
         // Use the hunk key we already computed
         let hunk_key = new_hunk_key;
 
-        // Create the prompt editor for the review input. Auto-height so the
-        // comment can span multiple lines (enter submits via the
-        // `diff_review_input` key context; shift-enter inserts a newline).
+        // Create the prompt editor for the review input
         let prompt_editor = cx.new(|cx| {
             let mut editor = Editor::auto_height(1, 6, window, cx);
             editor.set_placeholder_text("Add a review comment...", window, cx);
@@ -655,7 +650,6 @@ impl Editor {
             editor
         });
 
-        // Grow the overlay block as the comment grows.
         let subscription = cx.subscribe_in(&prompt_editor, window, {
             let hunk_key = hunk_key.clone();
             move |editor, _prompt_editor, event: &EditorEvent, window, cx| {
@@ -1039,15 +1033,10 @@ impl Editor {
     }
 
     pub(super) fn show_diff_review_button(&self, cx: &App) -> bool {
-        // Diff surfaces opt in explicitly via `set_show_diff_review_button`.
         if self.show_diff_review_button {
             return true;
         }
-        // Plain file editors also get the review affordance, so a comment can
-        // be left on any buffer in a worktree, not only on a diff. Restricted
-        // to full-mode singleton editors backed by a project file so it never
-        // appears on mini editors (search, rename, message inputs) or on
-        // non-diff multibuffers (project search, references).
+        // Any project file can be commented on, but not mini editors or non-diff multibuffers.
         if !self.mode.is_full() || self.project.is_none() {
             return false;
         }
@@ -1156,9 +1145,6 @@ impl Editor {
         cx.notify();
     }
 
-    /// Action handler for `agent::AddReviewComment`: opens the review overlay
-    /// on the selected lines. Only editors that show the diff review button
-    /// participate.
     pub(super) fn add_review_comment_action(
         &mut self,
         _: &zed_actions::agent::AddReviewComment,
@@ -1174,8 +1160,7 @@ impl Editor {
         let range = selection.range();
         let start_row = range.start.row();
         let mut end_row = range.end.row();
-        // A full-line selection ends at column 0 of the next row; don't
-        // include that row in the comment range.
+        // A full-line selection ends at column 0 of the next row.
         if end_row > start_row && range.end.column() == 0 {
             end_row.0 -= 1;
         }
@@ -1189,8 +1174,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // The overlay's own prompt editor sees the action first; propagate so
-        // the host editor that owns the overlays handles it.
+        // The overlay's prompt editor sees the action first; let the host editor handle it.
         if self.diff_review_overlays.is_empty() {
             cx.propagate();
             return;
@@ -1198,11 +1182,8 @@ impl Editor {
         self.submit_diff_review_comment(window, cx);
     }
 
-    /// Takes all stored review comments (including any text still sitting
-    /// unsubmitted in an overlay's input), dismisses the overlays, and returns
-    /// the comments ordered by buffer position.
+    /// Includes text still unsubmitted in an overlay's input.
     pub fn take_review_comments(&mut self, cx: &mut Context<Self>) -> Vec<TakenReviewComment> {
-        // Text typed into an overlay but not yet submitted still counts.
         let pending: Vec<_> = self
             .diff_review_overlays
             .iter()
@@ -2572,7 +2553,7 @@ impl Editor {
             )
         };
 
-        // Calculate new height, including extra lines in the input editor
+        // Calculate new height
         let snapshot = self.buffer.read(cx).snapshot(cx);
         let prompt_lines = prompt_editor.update(cx, |editor, cx| editor.max_point(cx).row().0 + 1);
         let new_height = self.calculate_overlay_height(hunk_key, comments_expanded, &snapshot)

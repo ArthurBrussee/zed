@@ -332,11 +332,8 @@ impl ListState {
         this
     }
 
-    /// Report, at info level, any item that lays out taller than the height
-    /// this list had remembered for it. That gap is the shape of every
-    /// overlap in a list whose items grow: the slot was sized from the stale
-    /// height and the element paints past it, over whatever is below. Off by
-    /// default, so no other list in the app says anything.
+    /// Log any item that lays out taller than its remembered height, which is what makes a grown
+    /// item paint over its neighbours.
     pub fn report_stale_measurements(&self) {
         self.0.borrow_mut().report_stale_measurements = true;
     }
@@ -1035,10 +1032,6 @@ impl StateInner {
         self.items = SumTree::from_iter(measured_items, ());
     }
 
-    /// Says when an item laid out taller than the height the list had
-    /// remembered for it, which is what leaves a grown item painting over
-    /// its neighbours. Silent unless the list asked for it with
-    /// [`ListState::report_stale_measurements`].
     fn report_stale_measurement(
         &self,
         item_index: usize,

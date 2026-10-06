@@ -746,10 +746,7 @@ impl TitleBar {
         }
     }
 
-    /// The open-sidebar affordance while the threads sidebar is closed: the
-    /// toggle button and a slim divider at the title bar's left end (the title
-    /// bar already clears the macOS window controls). While the sidebar is
-    /// open, the toggle lives in the sidebar's own header instead.
+    /// While the sidebar is open, its own header carries the toggle instead.
     fn render_collapsed_sidebar_toggle(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let multi_workspace = self.multi_workspace.clone()?.upgrade()?;
         let multi_workspace = multi_workspace.read(cx);
@@ -883,9 +880,7 @@ impl TitleBar {
 
         PopoverMenu::new("recent-projects-menu")
             .menu(move |window, cx| {
-                // No in-window workspace list here: cross-workspace thread
-                // tabs and the sidebar are the workspace switcher. This menu
-                // only opens recent projects.
+                // The sidebar is the workspace switcher.
                 Some(recent_projects::RecentProjects::popover(
                     workspace.clone(),
                     Vec::new(),
@@ -931,9 +926,7 @@ impl TitleBar {
 
         PopoverMenu::new("sidebar-title-recent-projects-menu")
             .menu(move |window, cx| {
-                // No in-window workspace list here: cross-workspace thread
-                // tabs and the sidebar are the workspace switcher. This menu
-                // only opens recent projects.
+                // The sidebar is the workspace switcher.
                 Some(recent_projects::RecentProjects::popover(
                     workspace.clone(),
                     Vec::new(),

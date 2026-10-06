@@ -83,11 +83,7 @@ pub struct FakeGitRepositoryState {
     pub stash_entries: GitStash,
     pub commit_template: Option<GitCommitTemplate>,
     pub blob_read_gate: Option<FakeBlobReadGate>,
-    /// Every remote this repository has been asked to fetch, in order, so a
-    /// test can tell a flow that fetched from one that did not.
     pub fetched_remotes: Vec<String>,
-    /// When set, every fetch records its attempt and then fails with this
-    /// message, standing in for a machine that is offline.
     pub simulated_fetch_error: Option<String>,
 }
 

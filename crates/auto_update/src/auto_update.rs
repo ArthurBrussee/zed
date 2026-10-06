@@ -266,14 +266,7 @@ struct GlobalAutoUpdate(Option<Entity<AutoUpdater>>);
 
 impl Global for GlobalAutoUpdate {}
 
-/// Dev does not poll upstream, because upstream has nothing to offer a build
-/// somebody made themselves. This fork publishes its own, so a released fork
-/// build polls for those; a debug build is still somebody working on the
-/// source and is left alone.
-///
-/// Background polling and the "Check for Updates" menu item both ask here.
-/// They used to carry a copy of the gate each, and the copies drifted: the
-/// menu item kept upstream's and returned before it reached the updater.
+/// Release builds of the fork (Dev channel) poll the fork's own releases; debug builds don't.
 fn polls_for_updates(cx: &App) -> bool {
     ReleaseChannel::try_global(cx)
         .map(|channel| {
@@ -769,10 +762,6 @@ impl AutoUpdater {
             cx.notify();
         });
 
-        // This fork publishes its own builds and has no account with zed.dev's
-        // release endpoint, so it asks its own release where the newest dmg is.
-        // Dev is the channel the fork builds under; a debug build is somebody
-        // working on the source and has no business being offered a dmg.
         let fetched_release_data = if release_channel == ReleaseChannel::Dev
             && !cfg!(debug_assertions)
         {
@@ -897,9 +886,7 @@ impl AutoUpdater {
         let fetched_version = fetched_version.parse::<Version>()?;
 
         match release_channel {
-            // The fork's version number never moves, so only the commit can say
-            // whether the build on the other end is a different one. That is
-            // exactly what Nightly asks.
+            // The fork's version never moves, so compare commits as Nightly does.
             ReleaseChannel::Nightly | ReleaseChannel::Dev => {
                 let should_download = if let AutoUpdateStatus::Updated { version } = status {
                     fetched_version != version
