@@ -26,16 +26,14 @@ regardless.
 
 ## Upstream first (from 2026-10-01)
 
-The fork stands at +45.8k / -11.4k lines across 109 files against upstream (+40.9k / -9.4k
-without this file and the sidebar test files; the exact figures on 10-05 were +45,792 / -11,354). It was +44.8k / -11.3k across 107 files at the
-start of 2026-10-05, +42.9k / -11.2k at the start of 2026-10-04, and +42.0k / -10.7k on
-2026-10-02. So it has gone **up** three nights running, by 1.0k on 10-05, and each time because a
-Work queue entry asked for the lines: 10-05's are four built items and their tests. Two new seams
-this night, both asked for: `gpui/src/elements/list.rs`, which now reports an item that lays out
-taller than the height the list remembered (five reports of pictures painting over chips arrived
-with no line to grep for), and `README.md`, which carries the review banner `CLAUDE.md` requires
-of any session that touches source — that one is not the fork's idea and will conflict every
-rebase until it is removed by hand. Every line is still rebase cost and a place
+The fork stands at +36.7k / -11.3k lines across 109 files against upstream (+33.1k / -9.4k
+without this file and the sidebar test files; the exact figures after the 2026-10-06 reduction run
+were +36,737 / -11,298). It was +45.8k / -11.4k at the start of that run, after going **up** four
+nights running (+42.0k on 10-02, +42.9k on 10-04, +44.8k on 10-05), each time because a Work queue
+entry asked for the lines. The 10-06 run built nothing and cut 9.1k added lines, almost all of it
+comment paragraphs, duplicated tests and dead code (see its rebase log entry). `README.md` carries
+the review banner `CLAUDE.md` requires of any session that touches source — not the fork's idea; it
+will conflict every rebase until removed by hand. Every line is still rebase cost and a place
 for bugs, and not all of it was asked for. Arthur's rule: **upstream wins by default, and the
 fork carries a change only with an explicit reason.** An explicit reason is that Arthur asked for it (a Work
 queue entry or a request recorded in this file), or that something he asked for needs it.
@@ -2354,3 +2352,104 @@ and left the user with no way back. **Adopted instead**, into the status bar the
 row's place, keeping upstream's `discard-protected-draft` selector so upstream's test is the test.
 That is the seam rule's other half earning its place: take ours for the *surface*, but look at what
 upstream put in it before throwing the contents away.
+
+**2026-10-06, reduction run** (no rebase; on top of the 10-05 tip `704ff0b`, merge base
+cac9d17a6). Arthur's ask: make the fork substantially smaller without losing anything he asked
+for, build nothing. **Diff size, histogram: 109 files, +45,792 / -11,354 before; 109 files,
++36,737 / -11,298 after** — 9,055 added lines gone. Without this file and the sidebar test files:
++40.9k / -9.4k before, +33.1k / -9.4k after. Eight agents cut in parallel, one per area, each owning
+its own files; seven commits, one per area plus the test fix below.
+
+**What was cut, by category.**
+
+- *Upstream provides it.* Only one case: chips.rs carried a moved copy of upstream's
+  `highlight_code_runs`; thread_view.rs has upstream's again and chips.rs uses it. Nothing else
+  the fork carries has an upstream equivalent yet (re-checked: `Repository::diff_stat` has no
+  merge-base variant, so `branch_diff_stats.rs` still parses its own patch).
+- *No reason.* `worktree_service`'s `WorktreeWorkspaceActivation` enum back to upstream's
+  `activate: bool`; upstream's `title_override`, `activate_new_thread` and a dozen other reshaped
+  or reworded upstream lines and comments put back (editor/git.rs, agent_diff, model selector,
+  sidebar, thread_item); `ThreadItem`'s unrequested "PR Chips" component-preview example.
+- *Leftovers of removed features.* The tab bar (09-28): `ThreadTab`/`ForeignThreadTab`'s tab
+  content, tooltips, status indicator and the observations that only repainted them. Drafts and
+  the retained cache: `CreateThreadOptions::activate` (always false) and the `discard_empty_draft`
+  branch it guarded, a `session_config` parameter every caller passed empty, `clear_draft_message`,
+  a no-op flag in the sidebar's `close_terminal_entry`.
+- *Dead and duplicated code.* diff_review is v2-only: the `ReviewBlockText` trait and both impls
+  are gone, and thread_view renders review comments with diff_review's parser instead of a second
+  one of its own. gh_status: unused pub API (`global`, `fetched_ago`, `last_error`,
+  `pr_chips_for_branches`, `set_prs_for_test`), and the GraphQL answer deserializes into the CLI
+  path's `GhPr`/`GhCheck` via `serde(flatten)` instead of mirroring them field by field.
+  acp_thread: `Subagent::display_label`, `is_plumbing`, and `pub` on crate-internal items; acp.rs
+  shares one field reader for the AIR updates. `ActionChipId::EditFile` (built and discarded),
+  `ThreadBookmarks::is_empty`, `ToolCallDiff::deploy` folded into `open_tool_call_diff`,
+  `activate_additional_new_thread` reduced to an alias, shared helpers for tab-thread bookkeeping
+  and submodule admin entries.
+- *Tests.* command_parse 45 → 26 (tables), pr_mentions 12 → 5, gh_status 59 → 43, sidebar fork
+  tests share one fixture and setup and lose five that another test covers, acp_thread's fork tests
+  use upstream's `new_test_thread`. Every requested behaviour keeps at least one test; no
+  `#[ignore]` was touched.
+- *Comments*, the largest single category: the fork's paragraphs cut to the non-obvious why
+  across every file (command_parse 562 → ~127 comment lines, chips.rs 481 → ~80, thread_view.rs
+  ~930 lines). Several stacked orphan doc comments from earlier rewrites went, and three
+  misattached ones were fixed (`persist_worktree_state`, an orphan action doc that had merged into
+  `ChatWithFollow`'s, `ThreadPrSnapshot::dismiss`).
+
+**Bugs found on the way.** A duplicated `#[gpui::test]` on git's submodule checkpoint test; a
+misplaced `#[cfg(unix)]` that sat on the chip-width test while the `sleep 60` stop test ran on
+every platform; and the fork's tests inserted into acp_thread.rs had taken the `#[cfg(unix)]` off
+upstream's terminal-kill test. All three fixed. And `test_a_spare_worktree_is_handed_over_and_replaced`
+**fails whenever it runs in parallel with the other spare test, on the old code too**:
+`CREATIONS_IN_FLIGHT` is process-wide, so one test's creation stops the other starting its
+replacement spare. The counter is thread-local under `cfg(test)` now; production is unchanged.
+
+**Kept although it looked cuttable.** `config_options.rs` (recorded as the requested combined
+menu; comments only), the "conversation" wording (recorded request), `ForeignThreadTab`
+(cross-worktree reorder), `ask_when_the_budget_returns` (the only reset source when no batch has
+answered recently), the npm-install dedupe in `agent_server_store.rs` (looks like a reliability fix;
+the 10-01 audit line for that file is stale), the executor `#[track_caller]` changes (a finding of
+the performance pass, missing from the audit), and the sidebar's remaining diff (compared function
+by function: ~85 are identical to upstream, the rest need their changes).
+
+**For Arthur to decide** (kept, none recorded as requested):
+- Unknown tool-call updates are dropped with a warning instead of upstream's "Tool call not found"
+  entry (`update_tool_call`).
+- Codex-oriented polish in acp_thread: generic edit labels, usage-limit error parsing and
+  linkifying, wait/lookup/stdin chip filters, compaction notices, plan entries reset on cancel.
+- thread_view: the "N subagents" chip in `render_generating` (the pill already counts them from
+  their lifecycle), `render_compaction_barrier`'s restyle, the diff-stat chip tinting.
+- agent_ui: back/forward thread navigation, `ToggleReviewLayout`, `agent_brand_color` tints,
+  opening `.html` links in the system browser, the model selector's working glimmer and its -2px
+  offset, the launch-deadline logs in `agent_connection_store.rs`; `NewAdditionalThread` now does
+  exactly what `NewThread` does and could go.
+- Empty-draft handling that sits oddly with "no drafts to drop": `local_thread_tab_removed`
+  deletes an empty thread's row on close, `redirect_activation_off_empty_draft`, and
+  `discard_empty_draft` before a worktree carry; the sidebar tests' `EMPTY_DRAFT_PLACEHOLDER`
+  filters may be unnecessary.
+- Outside agent_ui: upstream's carry of open files into a new worktree is dropped (~65 lines to
+  restore); the status bar renders in the centre column; `BranchDiffToolbar` is no longer
+  registered; `quiet_ui_build.yml`'s header comment is wrong (fix or delete the workflow).
+
+**The gate: green for everything this run changed.**
+`cargo check --workspace --all-targets` on a quiet tree: 0 errors, 0 warnings. `cargo test`:
+acp_thread 306, agent_servers 58, gh_status 43, ui 91 plus 41 doctests, agent_ui 534 (35
+`#[ignore]`d, the same 35), sidebar 189, gpui 382 plus 1 (2 ignored), project 68 plus 408, zed 93,
+git_ui_core 31, git_ui 176, workspace 278, title_bar 7, editor 1,177, plus scheduler, util, fs, git,
+language_model and markdown; zero failures except three, each shown not to be this fork's by
+running upstream's own source for that crate on the same tree and getting the same failure:
+`auto_update::test_auto_update_downloads` ("database not initialized", after installing `rsync`,
+which the sandbox lacks and the test needs), the two `gpui_macros` doctests for `property_test`
+(they need features a doctest doesn't get), and `editor`'s
+`code_lens::tests::test_code_lens_resolve_only_visible` (a viewport-boundary assertion that resolves
+row 60 as well; three of three runs). This run changed only comments in those crates and in
+everything `editor` depends on, so all three fail identically at `704ff0b`; none of them was in a
+previous night's gate. `./script/clippy` over all 22 crates touched (`--release --all-targets
+--all-features -- --deny warnings`): clean. The `cargo test` counts that went down are the merged
+tests above, not lost ones.
+
+**Environment.** `rsync` joins the list of things to install (for `auto_update`'s suite). The disk
+ran out twice, both times from several agents building test binaries at once — **parallel agents
+get `cargo check` only; the coordinator runs the suites**, one crate group at a time with
+`target/debug` deleted between groups, and `cargo test --no-fail-fast` across several crates or a
+failure in one hides the rest (it did here: `auto_update` failing stopped `git_ui_core`, `git_ui`,
+`title_bar` and `workspace` from running until they were re-run).
