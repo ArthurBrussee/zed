@@ -181,6 +181,30 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**Command chips: more room for the label, and no blank space inside or between them.**
+
+Arthur, 2026-10-06: too many command chips are cut off, and there is a strange amount of
+whitespace around them. Three limits cut a label, all in `chips.rs`:
+- `collapsed_command`: `WIDTH = 60` characters for a single command and `PIECE_WIDTH = 22` per
+  piece of a chained line, applied through `acp_thread::command_display_prefix`. That is how
+  `wc flushcut-review.dif…` lost its filename in the 10-05 screenshot.
+- `action_chip_base`: `max_w(relative(0.75))` of the row.
+
+Raise them. Pieces get about 40 characters and a single command about 100. The width cap goes to
+the full row, since chips wrap to a new line anyway. A long path inside a piece truncates from
+the start so the file name stays (`…/flushcut-review.diff`), the way path labels already do.
+
+The whitespace: in the 10-05 screenshot the `git add | git HEAD | wc flushcut-review.dif…` chip
+ends about 55px after its last character, and the `Searched "window\\.|globalThis\\."` chip
+in the 10-02 one has the same blank tail. The chip is measured wider than the text it draws.
+The suspect is the label's text size: the runs are built from `command_text_style` with
+`font_size` 12px, while the container is `text_xs()` and `StyledText` measures with the
+inherited style. A label measured at one size and drawn at another leaves exactly this gap.
+Measure, don't guess: a layout test that renders a single-command chip and a three-piece chip
+and asserts the chip's width equals its glyphs + label + gaps + padding, within a pixel.
+Check the gap between chips in a row too (`gap_1` in `render_action_group`), and whatever puts
+extra vertical space between rows and around the run. Arthur reads all of it as wasted space.
+
 **The two memory baselines: ~4,000 command terminals twice over, and ~17,925 `Markdown`. Read on
 2026-10-05; both need a design decision rather than a patch, and neither is where the entry
 thought.**
