@@ -327,61 +327,37 @@ pub struct ThreadMetadata {
     pub archived: bool,
 }
 
-/// The last PR state observed for a thread's branches.
-///
-/// Archiving a thread removes its git worktree from disk, so its branch can no
-/// longer be resolved and `gh_status` has nothing to query. Persisting the last
-/// observed branches and PRs keeps an archived thread's PR badge (merged,
-/// closed, ...) instead of degrading it to the inert "no PR" pill.
+/// The last PR state observed for a thread's branches, persisted because an
+/// archived thread's worktree (and so its branch) is gone.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ThreadPrSnapshot {
-    /// The branches the PRs were observed on, in the order they were seen.
     pub branches: Vec<SharedString>,
     pub prs: Vec<gh_status::PrStatus>,
-    /// The pull requests this thread watches, whatever branch they are on.
-    /// A branch is one way a PR gets in here, not the definition.
+    /// PRs this thread watches, whatever branch they are on.
     #[serde(default)]
     pub watched: Vec<WatchedPr>,
-    /// The ones taken out by hand. Kept, because the next mining pass would
-    /// otherwise put back what was just removed.
+    /// Kept so the next mining pass does not put back what was removed.
     #[serde(default)]
     pub dismissed: Vec<WatchedPr>,
-    /// The ones the user asked for rather than the thread naming them. Where
-    /// a watched PR came from is otherwise not recorded anywhere: a branch's
-    /// PRs are in `prs`, and what is in `watched` and not here is the miner's
-    /// guess. Only the guesses are the miner's to take back.
+    /// Watched PRs the user asked for; the rest are the miner's to take back.
     #[serde(default)]
     pub user_added: Vec<WatchedPr>,
-    /// Titles for the pull requests this thread watches or has taken out.
-    ///
-    /// Neither set records one of its own: a PR watched by number borrows its
-    /// title from whichever thread saw it as a branch PR, and a removed one
-    /// may be the last thread that ever did. Keeping the title at the moment
-    /// it is known is what stops a PR offered back reading as a bare number.
+    /// Kept so a PR nothing polls any more is not shown as a bare number.
     #[serde(default)]
     pub titles: Vec<(WatchedPr, SharedString)>,
-    /// Which version of the mining rules filled this set. An older one means
-    /// the set was mined by rules that read more than they should have; see
-    /// [`ThreadPrSnapshot::adopt_mining_rules`].
+    /// See [`ThreadPrSnapshot::adopt_mining_rules`].
     #[serde(default)]
     pub mining_rules: u32,
 }
 
-/// The mining rules as they stand: prose and `gh pr create` only, no piece of
-/// text naming three or more, and only text that has finished arriving. A
-/// snapshot filled by anything older gets its mined PRs re-decided the next
-/// time its thread is opened. Bump this whenever a change to the rules would
-/// leave PRs in a set that the new rules would not have put there.
+/// Bump whenever a rule change would leave PRs in a set that the new rules
+/// would not have put there; older sets are re-mined when their thread opens.
 ///
 /// 2: reading half-written text mined the numbers a URL passes through on its
 /// way, so a set can hold a PR that is a prefix of the one beside it.
 pub const MINING_RULES: u32 = 2;
 
-/// One pull request a thread watches.
-///
-/// A PR mined from the thread's own branch has no repository name of its own:
-/// it is whichever repository that branch is in. One named by a URL does, and
-/// carrying it is what lets a thread watch a PR it never checked out.
+/// `repo` is `None` for a PR of the thread's own branch's repository.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct WatchedPr {
     #[serde(default)]
@@ -398,9 +374,7 @@ impl ThreadPrSnapshot {
         set.iter().position(|watched| watched == pr)
     }
 
-    /// Adds a PR the thread named itself. A PR the user took out stays out:
-    /// mining runs on every pass and would otherwise undo the removal on the
-    /// next one.
+    /// Adds a PR the thread named itself, unless the user took it out.
     pub fn mine(&mut self, pr: WatchedPr) -> bool {
         if Self::position_of(&self.dismissed, &pr).is_some()
             || Self::position_of(&self.watched, &pr).is_some()
@@ -411,8 +385,7 @@ impl ThreadPrSnapshot {
         true
     }
 
-    /// Adds a PR the user asked for, which also says they want it back if
-    /// they had taken it out before.
+    /// Adds a PR the user asked for, undoing an earlier dismissal.
     pub fn add(&mut self, pr: WatchedPr) -> bool {
         if let Some(ix) = Self::position_of(&self.dismissed, &pr) {
             self.dismissed.remove(ix);
@@ -427,18 +400,9 @@ impl ThreadPrSnapshot {
         true
     }
 
-    /// Re-decides the mined part of the set under the current rules.
-    ///
-    /// The old rules read every tool call's output, so sets persisted under
-    /// them carry pull requests that were only ever printed inside a chip —
-    /// a `gh pr list`, a changelog, a search. `mined` is what a full pass
-    /// over the thread's own transcript found under the current rules;
-    /// everything else the miner put in goes. What the user asked for stays,
-    /// and a branch's PRs were never in this set to begin with.
-    ///
-    /// Dropped PRs are not dismissed: a dismissal is the user's statement,
-    /// and the next rule change (or the thread naming one properly) should be
-    /// free to bring them back.
+    /// Re-decides the mined part of the set under the current rules: `mined`
+    /// is what a full pass found, and what the user added stays. Dropped PRs
+    /// are not dismissed, so a later pass may bring them back.
     pub fn adopt_mining_rules(&mut self, mined: &[WatchedPr]) -> bool {
         if self.mining_rules >= MINING_RULES {
             return false;
@@ -447,19 +411,10 @@ impl ThreadPrSnapshot {
         let user_added = &self.user_added;
         self.watched
             .retain(|pr| user_added.contains(pr) || mined.contains(pr));
-        // The version itself has to be written back, so this is a change even
-        // when the old rules happened to have mined nothing wrong.
+        // The version itself has to be written back.
         true
     }
 
-    /// Takes a PR out, and remembers that it was taken out.
-    ///
-    /// A PR the thread's branch carries is never in `watched` — the branch
-    /// watch already asks about it — so a dismissal is recorded whether or
-    /// not there was a watch to remove. That record is what keeps the next
-    /// poll from putting the chip straight back.
-    /// Records what a pull request is called, so it can still be named after
-    /// nothing is polling for it any more.
     pub fn remember_title(&mut self, pr: &WatchedPr, title: SharedString) -> bool {
         match self.titles.iter_mut().find(|(known, _)| known == pr) {
             Some((_, known_title)) if *known_title == title => false,
@@ -481,6 +436,8 @@ impl ThreadPrSnapshot {
             .map(|(_, title)| title.clone())
     }
 
+    /// Recorded even when nothing was watched: a branch's PR is never in
+    /// `watched`, and the record keeps the next poll from putting it back.
     pub fn dismiss(&mut self, pr: &WatchedPr) -> bool {
         let was_watched = Self::position_of(&self.watched, pr)
             .map(|ix| self.watched.remove(ix))
@@ -622,23 +579,15 @@ impl From<&ThreadMetadata> for acp_thread::AgentSessionInfo {
     }
 }
 
-/// One initialised submodule of an archived worktree, with the checkpoint
-/// taken inside it.
-///
-/// The superproject's own checkpoint records a submodule only as the commit
-/// its gitlink names, so everything the user did *inside* one — edits, and
-/// commits its remote has never seen — would go with the worktree. Each
-/// submodule is a repository in its own right, so it gets the same two WIP
-/// commits the superproject gets, and its git directory is kept aside rather
-/// than deleted, which is where those commits live.
+/// One initialised submodule of an archived worktree. The superproject's
+/// checkpoint records only its gitlink, so each submodule gets its own two WIP
+/// commits and its git directory is kept aside rather than deleted.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ArchivedSubmodule {
-    /// The submodule's path relative to the worktree root, as `.gitmodules`
-    /// spells it.
+    /// Relative to the worktree root, as `.gitmodules` spells it.
     pub path: String,
-    /// The contents of the submodule's own `.git` file. Recreating it verbatim
-    /// on restore avoids having to work out which name the submodule's git
-    /// directory is filed under, which is not its path.
+    /// The submodule's `.git` file, recreated verbatim on restore because its
+    /// git directory is not filed under its path.
     pub git_file: String,
     /// See [`ArchivedGitWorktree::staged_commit_hash`], for this submodule.
     pub staged_commit_hash: String,
@@ -688,10 +637,7 @@ pub struct ArchivedGitWorktree {
     /// pre-restore sanity check (abort if this commit no longer exists in the
     /// repo) and as a fallback target if the WIP resets fail.
     pub original_commit_hash: String,
-    /// The worktree's initialised submodules, each with its own checkpoint.
-    /// Empty for the common case: `git worktree add` leaves submodules
-    /// uninitialised and nothing in Zed initialises them, so only a worktree
-    /// where the user did it by hand has any.
+    /// Usually empty: `git worktree add` leaves submodules uninitialised.
     pub submodules: Vec<ArchivedSubmodule>,
 }
 
@@ -700,9 +646,7 @@ pub struct ArchivedGitWorktree {
 /// Listens to ConversationView events and updates metadata when the root thread changes.
 pub struct ThreadMetadataStore {
     db: ThreadMetadataDb,
-    /// Rows are handed out as `Arc`s: the sidebar rebuilds its contents from
-    /// every stored thread, from forty call sites, and a rebuild that deep-cloned
-    /// each row paid for hundreds of copies it threw away on the next one.
+    /// `Arc`s so the sidebar's frequent rebuilds share rows instead of cloning.
     threads: HashMap<ThreadId, Arc<ThreadMetadata>>,
     threads_by_paths: HashMap<PathList, HashSet<ThreadId>>,
     threads_by_main_paths: HashMap<PathList, HashSet<ThreadId>>,
@@ -865,16 +809,11 @@ impl ThreadMetadataStore {
             .filter(move |s| s.matches_remote_connection(remote_connection))
     }
 
-    /// The last known branches and PR state for a thread, persisted so an
-    /// archived thread (whose worktree, and therefore branch, is gone) keeps
-    /// showing the PR it produced.
     pub fn pr_snapshot(&self, thread_id: ThreadId) -> Option<&ThreadPrSnapshot> {
         self.pr_snapshots.get(&thread_id)
     }
 
-    /// Record the PR state currently observed for a thread's branches. A no-op
-    /// when it matches what is already stored, so callers can refresh on every
-    /// poll without churning the database.
+    /// A no-op when unchanged, so callers can refresh on every poll.
     pub fn set_pr_snapshot(
         &mut self,
         thread_id: ThreadId,
@@ -896,8 +835,6 @@ impl ThreadMetadataStore {
         self.bookmarks.get(&thread_id)
     }
 
-    /// Record the marks set in a thread. A no-op when they match what is
-    /// already stored.
     pub fn set_bookmarks(
         &mut self,
         thread_id: ThreadId,
@@ -915,16 +852,18 @@ impl ThreadMetadataStore {
         cx.notify();
     }
 
-    /// Change a thread's PR snapshot in place. `edit` says whether it
-    /// actually changed anything, so a mining pass that finds nothing new
-    /// costs no write.
+    /// `edit` returns whether it changed anything; an unchanged one costs no write.
     pub fn update_pr_snapshot(
         &mut self,
         thread_id: ThreadId,
         edit: impl FnOnce(&mut ThreadPrSnapshot) -> bool,
         cx: &mut Context<Self>,
     ) {
-        let mut snapshot = self.pr_snapshots.get(&thread_id).cloned().unwrap_or_default();
+        let mut snapshot = self
+            .pr_snapshots
+            .get(&thread_id)
+            .cloned()
+            .unwrap_or_default();
         if !edit(&mut snapshot) {
             return;
         }
@@ -1177,10 +1116,8 @@ impl ThreadMetadataStore {
         cx.emit(ThreadMetadataStoreEvent::ThreadArchived(thread_id));
     }
 
-    /// Attach a worktree teardown to a thread that was archived earlier, so an
-    /// unarchive can still cancel it. The job is dropped — and so cancelled —
-    /// when the thread is no longer archived, which is the case where it must
-    /// never have been started: the worktree belongs to a live thread again.
+    /// Lets an unarchive cancel a teardown started after archiving. Dropped,
+    /// and so cancelled, if the thread is no longer archived.
     pub fn attach_archive_job(
         &mut self,
         thread_id: ThreadId,
@@ -1487,6 +1424,16 @@ impl ThreadMetadataStore {
         cx.notify();
     }
 
+    pub fn unarchived_draft_ids_matching(
+        &self,
+        matches: impl Fn(&ThreadMetadata) -> bool,
+    ) -> Vec<ThreadId> {
+        self.entries()
+            .filter(|thread| thread.is_draft() && !thread.archived && matches(thread))
+            .map(|thread| thread.thread_id)
+            .collect()
+    }
+
     pub fn delete_all(
         &mut self,
         thread_ids: impl IntoIterator<Item = ThreadId>,
@@ -1579,10 +1526,8 @@ impl ThreadMetadataStore {
         ops.into_values().collect()
     }
 
-    /// Seeds the metadata row for an unstarted draft at creation time. The
-    /// event-driven path below only writes rows once a session connects, and
-    /// an unstarted draft deliberately has no session: without this row the
-    /// draft would not survive a reload and would not show in the sidebar.
+    /// The event-driven path below only writes rows once a session connects,
+    /// which an unstarted draft never has.
     pub fn save_unstarted_draft(
         &mut self,
         thread_id: ThreadId,
@@ -2024,7 +1969,8 @@ impl ThreadMetadataDb {
 
     pub fn list_bookmarks(&self) -> anyhow::Result<HashMap<ThreadId, ThreadBookmarks>> {
         let rows = self
-            .select::<(ThreadId, String)>("SELECT thread_id, bookmarks FROM thread_bookmarks")?()?;
+            .select::<(ThreadId, String)>("SELECT thread_id, bookmarks FROM thread_bookmarks")?(
+        )?;
         let mut bookmarks = HashMap::default();
         for (thread_id, json) in rows {
             match serde_json::from_str::<ThreadBookmarks>(&json) {
@@ -2264,9 +2210,7 @@ impl Column for ArchivedGitWorktree {
         let (staged_commit_hash, next): (String, i32) = Column::column(statement, next)?;
         let (unstaged_commit_hash, next): (String, i32) = Column::column(statement, next)?;
         let (original_commit_hash, next): (String, i32) = Column::column(statement, next)?;
-        // Rows written before submodules were kept have no JSON here, and a
-        // record whose JSON cannot be read is a record with no submodules
-        // rather than a restore that refuses to run.
+        // Older rows have none; unreadable JSON must not block a restore.
         let (submodules_json, next): (Option<String>, i32) = Column::column(statement, next)?;
         let submodules = submodules_json
             .as_deref()
@@ -2990,13 +2934,9 @@ mod tests {
             migrate_thread_remote_connections(cx, Task::ready(Ok(())));
         });
 
-        // The migration reads the workspace database on a real thread, which
-        // the test executor does not wait for: one parked round is enough on
-        // an idle machine and not under a full parallel run, where this has
-        // now come back empty on two separate nights. Poll for the connection
-        // the migration writes, not for the row: the row is there from the
-        // `save` above, so waiting for it broke out of the loop before the
-        // migration had written anything and raced the assertion instead.
+        // The migration reads the database on a real thread the test executor
+        // does not wait for. Poll for the connection it writes, not the row,
+        // which the `save` above already wrote.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let metadata = loop {
             cx.run_until_parked();
@@ -3884,7 +3824,8 @@ mod tests {
             let store = ThreadMetadataStore::global(cx);
             let store = store.read(cx);
 
-            let entries: Vec<ThreadMetadata> = store.entries().map(|t| t.as_ref().clone()).collect();
+            let entries: Vec<ThreadMetadata> =
+                store.entries().map(|t| t.as_ref().clone()).collect();
             pretty_assertions::assert_eq!(
                 entries,
                 vec![ThreadMetadata {

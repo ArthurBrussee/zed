@@ -1,11 +1,5 @@
-//! Window-spanning unread state for agent threads.
-//!
-//! A thread becomes unread when a turn completes (the `Stopped` event) while
-//! its conversation view is not being viewed, and read again when the user
-//! actually views it (its tab is rendered in an active window). Thread tabs
-//! and the sidebar both read this one set, so the accent unread marker means
-//! the same thing everywhere: "finished since you last looked", never "output
-//! is streaming".
+//! Window-spanning unread state: a thread is unread when a turn completed
+//! while it was not on screen in an active window.
 
 use collections::HashSet;
 use gpui::{App, AppContext as _, Context, Entity, Global};

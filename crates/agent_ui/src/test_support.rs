@@ -158,8 +158,8 @@ pub async fn record_zed_created_worktree(
     .unwrap();
 }
 
-/// Records a worktree the way the spare pool does: made before anyone asked
-/// for one, and never handed over. The only kind the reclaim sweep still takes.
+/// Records a worktree the way the spare pool does, the only kind the reclaim
+/// sweep takes.
 pub async fn record_zed_created_spare_worktree(
     fs: &dyn fs::Fs,
     worktree_path: &Path,
@@ -295,8 +295,7 @@ pub fn send_message(panel: &Entity<AgentPanel>, cx: &mut VisualTestContext) {
     message_editor.update_in(cx, |editor, window, cx| {
         editor.set_text("Hello", window, cx);
     });
-    // Sending an unstarted draft goes through the composer's own Send event
-    // (this is the moment the agent starts); a started thread sends directly.
+    // An unstarted draft sends through its composer's Send event.
     let thread_view = panel.read_with(cx, |panel, cx| panel.active_thread_view(cx));
     if let Some(thread_view) = thread_view {
         thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
@@ -308,8 +307,7 @@ pub fn send_message(panel: &Entity<AgentPanel>, cx: &mut VisualTestContext) {
     cx.run_until_parked();
 }
 
-/// The active draft's composer: the unstarted draft's own editor, or the
-/// thread view's once a session has started.
+/// The unstarted draft's own editor, or the thread view's once started.
 pub fn draft_message_editor(
     panel: &Entity<AgentPanel>,
     cx: &VisualTestContext,
@@ -331,30 +329,13 @@ pub fn draft_message_editor(
     })
 }
 
-/// The active draft composer's current text.
 pub fn draft_prompt_text(panel: &Entity<AgentPanel>, cx: &VisualTestContext) -> String {
     let editor = draft_message_editor(panel, cx);
     editor.read_with(cx, |editor, cx| editor.text(cx))
 }
 
 pub fn type_draft_prompt(panel: &Entity<AgentPanel>, text: &str, cx: &mut VisualTestContext) {
-    // An unstarted draft owns its composer directly; a started thread's
-    // composer lives on the thread view.
-    let message_editor = panel.read_with(cx, |panel, cx| {
-        let conversation_view = panel.active_conversation_view().expect("an active view");
-        conversation_view
-            .read(cx)
-            .unstarted_message_editor()
-            .cloned()
-            .unwrap_or_else(|| {
-                panel
-                    .active_thread_view(cx)
-                    .expect("a thread view once started")
-                    .read(cx)
-                    .message_editor
-                    .clone()
-            })
-    });
+    let message_editor = draft_message_editor(panel, cx);
     message_editor.update_in(cx, |editor, window, cx| {
         editor.set_text(text, window, cx);
     });

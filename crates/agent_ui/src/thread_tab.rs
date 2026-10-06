@@ -1,28 +1,15 @@
-//! Agent threads as tabs in the agent panel's own pane.
-//!
-//! A [`ThreadTab`] wraps a [`ConversationView`] and lives in the
-//! [`AgentPanel`]'s thread pane, so the panel hosts thread tabs the same way
-//! the terminal panel hosts terminal tabs. An open tab is what "open in Zed"
-//! means: closing a tab closes the thread, cancelling any running turn. Tabs
-//! are restored across restarts by the panel's own serialization, not by
-//! workspace item serialization.
+//! Agent threads as items in the agent panel's own pane. An open tab is what
+//! "open" means: closing it closes the thread, cancelling any running turn.
 
 use acp_thread::ThreadStatus;
 use gpui::{
-    Animation, AnimationExt, AnyElement, App, Entity, EventEmitter, FocusHandle, Focusable,
-    SharedString, Subscription, WeakEntity, Window, div, prelude::*, pulsating_between, px,
+    App, Entity, EventEmitter, FocusHandle, Focusable, SharedString, Subscription, WeakEntity,
+    Window, prelude::*,
 };
 use settings::Settings as _;
-use std::time::Duration;
 use theme_settings::ThemeSettings;
-use ui::{
-    Color, Icon, IconName, IconSize, Label, LabelCommon, LabelSize, Tooltip, h_flex,
-    utils::WithRemSize, v_flex,
-};
-use workspace::{
-    Item, Workspace,
-    item::{ItemEvent, TabContentParams, TabTooltipContent},
-};
+use ui::{Color, Label, LabelCommon, LabelSize, utils::WithRemSize, v_flex};
+use workspace::{Item, Workspace, item::ItemEvent};
 
 use crate::{
     AgentPanel,
@@ -31,120 +18,11 @@ use crate::{
     thread_read_state::ThreadReadState,
 };
 
-/// What a thread tab shows about its thread, shared between local and foreign
-/// thread tabs. Running is drawn by the tab's own agent icon rather than by a
-/// glyph of its own; the attention and unread dots sit beside it. The unread
-/// accent dot only appears once a turn has completed while the thread was not
-/// being viewed.
-#[derive(Clone, Copy)]
-enum TabIndicator {
-    Running,
-    Attention(Color),
-    Unread,
-}
-
-fn conversation_tab_indicator(
-    conversation_view: &Entity<ConversationView>,
-    cx: &App,
-) -> Option<TabIndicator> {
-    let thread = conversation_view.read(cx).root_thread(cx)?;
-    let thread = thread.read(cx);
-    if thread.is_waiting_for_confirmation() {
-        Some(TabIndicator::Attention(Color::Warning))
-    } else if thread.had_error() {
-        Some(TabIndicator::Attention(Color::Error))
-    } else if thread.status() != ThreadStatus::Idle {
-        Some(TabIndicator::Running)
-    } else if ThreadReadState::try_global(cx).is_some_and(|state| {
-        state
-            .read(cx)
-            .is_unread(&conversation_view.read(cx).parent_id())
-    }) {
-        Some(TabIndicator::Unread)
-    } else {
-        None
-    }
-}
-
-/// The dot beside a tab's icon. A running thread has none: a row of tabs each
-/// wearing its own animated glyph is what makes a busy tab bar hard to read,
-/// so running lives in [`render_tab_icon`] instead.
-fn render_tab_dot(indicator: TabIndicator, cx: &App) -> Option<AnyElement> {
-    let dot = |color: Color| {
-        div()
-            .size(px(6.))
-            .flex_none()
-            .rounded_full()
-            .bg(color.color(cx))
-            .into_any_element()
-    };
-    match indicator {
-        TabIndicator::Running => None,
-        TabIndicator::Attention(color) => Some(dot(color)),
-        TabIndicator::Unread => Some(dot(Color::Accent)),
-    }
-}
-
-/// The agent icon every thread tab leads with, and the whole of how a tab says
-/// it is running: while a turn is in flight the icon pulses, which costs the
-/// tab no width and keeps the agent's own colour. All tabs share one clock, so
-/// a bar of running threads breathes together rather than shimmering.
-fn render_tab_icon(
-    agent_icon: IconName,
-    brand_color: Option<gpui::Hsla>,
-    indicator: Option<TabIndicator>,
-    params: &TabContentParams,
-) -> AnyElement {
-    let icon = Icon::new(agent_icon).size(IconSize::Small).color(
-        brand_color
-            .map(Color::Custom)
-            .unwrap_or_else(|| params.text_color()),
-    );
-    if matches!(indicator, Some(TabIndicator::Running)) {
-        div()
-            .flex_none()
-            .child(icon)
-            .with_animation(
-                "running-tab-icon",
-                Animation::new(Duration::from_secs(2))
-                    .repeat_synced()
-                    .with_easing(pulsating_between(0.4, 1.0)),
-                |icon, delta| icon.opacity(delta),
-            )
-            .into_any_element()
-    } else {
-        icon.into_any_element()
-    }
-}
-
-/// Tab content shared by [`ThreadTab`] and [`ForeignThreadTab`]: title plus a
-/// status indicator.
-fn render_tab_content(
-    title: SharedString,
-    agent_icon: IconName,
-    brand_color: Option<gpui::Hsla>,
-    indicator: Option<TabIndicator>,
-    params: &TabContentParams,
-    cx: &App,
-) -> AnyElement {
-    h_flex()
-        .gap_1()
-        .child(render_tab_icon(agent_icon, brand_color, indicator, params))
-        .children(indicator.and_then(|indicator| render_tab_dot(indicator, cx)))
-        .child(
-            Label::new(title)
-                .size(LabelSize::Small)
-                .color(params.text_color()),
-        )
-        .into_any_element()
-}
-
 pub struct ThreadTab {
     conversation_view: Entity<ConversationView>,
     workspace: WeakEntity<Workspace>,
     _observation: Subscription,
     _read_state_observation: Subscription,
-    _metadata_observation: Option<Subscription>,
     _thread_view_subscription: Option<Subscription>,
 }
 
@@ -166,25 +44,11 @@ impl ThreadTab {
             cx.notify();
         });
 
-        // Repaint the tab's unread dot when the shared read state changes.
+        // Re-render so a thread marked unread while on screen is marked read.
         let read_state = ThreadReadState::global(cx);
-        let read_state_observation = cx.observe(&read_state, |_this, _, cx| {
-            cx.emit(ThreadTabEvent::UpdateTab);
-            cx.notify();
-        });
-
-        // A rename from the sidebar only writes the metadata store's title
-        // override; the tab title reads it, so repaint when the store changes.
-        let metadata_observation = ThreadMetadataStore::try_global(cx).map(|store| {
-            cx.observe(&store, |_this, _store, cx| {
-                cx.emit(ThreadTabEvent::UpdateTab);
-                cx.notify();
-            })
-        });
+        let read_state_observation = cx.observe(&read_state, |_this, _, cx| cx.notify());
 
         cx.on_release(|this: &mut Self, cx: &mut App| {
-            // Closing the tab closes the thread. Cancel any running turn
-            // before the ConversationView drops and closes its sessions.
             // Deferred: tabs are usually released inside a pane update.
             let conversation_view = this.conversation_view.clone();
             cx.defer(move |cx| {
@@ -198,7 +62,6 @@ impl ThreadTab {
             workspace,
             _observation: observation,
             _read_state_observation: read_state_observation,
-            _metadata_observation: metadata_observation,
             _thread_view_subscription: None,
         };
         this.subscribe_to_thread_view(&conversation_view, cx);
@@ -254,10 +117,6 @@ impl ThreadTab {
             )
         });
     }
-
-    fn tab_indicator(&self, cx: &App) -> Option<TabIndicator> {
-        conversation_tab_indicator(&self.conversation_view, cx)
-    }
 }
 
 impl Focusable for ThreadTab {
@@ -302,35 +161,6 @@ impl Item for ThreadTab {
         self.conversation_view.read(cx).title(cx)
     }
 
-    fn tab_content(&self, params: TabContentParams, _window: &Window, cx: &App) -> AnyElement {
-        let title = self.tab_content_text(params.detail.unwrap_or_default(), cx);
-        let conversation_view = self.conversation_view.read(cx);
-        render_tab_content(
-            title,
-            conversation_view.agent_logo(),
-            crate::agent_brand_color(&conversation_view.agent_key().id()),
-            self.tab_indicator(cx),
-            &params,
-            cx,
-        )
-    }
-
-    fn tab_tooltip_content(&self, cx: &App) -> Option<TabTooltipContent> {
-        let title = self.conversation_view.read(cx).title(cx);
-        Some(TabTooltipContent::Custom(Box::new(Tooltip::element(
-            move |_, _| {
-                ui::v_flex()
-                    .child(Label::new(title.clone()))
-                    .child(
-                        Label::new("Agent")
-                            .color(Color::Muted)
-                            .size(LabelSize::Small),
-                    )
-                    .into_any_element()
-            },
-        ))))
-    }
-
     fn can_split(&self) -> bool {
         false
     }
@@ -340,23 +170,16 @@ impl Item for ThreadTab {
     }
 }
 
-/// Tab-strip proxy for a thread whose tab lives in another workspace's agent
-/// panel. Shows the same title and status dot as the real [`ThreadTab`], but
-/// never owns or renders a `ConversationView`; activating it switches to the
-/// owning workspace instead (handled by the panel's pane-event handler).
+/// Pane item standing in for a thread whose tab lives in another workspace's
+/// agent panel, so the strip carries the window-wide order. Activating it
+/// switches to the owning workspace (handled by the panel).
 pub struct ForeignThreadTab {
     thread_id: ThreadId,
-    /// The workspace whose panel hosts the real thread tab.
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
-    _observations: Vec<Subscription>,
 }
 
-pub enum ForeignThreadTabEvent {
-    UpdateTab,
-}
-
-impl EventEmitter<ForeignThreadTabEvent> for ForeignThreadTab {}
+impl EventEmitter<()> for ForeignThreadTab {}
 
 impl ForeignThreadTab {
     pub fn new(
@@ -364,31 +187,10 @@ impl ForeignThreadTab {
         workspace: WeakEntity<Workspace>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut observations = Vec::new();
-        // Live status comes from the owning workspace's panel; re-render the
-        // tab whenever that panel or the thread metadata change.
-        if let Some(panel) = workspace
-            .upgrade()
-            .and_then(|workspace| workspace.read(cx).panel::<AgentPanel>(cx))
-        {
-            observations.push(cx.observe(&panel, |_this, _panel, cx| {
-                cx.emit(ForeignThreadTabEvent::UpdateTab);
-            }));
-        }
-        if let Some(store) = ThreadMetadataStore::try_global(cx) {
-            observations.push(cx.observe(&store, |_this, _store, cx| {
-                cx.emit(ForeignThreadTabEvent::UpdateTab);
-            }));
-        }
-        let read_state = ThreadReadState::global(cx);
-        observations.push(cx.observe(&read_state, |_this, _, cx| {
-            cx.emit(ForeignThreadTabEvent::UpdateTab);
-        }));
         Self {
             thread_id,
             workspace,
             focus_handle: cx.focus_handle(),
-            _observations: observations,
         }
     }
 
@@ -396,13 +198,10 @@ impl ForeignThreadTab {
         self.thread_id
     }
 
-    /// The workspace hosting the real thread tab.
     pub fn home_workspace(&self) -> &WeakEntity<Workspace> {
         &self.workspace
     }
 
-    /// The real thread's conversation view, resolved through the owning
-    /// workspace's panel. `None` when the workspace or panel is gone.
     fn home_conversation_view(&self, cx: &App) -> Option<Entity<ConversationView>> {
         let workspace = self.workspace.upgrade()?;
         let panel = workspace.read(cx).panel::<AgentPanel>(cx)?;
@@ -432,8 +231,7 @@ impl Focusable for ForeignThreadTab {
 
 impl Render for ForeignThreadTab {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        // Normally never visible: activation immediately re-activates a
-        // local tab and switches to the owning workspace.
+        // Normally never visible: activation re-routes to the owning workspace.
         v_flex()
             .size_full()
             .items_center()
@@ -448,79 +246,13 @@ impl Render for ForeignThreadTab {
 }
 
 impl Item for ForeignThreadTab {
-    type Event = ForeignThreadTabEvent;
-
-    fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(ItemEvent)) {
-        match event {
-            ForeignThreadTabEvent::UpdateTab => f(ItemEvent::UpdateTab),
-        }
-    }
+    type Event = ();
 
     fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
         self.title(cx)
     }
 
-    fn tab_content(&self, params: TabContentParams, _window: &Window, cx: &App) -> AnyElement {
-        let home_conversation_view = self.home_conversation_view(cx);
-        let indicator = home_conversation_view
-            .as_ref()
-            .and_then(|conversation_view| conversation_tab_indicator(conversation_view, cx));
-        let (agent_icon, brand_color) = home_conversation_view
-            .map(|conversation_view| {
-                let conversation_view = conversation_view.read(cx);
-                (
-                    conversation_view.agent_logo(),
-                    crate::agent_brand_color(&conversation_view.agent_key().id()),
-                )
-            })
-            .unwrap_or((IconName::Thread, None));
-        render_tab_content(
-            self.title(cx),
-            agent_icon,
-            brand_color,
-            indicator,
-            &params,
-            cx,
-        )
-    }
-
-    fn tab_tooltip_content(&self, cx: &App) -> Option<TabTooltipContent> {
-        let title = self.title(cx);
-        Some(TabTooltipContent::Custom(Box::new(Tooltip::element(
-            move |_, _| {
-                v_flex()
-                    .child(Label::new(title.clone()))
-                    .child(
-                        Label::new("Agent in another workspace")
-                            .color(Color::Muted)
-                            .size(LabelSize::Small),
-                    )
-                    .into_any_element()
-            },
-        ))))
-    }
-
     fn can_split(&self) -> bool {
         false
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_support::init_test;
-    use gpui::TestAppContext;
-
-    #[gpui::test]
-    fn test_only_attention_and_unread_draw_a_dot(cx: &mut TestAppContext) {
-        init_test(cx);
-        cx.update(|cx| {
-            assert!(
-                render_tab_dot(TabIndicator::Running, cx).is_none(),
-                "a running tab says so with its own icon, not with a glyph beside it"
-            );
-            assert!(render_tab_dot(TabIndicator::Attention(Color::Warning), cx).is_some());
-            assert!(render_tab_dot(TabIndicator::Unread, cx).is_some());
-        });
     }
 }

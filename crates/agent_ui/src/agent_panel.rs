@@ -53,8 +53,7 @@ use crate::{
     ResetFastModeWarnings, ResetTrialEndUpsell, ResetTrialUpsell, ShowAllSidebarThreadMetadata,
     ShowThreadMetadata, ToggleNewThreadMenu, ToggleOptionsMenu,
     conversation_view::{
-        AcpThreadViewEvent, RootThreadUpdated, ThreadView,
-        reset_fast_mode_warnings,
+        AcpThreadViewEvent, RootThreadUpdated, ThreadView, reset_fast_mode_warnings,
     },
     ui::{AgentNotification, AgentNotificationEvent, EndTrialUpsell},
 };
@@ -112,9 +111,7 @@ const LAST_USED_AGENT_KEY: &str = "agent_panel__last_used_external_agent";
 const LAST_CREATED_ENTRY_KIND_KEY: &str = "agent_panel__last_created_entry_kind";
 const TERMINAL_AGENT_TELEMETRY_ID: &str = "terminal";
 /// How long a thread tab stays off screen before its per-entry view tree is
-/// dropped. Long enough that flipping between two threads never pays for
-/// building one again, short enough that the threads left open all day stop
-/// costing their views while nobody is reading them.
+/// dropped.
 const OFFSCREEN_VIEW_GRACE: Duration = Duration::from_secs(30);
 
 const TERMINAL_INIT_COMMAND_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -347,15 +344,12 @@ struct SerializedAgentPanel {
     selected_agent: Option<Agent>,
     #[serde(default)]
     last_created_entry_kind: AgentPanelEntryKind,
-    /// Kept alongside `open_thread_tabs` for back-compat with payloads
-    /// written before the panel hosted thread tabs.
     #[serde(default)]
     last_active_thread: Option<SerializedActiveThread>,
     #[serde(default)]
     last_active_terminal_id: Option<String>,
     #[serde(default)]
     new_draft_thread_id: Option<ThreadId>,
-    /// The thread pane's tabs, in tab order.
     #[serde(default)]
     open_thread_tabs: Vec<SerializedThreadTab>,
     #[serde(default)]
@@ -395,14 +389,12 @@ pub fn init(cx: &mut App) {
                 .register_action(|workspace, _: &crate::NewAdditionalThread, window, cx| {
                     if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
                         panel.update(cx, |panel, cx| {
-                            if panel.has_open_project(cx) {
-                                panel.activate_additional_new_thread(
-                                    true,
-                                    AgentThreadSource::AgentPanel,
-                                    window,
-                                    cx,
-                                );
-                            }
+                            panel.activate_new_thread(
+                                true,
+                                AgentThreadSource::AgentPanel,
+                                window,
+                                cx,
+                            );
                         });
                         workspace.focus_panel::<AgentPanel>(window, cx);
                     }
@@ -1013,19 +1005,10 @@ pub struct CreateThreadOptions {
     /// Model override, as `provider/model-id`. Only applied when the thread
     /// uses the native Zed agent.
     pub model: Option<String>,
-    /// Session config values (model, effort, ...) to apply to the new session
-    /// before its first message, e.g. carried over from a draft's preview
-    /// session.
-    pub session_config: Vec<(acp_v2::SessionConfigId, acp_v2::SessionConfigOptionValue)>,
     /// Working directories to attach to the new thread (e.g., the path of a
     /// freshly-created sibling worktree). When `None`, the thread inherits
     /// the project's default path list.
     pub work_dirs: Option<PathList>,
-    /// Whether to activate and focus the new thread's tab, and drop the
-    /// panel's empty draft so it is not left active beside it. Off by default:
-    /// the `create_thread` tool deliberately opens threads in the background,
-    /// keeping the user where they are.
-    pub activate: bool,
 }
 
 pub(crate) struct AgentThread {
@@ -1208,61 +1191,33 @@ pub struct AgentPanel {
     base_view: BaseView,
     last_created_entry_kind: AgentPanelEntryKind,
     draft_thread: Option<Entity<ConversationView>>,
-    /// Conversation views hosted in workspace thread tabs. Weak: the tab
-    /// items own them. Lets the panel (and through it the sidebar) see
-    /// tab-hosted threads without touching the workspace, which may be
-    /// exclusively leased when panel methods run.
+    /// Weak: the tab items own them. Read through the panel because the
+    /// workspace may be leased when panel methods run.
     tab_threads: HashMap<ThreadId, WeakEntity<ConversationView>>,
     _tab_thread_observations: HashMap<ThreadId, Subscription>,
-    /// The release observation for each tab's view, keyed the same way.
-    ///
-    /// Registering a thread happens whenever its tab is opened or
-    /// re-activated, and a detached release observation from an earlier
-    /// registration is never dropped: the callback then runs once per
-    /// registration when the view finally goes, and gpui walks the extra
-    /// entries in the meantime. Keyed, the second registration replaces the
-    /// first.
+    /// Keyed rather than detached: a thread is re-registered every time its
+    /// tab is activated, and each detached observation would fire on release.
     _tab_thread_releases: HashMap<ThreadId, Subscription>,
-    /// The pane hosting the panel's thread tabs, terminal-panel style.
     thread_pane: Entity<Pane>,
-    /// The conversation view of the thread pane's active tab, if any. Kept
-    /// in sync from the pane's events; this is what the panel's "active
-    /// thread" accessors report now that threads live in tabs.
     active_tab_thread: Option<Entity<ConversationView>>,
-    /// Visited-thread history for back/forward navigation. `nav_back` is the
-    /// trail behind the current thread, `nav_forward` what a back step left
-    /// ahead; `nav_current` is where we are. A back/forward step sets
-    /// `nav_suppress_record` so the resulting activation is not recorded as a
-    /// new visit.
     nav_back: Vec<ThreadId>,
     nav_forward: Vec<ThreadId>,
     nav_current: Option<ThreadId>,
     nav_suppress_record: bool,
-    /// True while the pane's foreign-tab proxies are being rebuilt from the
-    /// thread-tabs registry, so the resulting pane events do not re-publish
-    /// to the registry.
+    /// Set while proxies are rebuilt from the registry, so the resulting pane
+    /// events do not re-publish to it.
     syncing_foreign_tabs: bool,
-    /// Proxy item ids removed by the sync itself. `RemovedItem` events for
-    /// these are bookkeeping, not user closes, and must not be routed to
-    /// the thread's home workspace.
+    /// Proxies removed by the sync itself, not closed by the user.
     expected_proxy_removals: HashSet<EntityId>,
-    /// Thread tabs the panel closed itself (replacing a draft, rebinding its
-    /// agent, migrating one into a worktree). The removal event cannot tell
-    /// these from the user closing a tab, and only the latter should move the
-    /// activation off the draft.
+    /// Tabs the panel closed itself; only a user close moves activation off
+    /// the draft.
     expected_thread_tab_removals: HashSet<ThreadId>,
-    /// Foreign tab the user activated, awaiting deferred routing to its
-    /// home workspace. Cancelled when the activation turns out to be the
-    /// side effect of closing a real tab.
+    /// Cancelled when the activation turns out to be the side effect of
+    /// closing a real tab.
     pending_foreign_activation: Option<(ThreadId, WeakEntity<Workspace>)>,
-    /// Restarted on every activation; drops the view trees of the thread tabs
-    /// that are still off screen when it fires, then sleeps and looks again.
-    /// See [`OFFSCREEN_VIEW_GRACE`].
     offscreen_view_sweep: Option<Task<()>>,
     _thread_tabs_registry_observation: Subscription,
-    /// A window at the back shows none of its threads, so its panel has to
-    /// hear about the window going away and coming back rather than only
-    /// about its own tabs being activated.
+    /// A window at the back shows none of its threads.
     _view_residency_observation: Subscription,
     terminals: HashMap<TerminalId, AgentTerminal>,
     pending_terminal_spawn: Option<TerminalId>,
@@ -1533,8 +1488,7 @@ impl AgentPanel {
                 Vec::new()
             };
             if !tabs_to_restore.is_empty() {
-                // Filtering archived or deleted tabs during restore needs
-                // the metadata store loaded.
+                // Skipping archived or deleted tabs needs the store loaded.
                 let reload_task = cx.update(|_window, cx| {
                     ThreadMetadataStore::try_global(cx).map(|store| store.read(cx).reload_task())
                 });
@@ -1629,17 +1583,6 @@ impl AgentPanel {
                     {
                         panel.restore_new_draft(new_draft_thread_id, window, cx);
                     }
-                    // Nothing is created on the user's behalf beyond that, and
-                    // that one creates nothing: it reattaches the slot to a
-                    // thread that already exists, reusing its restored tab
-                    // where there is one. A panel that restored no tabs shows
-                    // upstream's empty state. The check that used to make one
-                    // here ran before the requested thread had opened and
-                    // before restored tabs had finished loading, so re-opening
-                    // a worktree — clicking one of its threads while its
-                    // workspace was closed, or restoring an archived one —
-                    // came back with an extra "New thread" beside the thread
-                    // that was asked for.
                     cx.notify();
                 });
 
@@ -1672,14 +1615,8 @@ impl AgentPanel {
             let agent = if is_via_collab && !tab.agent.is_native() {
                 Agent::NativeAgent
             } else if metadata.session_id.is_some() || self.should_restore_agent(&tab.agent, cx) {
-                // A session keeps its own agent so it can still be resumed
-                // after that agent is reinstalled.
                 tab.agent.clone()
             } else {
-                // A draft is not a session to resume, so an agent uninstalled
-                // since the tab was written is dropped rather than restored
-                // with it. Threads reach the panel as tabs here, so this is
-                // where that rule has to be applied.
                 self.restorable_agent_selection(cx)
             };
             self.load_agent_thread(
@@ -1755,16 +1692,14 @@ impl AgentPanel {
                 _ => {}
             });
 
-        // Archiving a thread closes its tab: an open tab is what "open in
-        // Zed" means, and an archived thread is not open.
+        // An archived thread is not open, so its tab closes.
         let window_handle = window.window_handle();
         let _thread_metadata_store_subscription = cx.subscribe(
             &ThreadMetadataStore::global(cx),
             move |_this, _store, event, cx| {
                 let ThreadMetadataStoreEvent::ThreadArchived(thread_id) = *event;
                 let panel = cx.weak_entity();
-                // Deferred: closing the tab needs the window, and the panel
-                // is already being updated here.
+                // Closing the tab needs the window.
                 cx.defer(move |cx| {
                     window_handle
                         .update(cx, |_root, window, cx| {
@@ -1782,8 +1717,6 @@ impl AgentPanel {
 
         cx.on_release(|this, cx| {
             this.dismiss_all_terminal_notifications(cx);
-            // Withdraw this workspace's thread tabs from the window-global
-            // registry so other panels drop their proxies.
             let workspace_id = this.workspace.entity_id();
             crate::thread_tab_registry::ThreadTabsRegistry::global(cx).update(
                 cx,
@@ -1805,9 +1738,10 @@ impl AgentPanel {
             },
         );
 
-        let _view_residency_observation = cx.observe_window_activation(window, |this, window, cx| {
-            this.sync_thread_view_residency(window, cx);
-        });
+        let _view_residency_observation =
+            cx.observe_window_activation(window, |this, window, cx| {
+                this.sync_thread_view_residency(window, cx);
+            });
 
         let mut panel = Self {
             workspace_id,
@@ -1865,15 +1799,10 @@ impl AgentPanel {
         };
 
         panel.ensure_native_agent_connection(cx);
-        // Mirror thread tabs already registered by other workspaces' panels.
         panel.sync_foreign_thread_tabs(window, cx);
         panel
     }
 
-    /// Builds the pane that hosts thread tabs inside the panel, configured
-    /// like the terminal panel's pane: tab bar always shown, no splits, no
-    /// nav history. The pane has no tab-bar buttons; threads are created
-    /// from the sidebar, not from the panel.
     fn new_thread_pane(
         workspace: WeakEntity<Workspace>,
         project: Entity<Project>,
@@ -1904,14 +1833,7 @@ impl AgentPanel {
                 cx,
             );
             pane.set_can_navigate(false, cx);
-            // The sidebar is the vertical tab list: it already shows every
-            // open thread with its logo, title, running state, unread dot and
-            // PR chips, in tab order, and it can be reordered by dragging. A
-            // strip across the top would say all of it a second time for a row
-            // of the thread's height. The pane stays the model underneath —
-            // an open pane item is still what "open in Zed" means, and the
-            // sidebar reads its order from pane item order — so this is a
-            // change to what is drawn, not to what exists.
+            // The sidebar is the tab list; the pane stays the model underneath.
             pane.set_should_display_tab_bar(|_, _| false);
             pane.set_close_pane_if_empty(false, cx);
             pane.set_zoom_out_on_close(false);
@@ -1942,8 +1864,8 @@ impl AgentPanel {
             }
             pane::Event::AddItem { .. } => {
                 self.thread_pane_changed(cx);
-                // A tab opened behind the one being read never activates, so
-                // without this the sweep has nothing to start it.
+                // A tab opened in the background never activates, so start the
+                // sweep here too.
                 self.sync_thread_view_residency(window, cx);
             }
             pane::Event::Remove { .. } => self.thread_pane_changed(cx),
@@ -1963,9 +1885,6 @@ impl AgentPanel {
         }
     }
 
-    /// Re-derives `active_tab_thread` from the thread pane's active item
-    /// after tabs are added, removed, or activated, and publishes the real
-    /// tab set to the thread-tabs registry.
     fn thread_pane_changed(&mut self, cx: &mut Context<Self>) {
         let active = self
             .thread_pane
@@ -1980,9 +1899,8 @@ impl AgentPanel {
                 cx.notify();
             }
         } else {
-            // A ForeignThreadTab may be transiently active (activation is
-            // re-routed to its home workspace); keep reporting the last
-            // real tab as the active thread unless it is gone.
+            // A ForeignThreadTab may be transiently active while its
+            // activation is re-routed; keep the last real tab unless it is gone.
             let last_real_tab_gone = self.active_tab_thread.as_ref().is_some_and(|active| {
                 !self
                     .thread_pane
@@ -2003,13 +1921,9 @@ impl AgentPanel {
         }
     }
 
-    /// Gives the thread on screen its views back, and starts the clock on the
-    /// ones that are not. Called on every activation and whenever the window
-    /// comes forward or goes to the back, so a run of tab switches keeps
-    /// pushing the sweep out and only a thread left alone loses its views.
+    /// Gives the thread on screen its views back and restarts the clock on
+    /// dropping the others'.
     fn sync_thread_view_residency(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // A window at the back is showing nothing, so there is nothing to give
-        // views back to; the sweep below takes them instead.
         if window.is_window_active()
             && let Some(active) = self.active_tab_thread.clone()
         {
@@ -2017,12 +1931,7 @@ impl AgentPanel {
                 conversation.rebuild_active_entry_views(window, cx);
             });
         }
-        // One pass per activation was not enough to run at all in practice: a
-        // panel nobody touches again never activates another item, so threads
-        // opened behind the one being read kept their view trees for as long
-        // as the app was up. The sweep now looks again every grace period, and
-        // an activation restarts the clock rather than being the only thing
-        // that starts it.
+        // Repeats, because a panel nobody touches never activates again.
         self.offscreen_view_sweep = Some(cx.spawn_in(window, async move |this, cx| {
             loop {
                 cx.background_executor().timer(OFFSCREEN_VIEW_GRACE).await;
@@ -2038,22 +1947,13 @@ impl AgentPanel {
         }));
     }
 
-    /// Drops the view trees of every thread tab that is not the one on screen.
-    /// A thread refuses while a past message is being edited, so nothing that
-    /// holds unsaved text goes.
+    /// Drops the view trees of every thread tab that is not on screen. A
+    /// thread refuses while a past message is being edited.
     fn drop_offscreen_thread_views(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Nothing in a window the user is not looking at is on screen, its
-        // active tab included. With one worktree per window that is most of
-        // what there is to reclaim: from its own pane's point of view the one
-        // thread in a window at the back was never off screen, so a sweep that
-        // only spared "the active tab of this pane" spared everything.
+        // A window at the back has nothing on screen, its active tab included.
         let on_screen = if window.is_window_active() {
-            // No active tab means the panel does not currently know which
-            // thread is on screen — a `ForeignThreadTab` can be transiently
-            // active while its activation is re-routed, and
-            // `thread_pane_changed` leaves the slot empty until a real tab
-            // claims it. Dropping "everything that is not the active one" then
-            // would drop the views of the thread being read.
+            // No active tab means the thread on screen is unknown (a proxy
+            // being re-routed), so drop nothing.
             let Some(active) = self.active_tab_thread.clone() else {
                 return;
             };
@@ -2070,15 +1970,14 @@ impl AgentPanel {
             .collect();
         let mut dropped = 0;
         for conversation in offscreen {
-            dropped += conversation.update(cx, |conversation, cx| conversation.drop_entry_views(cx));
+            dropped +=
+                conversation.update(cx, |conversation, cx| conversation.drop_entry_views(cx));
         }
         if dropped > 0 {
             log::info!("quiet-ui perf: dropped the views of {dropped} off-screen threads");
         }
     }
 
-    /// Records a change of active thread in the back/forward history, unless
-    /// the change came from a back/forward step itself.
     fn record_thread_visit(&mut self, cx: &App) {
         let current = self.active_thread_id(cx);
         if current == self.nav_current {
@@ -2103,7 +2002,7 @@ impl AgentPanel {
         !self.nav_forward.is_empty()
     }
 
-    /// Activates a thread from the history. Skips ids whose tab is gone.
+    /// Skips ids whose tab is gone.
     fn navigate_thread_history(
         &mut self,
         forward: bool,
@@ -2125,7 +2024,6 @@ impl AgentPanel {
                 .items_of_type::<crate::thread_tab::ThreadTab>()
                 .any(|tab| tab.read(cx).thread_id(cx) == target);
             if !has_tab {
-                // The thread was closed; drop it from history and keep looking.
                 continue;
             }
             if let Some(current) = self.nav_current.take() {
@@ -2167,11 +2065,8 @@ impl AgentPanel {
         }
     }
 
-    /// Publishes the pane's real [`ThreadTab`](crate::thread_tab::ThreadTab)
-    /// set, in pane order, to the window-global thread-tabs registry.
-    /// Publishes this pane's whole tab strip — its own tabs and the proxies
-    /// mirroring the window's other workspaces — so the registry records the
-    /// order the user arranged, whichever kind of tab they dragged.
+    /// Publishes the whole strip, proxies included, so the registry records
+    /// the order the user arranged whichever kind of tab they dragged.
     fn publish_thread_tabs(&mut self, cx: &mut Context<Self>) {
         use crate::thread_tab::{ForeignThreadTab, ThreadTab};
         use crate::thread_tab_registry::ThreadTabsEntry;
@@ -2203,10 +2098,8 @@ impl AgentPanel {
         });
     }
 
-    /// Rebuilds the pane's [`ForeignThreadTab`](crate::thread_tab::ForeignThreadTab)
-    /// proxies to mirror the registry: one proxy per entry owned by another
-    /// workspace of this window, in the registry's global insertion order
-    /// around this pane's own real tabs.
+    /// Rebuilds the pane's proxies to mirror the registry: one per entry owned
+    /// by another workspace of this window, in registry order.
     fn sync_foreign_thread_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use crate::thread_tab::{ForeignThreadTab, ThreadTab};
 
@@ -2269,10 +2162,8 @@ impl AgentPanel {
             }
         }
 
-        // The desired item sequence: registry order, with local entries
-        // resolved to this pane's real tabs (skipped while a just-closed tab
-        // is still registered) and real tabs the registry does not know yet
-        // kept at the end (the next publish appends them).
+        // Local entries resolve to real tabs (skipped while a just-closed tab
+        // is still registered); unregistered real tabs stay at the end.
         enum DesiredItem {
             Existing(EntityId),
             NewProxy(ThreadId, WeakEntity<Workspace>),
@@ -2329,9 +2220,8 @@ impl AgentPanel {
             .active_item()
             .map(|item| item.item_id());
 
-        // Remove every proxy, then re-insert (reusing entities) at the
-        // desired indices. Real tabs keep their relative order, which the
-        // registry mirrors, so ascending inserts land the full sequence.
+        // Real tabs keep their relative order, which the registry mirrors, so
+        // removing every proxy and re-inserting in ascending order lands it.
         for proxy in current_proxies.values() {
             self.expected_proxy_removals.insert(proxy.entity_id());
         }
@@ -2363,8 +2253,6 @@ impl AgentPanel {
                     cx,
                 );
             }
-            // Keep the user's tab active; removals and inserts may have
-            // shifted the active index.
             let restored_index = previously_active.and_then(|previously_active| {
                 pane.items()
                     .position(|item| item.item_id() == previously_active)
@@ -2374,10 +2262,8 @@ impl AgentPanel {
             {
                 pane.activate_item(index, false, false, window, cx);
             }
-            // A panel that is new has no previous tab to restore, so the
-            // sync can leave a proxy as the active item with no activation
-            // event to re-route it. A proxy must never be what the pane
-            // shows, so put a local tab in front whenever there is one.
+            // A new panel has no previous tab to restore, and a proxy must
+            // never be what the pane shows.
             let proxy_is_active = pane
                 .active_item()
                 .is_some_and(|item| item.downcast::<ForeignThreadTab>().is_some());
@@ -2394,16 +2280,12 @@ impl AgentPanel {
         cx.notify();
     }
 
-    /// A foreign tab must never stay visible: put the previous local tab
-    /// back immediately and, for user activations, route to the thread's
-    /// home workspace.
+    /// A foreign tab must never stay visible: put the previous local tab back
+    /// and, for user activations, route to the thread's home workspace.
     ///
-    /// Only activations that moved focus (`focus_changed`) are routed: a tab
-    /// click focuses the tab, while pane bookkeeping (proxy syncing, closing
-    /// a tab activating its neighbour) activates without focus. Routing is
-    /// additionally deferred so that a focused activation caused by closing
-    /// a real tab can still be cancelled by the `RemovedItem` handler, which
-    /// the pane notifies in the same effect cycle.
+    /// Only focused activations are routed; pane bookkeeping activates
+    /// without focus. Routing is deferred so that the `RemovedItem` handler
+    /// can cancel an activation caused by closing a real tab.
     fn handle_possible_foreign_activation(
         &mut self,
         focus_changed: bool,
@@ -2477,10 +2359,6 @@ impl AgentPanel {
         });
     }
 
-    /// Routes a user-initiated close of a foreign tab to the real tab in
-    /// its home workspace, and cancels pending foreign-activation routing
-    /// when a real tab was closed (its neighbour activation must not switch
-    /// workspaces).
     fn handle_thread_pane_item_removed(
         &mut self,
         item: &dyn ItemHandle,
@@ -2688,9 +2566,7 @@ impl AgentPanel {
         cx.notify();
     }
 
-    /// Clears the base view without creating a replacement draft: for
-    /// workspaces mid-teardown (a worktree being archived), where a fresh
-    /// draft tab would flash into existence just to die with the workspace.
+    /// For a workspace mid-teardown, where a fresh draft would die with it.
     pub fn clear_base_view_without_draft(&mut self, cx: &mut Context<Self>) {
         self.base_view = BaseView::Uninitialized;
         self.serialize(cx);
@@ -2727,20 +2603,6 @@ impl AgentPanel {
             return;
         }
 
-        self.activate_additional_new_thread(focus, source, window, cx);
-    }
-
-    pub fn activate_additional_new_thread(
-        &mut self,
-        focus: bool,
-        source: AgentThreadSource,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.has_open_project(cx) {
-            return;
-        }
-
         self.set_last_created_entry_kind_from_user_action(AgentPanelEntryKind::Thread, cx);
 
         // If the user is viewing a non-ephemeral draft and the ephemeral
@@ -2765,8 +2627,7 @@ impl AgentPanel {
 
         if let Some(draft) = self.draft_thread.clone() {
             if self.draft_has_content(&draft, cx) {
-                // The draft leaves the ephemeral new-draft slot; its open
-                // tab keeps the view (and typed content) alive.
+                // Its open tab keeps the view alive.
                 self.draft_thread = None;
                 self._draft_editor_observation = None;
             } else if *draft.read(cx).agent_key() != self.selected_agent {
@@ -2780,6 +2641,16 @@ impl AgentPanel {
             }
         }
         self.activate_draft(focus, source, window, cx);
+    }
+
+    pub fn activate_additional_new_thread(
+        &mut self,
+        focus: bool,
+        source: AgentThreadSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.activate_new_thread(focus, source, window, cx);
     }
 
     fn draft_has_content(&self, draft: &Entity<ConversationView>, cx: &App) -> bool {
@@ -2828,8 +2699,6 @@ impl AgentPanel {
             return;
         }
 
-        // Reuse the tab-hosted view when the draft is already open as a
-        // thread pane tab, instead of building a second ConversationView.
         let tab_matching = self
             .tab_threads
             .get(&thread_id)
@@ -2872,16 +2741,12 @@ impl AgentPanel {
             metadata.title.clone(),
             initial_content,
             None,
-            Vec::new(),
             AgentThreadSource::AgentPanel,
             crate::conversation_view::ConnectionStart::OnFirstSend,
             window,
             cx,
         );
         self.observe_draft_editor(&thread.conversation_view, cx);
-        // Opened, unfocused, behind whatever the user was last reading. The
-        // sidebar lists open threads, and with no tab bar a draft that is not
-        // a pane item is a thread with nowhere to be found.
         self.open_thread_tab_in_background(thread.conversation_view.clone(), window, cx);
         self.draft_thread = Some(thread.conversation_view);
     }
@@ -2897,9 +2762,7 @@ impl AgentPanel {
         }
 
         self.selected_agent = action.agent.clone().into();
-        // Picking an agent explicitly is a deliberate request for a new
-        // thread, so skip the focus-existing shortcut.
-        self.activate_additional_new_thread(true, AgentThreadSource::AgentPanel, window, cx);
+        self.activate_new_thread(true, AgentThreadSource::AgentPanel, window, cx);
     }
 
     fn set_selected_agent_and_persist(&mut self, agent: Agent, cx: &mut Context<Self>) {
@@ -2925,11 +2788,6 @@ impl AgentPanel {
             return;
         }
 
-        // Upstream asks `base_view` whether the new draft is what the panel is
-        // showing. Here threads are hosted as tabs, so a shown draft usually
-        // leaves `base_view` alone and lives in `active_tab_thread` instead;
-        // `active_conversation_view` is the fork's answer to the same question
-        // and covers both.
         let showing_new_draft = matches!(
             (self.active_conversation_view(), &self.draft_thread),
             (Some(conversation_view), Some(draft))
@@ -3973,18 +3831,13 @@ impl AgentPanel {
         );
     }
 
-    /// Immediately creates a new git worktree (off the fetched default branch
-    /// when one resolves, else current HEAD) and switches to it; the new
-    /// workspace's panel opens with a fresh thread. Nothing is deferred: the
-    /// worktree exists as soon as this returns, and the thread inside it is an
-    /// ordinary thread in an ordinary worktree that happens to have no message
-    /// yet.
+    /// Creates a git worktree off the fetched default branch (else HEAD),
+    /// switches to it and opens a new thread in it.
     pub fn create_new_worktree_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
-        // The same base the spare worktrees are made from: they are only ever
-        // this `+`'s if the two agree on what it asks for.
+        // Must match the base the spare worktrees are made from.
         let branch_target = git_ui_core::worktree_service::default_worktree_branch_target(
             &workspace.read(cx).project().clone(),
             cx,
@@ -4010,12 +3863,8 @@ impl AgentPanel {
             if let Ok(task) = task
                 && let Some(created) = task.await.log_err()
             {
-                // The new workspace opens with no thread in it and nothing
-                // else will make one: the panel's load path stopped creating
-                // drafts, and the pane is left holding only the proxies of
-                // other workspaces' threads. `open_worktree_workspace` has
-                // already awaited the new workspace's panels, so its agent
-                // panel is registered by the time this resolves.
+                // The new workspace opens with no thread, and its panels are
+                // already registered by the time this resolves.
                 created
                     .workspace
                     .update_in(cx, |workspace, window, cx| {
@@ -4038,8 +3887,6 @@ impl AgentPanel {
         .detach();
     }
 
-    /// Drops the panel's empty draft thread along with its tab and metadata
-    /// row, so replacing it leaves no ghost behind.
     fn discard_empty_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(draft) = self.draft_thread.take() else {
             return;
@@ -4052,11 +3899,8 @@ impl AgentPanel {
         self.close_thread_tab(draft_id, window, cx);
     }
 
-    /// Clears the draft's typed message, e.g. after its content migrated
-    /// into another workspace's draft.
-    /// Rebinds an unstarted draft to a different agent, in place. The typed
-    /// message and the tab survive; the metadata row follows so the sidebar
-    /// and a reload agree on the binding.
+    /// Rebinds an unstarted draft to a different agent in place, keeping its
+    /// typed message and tab.
     pub fn rebind_draft_agent(
         &mut self,
         conversation_view: &Entity<ConversationView>,
@@ -4084,32 +3928,6 @@ impl AgentPanel {
         cx.notify();
     }
 
-    pub fn clear_draft_message(
-        &mut self,
-        thread_id: ThreadId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(conversation_view) = self.conversation_view_for_id(&thread_id, cx) else {
-            return;
-        };
-        if let Some(message_editor) = conversation_view
-            .read(cx)
-            .unstarted_message_editor()
-            .cloned()
-        {
-            message_editor.update(cx, |editor, cx| editor.clear(window, cx));
-            return;
-        }
-        if let Some(thread_view) = conversation_view.read(cx).root_thread_view() {
-            thread_view.update(cx, |thread_view, cx| {
-                thread_view.message_editor.update(cx, |editor, cx| {
-                    editor.clear(window, cx);
-                });
-            });
-        }
-    }
-
     fn ensure_draft(
         &mut self,
         source: AgentThreadSource,
@@ -4122,8 +3940,8 @@ impl AgentPanel {
             let agent_matches = *draft.read(cx).agent_key() == desired_agent;
             let has_editor_content = self.draft_has_content(draft, cx);
             // Only retarget the empty draft when the user is actively
-            // viewing it: that's the case where selecting a different
-            // agent should replace the draft with one bound to the
+            // viewing it — that's the case where switching agents in the
+            // toolbar should replace the draft with one bound to the
             // newly-selected agent. When the draft is parked in its slot
             // while the user is viewing a real thread, `selected_agent`
             // reflects that real thread's agent and must not be allowed
@@ -4151,7 +3969,6 @@ impl AgentPanel {
             None,
             None,
             None,
-            Vec::new(),
             source,
             crate::conversation_view::ConnectionStart::OnFirstSend,
             window,
@@ -4318,10 +4135,9 @@ impl AgentPanel {
         self.serialize(cx);
     }
 
-    /// Creates a new thread as a background tab, without switching the
-    /// active tab to it. Used by the `create_thread` agent tool, which
-    /// passes an initial prompt, and optionally an agent and model
-    /// override.
+    /// Creates a new thread as a background tab. Used by the `create_thread`
+    /// agent tool, which passes an initial prompt, and optionally an agent and
+    /// model override.
     pub fn create_thread_with_options(
         &mut self,
         options: CreateThreadOptions,
@@ -4349,7 +4165,6 @@ impl AgentPanel {
             options.title.clone(),
             options.initial_content,
             options.model,
-            options.session_config,
             source,
             crate::conversation_view::ConnectionStart::Immediate,
             window,
@@ -4359,14 +4174,7 @@ impl AgentPanel {
             self.set_selected_agent_and_persist(original, cx);
         }
         let thread_id = thread.conversation_view.read(cx).thread_id;
-        if options.activate {
-            self.open_thread_tab(thread.conversation_view, true, window, cx);
-            // The panel auto-creates an empty draft on load; leaving it would
-            // show an empty thread beside the one we just started.
-            self.discard_empty_draft(window, cx);
-        } else {
-            self.open_thread_tab_in_background(thread.conversation_view, window, cx);
-        }
+        self.open_thread_tab_in_background(thread.conversation_view, window, cx);
         thread_id
     }
 
@@ -4381,9 +4189,7 @@ impl AgentPanel {
         self.remove_thread_internal(id, true, window, cx);
     }
 
-    /// Closes a thread without archiving it: the tab goes, the thread stays in
-    /// history. This is what `cmd-w` does to the active thread, and with no tab
-    /// bar to middle-click it is what the sidebar row offers instead.
+    /// Closes a thread's tab without archiving it.
     pub fn close_thread(&mut self, id: ThreadId, window: &mut Window, cx: &mut Context<Self>) {
         self.close_thread_tab(id, window, cx);
     }
@@ -4611,7 +4417,6 @@ impl AgentPanel {
             title,
             initial_content,
             None,
-            Vec::new(),
             source,
             start,
             window,
@@ -5089,9 +4894,6 @@ impl AgentPanel {
         self.workspace_id
     }
 
-    /// The conversation view of the thread the user is working with: the
-    /// panel's base view if it hosts one (legacy), else the workspace's
-    /// active thread tab.
     pub fn active_conversation_view(&self) -> Option<&Entity<ConversationView>> {
         match &self.base_view {
             BaseView::AgentThread { conversation_view } => Some(conversation_view),
@@ -5274,10 +5076,7 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Agent threads live as tabs in the panel's thread pane, not as the
-        // panel's base view. The panel remains the factory for conversation
-        // views and the host for terminal threads. Pane adds are pane-local,
-        // so this is safe even while the workspace is leased.
+        // Agent threads live as tabs in the thread pane, not as the base view.
         if let BaseView::AgentThread { conversation_view } = new_view {
             self.open_thread_tab(conversation_view, focus, window, cx);
             return;
@@ -5367,13 +5166,8 @@ impl AgentPanel {
         }
     }
 
-    /// Whether the panel should show its thread pane: threads are open as
-    /// tabs and no terminal has claimed the base view.
-    ///
-    /// A pane holding only [`ForeignThreadTab`](crate::thread_tab::ForeignThreadTab)
-    /// proxies has nothing to show — a proxy renders a placeholder, never a
-    /// conversation — so a workspace with no thread of its own falls through
-    /// to the empty panel state rather than drawing that placeholder.
+    /// A pane holding only proxies has nothing to show, so it falls through to
+    /// the empty state.
     fn thread_pane_is_visible(&self, cx: &App) -> bool {
         matches!(self.base_view, BaseView::Uninitialized)
             && self
@@ -5421,8 +5215,6 @@ impl AgentPanel {
         })
     }
 
-    /// Open (or activate) a tab for this conversation view in the panel's
-    /// thread pane.
     pub(crate) fn open_thread_tab(
         &mut self,
         conversation_view: Entity<ConversationView>,
@@ -5442,18 +5234,13 @@ impl AgentPanel {
             crate::thread_tab::ThreadTab::new(conversation_view, self.workspace.clone(), cx)
         });
         self.thread_pane.update(cx, |pane, cx| {
-            // The end of the strip, not next to whatever is active: the strip
-            // spans the window's worktrees, so "next to the active tab" can
-            // drop a new thread into the middle of another worktree's tabs.
+            // Next to the active tab could land inside another worktree's tabs.
             let end = pane.items_len();
             pane.add_item(Box::new(tab), true, focus, Some(end), window, cx);
         });
         cx.notify();
     }
 
-    /// Adds a tab for this conversation view without activating it, keeping
-    /// the user's current tab in front. Used for threads created in the
-    /// background (e.g. by the `create_thread` agent tool).
     pub(crate) fn open_thread_tab_in_background(
         &mut self,
         conversation_view: Entity<ConversationView>,
@@ -5468,24 +5255,11 @@ impl AgentPanel {
         if already_open {
             return;
         }
-        self.tab_threads
-            .insert(thread_id, conversation_view.downgrade());
-        self._tab_thread_observations.insert(
+        self.track_tab_thread(
             thread_id,
-            cx.observe(&conversation_view, |_this, _view, cx| {
-                cx.emit(AgentPanelEvent::EntryChanged);
-                cx.notify();
-            }),
-        );
-        self._tab_thread_releases.insert(
-            thread_id,
-            cx.observe_release(&conversation_view, move |this, _view, cx| {
-                this.tab_threads.remove(&thread_id);
-                this._tab_thread_observations.remove(&thread_id);
-                this._tab_thread_releases.remove(&thread_id);
-                cx.emit(AgentPanelEvent::EntryChanged);
-                cx.notify();
-            }),
+            &conversation_view,
+            || AgentPanelEvent::EntryChanged,
+            cx,
         );
         let tab = cx.new(|cx| {
             crate::thread_tab::ThreadTab::new(conversation_view, self.workspace.clone(), cx)
@@ -5521,14 +5295,8 @@ impl AgentPanel {
         true
     }
 
-    /// Gives up a terminal base view for the thread the user is being sent to.
-    /// A terminal covers the thread pane, so leaving it behind is what makes
-    /// the thread visible; until it did, the panel kept the terminal on screen
-    /// while a thread's tab was the active one, and anything that asked what
-    /// was selected — `RenameSelectedThread`, for one — answered with the
-    /// terminal. Only a focused activation counts: a tab restored or opened
-    /// behind the user's back must not take the surface from the terminal
-    /// they left showing.
+    /// A terminal base view covers the thread pane, so a focused activation
+    /// of a thread has to leave it.
     fn leave_terminal_base_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !matches!(self.base_view, BaseView::Terminal { .. }) {
             return;
@@ -5540,8 +5308,6 @@ impl AgentPanel {
         cx.notify();
     }
 
-    /// Removes the thread pane tab hosting `thread_id`, if any. Used when a
-    /// draft is discarded so its tab does not linger as a ghost.
     fn close_thread_tab(
         &mut self,
         thread_id: ThreadId,
@@ -5560,12 +5326,11 @@ impl AgentPanel {
         }
     }
 
-    /// The pane hosting the panel's thread tabs.
     pub fn thread_pane(&self) -> &Entity<Pane> {
         &self.thread_pane
     }
 
-    /// Thread ids of this workspace's open thread tabs, in pane order.
+    /// This workspace's own open threads, in pane order.
     pub fn open_thread_tab_ids(&self, cx: &App) -> Vec<ThreadId> {
         self.thread_pane
             .read(cx)
@@ -5574,12 +5339,7 @@ impl AgentPanel {
             .collect()
     }
 
-    /// Every thread this pane shows a tab for, in strip order: its own threads
-    /// and the proxies standing in for the other workspaces'. Every pane
-    /// mirrors the registry, so this is one window's view of that global
-    /// order; the registry itself is what the sidebar sorts Active by.
-    /// [`Self::open_thread_tab_ids`] is the narrower question — which threads
-    /// are open *here* — and stays the answer for membership.
+    /// Every thread in the strip, proxies included.
     pub fn thread_tab_ids_in_pane_order(&self, cx: &App) -> Vec<ThreadId> {
         self.thread_pane
             .read(cx)
@@ -5595,11 +5355,8 @@ impl AgentPanel {
             .collect()
     }
 
-    /// Every thread this window's strip carries, as (pane index, item id, thread
-    /// id), own tabs and proxies alike. The registry is published from this
-    /// strip, so it is the thing a reorder has to move: a thread belonging to
-    /// another worktree is a `ForeignThreadTab` here, and moving the proxy is
-    /// what carries the new global order to every window.
+    /// (pane index, item id, thread id) for own tabs and proxies alike. The
+    /// registry is published from this strip, so a reorder moves it.
     fn thread_strip(&self, cx: &App) -> Vec<(usize, EntityId, ThreadId)> {
         self.thread_pane
             .read(cx)
@@ -5618,14 +5375,8 @@ impl AgentPanel {
             .collect()
     }
 
-    /// Moves the run of strip entries named by `moving` so it lands against
-    /// `target`'s run, which is what dropping a row on a row of another worktree
-    /// means. The sidebar groups by worktree and cannot show one thread sitting
-    /// inside another worktree's group, so a drop across groups moves the whole
-    /// group; its threads keep their own order.
-    ///
-    /// A group sits where its earliest tab sits, which is the rule the sidebar
-    /// sorts groups by, so that is what decides which way this is going.
+    /// Moves the group `moving` against the group `target`, keeping its
+    /// threads' order. A group sits where its earliest tab sits.
     pub fn move_thread_group_to(
         &mut self,
         moving: &[ThreadId],
@@ -5653,12 +5404,8 @@ impl AgentPanel {
             .collect();
         ordered.sort_by_key(|id| position(id).unwrap_or(usize::MAX));
 
-        // Landing one thread on another is the primitive the within-a-worktree
-        // drag already uses: onto a tab below lands after it, onto one above
-        // lands before it. Moving a whole group is that primitive applied to
-        // each member against the target group's near edge — in reverse when
-        // going down, because each one lands immediately against the anchor and
-        // pushes the last one further away.
+        // Each member lands against the target group's near edge, in reverse
+        // when going down because each one pushes the last further away.
         let going_down = moving_first < target_first;
         let anchor = if going_down {
             target.iter().filter_map(position).max()
@@ -5677,15 +5424,8 @@ impl AgentPanel {
         true
     }
 
-    /// Moves `thread_id`'s place in this window's strip to where
-    /// `target_thread_id` sits, which is what dropping one sidebar row on
-    /// another inside a worktree means. Either may be a proxy: the strip is
-    /// where the global order lives, and the sidebar allows a drop between
-    /// worktrees.
-    /// Returns whether the pair was found and the move made.
-    ///
-    /// Nothing is activated. Reordering is arranging the list, not asking to
-    /// read the thread, and the drag never touched the panel's focus.
+    /// Moves `thread_id` to where `target_thread_id` sits in the strip, without
+    /// activating anything. Returns whether the pair was found.
     pub fn move_thread_tab_to(
         &mut self,
         thread_id: ThreadId,
@@ -5708,14 +5448,10 @@ impl AgentPanel {
             return true;
         }
 
-        // The target's index in the strip as it stands, which is the same thing
-        // a tab drag hands `move_item`: dropping on a row above lands before it,
-        // dropping on one below lands after it.
         workspace::move_item(&pane, &pane, item_id, destination_index, false, window, cx);
         true
     }
 
-    /// Whether any tab-hosted conversation view is still alive.
     fn has_live_tab_thread(&self) -> bool {
         self.active_tab_thread.is_some()
             || self
@@ -5724,9 +5460,6 @@ impl AgentPanel {
                 .any(|view| view.upgrade().is_some())
     }
 
-    /// Track a conversation view that is (about to be) hosted in a thread
-    /// pane tab, so the panel's view enumeration (and through it the
-    /// sidebar's thread list and live status) includes tab-hosted threads.
     pub(crate) fn register_tab_thread(
         &mut self,
         conversation_view: &Entity<ConversationView>,
@@ -5734,12 +5467,29 @@ impl AgentPanel {
     ) {
         let thread_id = conversation_view.read(cx).thread_id;
         self.active_tab_thread = Some(conversation_view.clone());
+        self.track_tab_thread(
+            thread_id,
+            conversation_view,
+            || AgentPanelEvent::ActiveViewChanged,
+            cx,
+        );
+        cx.emit(AgentPanelEvent::ActiveViewChanged);
+        cx.notify();
+    }
+
+    fn track_tab_thread(
+        &mut self,
+        thread_id: ThreadId,
+        conversation_view: &Entity<ConversationView>,
+        event: fn() -> AgentPanelEvent,
+        cx: &mut Context<Self>,
+    ) {
         self.tab_threads
             .insert(thread_id, conversation_view.downgrade());
         self._tab_thread_observations.insert(
             thread_id,
-            cx.observe(conversation_view, |_this, _view, cx| {
-                cx.emit(AgentPanelEvent::ActiveViewChanged);
+            cx.observe(conversation_view, move |_this, _view, cx| {
+                cx.emit(event());
                 cx.notify();
             }),
         );
@@ -5749,19 +5499,14 @@ impl AgentPanel {
                 this.tab_threads.remove(&thread_id);
                 this._tab_thread_observations.remove(&thread_id);
                 this._tab_thread_releases.remove(&thread_id);
-                cx.emit(AgentPanelEvent::ActiveViewChanged);
+                cx.emit(event());
                 cx.notify();
             }),
         );
-        cx.emit(AgentPanelEvent::ActiveViewChanged);
-        cx.notify();
     }
 
-    /// A local thread tab was removed from the pane. Closing a tab is
-    /// closing the thread: release the ephemeral draft pointer if it held
-    /// this view (so the `ConversationView` drops and its sessions close).
-    /// Closing never creates a replacement tab: an emptied pane stays empty
-    /// and shows the placeholder, so the last tab can actually be closed.
+    /// Releases the draft pointer if it held this view, so the view drops and
+    /// its sessions close.
     fn local_thread_tab_removed(
         &mut self,
         tab: &Entity<crate::thread_tab::ThreadTab>,
@@ -5776,8 +5521,6 @@ impl AgentPanel {
         {
             self.draft_thread = None;
             self._draft_editor_observation = None;
-            // A closed empty draft would otherwise linger as a ghost
-            // metadata row; drafts with typed content stay restorable.
             if !self.draft_has_content(&conversation_view, cx) {
                 let thread_id = conversation_view.read(cx).thread_id;
                 ThreadMetadataStore::global(cx).update(cx, |store, cx| {
@@ -5787,11 +5530,8 @@ impl AgentPanel {
         }
     }
 
-    /// Closing a tab hands activation to a neighbour, and that neighbour can
-    /// be the empty draft every workspace loads with. Landing there reads as a
-    /// new thread nobody asked for, so while a started thread is still open,
-    /// activate the one nearest the draft instead. A draft with typed content
-    /// is somewhere the user has been, and is left alone.
+    /// Closing a tab must not land on an empty draft while another thread is
+    /// open.
     fn redirect_activation_off_empty_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(draft) = self.draft_thread.clone() else {
             return;
@@ -5836,10 +5576,7 @@ impl AgentPanel {
             Some(target) => self.thread_pane.update(cx, |pane, cx| {
                 pane.activate_item(target, keep_focus, keep_focus, window, cx);
             }),
-            // Nothing else is open, so the draft is all that stands between
-            // the user and the empty pane they asked for by closing their
-            // last thread. Closing it too leaves the placeholder, and its
-            // own removal drops the metadata row.
+            // Closing the last thread leaves the pane empty.
             None => {
                 self.close_thread_tab(draft_id, window, cx);
                 self.base_view = BaseView::Uninitialized;
@@ -5850,11 +5587,7 @@ impl AgentPanel {
         }
     }
 
-    /// A workspace that opens (or restores) with no thread tabs gets a draft
-    /// tab, quietly and unfocused, ready to type into. This runs only at
-    /// workspace load: closing tabs never re-creates one.
-    /// A thread hosted in a tab received user interaction: promote it out
-    /// of the draft slot and notify listeners (sidebar).
+    /// Promotes an interacted-with thread out of the draft slot.
     pub(crate) fn thread_tab_interacted(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
         if self
             .draft_thread
@@ -5912,7 +5645,6 @@ impl AgentPanel {
             });
         }
 
-        // Check if the thread is already open as a thread pane tab.
         if let Some(conversation_view) = self
             .tab_threads
             .get(&thread_id)
@@ -5962,8 +5694,7 @@ impl AgentPanel {
                 auto_submit: false,
             });
 
-        // A restored draft stays unstarted: reopening the app must not spawn
-        // agents for every draft tab.
+        // Reopening the app must not spawn agents for every draft tab.
         let start = if is_draft {
             crate::conversation_view::ConnectionStart::OnFirstSend
         } else {
@@ -5992,7 +5723,6 @@ impl AgentPanel {
         title: Option<SharedString>,
         initial_content: Option<AgentInitialContent>,
         model_override: Option<String>,
-        session_config: Vec<(acp_v2::SessionConfigId, acp_v2::SessionConfigOptionValue)>,
         source: AgentThreadSource,
         start: crate::conversation_view::ConnectionStart,
         window: &mut Window,
@@ -6011,7 +5741,6 @@ impl AgentPanel {
             title,
             initial_content,
             model_override,
-            session_config,
             source,
             start,
             window,
@@ -6048,7 +5777,6 @@ impl AgentPanel {
             title,
             initial_content,
             None,
-            Vec::new(),
             source,
             crate::conversation_view::ConnectionStart::Immediate,
             window,
@@ -6066,7 +5794,6 @@ impl AgentPanel {
         title: Option<SharedString>,
         initial_content: Option<AgentInitialContent>,
         model_override: Option<String>,
-        session_config: Vec<(acp_v2::SessionConfigId, acp_v2::SessionConfigOptionValue)>,
         source: AgentThreadSource,
         start: crate::conversation_view::ConnectionStart,
         window: &mut Window,
@@ -6099,7 +5826,7 @@ impl AgentPanel {
                 work_dirs,
                 title,
                 initial_content,
-                session_config,
+                Vec::new(),
                 workspace.clone(),
                 project,
                 thread_store,
@@ -6314,9 +6041,7 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
                 initial_content: Some(initial_content),
                 agent: agent_choice.clone(),
                 model: request.model.clone(),
-                session_config: Vec::new(),
                 work_dirs: None,
-                activate: false,
             };
 
             // If the caller asked for a fresh worktree, open a new workspace
@@ -6483,25 +6208,18 @@ impl Panel for AgentPanel {
         AGENT_PANEL_KEY
     }
 
-    /// How wide the thread is is a preference about how you like to work, not
-    /// a property of a checkout. Every worktree is its own workspace with its
-    /// own id, so a per-workspace width resized the thread under you every
-    /// time you moved between the worktrees of one project.
+    /// Every worktree is its own workspace, so a per-workspace width resized
+    /// the thread when moving between worktrees.
     fn size_is_global() -> bool {
         true
     }
 
-    /// Focusing the panel focuses what the user came to type into. With
-    /// threads hosted as tabs, that is the active tab's composer rather than
-    /// the panel's own root.
     fn activation_focus_handle(&self, cx: &App) -> FocusHandle {
         Focusable::focus_handle(self, cx)
     }
 
-    /// The thread pane. Lets pane-generic machinery (the tab switcher,
-    /// tab cycling, focused-pane resolution) treat thread tabs like any
-    /// other pane's tabs while the panel is focused, so the user's
-    /// configured ctrl-tab behavior applies.
+    /// Lets pane-generic machinery (tab switcher, ctrl-tab) treat thread tabs
+    /// like any other pane's.
     fn pane(&self) -> Option<Entity<Pane>> {
         Some(self.thread_pane.clone())
     }
@@ -6615,9 +6333,7 @@ impl Panel for AgentPanel {
 
 impl AgentPanel {
     fn ensure_thread_initialized(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Threads live as workspace tabs, so panel activation must not
-        // auto-create a draft thread; new threads are created explicitly
-        // (sidebar button, agent::NewThread). Only the terminal-kind panel
+        // Panel activation never creates a thread; only a terminal-kind panel
         // still initializes itself.
         if self.has_live_tab_thread() {
             return;
@@ -6724,9 +6440,7 @@ impl AgentPanel {
             return true;
         }
 
-        // Threads live as tabs in the thread pane. A lone empty draft tab is
-        // not meaningful state (mirrors the legacy empty-draft base view);
-        // anything else is.
+        // A lone empty draft tab is not meaningful state.
         let tabs = self
             .thread_pane
             .read(cx)
@@ -6785,7 +6499,6 @@ impl AgentPanel {
             if blocks.is_empty() {
                 return None;
             }
-            // A workspace switch carries the typed text over; it never submits.
             return Some(AgentInitialContent::ContentBlock {
                 blocks,
                 auto_submit: false,
@@ -6816,8 +6529,8 @@ impl AgentPanel {
         if blocks.is_empty() {
             return None;
         }
-        // A workspace switch carries the typed text over; it never submits it.
-        // The new-worktree send delivers its own message directly instead.
+        // The new-worktree send delivers its own message, so a switch never
+        // submits.
         Some(AgentInitialContent::ContentBlock {
             blocks,
             auto_submit: false,
@@ -6837,11 +6550,7 @@ impl AgentPanel {
         })
     }
 
-    /// Continues the source workspace's draft in this workspace: the message
-    /// the user typed moves into this panel's own draft thread. Used when a
-    /// workspace switch (including a send-initiated worktree creation) carries
-    /// content into a freshly opened workspace. Returns whether content was
-    /// carried over.
+    /// Returns whether content was carried over.
     pub fn initialize_from_source_workspace_if_needed(
         &mut self,
         source_workspace: WeakEntity<Workspace>,
@@ -6868,11 +6577,7 @@ impl AgentPanel {
         }
 
         if let Some(initial_content) = initialization.initial_content {
-            // This panel's own draft has been connecting since the workspace
-            // loaded, so handing the content to it keeps the migration to a
-            // single tab and a single session: no thread is created here, and
-            // the first frame this workspace renders already carries the
-            // message instead of a fresh thread's connecting placeholder.
+            // Reuse this panel's own draft so the carry makes no second thread.
             let reusable_draft = self
                 .draft_thread
                 .clone()
@@ -6896,7 +6601,6 @@ impl AgentPanel {
                 None,
                 Some(initial_content),
                 None,
-                Vec::new(),
                 AgentThreadSource::AgentPanel,
                 crate::conversation_view::ConnectionStart::OnFirstSend,
                 window,
@@ -6912,7 +6616,6 @@ impl AgentPanel {
                     .is_some_and(|active| active.entity_id() == draft.entity_id())
             });
             if initialized && viewing_draft {
-                // Rebind the visible empty draft to the inherited agent.
                 self.activate_draft(false, AgentThreadSource::AgentPanel, window, cx);
             } else if initialized {
                 cx.notify();
@@ -7404,9 +7107,7 @@ impl AgentPanel {
         })
     }
 
-    /// Quiet placeholder shown when no thread tabs are open. Deliberately
-    /// offers no thread-creation affordance: threads are created from the
-    /// sidebar.
+    /// Threads are created from the sidebar, so this offers no way to make one.
     fn render_empty_thread_state(&self, cx: &Context<Self>) -> impl IntoElement {
         v_flex()
             .size_full()
@@ -7480,7 +7181,7 @@ impl AgentPanel {
                                                 {
                                                     panel.update(cx, |panel, cx| {
                                                         panel.selected_agent = Agent::NativeAgent;
-                                                        panel.activate_additional_new_thread(
+                                                        panel.activate_new_thread(
                                                             true,
                                                             AgentThreadSource::AgentPanel,
                                                             window,
@@ -7672,8 +7373,6 @@ impl AgentPanel {
             .flex_none()
             .justify_between();
 
-        // The empty state must not advertise thread creation; the sidebar
-        // is the only thread creator.
         let empty_thread_title = matches!(mode, ToolbarMode::EmptyThread).then(|| {
             Label::new("No Open Worktrees")
                 .color(Color::Muted)
@@ -7733,8 +7432,7 @@ impl AgentPanel {
                         .flex_none()
                         .gap_1()
                         .children(sandbox_status)
-                        // Threads are created from the sidebar; the panel's
-                        // new-entry menu only applies to the terminal surface.
+                        // Threads are created from the sidebar.
                         .when(
                             can_create_entries && matches!(mode, ToolbarMode::Terminal),
                             |this| this.child(new_thread_menu),
@@ -8125,14 +7823,7 @@ impl Render for AgentPanel {
             }))
             .on_action(
                 cx.listener(|this, _: &crate::NewAdditionalThread, window, cx| {
-                    if this.has_open_project(cx) {
-                        this.activate_additional_new_thread(
-                            true,
-                            AgentThreadSource::AgentPanel,
-                            window,
-                            cx,
-                        );
-                    }
+                    this.activate_new_thread(true, AgentThreadSource::AgentPanel, window, cx);
                 }),
             )
             .on_action(cx.listener(|this, _: &NewTerminalThread, window, cx| {
@@ -8148,8 +7839,7 @@ impl Render for AgentPanel {
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 this.open_configuration(window, cx);
             }))
-            // Captured (top-down) so the thread pane, which registers the same
-            // actions unconditionally, does not swallow them first.
+            // Captured so the thread pane's own handlers do not swallow them.
             .capture_action(cx.listener(Self::navigate_back))
             .capture_action(cx.listener(Self::navigate_forward))
             .on_action(cx.listener(Self::open_active_thread_as_markdown))
@@ -8179,8 +7869,6 @@ impl Render for AgentPanel {
                     .children(self.render_new_user_onboarding(window, cx))
             })
             .map(|parent| match self.visible_surface() {
-                // The thread pane fills the panel; each tab applies the
-                // agent font to its own contents.
                 VisibleSurface::Uninitialized if thread_pane_visible => {
                     parent.child(self.thread_pane.clone())
                 }
@@ -8255,9 +7943,8 @@ impl AgentPanel {
         Self::new(workspace, window, cx)
     }
 
-    /// Closes a thread's tab without deleting its metadata or kvp state.
-    /// Simulates the post-restart situation where a thread exists only as
-    /// a metadata row.
+    /// Simulates the post-restart state where a thread exists only as a
+    /// metadata row.
     pub fn test_close_thread_tab(
         &mut self,
         id: ThreadId,
@@ -8298,7 +7985,6 @@ impl AgentPanel {
             None,
             None,
             None,
-            Vec::new(),
             AgentThreadSource::AgentPanel,
             crate::conversation_view::ConnectionStart::Immediate,
             window,
@@ -8340,7 +8026,6 @@ impl AgentPanel {
             None,
             None,
             None,
-            Vec::new(),
             AgentThreadSource::AgentPanel,
             crate::conversation_view::ConnectionStart::Immediate,
             window,
@@ -8376,7 +8061,6 @@ impl AgentPanel {
             None,
             None,
             None,
-            Vec::new(),
             AgentThreadSource::AgentPanel,
             crate::conversation_view::ConnectionStart::OnFirstSend,
             window,
@@ -8784,9 +8468,6 @@ mod tests {
         }
     }
 
-    // The second half focuses the thread's title editor and expects it inside
-    // the panel. This fork renames threads from the tab and sidebar menus, so
-    // the title editor is not part of the panel's surface at all.
     #[ignore = "the panel has no title editor in this fork"]
     #[gpui::test]
     async fn test_clicking_tool_call_output_keeps_agent_panel_focused_and_zoomed(
@@ -9201,8 +8882,6 @@ mod tests {
 
         loaded.read_with(cx, |panel, cx| {
             assert_eq!(panel.active_terminal_id(), Some(terminal_id));
-            // The draft thread tab is restored into the thread pane, but the
-            // terminal must remain the panel's visible surface.
             assert!(
                 matches!(panel.visible_surface(), VisibleSurface::Terminal(_)),
                 "the restored terminal should remain the visible surface instead of a draft"
@@ -10322,10 +10001,6 @@ mod tests {
 
     #[gpui::test]
     async fn test_cmd_w_closes_the_thread_from_the_message_editor(cx: &mut TestAppContext) {
-        // Where the pointer is when someone wants a thread gone is the
-        // message editor, not the pane. With no tab bar to click, cmd-w is
-        // the keyboard way out, and it has to resolve from where focus
-        // actually sits.
         let (panel, mut cx) = setup_visible_panel(cx).await;
         let cx = &mut cx;
         cx.update(|_window, cx| {
@@ -10363,8 +10038,7 @@ mod tests {
             );
         });
 
-        // And from the conversation itself, which is the other place focus
-        // sits while reading a thread.
+        // And from the thread view.
         panel.update_in(cx, |panel, window, cx| {
             panel.activate_draft(true, AgentThreadSource::AgentPanel, window, cx);
         });
@@ -10783,10 +10457,8 @@ mod tests {
         let real_session_id = crate::test_support::active_session_id(&panel, cx);
         cx.run_until_parked();
 
-        // 2. Open a draft, type into it, then deliberately create another
-        //    thread. The typed draft leaves the ephemeral new-draft slot
-        //    but stays open as a tab (tabs are what "open" means; there is
-        //    no parked background cache anymore).
+        // 2. Open a draft, type into it, then create another thread. The
+        //    typed draft leaves the new-draft slot but stays open as a tab.
         panel.update_in(cx, |panel, window, cx| {
             panel.activate_draft(true, AgentThreadSource::AgentPanel, window, cx);
         });
@@ -10795,7 +10467,7 @@ mod tests {
         crate::test_support::type_draft_prompt(&panel, "retained draft text", cx);
 
         panel.update_in(cx, |panel, window, cx| {
-            panel.activate_additional_new_thread(true, AgentThreadSource::AgentPanel, window, cx);
+            panel.activate_new_thread(true, AgentThreadSource::AgentPanel, window, cx);
         });
         cx.run_until_parked();
 
@@ -11170,16 +10842,8 @@ mod tests {
         }
     }
 
-    // Upstream's panel opens a thread that connects straight away, so this
-    // drives a gated agent server and expects the selections queued during the
-    // load to arrive in the loaded thread's editor. A thread this panel makes
-    // is a draft that starts no server until its first send: it never enters
-    // that flow, and the selections never reach the draft this test holds
-    // (checked: nothing is queued and the draft keeps its own empty editor).
-    // What the test is about is covered here by
-    // `test_a_selection_on_an_unstarted_draft_lands_in_its_editor`, and the
-    // queue's own drain by `test_pending_selections_survive_connection_retry`
-    // in `conversation_view.rs`.
+    // Covered by `test_a_selection_on_an_unstarted_draft_lands_in_its_editor`
+    // and `test_pending_selections_survive_connection_retry`.
     #[ignore = "upstream's panel thread connects on open; this fork's draft waits for the first send"]
     #[gpui::test]
     async fn test_add_selection_to_loading_thread(cx: &mut TestAppContext) {
@@ -11310,11 +10974,8 @@ mod tests {
         });
     }
 
-    /// A selection added to a draft that has not started a server yet belongs
-    /// in the editor the reader is looking at. Upstream queues it for the
-    /// active thread's editor, which a draft of this kind does not have until
-    /// its first message has already been sent, so the selection would sit
-    /// invisible in the queue until then.
+    /// Upstream queues the selection for the active thread's editor, which an
+    /// unstarted draft does not have until after its first send.
     #[gpui::test]
     async fn test_a_selection_on_an_unstarted_draft_lands_in_its_editor(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_visible_panel(cx).await;
@@ -12061,10 +11722,8 @@ mod tests {
         cx.run_until_parked();
 
         panel.read_with(&cx, |panel, _cx| {
-            // Upstream's own assertion is that the panel is showing the agent
-            // thread. Here a thread is a tab in the thread pane rather than
-            // the panel's base view, so "showing the thread" is the panel
-            // having left the terminal behind.
+            // The thread is a tab, not the base view, so it shows once the
+            // terminal is left behind.
             assert!(!matches!(
                 panel.visible_surface(),
                 VisibleSurface::Terminal(_)
@@ -13183,10 +12842,6 @@ mod tests {
         });
     }
 
-    // Rewritten from test_running_thread_retained_when_navigating_away:
-    // there is no parked background cache anymore. A running thread stays
-    // open as its tab when the user navigates away, and closing that tab
-    // closes the thread, cancelling the running turn.
     #[gpui::test]
     async fn test_closing_running_thread_tab_closes_the_thread(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
@@ -13251,9 +12906,7 @@ mod tests {
         );
     }
 
-    /// Closes a thread's tab through the pane, the way the tab's own close
-    /// button and the sidebar's do, rather than through the panel's internal
-    /// `close_thread_tab` (which the panel uses for its own bookkeeping).
+    /// Through the pane, not the panel's own `close_thread_tab`.
     fn close_thread_tab_like_the_user(
         panel: &Entity<AgentPanel>,
         thread_id: &ThreadId,
@@ -13273,15 +12926,10 @@ mod tests {
         cx.run_until_parked();
     }
 
-    /// Closing a thread must not hand the pane to the empty draft a workspace
-    /// loads with: another open thread takes the activation, and when there is
-    /// no other the draft goes too, so the pane is left showing the
-    /// placeholder rather than a new thread nobody asked for.
     #[gpui::test]
     async fn test_closing_a_thread_never_lands_on_the_empty_draft(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
 
-        // The draft every workspace loads with, then two started threads.
         open_draft_with_connection(&panel, StubAgentConnection::new(), &mut cx);
         let draft_id = active_thread_id(&panel, &cx);
         open_thread_with_connection(&panel, StubAgentConnection::new(), &mut cx);
@@ -13320,9 +12968,6 @@ mod tests {
         });
     }
 
-    // Rewritten from test_idle_non_loadable_thread_retained_when_navigating_away:
-    // open tabs are the definition of open threads, so navigating away never
-    // drops a thread's view, loadable or not.
     #[gpui::test]
     async fn test_thread_stays_open_as_tab_when_navigating_away(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
@@ -13368,8 +13013,6 @@ mod tests {
     #[gpui::test]
     async fn test_thread_without_an_agent_title_generates_one_locally(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
-        // The fake provider, not the model, is what carries the pending
-        // requests now; take a fresh registry so this test holds one.
         let fake = cx.update(|_, cx| language_model::LanguageModelRegistry::test(cx));
 
         let connection = StubAgentConnection::new();
@@ -13392,15 +13035,12 @@ mod tests {
             panel.active_conversation_view().unwrap().clone()
         });
 
-        // The stand-in title is a short single line, not the whole message.
         let provisional = conversation_view.read_with(&cx, |view, cx| view.title(cx));
         assert!(
             provisional.chars().count() <= crate::conversation_view::PROVISIONAL_TITLE_LEN + 1,
             "provisional title should be short, got {provisional:?}"
         );
 
-        // The turn ended with no title from the agent, so a title generation
-        // request goes to the summarization model.
         let model = cx.update(|_, cx| {
             LanguageModelRegistry::read_global(cx)
                 .thread_summary_model(cx)
@@ -13508,9 +13148,7 @@ mod tests {
 
         let thread_id = active_thread_id(&panel, &cx);
 
-        // `+` while viewing a live thread creates (and shows) a draft. It
-        // never silently re-focuses the live thread: that read as `+` doing
-        // nothing at all.
+        // `+` never silently re-focuses the live thread.
         panel.update_in(&mut cx, |panel, window, cx| {
             panel.activate_new_thread(true, AgentThreadSource::AgentPanel, window, cx);
         });
@@ -13559,7 +13197,6 @@ mod tests {
             assert!(!panel.can_navigate_forward());
         });
 
-        // Back returns to the first thread; forward returns to the second.
         panel.update_in(&mut cx, |panel, window, cx| {
             panel.navigate_back(&workspace::pane::GoBack, window, cx);
         });
@@ -13577,9 +13214,6 @@ mod tests {
         assert_eq!(active_thread_id(&panel, &cx), second);
     }
 
-    // Rewritten from test_background_thread_promoted_via_load: threads no
-    // longer move to a background cache; loading an already-open thread
-    // re-activates its existing tab without rebuilding the view.
     #[gpui::test]
     async fn test_loading_open_thread_activates_its_tab(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
@@ -13790,13 +13424,6 @@ mod tests {
         );
     }
 
-    /// A panel that restored nothing creates nothing.
-    ///
-    /// It used to be handed a thread whenever the pane had no tab at the
-    /// moment the check ran — which is before the requested thread has opened
-    /// and while restored tabs may still be loading. So re-opening a worktree
-    /// by clicking one of its threads, or restoring an archived one, came back
-    /// with an extra "New thread" beside the thread that was asked for.
     #[gpui::test]
     async fn test_a_panel_that_restored_nothing_creates_no_thread(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
@@ -13831,12 +13458,7 @@ mod tests {
         });
     }
 
-    /// The sweep's idea of "off screen" has to include a window the user is not
-    /// looking at. With one worktree per window the thread in a background
-    /// window is its pane's active tab, so a sweep that only spared "the active
-    /// tab of this pane" spared every thread in the app. The thread actually
-    /// being read must survive the sweep running on its own clock, which is the
-    /// other half of the same change.
+    /// A background window's active tab is off screen too.
     #[gpui::test]
     async fn test_a_window_at_the_back_drops_the_views_of_the_thread_it_showed(
         cx: &mut TestAppContext,
@@ -13858,8 +13480,6 @@ mod tests {
             })
         };
 
-        // The sweep now runs on a clock of its own rather than once per
-        // activation, so the thread being read has to keep its views across it.
         cx.executor().advance_clock(OFFSCREEN_VIEW_GRACE * 3);
         cx.run_until_parked();
         assert!(
@@ -13876,10 +13496,6 @@ mod tests {
         );
     }
 
-    // Rewritten from the two cleanup_retained_threads tests: the retained
-    // cache (and its five-idle-threads eviction) is gone. Open tabs are the
-    // definition of open threads, and only closing a tab closes a thread,
-    // so no amount of idle threads is ever evicted behind the user's back.
     #[gpui::test]
     async fn test_open_thread_tabs_are_never_evicted(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
@@ -13913,14 +13529,10 @@ mod tests {
         });
     }
 
-    /// Closing is not archiving: the tab goes and the thread stays in history,
-    /// which is the distinction the sidebar row's menu now has to carry on its
-    /// own.
     #[gpui::test]
     async fn test_closing_a_thread_leaves_it_in_history(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
-        // A thread that has been sent, not a draft: an empty draft is deleted
-        // on close on purpose, so it would say nothing about this.
+        // An empty draft is deleted on close, so use a sent thread.
         let connection = StubAgentConnection::new();
         let (_session_id, thread_id) =
             open_generating_thread_with_loadable_connection(&panel, &connection, &mut cx);
@@ -13943,40 +13555,6 @@ mod tests {
                     .entry(thread_id)
                     .is_some(),
                 "and leaves the thread itself in history, unlike archiving it"
-            );
-        });
-    }
-
-    #[gpui::test]
-    async fn test_closing_last_thread_tab_leaves_the_pane_empty(cx: &mut TestAppContext) {
-        let (panel, mut cx) = setup_panel(cx).await;
-
-        panel.update_in(&mut cx, |panel, window, cx| {
-            panel.activate_draft(true, AgentThreadSource::AgentPanel, window, cx);
-        });
-        cx.run_until_parked();
-
-        let pane = panel.read_with(&cx, |panel, _| panel.thread_pane().clone());
-        assert_eq!(
-            panel.read_with(&cx, |panel, cx| panel.open_thread_tab_ids(cx).len()),
-            1,
-            "the draft should be open as a thread tab"
-        );
-
-        pane.update_in(&mut cx, |pane, window, cx| {
-            let item_ids: Vec<_> = pane.items().map(|item| item.item_id()).collect();
-            for item_id in item_ids {
-                pane.remove_item(item_id, false, false, window, cx);
-            }
-        });
-        cx.run_until_parked();
-
-        // Closing a tab must never auto-create a replacement: the pane stays
-        // empty and shows the placeholder.
-        panel.read_with(&cx, |panel, cx| {
-            assert!(
-                panel.open_thread_tab_ids(cx).is_empty(),
-                "closing the last thread tab should leave no thread tabs"
             );
         });
     }
@@ -14977,10 +14555,8 @@ mod tests {
             editor.set_text("Don't lose me!", window, cx);
         });
 
-        // Press cmd-n on a typed draft: the typed draft stays open as a
-        // tab (there is no parked cache anymore) and a fresh, *empty*
-        // ephemeral draft becomes active. The typed draft retains the
-        // prompt; the new one is a blank slate.
+        // Press cmd-n on a typed draft: it stays open as a tab, and a fresh,
+        // *empty* ephemeral draft becomes active.
         cx.dispatch_action(NewThread);
         cx.run_until_parked();
 
@@ -16073,11 +15649,8 @@ mod tests {
         (workspace, panel, cx)
     }
 
-    /// Rewritten from the retained-thread reset race test. With tabs as
-    /// the only place threads live, reopening a session that is already
-    /// open reuses the tab-hosted view instead of building a duplicate
-    /// ConversationView, so a background view reset (error + server
-    /// update) must not disassociate the session of the reopened thread:
+    /// Reopening an open session reuses its tab-hosted view, so a background
+    /// reset must not disassociate the session:
     ///
     /// 1. Thread A is active and Connected.
     /// 2. User switches to thread B; A stays open as a background tab.
@@ -16629,22 +16202,9 @@ mod tests {
         });
     }
 
-    /// The draft-first worktree flow's two sides: a source workspace whose
-    /// panel holds the pending draft, and the freshly opened worktree
-    /// workspace whose panel has already created (and connected) its own
-    /// thread tab.
-    /// `+` makes a worktree and a thread in it. The thread was the half that
-    /// went missing: `create_new_worktree_thread` opened the workspace and
-    /// relied on the panel's load path making a draft, which the "no more
-    /// drafts" change removed. The new workspace's pane was then left holding
-    /// only the proxies of other workspaces' threads, one of them active, so
-    /// the panel drew "Worktree is open in another workspace".
-    ///
-    /// The worktree `+` opens gets its agent panel from `initialize_workspace`,
-    /// which lives in the `zed` crate, so a workspace created here never has
-    /// one. What this covers is both halves of the fix on a panel that does:
-    /// a pane holding nothing but proxies is not shown, and the thread `+` now
-    /// asks for lands as this workspace's own active tab.
+    /// The worktree `+` opens gets its panel from `zed`'s `initialize_workspace`,
+    /// so this adds one by hand: a pane holding only proxies is not shown, and
+    /// the new thread lands as this workspace's own active tab.
     #[gpui::test]
     async fn test_a_worktree_workspace_shows_its_own_thread_not_a_proxy(cx: &mut TestAppContext) {
         init_test(cx);
@@ -16659,8 +16219,6 @@ mod tests {
             .await;
         fs.insert_tree("/worktree", json!({ ".git": {}, "src": { "main.rs": "" } }))
             .await;
-        // The base `+` asks for is already in the clone, so nothing waits on a
-        // fetch.
         fs.insert_branches(&PathBuf::from("/repo/.git"), &["main", "origin/main"]);
 
         let project = Project::test(fs.clone(), [Path::new("/repo")], cx).await;
@@ -16703,8 +16261,6 @@ mod tests {
             "the workspace `+` is pressed from has a thread of its own"
         );
 
-        // `+` does open the worktree's workspace; what it never did was put a
-        // thread in it.
         panel.update_in(cx, |panel, window, cx| {
             panel.create_new_worktree_thread(window, cx);
         });
@@ -16712,19 +16268,17 @@ mod tests {
             cx.run_until_parked();
         }
         assert_eq!(
-            multi_workspace_entity
-                .read_with(cx, |multi_workspace, _cx| multi_workspace
-                    .workspaces()
-                    .count()),
+            multi_workspace_entity.read_with(cx, |multi_workspace, _cx| multi_workspace
+                .workspaces()
+                .count()),
             2,
             "`+` opens the worktree's workspace"
         );
 
-        // That workspace, with the panel the app gives it: its pane mirrors
-        // the thread above as a `ForeignThreadTab` and owns nothing.
-        let worktree_workspace = multi_workspace_entity.update_in(cx, |multi_workspace, window, cx| {
-            multi_workspace.test_add_workspace(worktree_project.clone(), window, cx)
-        });
+        let worktree_workspace =
+            multi_workspace_entity.update_in(cx, |multi_workspace, window, cx| {
+                multi_workspace.test_add_workspace(worktree_project.clone(), window, cx)
+            });
         worktree_workspace.update(cx, |workspace, _cx| {
             workspace.set_random_database_id();
         });
@@ -16751,13 +16305,10 @@ mod tests {
             );
             assert!(
                 !panel.thread_pane_is_visible(cx),
-                "a pane holding nothing but proxies is not shown, so the panel \
-                 falls through to the empty state instead of drawing a \
-                 ForeignThreadTab's placeholder"
+                "a pane holding nothing but proxies is not shown"
             );
         });
 
-        // The thread `+` now asks for, in the new workspace's own panel.
         worktree_panel.update_in(cx, |panel, window, cx| {
             panel.selected_agent = Agent::Stub;
             panel.activate_new_thread(true, AgentThreadSource::AgentPanel, window, cx);
@@ -16859,9 +16410,8 @@ mod tests {
         (workspace_a, panel_a, panel_b, stub_connection, cx)
     }
 
-    /// The destination-pull that carries a send-triggered worktree switch's
-    /// message into the new workspace reuses the destination's own draft (one
-    /// tab, no dummy thread), and the source draft is cleared afterward.
+    /// The carried message reuses the destination's own draft: one tab, no
+    /// second thread.
     #[gpui::test]
     async fn test_worktree_switch_carries_source_draft_into_destination(cx: &mut TestAppContext) {
         let (workspace_a, panel_a, panel_b, _stub_connection, mut cx) =
@@ -16872,7 +16422,6 @@ mod tests {
             panel.activate_draft(false, AgentThreadSource::Sidebar, window, cx);
         });
         cx.run_until_parked();
-        let draft_id = crate::test_support::active_thread_id(&panel_a, cx);
         crate::test_support::type_draft_prompt(&panel_a, "Fix the flaky test", cx);
 
         let destination_draft = panel_b.read_with(cx, |panel, _cx| {
@@ -16908,59 +16457,10 @@ mod tests {
                 .text(cx);
             assert_eq!(text, "Fix the flaky test");
         });
-
-        // What the caller does once the content has moved over.
-        panel_a.update_in(cx, |panel, window, cx| {
-            panel.clear_draft_message(draft_id, window, cx);
-        });
-        cx.run_until_parked();
-
-        let source_editor = crate::test_support::draft_message_editor(&panel_a, cx);
-        let text = source_editor.read_with(cx, |editor, cx| editor.text(cx));
-        assert!(
-            text.is_empty(),
-            "the source draft's message moved to the worktree, leaving it empty: {text:?}"
-        );
     }
 
-    /// Content handed to an unstarted destination draft lands straight in its
-    /// composer: there is no connection to wait for, because nothing starts
-    /// until the user sends.
-    #[gpui::test]
-    async fn test_worktree_switch_into_unstarted_destination(cx: &mut TestAppContext) {
-        let (workspace_a, panel_a, panel_b, _stub_connection, mut cx) =
-            setup_worktree_draft_migration(cx).await;
-        let cx = &mut cx;
-
-        panel_a.update_in(cx, |panel, window, cx| {
-            panel.activate_draft(false, AgentThreadSource::Sidebar, window, cx);
-        });
-        cx.run_until_parked();
-        crate::test_support::type_draft_prompt(&panel_a, "Rename the crate", cx);
-
-        let carried = panel_b.update_in(cx, |panel, window, cx| {
-            panel.discard_empty_draft(window, cx);
-            panel.activate_draft(false, AgentThreadSource::AgentPanel, window, cx);
-            panel.initialize_from_source_workspace_if_needed(workspace_a.downgrade(), window, cx)
-        });
-        assert!(carried, "an unstarted draft should still carry the content");
-        cx.run_until_parked();
-
-        panel_b.read_with(cx, |panel, cx| {
-            assert_eq!(panel.open_thread_tab_ids(cx).len(), 1);
-        });
-        let editor = crate::test_support::draft_message_editor(&panel_b, cx);
-        let text = editor.read_with(cx, |editor, cx| editor.text(cx));
-        assert_eq!(
-            text, "Rename the crate",
-            "content handed to an unstarted draft lands straight in its composer"
-        );
-    }
-
-    /// The prod carry path (zed's MultiWorkspaceEvent subscription) calls
-    /// into the panel from INSIDE a workspace update; applying the carried
-    /// content synchronously reads the workspace back (mention resolution)
-    /// and double-lease panics. The application must defer.
+    /// The prod carry path runs inside a workspace update, and applying the
+    /// content synchronously reads the workspace back, so it must defer.
     #[gpui::test]
     async fn test_switch_carry_is_safe_under_a_workspace_update(cx: &mut TestAppContext) {
         let (workspace_a, panel_a, panel_b, _stub_connection, mut cx) =
@@ -16992,10 +16492,8 @@ mod tests {
         assert_eq!(text.trim(), "Ship it", "the deferred carry still lands");
     }
 
-    /// A workspace switch carries the typed text into the destination draft but
-    /// never sends it. The new-worktree send delivers its own message directly
-    /// to the created workspace, so a switch that also submitted would send the
-    /// message twice.
+    /// The new-worktree send delivers its own message, so a switch that also
+    /// submitted would send it twice.
     #[gpui::test]
     async fn test_worktree_switch_carries_text_without_sending(cx: &mut TestAppContext) {
         let (workspace_a, panel_a, panel_b, stub_connection, mut cx) =
@@ -17040,7 +16538,7 @@ mod tests {
             crate::test_support::set_stub_agent_connection(StubAgentConnection::new());
 
         // Baseline: panel's selected_agent is the stub, and a draft tab is
-        // active so background creation has an active tab to not steal.
+        // active.
         panel.update_in(&mut cx, |panel, window, cx| {
             panel.selected_agent = Agent::Stub;
             panel.activate_draft(true, AgentThreadSource::AgentPanel, window, cx);

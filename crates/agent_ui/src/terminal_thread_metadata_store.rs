@@ -159,8 +159,7 @@ pub fn terminal_title_prefix(title: &str) -> Option<&str> {
 
 pub struct TerminalThreadMetadataStore {
     db: TerminalThreadMetadataDb,
-    /// Rows are handed out as `Arc`s, for the reason `ThreadMetadataStore`
-    /// gives: the sidebar rebuilds from every stored terminal.
+    /// `Arc`s for the reason `ThreadMetadataStore` gives.
     terminals: HashMap<TerminalId, Arc<TerminalThreadMetadata>>,
     terminals_by_paths: HashMap<PathList, HashSet<TerminalId>>,
     terminals_by_main_paths: HashMap<PathList, HashSet<TerminalId>>,
@@ -217,7 +216,6 @@ impl TerminalThreadMetadataStore {
         self.terminals.get(&terminal_id).map(Arc::as_ref)
     }
 
-    /// Returns all terminals, as the shared rows the store holds.
     pub fn entries(&self) -> impl Iterator<Item = &Arc<TerminalThreadMetadata>> + '_ {
         self.terminals.values()
     }
@@ -336,8 +334,7 @@ impl TerminalThreadMetadataStore {
         }
 
         for terminal_id in terminal_ids {
-            if let Some(mut terminal) = self.terminals.get(&terminal_id).map(|t| t.as_ref().clone())
-            {
+            if let Some(mut terminal) = self.terminals.get(&terminal_id).map(|t| (**t).clone()) {
                 mutate(&mut terminal.worktree_paths);
                 self.save_internal(terminal);
             }

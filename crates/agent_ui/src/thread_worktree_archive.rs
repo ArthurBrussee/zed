@@ -484,25 +484,8 @@ async fn rollback_root(root: &RootPlan, cx: &mut AsyncApp) {
     }
 }
 
-/// Saves the worktree's full git state so it can be restored later.
-///
-/// This creates two detached commits (via [`create_archive_checkpoint`] on
-/// the `GitRepository` trait) that capture the staged and unstaged state
-/// without moving any branch ref. The commits are:
-///   - "WIP staged": a tree matching the current index, parented on HEAD
-///   - "WIP unstaged": a tree with all files (including untracked),
-///     parented on the staged commit
-///
-/// After creating the commits, this function:
-///   1. Records the commit SHAs, branch name, and paths in a DB record.
-///   2. Links every thread referencing this worktree to that record.
-///   3. Creates a git ref on the main repo to prevent GC of the commits.
-///
-/// On success, returns the archived worktree DB row ID for rollback.
-/// A worktree's own git admin directory (`…/.git/worktrees/<name>`) and the
-/// repository's common one (`…/.git`), read off the `.git` file every linked
-/// worktree carries. Nothing in the tree can ask git a question about a
-/// worktree's submodules, but the answers this needs are on disk.
+/// A linked worktree's own git admin directory (`…/.git/worktrees/<name>`)
+/// and the repository's common one (`…/.git`), read off its `.git` file.
 async fn worktree_git_dirs(fs: &dyn Fs, worktree_path: &Path) -> Option<(PathBuf, PathBuf)> {
     let dot_git = worktree_path.join(".git");
     let metadata = fs.metadata(&dot_git).await.ok()??;
@@ -524,32 +507,23 @@ async fn worktree_git_dirs(fs: &dyn Fs, worktree_path: &Path) -> Option<(PathBuf
 }
 
 /// The parts of a worktree's admin directory that `git worktree remove` would
-/// take with it and that nothing else records.
-///
-/// `modules` holds the git directory of every initialised submodule, which is
-/// where a commit made in one lives. `info` holds the sparse-checkout
-/// patterns, so a sparse worktree does not come back dense.
+/// take with it and nothing else records: the submodules' git directories
+/// (where their commits live) and the sparse-checkout patterns.
 const KEPT_ADMIN_ENTRIES: [&str; 2] = ["modules", "info"];
 
-/// Where those parts live while the worktree is archived.
-///
-/// Keyed by the archived-worktree row that owns them, so the record already
-/// says where they are and nothing extra has to be stored to find them again.
+/// Keyed by the archived-worktree row, so the record says where they are.
 fn archived_admin_path(common_git_dir: &Path, archived_worktree_id: i64) -> PathBuf {
     common_git_dir
         .join("zed-archived-worktrees")
         .join(archived_worktree_id.to_string())
 }
 
-/// The initialised submodules of a worktree: the `path =` entries of its
-/// `.gitmodules` whose directory carries a `.git` file, paired with that
-/// file's contents.
-///
-/// A worktree Zed created has none of these — `git worktree add` leaves
-/// submodules uninitialised and nothing here runs `git submodule update
-/// --init` — so this is empty unless the user initialised them by hand, which
-/// is exactly the case that loses work.
-async fn initialized_submodules(fs: &dyn Fs, worktree_path: &Path) -> Result<Vec<(String, String)>> {
+/// The `.gitmodules` paths whose directory carries a `.git` file, paired with
+/// that file's contents. Empty unless the user initialised submodules by hand.
+async fn initialized_submodules(
+    fs: &dyn Fs,
+    worktree_path: &Path,
+) -> Result<Vec<(String, String)>> {
     let Ok(gitmodules) = fs.load(&worktree_path.join(".gitmodules")).await else {
         return Ok(Vec::new());
     };
@@ -560,11 +534,8 @@ async fn initialized_submodules(fs: &dyn Fs, worktree_path: &Path) -> Result<Vec
         let Ok(Some(metadata)) = fs.metadata(&dot_git).await else {
             continue;
         };
-        // A submodule's `.git` is a file pointing into the superproject's
-        // admin directory. A directory there is an independent clone standing
-        // where a submodule should be: its history is referenced by nothing,
-        // so deleting the worktree would take the only copy, and a checkpoint
-        // has nowhere to put it. Refusing is the only honest answer.
+        // A `.git` directory is an independent clone whose history nothing
+        // else references, so deleting the worktree would lose it.
         if metadata.is_dir {
             return Err(anyhow!(
                 "refusing to delete worktree at {}: {path} holds its own git \
@@ -581,7 +552,6 @@ async fn initialized_submodules(fs: &dyn Fs, worktree_path: &Path) -> Result<Vec
     Ok(found)
 }
 
-/// The `path =` entries of a `.gitmodules` file.
 fn declared_submodule_paths(gitmodules: &str) -> Vec<String> {
     gitmodules
         .lines()
@@ -595,17 +565,13 @@ fn declared_submodule_paths(gitmodules: &str) -> Vec<String> {
         .collect()
 }
 
-/// Takes the superproject's own checkpoint inside each initialised submodule.
-///
-/// A submodule is a repository with its own working directory, so it can be
-/// opened as one and given the same two WIP commits the worktree itself gets.
-/// That is what saves the edits and the unpushed commits the gitlink alone
-/// would drop; [`preserve_submodule_git_dirs`] is what keeps the objects those
-/// commits are written to.
-async fn checkpoint_submodules(root: &RootPlan, cx: &mut AsyncApp) -> Result<Vec<ArchivedSubmodule>> {
+/// Gives each initialised submodule the same two WIP commits the worktree
+/// gets, saving the edits and unpushed commits its gitlink alone would drop.
+async fn checkpoint_submodules(
+    root: &RootPlan,
+    cx: &mut AsyncApp,
+) -> Result<Vec<ArchivedSubmodule>> {
     if root.remote_connection.is_some() {
-        // The worktree is on another machine and nothing here can read its
-        // filesystem to find the submodules in the first place.
         return Ok(Vec::new());
     }
     let Some(fs) = current_app_state(cx).map(|state| state.fs.clone()) else {
@@ -654,13 +620,29 @@ async fn checkpoint_submodules(root: &RootPlan, cx: &mut AsyncApp) -> Result<Vec
     Ok(archived)
 }
 
-/// Moves the submodules' git directories out of the worktree's admin directory
-/// before `git worktree remove` deletes it along with everything in it.
-///
-/// This is the half that keeps the objects: a checkpoint commit written inside
-/// a submodule lives in that submodule's own object store, which is under
-/// `…/.git/worktrees/<name>/modules/`. Failing here fails the archive, because
-/// carrying on would delete exactly the work the checkpoint was taken to save.
+async fn move_kept_admin_entries(from: &Path, to: &Path, fs: &dyn Fs) -> Result<()> {
+    for entry in KEPT_ADMIN_ENTRIES {
+        let source = from.join(entry);
+        if fs.metadata(&source).await?.is_none() {
+            continue;
+        }
+        fs.rename(
+            &source,
+            &to.join(entry),
+            RenameOptions {
+                overwrite: true,
+                ignore_if_exists: false,
+                create_parents: true,
+            },
+        )
+        .await
+        .with_context(|| format!("could not move the worktree's git directory's {entry}"))?;
+    }
+    Ok(())
+}
+
+/// Sets the kept admin entries aside before `git worktree remove` deletes
+/// them. Failing fails the archive, since carrying on would delete the work.
 async fn preserve_submodule_git_dirs(
     worktree_path: &Path,
     archived_worktree_id: i64,
@@ -670,36 +652,17 @@ async fn preserve_submodule_git_dirs(
         return Ok(());
     };
     let kept = archived_admin_path(&common_dir, archived_worktree_id);
-
-    for entry in KEPT_ADMIN_ENTRIES {
-        let source = admin_dir.join(entry);
-        if fs.metadata(&source).await?.is_none() {
-            continue;
-        }
-        fs.rename(
-            &source,
-            &kept.join(entry),
-            RenameOptions {
-                overwrite: true,
-                ignore_if_exists: false,
-                create_parents: true,
-            },
-        )
+    move_kept_admin_entries(&admin_dir, &kept, fs)
         .await
         .with_context(|| {
             format!(
-                "refusing to archive worktree at {}: could not set aside its \
-                 git directory's {entry}",
+                "refusing to archive worktree at {}",
                 worktree_path.display()
             )
-        })?;
-    }
-    Ok(())
+        })
 }
 
-/// Moves a worktree's set-aside `modules` tree back into its admin directory,
-/// and forgets what was kept for it. Used both when a restore recreates the
-/// worktree and when an archive is rolled back and it never left.
+/// Moves the set-aside entries back, on restore and on a rolled-back archive.
 async fn return_submodule_git_dirs(
     worktree_path: &Path,
     archived_worktree_id: i64,
@@ -709,40 +672,14 @@ async fn return_submodule_git_dirs(
         return Ok(());
     };
     let kept = archived_admin_path(&common_dir, archived_worktree_id);
-    for entry in KEPT_ADMIN_ENTRIES {
-        let source = kept.join(entry);
-        if fs.metadata(&source).await?.is_none() {
-            continue;
-        }
-        fs.rename(
-            &source,
-            &admin_dir.join(entry),
-            RenameOptions {
-                overwrite: true,
-                ignore_if_exists: false,
-                create_parents: true,
-            },
-        )
-        .await
-        .with_context(|| {
-            format!("failed to restore the worktree's git directory's {entry}")
-        })?;
-    }
+    move_kept_admin_entries(&kept, &admin_dir, fs).await?;
     forget_archived_admin_entries(fs, &common_dir, archived_worktree_id).await;
     Ok(())
 }
 
-/// Puts the submodules' git directories back where a restored worktree's
-/// admin directory expects them, and recreates the `.git` file each submodule
-/// carries from the record, so nothing has to work out which name a
-/// submodule's git directory is filed under.
-///
-/// This is the half that makes a submodule a repository again; replaying what
-/// was in it is [`replay_submodule_checkpoints`].
-async fn restore_submodule_git_dirs(
-    row: &ArchivedGitWorktree,
-    fs: &dyn Fs,
-) -> Result<()> {
+/// Puts the submodules' git directories back and recreates each submodule's
+/// `.git` file verbatim from the record.
+async fn restore_submodule_git_dirs(row: &ArchivedGitWorktree, fs: &dyn Fs) -> Result<()> {
     if row.submodules.is_empty() {
         return Ok(());
     }
@@ -758,14 +695,8 @@ async fn restore_submodule_git_dirs(
     Ok(())
 }
 
-/// Replays each submodule's checkpoint into the working tree just reattached.
-///
-/// Every submodule is attempted even when one fails: they are independent
-/// repositories, and the work in the others is no less worth restoring.
-async fn replay_submodule_checkpoints(
-    row: &ArchivedGitWorktree,
-    cx: &mut AsyncApp,
-) -> Result<()> {
+/// Every submodule is attempted even when one fails: they are independent.
+async fn replay_submodule_checkpoints(row: &ArchivedGitWorktree, cx: &mut AsyncApp) -> Result<()> {
     let mut failures = Vec::new();
     for submodule in &row.submodules {
         let submodule_path = row.worktree_path.join(&submodule.path);
@@ -798,7 +729,6 @@ async fn replay_submodule_checkpoints(
     }
 }
 
-/// Drops whatever an archived worktree still has set aside.
 async fn forget_archived_admin_entries(
     fs: &dyn Fs,
     common_git_dir: &Path,
@@ -815,6 +745,21 @@ async fn forget_archived_admin_entries(
     .log_err();
 }
 
+/// Saves the worktree's full git state so it can be restored later.
+///
+/// This creates two detached commits (via [`create_archive_checkpoint`] on
+/// the `GitRepository` trait) that capture the staged and unstaged state
+/// without moving any branch ref. The commits are:
+///   - "WIP staged": a tree matching the current index, parented on HEAD
+///   - "WIP unstaged": a tree with all files (including untracked),
+///     parented on the staged commit
+///
+/// After creating the commits, this function:
+///   1. Records the commit SHAs, branch name, and paths in a DB record.
+///   2. Links every thread referencing this worktree to that record.
+///   3. Creates a git ref on the main repo to prevent GC of the commits.
+///
+/// On success, returns the archived worktree DB row ID for rollback.
 pub async fn persist_worktree_state(root: &RootPlan, cx: &mut AsyncApp) -> Result<i64> {
     let worktree_repo = root.worktree_repo.clone();
 
@@ -942,8 +887,6 @@ pub async fn persist_worktree_state(root: &RootPlan, cx: &mut AsyncApp) -> Resul
 /// detached (they don't move any branch), no git reset is needed — the
 /// commits will be garbage-collected once the ref is removed.
 pub async fn rollback_persist(archived_worktree_id: i64, root: &RootPlan, cx: &mut AsyncApp) {
-    // The worktree is staying, so its submodules need their git directories
-    // back where they were.
     if let Some(fs) = current_app_state(cx).map(|state| state.fs.clone()) {
         return_submodule_git_dirs(&root.root_path, archived_worktree_id, fs.as_ref())
             .await
@@ -1128,9 +1071,7 @@ pub async fn restore_worktree_via_git(
         return Err(error.context("failed to restore archive checkpoint"));
     }
 
-    // The worktree itself is restored and holds the user's work; a submodule
-    // that could not be reattached is worth saying so about, not worth
-    // throwing the restore away over.
+    // A submodule that cannot be reattached is not worth failing the restore.
     if remote_connection.is_none() && !row.submodules.is_empty() {
         let restored = async {
             restore_submodule_git_dirs(row, app_state.fs.as_ref()).await?;
@@ -1199,8 +1140,6 @@ pub async fn cleanup_archived_worktree_record(
         drop(_temp_project);
     }
 
-    // The record is going, so the submodule git directories it was the key
-    // to have nothing left pointing at them.
     if remote_connection.is_none()
         && let Some(fs) = current_app_state(cx).map(|state| state.fs.clone())
         && let Some(common_dir) = main_repo_git_dir(fs.as_ref(), &row.main_repo_path).await
@@ -1216,9 +1155,7 @@ pub async fn cleanup_archived_worktree_record(
         .log_err();
 }
 
-/// A main repository's git directory. Usually `<repo>/.git`, but a repository
-/// that is itself a linked worktree keeps one elsewhere and says where in that
-/// same `.git` file.
+/// Usually `<repo>/.git`, unless the repository is itself a linked worktree.
 async fn main_repo_git_dir(fs: &dyn Fs, main_repo_path: &Path) -> Option<PathBuf> {
     let dot_git = main_repo_path.join(".git");
     let metadata = fs.metadata(&dot_git).await.ok()??;
@@ -1747,11 +1684,6 @@ mod tests {
         });
     }
 
-
-    /// The case the complaint is about: a worktree Zed created, whose
-    /// submodules the *user* initialised by hand. `git worktree remove`
-    /// deletes the admin directory, and with it every submodule's object
-    /// store, so anything committed in one and never pushed goes with it.
     #[gpui::test]
     async fn test_submodule_git_dirs_survive_archive_and_come_back(cx: &mut TestAppContext) {
         init_test(cx);
@@ -1780,9 +1712,6 @@ mod tests {
         )
         .await;
 
-        // What `git submodule update --init` leaves behind inside a linked
-        // worktree: a `.git` file in the checkout, and the objects under the
-        // worktree's own admin directory.
         let admin_dir = PathBuf::from("/project/.git/worktrees/feature");
         let git_file = "gitdir: ../../../../../project/.git/worktrees/feature/modules/vendor/lib";
         fs.insert_tree(
@@ -1875,7 +1804,8 @@ mod tests {
             .expect("putting the modules tree back");
 
         assert!(
-            fs.is_dir(&admin_dir.join("modules/vendor/lib/objects")).await,
+            fs.is_dir(&admin_dir.join("modules/vendor/lib/objects"))
+                .await,
             "the submodule's objects are back where its .git file points"
         );
         assert_eq!(
@@ -1892,10 +1822,6 @@ mod tests {
         );
     }
 
-
-    /// A `.gitmodules` entry whose directory holds a real `.git` is an
-    /// independent clone, not a submodule: nothing references its history, so
-    /// deleting the worktree would take the only copy of it.
     #[gpui::test]
     async fn test_a_nested_clone_where_a_submodule_should_be_refuses_the_archive(
         cx: &mut TestAppContext,
@@ -1925,8 +1851,6 @@ mod tests {
         );
     }
 
-    /// A worktree whose sparse-checkout patterns live in its admin directory
-    /// comes back sparse, not dense.
     #[gpui::test]
     async fn test_sparse_checkout_patterns_survive_archive(cx: &mut TestAppContext) {
         init_test(cx);

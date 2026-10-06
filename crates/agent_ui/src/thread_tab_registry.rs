@@ -1,15 +1,6 @@
-//! Window-spanning registry of open thread tabs.
-//!
-//! Every [`AgentPanel`](crate::AgentPanel) publishes its own pane's whole tab
-//! strip here — its real [`ThreadTab`](crate::thread_tab::ThreadTab)s plus the
-//! [`ForeignThreadTab`](crate::thread_tab::ForeignThreadTab) proxies mirroring
-//! the other workspaces of its window — and mirrors this registry back into
-//! that strip, so every pane in a window shows one order spanning all of its
-//! workspaces.
-//!
-//! That makes this list, not any one pane, the order the tabs are in: the
-//! sidebar reads it to sort its rows, and a drag lands the same way whichever
-//! pane it happened in and whichever kind of tab was dragged.
+//! Window-spanning order of open thread tabs. Every agent panel publishes its
+//! whole strip (own tabs and proxies) here and mirrors this list back, and the
+//! sidebar sorts its rows by it.
 
 use std::collections::HashSet;
 
@@ -52,17 +43,9 @@ impl ThreadTabsRegistry {
         &self.entries
     }
 
-    /// Records `owner`'s pane as `strip`: its whole tab sequence, real tabs
-    /// and foreign proxies alike, each carrying the workspace that owns the
-    /// thread.
-    ///
-    /// Only the workspaces the strip names (plus `owner`, whose last tab may
-    /// have just closed) are that pane's to speak for — those are the window's
-    /// — so their entries are replaced wholesale, in the slots they already
-    /// occupy. Every other window's entries keep theirs. Publishing the whole
-    /// strip rather than only the owner's own tabs is what lets a tab dragged
-    /// past another worktree's tabs stay where it was dropped: the drag is the
-    /// order, and the panes that mirror this list follow it.
+    /// Replaces, in the slots they already occupy, the entries of the
+    /// workspaces `strip` names plus `owner` (whose last tab may have just
+    /// closed). Other windows' entries are untouched.
     pub fn set_window_tabs(
         &mut self,
         owner: WeakEntity<Workspace>,
@@ -114,8 +97,6 @@ impl ThreadTabsRegistry {
         cx.notify();
     }
 
-    /// Drops every entry belonging to `workspace_id`. Called when a panel is
-    /// released (its workspace closed).
     pub fn remove_workspace(&mut self, workspace_id: EntityId, cx: &mut Context<Self>) {
         let before = self.entries.len();
         self.entries
@@ -125,8 +106,7 @@ impl ThreadTabsRegistry {
         }
     }
 
-    /// Drops entries whose workspace entity is gone, returning whether any
-    /// were removed.
+    /// Returns whether any entries were removed.
     fn prune_dead_workspaces(&mut self) -> bool {
         let before = self.entries.len();
         self.entries

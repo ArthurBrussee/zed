@@ -98,17 +98,12 @@ pub use thread_import::{
 use zed_actions;
 pub use zed_actions::{CreateWorktree, NewWorktreeBranchTarget, SwitchWorktree};
 
-/// A subtle brand tint per agent, so Claude and Codex threads read apart at a
-/// glance. `None` for the native agent and unknown externals: they keep the
-/// theme's neutral icon color.
+/// A subtle brand tint per agent; `None` keeps the theme's neutral icon color.
 pub fn agent_brand_color(agent_id: &project::AgentId) -> Option<gpui::Hsla> {
     let id = agent_id.as_ref().to_ascii_lowercase();
-    // Low-saturation hints of each brand's hue: enough to tell agents apart,
-    // not so vivid that a row shouts. Works in either theme.
     if id.contains("claude") {
         Some(gpui::hsla(0.055, 0.42, 0.56, 0.85))
     } else if id.contains("codex") || id.contains("openai") {
-        // A muted slate-teal rather than the vivid brand green.
         Some(gpui::hsla(0.47, 0.22, 0.52, 0.85))
     } else if id.contains("gemini") {
         Some(gpui::hsla(0.58, 0.38, 0.60, 0.85))
@@ -144,30 +139,9 @@ pub(crate) fn resolve_agent_image(
     None
 }
 
-/// Whether a path is an HTML page, which the agent means for us to look at
-/// rendered, not to read as source.
-pub(crate) fn is_html_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm")
-        })
-}
-
-/// The `file://` URL for an absolute path, for handing a local file to the
-/// system browser.
-pub(crate) fn file_url(abs_path: &Path) -> Option<String> {
-    url::Url::from_file_path(abs_path)
-        .ok()
-        .map(|url| url.to_string())
-}
-
 /// Opens `abs_path` in the workspace, moving the cursor to `point` when one
 /// is given. Paths outside every worktree are only opened when a file exists
 /// there, so broken agent links don't create empty buffers.
-///
-/// HTML files are opened in the system browser: agents produce little HTML
-/// report pages to be looked at, not edited.
 pub(crate) fn open_abs_path_at_point(
     workspace: &mut Workspace,
     abs_path: PathBuf,
@@ -175,10 +149,15 @@ pub(crate) fn open_abs_path_at_point(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    if is_html_path(&abs_path)
-        && let Some(url) = file_url(&abs_path)
-    {
-        cx.open_url(&url);
+    // Agents produce HTML report pages to be looked at, not edited.
+    let is_html = abs_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm")
+        });
+    if is_html && let Ok(url) = url::Url::from_file_path(&abs_path) {
+        cx.open_url(url.as_str());
         return;
     }
 
@@ -284,7 +263,6 @@ actions!(
         RemoveSelectedThread,
         /// Renames the currently selected thread.
         RenameSelectedThread,
-        /// Renames the thread shown in the focused thread tab.
         /// Starts a chat conversation with follow-up enabled.
         ChatWithFollow,
         /// Cycles to the next inline assist suggestion.
@@ -327,8 +305,7 @@ actions!(
         RejectOnce,
         /// Follows the agent's suggestions.
         Follow,
-        /// Toggles between an agent-focused and a review-focused workspace
-        /// layout (git panel + agent diff vs thread tabs).
+        /// Toggles between an agent-focused and a review-focused layout.
         ToggleReviewLayout,
         /// Resets the trial upsell notification.
         ResetTrialUpsell,
@@ -379,8 +356,7 @@ actions!(
         /// Scroll the output to the next waypoint: a bookmark, or the user
         /// message that started a turn.
         ScrollOutputToNextMessage,
-        /// Bookmark the entry at the top of the thread's viewport, or clear
-        /// the bookmark that is already on it.
+        /// Toggles a bookmark on the entry at the top of the viewport.
         ToggleBookmark,
         /// Toggles in-thread search over the current agent thread's contents.
         ToggleSearch,
@@ -388,8 +364,7 @@ actions!(
         ImportThreadsFromOtherChannels,
         /// Starts a new terminal thread.
         NewTerminalThread,
-        /// Starts another agent in this worktree even when one is already
-        /// running; new-thread creation normally focuses the existing agent.
+        /// Starts another agent in this worktree.
         NewAdditionalThread,
     ]
 );
@@ -560,8 +535,7 @@ impl Agent {
         }
     }
 
-    /// The agent's brand logo: the same icon its `AgentServer` reports, so tabs,
-    /// sidebar rows, and menus all show one glyph per agent.
+    /// The same icon the agent's `AgentServer` reports.
     pub fn logo(&self) -> IconName {
         match self {
             Self::NativeAgent => IconName::ZedAgent,

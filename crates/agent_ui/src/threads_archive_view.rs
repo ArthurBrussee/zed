@@ -1,6 +1,4 @@
-//! Shared helpers for the sidebar's thread history list: fuzzy title matching
-//! and age formatting. The dedicated archive view surface was merged into the
-//! sidebar list.
+//! Fuzzy title matching and age formatting for the sidebar's thread list.
 
 use chrono::{DateTime, Utc};
 
