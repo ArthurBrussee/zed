@@ -195,6 +195,18 @@ dissolving its last 64px, and keep the status slot `flex_none` so the box ends w
 begins. Test: a row with a title much wider than the sidebar and a running pill. The title's
 painted bounds end at or before the pill's left edge, in an opaque and a transparent window.
 
+**A nicer subagent glyph.**
+
+Arthur finds the subagent icon "a bit naff". The activity pill draws `IconName::ZedAgent`, Zed's
+own logo, for the subagent count (`agent_activity_pill` in `thread_item.rs`), even when the
+subagents are Claude's. The subagent chip draws `tool_kind_icon(tool_call.kind())`, a generic
+glyph for whatever kind the `Agent` call reports. Use the agent's own logo for a subagent in
+both places: the same icon the sidebar row and thread already show for that agent
+(`ConversationView::agent_logo` / the row's agent icon). That is Claude's for Claude's
+subagents and Codex's for Codex's, tinted like the other chip glyphs (muted, not the brand
+colour), so a pill reads "terminal 1, Claude 2". `agent_activity_pill` takes the icon from its
+caller instead of hard-coding `ZedAgent`.
+
 **Command chips: more room for the label, and no blank space inside or between them.**
 
 Arthur, 2026-10-06: too many command chips are cut off, and there is a strange amount of
