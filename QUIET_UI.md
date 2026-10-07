@@ -231,6 +231,27 @@ and asserts the chip's width equals its glyphs + label + gaps + padding, within 
 Check the gap between chips in a row too (`gap_1` in `render_action_group`), and whatever puts
 extra vertical space between rows and around the run. Arthur reads all of it as wasted space.
 
+**PR chip: show how many checks failed and how many are still running, as counts.**
+
+Arthur, 2026-10-07: a PR chip should say how much CI is left, not just one glyph. With one
+failure and ten still going it reads `✗ 1  ◌ 10`: a red cross with the failed count, and the
+spinning yellow pending glyph (10-02's) with the count of checks not yet finished. When
+everything has finished and passed, it shows the single green check as now. Show the counts in
+both the sidebar row's chip and the thread's chip, and put the full breakdown in the hover card
+(failed, running, passed, skipped).
+
+GitHub already counts them, so there is nothing to tally from a truncated list. On the
+statusCheckRollup, `contexts(first: N)` exposes `checkRunCountsByState { state count }` and
+`statusContextCountsByState { state count }` (verified live on 2026-10-07 against
+zed-industries/zed#65285: `SUCCESS 23, SKIPPED 25`, plus `statusContextCountsByState SUCCESS 2`;
+`totalCount 50`). Add those two fields to the batched GraphQL query in `crates/gh_status`.
+Failed means `FAILURE`, `TIMED_OUT`, `STARTUP_FAILURE`, `ACTION_REQUIRED` and `CANCELLED` check
+runs, plus `FAILURE` and `ERROR` statuses. Running means `QUEUED`, `IN_PROGRESS`, `PENDING`,
+`WAITING`, `REQUESTED` and `EXPECTED`. Keep the check names the hover card already lists from
+`contexts`, and take the counts from the new fields. The `gh pr list` fallback has only the
+flattened rollup, so count from that list when it is all there is. Test with a parsed sample
+holding both kinds of counts.
+
 **The two memory baselines: ~4,000 command terminals twice over, and ~17,925 `Markdown`. Read on
 2026-10-05; both need a design decision rather than a patch, and neither is where the entry
 thought.**
