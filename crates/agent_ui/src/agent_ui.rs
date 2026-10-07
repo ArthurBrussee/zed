@@ -210,6 +210,15 @@ pub(crate) fn project_path_for_file_link(
     }
 }
 
+/// Agents produce HTML report pages to be looked at, not edited.
+pub(crate) fn is_html_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm")
+        })
+}
+
 /// Opens `abs_path` in the workspace, moving the cursor to `point` when one
 /// is given. Paths outside every worktree are only opened when a file exists
 /// there, so broken agent links don't create empty buffers.
@@ -220,14 +229,7 @@ pub(crate) fn open_abs_path_at_point(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    // Agents produce HTML report pages to be looked at, not edited.
-    let is_html = abs_path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm")
-        });
-    if is_html && let Ok(url) = url::Url::from_file_path(&abs_path) {
+    if is_html_path(&abs_path) && let Ok(url) = url::Url::from_file_path(&abs_path) {
         cx.open_url(url.as_str());
         return;
     }

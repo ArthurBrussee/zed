@@ -26,12 +26,13 @@ regardless.
 
 ## Upstream first (from 2026-10-01)
 
-The fork stands at +36.7k / -11.3k lines across 109 files against upstream (+33.1k / -9.4k
-without this file and the sidebar test files; the exact figures after the 2026-10-06 reduction run
-were +36,737 / -11,298). It was +45.8k / -11.4k at the start of that run, after going **up** four
-nights running (+42.0k on 10-02, +42.9k on 10-04, +44.8k on 10-05), each time because a Work queue
-entry asked for the lines. The 10-06 run built nothing and cut 9.1k added lines, almost all of it
-comment paragraphs, duplicated tests and dead code (see its rebase log entry). `README.md` carries
+The fork stands at +37.5k / -11.4k lines across 109 files against upstream (the exact figures
+after the 2026-10-07 run were +37,495 / -11,382, against +36,737 / -11,298 after the 10-06
+reduction run). It was +45.8k / -11.4k before 10-06, after going **up** four nights running
+(+42.0k on 10-02, +42.9k on 10-04, +44.8k on 10-05), each time because a Work queue entry asked
+for the lines. The 10-06 run built nothing and cut 9.1k added lines, almost all of it comment
+paragraphs, duplicated tests and dead code (see its rebase log entry); 10-07 put 731 back, for
+four queue entries, and roughly two thirds of that is the tests they asked for. `README.md` carries
 the review banner `CLAUDE.md` requires of any session that touches source — not the fork's idea; it
 will conflict every rebase until removed by hand. Every line is still rebase cost and a place
 for bugs, and not all of it was asked for. Arthur's rule: **upstream wins by default, and the
@@ -92,8 +93,10 @@ the per-worktree language-server switch, which `project/manifest_tree/server_tre
 worktree runs no language servers until it is switched on, so restoring a dozen worktree windows
 does not start a dozen servers indexing copies of the same repository.
 
-**The sidebar is the source of truth for open threads.** The `sidebar` crate (`sidebar.rs`, with
-`thread_switcher.rs` for ctrl-tab) is a worktree-shaped index of every thread: live state
+**The sidebar is the source of truth for open threads.** The `sidebar` crate is upstream's, not
+the fork's (worth knowing before a rebase: upstream ships `sidebar.rs`, `sidebar_tests.rs` and
+`thread_switcher.rs`, and the fork extends them, with `sidebar_tests/` its own). What the fork
+makes of it is a worktree-shaped index of every thread: live state
 (running — including commands still running after the turn — needs input, unread, error), click
 to switch, drag to reorder across worktrees, close and archive from the row.
 `agent_ui/thread_metadata_store.rs` and `terminal_thread_metadata_store.rs` persist the rows,
@@ -179,121 +182,28 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
-**A long sidebar title runs under the activity pill.**
+**The memory baselines: what it would take, and the one measurement that would justify it.**
 
-Arthur's screenshot (2026-10-06): "Backdrops auto/fixed dis… ce model". The fade sits mid-title
-and the rest of the title ("ce model") is painted over the pill. In `ThreadItem::render`
-(`crates/ui/src/components/ai/thread_item.rs`), the title box (`id("content")`, `relative`,
-`h_full`, `min_w_0`, `flex_1`) has no `overflow_hidden`. In an opaque window the label is
-deliberately not truncated (`.when(!opaque_window, |label| label.truncate())`), so the fade
-(10-04 moved it inside this box, `right(0)`) is the only thing hiding the end of a long title.
-The label's text overflows the box to the right, under the status slot. The fade covers the
-box's last 64px, and everything past the box stays visible.
+Decided on 2026-10-07 by reading the code; the 10-05 findings and the 10-07 rebase log entry hold
+the detail. The conclusion is that the remaining baseline (~8,000 terminal entities and ~17,925
+`Markdown` for a thread loaded from history) is thread data, and releasing it means
+`ToolCallContent::Terminal` holding a terminal id rather than an `Entity<Terminal>`, with
+`ToolCall::terminals()` resolving through the thread's own registry. That is ~46 `ToolCallContent::Terminal`
+sites and ~30 `terminals()` sites across `acp_thread`, `agent`, `agent_servers` and `agent_ui`,
+nearly all of it upstream's, in the file that conflicts on most rebases. **Upstream first** says
+no to carrying that in the fork, and nothing here can measure what it would buy.
 
-Fix: clip the title box (`overflow_hidden`) so the label ends at the box's edge, with the fade
-dissolving its last 64px, and keep the status slot `flex_none` so the box ends where the pill
-begins. Test: a row with a title much wider than the sidebar and a running pill. The title's
-painted bounds end at or before the pill's left edge, in an opaque and a transparent window.
+So the ball is with Arthur, and it is one line: **two `entities live` lines from a real session** —
+one just after launch, one after a day's threads have been opened — which say whether those 8,000
+entities are actually there and actually stay. With those numbers the shape to propose is a patch
+to the `terminal` crate rather than to thread data: `TerminalBuilder::new_display_only` not
+allocating its alacritty grid until something writes to it or reads it as a grid. That is
+self-contained, needs no change to the thread's data, and is the kind of patch upstream could
+take. Without the numbers, neither should be built.
 
-**A nicer subagent glyph.**
-
-Arthur finds the subagent icon "a bit naff". The activity pill draws `IconName::ZedAgent`, Zed's
-own logo, for the subagent count (`agent_activity_pill` in `thread_item.rs`), even when the
-subagents are Claude's. The subagent chip draws `tool_kind_icon(tool_call.kind())`, a generic
-glyph for whatever kind the `Agent` call reports. Use the agent's own logo for a subagent in
-both places: the same icon the sidebar row and thread already show for that agent
-(`ConversationView::agent_logo` / the row's agent icon). That is Claude's for Claude's
-subagents and Codex's for Codex's, tinted like the other chip glyphs (muted, not the brand
-colour), so a pill reads "terminal 1, Claude 2". `agent_activity_pill` takes the icon from its
-caller instead of hard-coding `ZedAgent`.
-
-**Command chips: more room for the label, and no blank space inside or between them.**
-
-Arthur, 2026-10-06: too many command chips are cut off, and there is a strange amount of
-whitespace around them. Three limits cut a label, all in `chips.rs`:
-- `collapsed_command`: `WIDTH = 60` characters for a single command and `PIECE_WIDTH = 22` per
-  piece of a chained line, applied through `acp_thread::command_display_prefix`. That is how
-  `wc flushcut-review.dif…` lost its filename in the 10-05 screenshot.
-- `action_chip_base`: `max_w(relative(0.75))` of the row.
-
-Raise them. Pieces get about 40 characters and a single command about 100. The width cap goes to
-the full row, since chips wrap to a new line anyway. A long path inside a piece truncates from
-the start so the file name stays (`…/flushcut-review.diff`), the way path labels already do.
-
-The whitespace: in the 10-05 screenshot the `git add | git HEAD | wc flushcut-review.dif…` chip
-ends about 55px after its last character, and the `Searched "window\\.|globalThis\\."` chip
-in the 10-02 one has the same blank tail. The chip is measured wider than the text it draws.
-The suspect is the label's text size: the runs are built from `command_text_style` with
-`font_size` 12px, while the container is `text_xs()` and `StyledText` measures with the
-inherited style. A label measured at one size and drawn at another leaves exactly this gap.
-Measure, don't guess: a layout test that renders a single-command chip and a three-piece chip
-and asserts the chip's width equals its glyphs + label + gaps + padding, within a pixel.
-Check the gap between chips in a row too (`gap_1` in `render_action_group`), and whatever puts
-extra vertical space between rows and around the run. Arthur reads all of it as wasted space.
-
-**PR chip: show how many checks failed and how many are still running, as counts.**
-
-Arthur, 2026-10-07: a PR chip should say how much CI is left, not just one glyph. With one
-failure and ten still going it reads `✗ 1  ◌ 10`: a red cross with the failed count, and the
-spinning yellow pending glyph (10-02's) with the count of checks not yet finished. When
-everything has finished and passed, it shows the single green check as now. Show the counts in
-both the sidebar row's chip and the thread's chip, and put the full breakdown in the hover card
-(failed, running, passed, skipped).
-
-GitHub already counts them, so there is nothing to tally from a truncated list. On the
-statusCheckRollup, `contexts(first: N)` exposes `checkRunCountsByState { state count }` and
-`statusContextCountsByState { state count }` (verified live on 2026-10-07 against
-zed-industries/zed#65285: `SUCCESS 23, SKIPPED 25`, plus `statusContextCountsByState SUCCESS 2`;
-`totalCount 50`). Add those two fields to the batched GraphQL query in `crates/gh_status`.
-Failed means `FAILURE`, `TIMED_OUT`, `STARTUP_FAILURE`, `ACTION_REQUIRED` and `CANCELLED` check
-runs, plus `FAILURE` and `ERROR` statuses. Running means `QUEUED`, `IN_PROGRESS`, `PENDING`,
-`WAITING`, `REQUESTED` and `EXPECTED`. Keep the check names the hover card already lists from
-`contexts`, and take the counts from the new fields. The `gh pr list` fallback has only the
-flattened rollup, so count from that list when it is all there is. Test with a parsed sample
-holding both kinds of counts.
-
-**The two memory baselines: ~4,000 command terminals twice over, and ~17,925 `Markdown`. Read on
-2026-10-05; both need a design decision rather than a patch, and neither is where the entry
-thought.**
-
-The numbers and the session they came from are in the 10-05 rebase log entry. What that night
-established by reading the code, so this does not have to be rediscovered:
-
-- **The terminals are real and the proposed fix is not small.** A thread loaded from history
-  carries `ToolCallContent::Terminal` for every command it ever ran, and
-  `AcpThread::ensure_tool_content_terminal` builds one for each as the content is prepared. It
-  already takes the cheap road — `TerminalBuilder::new_display_only`, so there is no PTY and no
-  process — but it still creates an alacritty grid and an `acp_thread::Terminal` to wrap it, which
-  is the `Terminal 4028, Terminal 4017` pair in the census. "Don't build `terminal::Terminal` for a
-  command whose exit is already known" means `acp_thread::Terminal::terminal` becomes an `Option`,
-  and `Terminal::terminal()` has **44 callers outside the terminal crate**, nearly all of them in
-  code the fork does not own. Making the creation lazy instead moves the same problem to
-  `ToolCall::terminals()`, which would hand back an id rather than an entity. Either way it is a
-  change to the shape of upstream's thread data, which wants a night and a decision about where a
-  finished command's text lives — not an evening's patch. The entry's own measurement is also
-  outside the sandbox: whether 8,000 entities actually go needs two `entities live` lines from a
-  real session.
-- **The sweep structurally cannot release the `Markdown`, so "release it with the views" is not the
-  fix.** The entry guesses the `Markdown` "may be owned by entry state that stays". It is not owned
-  by entry state at all: `EntryViewState` holds no `Markdown`, and every one of them hangs off the
-  *thread's* entries — `ToolCall::label`, `ToolCall::raw_input_markdown`, the error markdown,
-  `AssistantMessage`'s chunks, and `Terminal::command`. That is why the sweep took `TerminalView`
-  and `BlinkManager` out of the top ten and left `Markdown` at 17,925: it is a view-level mechanism
-  and this is thread data. Releasing it means thread entries dropping parsed markdown and
-  re-parsing from the source they already keep, which is the same kind of change as the terminals
-  above and runs into the same non-optional fields.
-- **`environment.rs:303` is not running twice for the same directory.** `local_directory_environment`
-  caches on `(shell, abs_path)` in a global, and the insert happens on the foreground thread
-  *before* the capture is awaited, so two callers for one key cannot both miss. Two 870ms hangs at
-  that line are two different directories, one shell each, already serialised behind
-  `SHELL_ENVIRONMENT_CAPTURES` and already timed out. Nothing to fix; the cost is one shell spawn
-  per distinct worktree at launch.
-
-So the thing both baselines share, and the thing worth deciding first: **the fork's remaining
-memory baseline is thread data, not view data.** The off-screen sweep got the view trees, which is
-what it is for and why the leak levelled off. Getting the rest means a thread entry being able to
-drop what it derived from its own source and rebuild it on demand, which is one mechanism that
-would serve the terminals and the markdown both, and is worth designing once rather than twice.
+(Also settled on 10-05 and not worth rediscovering: `environment.rs:303` is not running twice for
+one directory, and the off-screen view sweep structurally cannot release the `Markdown`, because
+none of it is owned by `EntryViewState`.)
 
 ## Verification queue
 
@@ -2486,3 +2396,151 @@ get `cargo check` only; the coordinator runs the suites**, one crate group at a 
 `target/debug` deleted between groups, and `cargo test --no-fail-fast` across several crates or a
 failure in one hides the rest (it did here: `auto_update` failing stopped `git_ui_core`, `git_ui`,
 `title_bar` and `workspace` from running until they were re-run).
+
+**2026-10-07**: onto main da0a7a78c (52 upstream commits). A working night four times over: the
+Work queue held four buildable items and one design note, the branch carried 21 commits over the
+merge base, and the branch had last moved the same day. Squash-then-rebase folded all 21 into one,
+reusing the squash's own message; tree-identical to the old tip (`6e9d7cc88`) before rebasing.
+Backup at `quiet-ui-pre-rebase46-2026-10-07`.
+
+**What upstream has built that this fork had by hand: resolving a file link outside every
+worktree.** `agent_ui.rs`'s `open_abs_path_at_point` conflicted, and that is the find of the
+round. The fork took the `fs` out of the project, checked a path existed and only then opened it,
+so a broken agent link would not create an empty buffer. Upstream now does the whole thing itself:
+`project_path_for_file_link` picks the worktree-relative path and `Project::resolve_abs_file_link`
+resolves anything outside every worktree. Upstream's version is taken whole and the fork's `fs`
+line is gone; the only fork code left in that function is the four lines that send an `.html`
+report to the browser instead of the editor.
+
+**Adopted: `scroll_to_user_message_index`.** The 09-22 entry said to take it when it next
+conflicted, and it did. The fork's `scroll_to_most_recent_user_prompt` is deleted and upstream's
+richer version kept behind `#[cfg(test)]`, since the fork does not draw the button that calls it;
+its two call sites in `conversation_view.rs` pass `None`. Upstream's predicate
+(`AcpThread::is_user_authored_scroll_target`) comes with it, in place of the fork's
+`matches!(entry, UserMessage(_))`.
+
+**Seven files conflicted, seventeen hunks.** Ten of them in `thread_view.rs`, as ever. The fork's
+side was taken for the turn-end gating and the per-turn thread-controls row (the fork draws one
+set of controls on the last entry, not a row per turn), for the bookmarks waypoint navigation that
+`ScrollOutputToNextMessage` runs over, and for `render_thinking_block`, which the fork replaced
+with thought chips and which the replay left stranded. Upstream's side was taken for its four new
+file-link tests, and the fork's three tests in that region were re-appended beside them.
+Elsewhere: upstream's reworded doc comment over the fork's fd-limit helpers in `util/process.rs`,
+import and module unions in `acp_thread`, and upstream's own enriched
+`RestoredAvailableCommandsConnection` in place of the fork's stale copy, keeping the fork's
+`ReplayingConnection` test next to it.
+
+**`crates/sidebar` is upstream's, not the fork's.** Worth writing down, because the fork's own
+description of it reads as though the crate were fork-only. Upstream changed
+`workspace_menu_worktree_labels` for `path_style`, which conflicted with the fork having deleted
+that whole workspace-menu block together with both its call sites. The deletion stands: restoring
+upstream's version would have put three dead items back in a file the fork heavily patches.
+
+**Markerless drift: one, and it was upstream's test calling the fork's constructor.** Upstream's
+`test_restores_available_commands_from_a_loaded_session` calls `ConversationView::new`, which the
+fork has given two extra parameters (`session_config` and `start: ConnectionStart`), so the
+replayed call was two arguments short — no conflict marker, and `cargo check --workspace
+--all-targets` is the only thing that found it. `ConnectionStart::Immediate`, since the test
+asserts the load started. Also one self-inflicted replay artifact worth noting for next time: the
+three fork tests re-appended to `thread_view.rs` went in after the file's last brace, which is
+not the test module's — that file carries top-level functions after `mod tests`, so they landed
+inside `reset_fast_mode_warnings` and read as "cannot test inner items". A restored test belongs
+before the closing brace of the module it came from, found by counting braces, never at the end
+of the file. After both fixes the workspace check came back with 0 errors and 0 warnings.
+
+**What was built: all four buildable Work queue items, and the fifth decided.**
+
+- *The sidebar title under the pill.* The plan's diagnosis was right to the line: the title box
+  (`id("content")` in `ThreadItem::render`) had `min_w_0` and `flex_1` but no `overflow_hidden`,
+  and in an opaque window the label is deliberately left untruncated so the fade can dissolve it,
+  so the text ran past the box and under the status slot, which was already `flex_none`. One
+  `overflow_hidden` is the whole fix. **Where the plan and the test harness disagreed:** the plan
+  asks for a test on the title's painted bounds, and painted glyphs are not observable in gpui
+  tests — the test text system's `glyph_raster_bounds` returns zero-size bounds, so every glyph
+  sprite is culled before it reaches the scene. The test asserts the clip the glyphs are subject
+  to instead: a painted quad masked to the title box, whose right edge is at or before the pill's
+  left. Reverted against the old code it fails on exactly that line.
+- *The subagent glyph.* `agent_activity_pill` takes the glyph from its caller now, so the sidebar
+  row passes its own agent icon and the thread's bottom bar passes `agent_icon`. **Where the plan
+  and the code disagreed:** the plan says a subagent's chip draws `tool_kind_icon`, and a chip
+  with a reported lifecycle never reaches that branch — it draws the spinner while running and a
+  check once finished, and only a subagent whose lifecycle was never reported falls through to the
+  generic glyph. Either way it said nothing about whose subagent it was, so the chip now draws the
+  agent's logo past running, stopped and failed, keyed on `subagent_session_info` rather than on
+  reported state. No test: the icon a chip picks is not observable in these tests and there is no
+  branch to unit-test.
+- *Command chip labels and the blank space.* Pieces 22 → 40 characters, a single command 60 → 100,
+  and the chip's cap from three quarters of the row to all of it. Past the cap a line now loses
+  directories rather than file names (`command_display_label` in `acp_thread`). **The blank space
+  was measured, and it was not what the plan thought.** A chip measured 155px drawing 134px:
+  21.5px of padding, glyph and gap, a 106.5px label, 6px of padding, and 21px of nothing. The 21px
+  was the copy button — hidden until the chip is hovered, but still holding its place in the flow,
+  so every command chip reserved it. It is overlaid now, the way the PR chip's remove control
+  already overlays its state icon. The plan's suspect, a size mismatch between the label's runs
+  and its container, does not exist: `rems_from_px(12.)` and `text_xs()` are both `rems(0.75)`.
+  The gaps measure 4px between chips, 4px between wrapped rows and 2px around the run, which is
+  already tight, so they are left alone.
+- *The PR chip's counts.* `checkRunCountsByState` and `statusContextCountsByState` added to the
+  batched query, lowered into a `CheckCounts` on `PrStatus`, drawn as `✗ n  ◌ m` on the row's chip
+  and the thread's, with the full breakdown in the hover card. Counted from the flattened rollup
+  when `gh pr list` is all there is. Only an explicitly finished state counts as finished, so a
+  state GitHub adds later lands in "running" rather than making a chip read green.
+- *The memory baselines: decided, not built.* See the Work queue entry this leaves. The short of
+  it is that the 10-05 finding is right about where the memory is and its cost figure names the
+  wrong method: `Terminal::terminal()` no longer exists, the accessor is `Terminal::inner()`, and
+  its production callers are few. The cost is elsewhere — `ToolCallContent::Terminal` holds an
+  `Entity<Terminal>` directly, not an id, so releasing a finished command's terminal means that
+  enum field becoming an id and `ToolCall::terminals()` resolving through the thread's registry:
+  ~46 and ~30 sites, nearly all upstream's, in the file that conflicts on most rebases. **Upstream
+  first** decides it: the fork does not carry that, and nothing in this sandbox can measure what
+  it would buy. The queue entry now holds the one measurement Arthur can take that would, and the
+  smaller patch to propose if the numbers say so.
+
+**The gate.** `cargo test` and `./script/clippy` for the fork's three core crates and the two more
+this run touched (`ui`, `gh_status`); the Verification queue was empty. The suites: `acp_thread`
+313, `ui` 92 plus 41 doctests, `gh_status` 48, `sidebar` 189, `agent_ui` 547 with its 35
+deliberate `#[ignore]`s left alone. Two failures, both upstream drift from tonight's replay rather
+than tonight's code, and the first of them a feature the fork had silently lost:
+
+- **`test_open_link_html_file_opens_in_the_browser`.** Upstream rewrote `open_link` to resolve a
+  file link and open it itself instead of handing the path to `open_abs_path_at_point`. No
+  conflict, because the fork does not touch `open_link` — but the fork's "an HTML report opens in
+  the browser, not the editor" lives in `open_abs_path_at_point`, so every agent link to an
+  `.html` file had started opening in an editor. This is the strongest argument yet for the fork
+  keeping a test per fork behaviour, however small: nothing else in the gate noticed, and the diff
+  looked clean. The predicate is shared now and `open_link` checks it against the candidates it
+  has already worked out.
+- **`test_thinking_preview_copies_selected_content`**, new from upstream in these 52 commits,
+  drives upstream's thinking block. The fork draws thoughts as chips and the replay left
+  `render_thinking_block` stranded (taken out with the rest of that seam), so there is no
+  `message-content-{entry}-{chunk}-{block}` for a thinking chunk to select in and the test cannot
+  pass here. Removed, with a note in its place. `thinking_block_state` stays: the thread search bar
+  still reads it.
+
+Clippy came back clean for all five crates under `--deny warnings` in 7m57s, and nothing in the
+replay left a stranded helper behind: the workspace check after the replay reported 0 warnings as
+well as 0 errors, so `render_thinking_block` and the per-turn controls row went without residue.
+
+**A note on how clippy was run.** `script/clippy` forces `--release`, and this container's disk
+allowance cannot hold a debug dependency tree and a release one at once, so the suites ran first
+and `target/debug` was deleted before clippy. The release profile's `lto = "thin"` and
+`codegen-units = 1` were overridden for the run (`CARGO_PROFILE_RELEASE_LTO=false`,
+`CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16`, `CARGO_PROFILE_RELEASE_DEBUG=0`), which changes how the
+dependencies are compiled and not one lint clippy reports.
+
+**Diff against upstream: +37,495 / -11,382**, against +36,737 / -11,298 after the 10-06 reduction
+run. Up 758 added lines, four fifths of it the four queue entries (59, 16, 268 and 415 lines) and
+the rest the replay repair; roughly two thirds of what the entries cost is their tests. The 84 new
+deletions are mostly upstream's thinking-preview test.
+
+**An environment failure worth writing down: the container ran out of disk in the middle of the
+gate.** `sidebar`'s test binary died with `ar` taking SIGBUS while archiving `webrtc-sys` object
+files, which reads like a toolchain fault and is not one: `df` said 488MB available on a 99%-full
+filesystem. `target` had reached 27GB, 23GB of it `target/debug/deps`, because a night of repeated
+`cargo test -p agent_ui` runs leaves a copy of every rlib per feature configuration — five of
+`libgpui`, four of `libsettings_content`, four of `libcranelift_codegen`, two of `libproject` at
+448MB each. Deleting all but the newest artifact per crate freed **12.5GB** and the build carried
+on. Two things for next time: sweep `target/debug/deps` for duplicates before the gate rather than
+after it fails, and remember that `script/clippy` forces `--release`, so the gate needs a debug
+dependency tree and a release one that cannot both be held at once — run the suites, then delete
+`target/debug`, then run clippy.

@@ -1,7 +1,7 @@
 use crate::{
     DEFAULT_THREAD_TITLE, SelectPermissionGranularity,
     conversation_view::thread_search_bar::{ThreadSearchBar, ThreadSearchBarEvent},
-    open_abs_path_at_point, project_path_for_file_link,
+    is_html_path, open_abs_path_at_point, project_path_for_file_link,
     thread_metadata_store::{ThreadId, ThreadMetadataStore, WatchedPr},
 };
 use agent_client_protocol::schema::{v1 as acp_v1, v2 as acp_v2};
@@ -15624,6 +15624,26 @@ pub(crate) fn open_link(
             }) else {
                 return;
             };
+            // `open_link` resolves and opens the file itself rather than going through
+            // `open_abs_path_at_point`, so an HTML report has to be caught here as well.
+            if is_html_path(Path::new(path))
+                && let Some(abs_path) = candidates.iter().find_map(|(candidate, _)| {
+                    if path_style.is_absolute(&candidate.to_string_lossy()) {
+                        Some(candidate.clone())
+                    } else {
+                        roots.iter().find_map(|root| {
+                            path_style
+                                .join_path_preserving_components(root, candidate)
+                                .ok()
+                        })
+                    }
+                })
+                && let Ok(url) = url::Url::from_file_path(&abs_path)
+            {
+                cx.open_url(url.as_str());
+                return;
+            }
+
             let workspace = workspace.downgrade();
             window
                 .spawn(cx, async move |cx| {
