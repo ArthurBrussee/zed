@@ -79,6 +79,59 @@ impl ChecksGlyph {
     }
 }
 
+/// How much of a pull request's CI is left, as counts rather than one glyph.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PrCheckCounts {
+    pub failed: usize,
+    pub running: usize,
+    pub passed: usize,
+    pub skipped: usize,
+}
+
+impl PrCheckCounts {
+    pub fn total(self) -> usize {
+        self.failed + self.running + self.passed + self.skipped
+    }
+
+    /// Whether there is anything left to say beyond a single settled glyph.
+    fn unfinished(self) -> bool {
+        self.failed > 0 || self.running > 0
+    }
+
+    /// The full tally, so the chip's two counts can be read in context.
+    pub fn breakdown(self) -> String {
+        [
+            (self.failed, "failed"),
+            (self.running, "running"),
+            (self.passed, "passed"),
+            (self.skipped, "skipped"),
+        ]
+        .into_iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, name)| format!("{count} {name}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+    }
+}
+
+/// A glyph and the number of checks in that state, as one group.
+fn check_count_group(
+    id: &'static str,
+    glyph: ChecksGlyph,
+    count: usize,
+    label_size: LabelSize,
+) -> AnyElement {
+    h_flex()
+        .gap_0p5()
+        .child(glyph.render(id, IconSize::Small))
+        .child(
+            Label::new(count.to_string())
+                .size(label_size)
+                .color(Color::Muted),
+        )
+        .into_any_element()
+}
+
 /// A pull-request badge. Without a `url` (the "no PR" indicator) it is inert
 /// and muted.
 #[derive(Clone)]
@@ -87,6 +140,8 @@ pub struct ThreadItemPrChip {
     pub state_icon: IconName,
     pub state_color: Color,
     pub checks: Option<ChecksGlyph>,
+    /// Drawn instead of `checks` while any check has failed or is still going.
+    pub check_counts: Option<PrCheckCounts>,
     pub url: Option<SharedString>,
     pub tooltip: SharedString,
     /// Without it the badge falls back to the plain `tooltip` text.
@@ -101,6 +156,7 @@ pub struct PrChipDetail {
     pub state_color: Color,
     pub checks: SharedString,
     pub checks_icon: Option<ChecksGlyph>,
+    pub check_counts: Option<PrCheckCounts>,
     pub review: SharedString,
     /// Capped by the producer.
     pub failing_checks: Vec<SharedString>,
@@ -262,8 +318,31 @@ impl RenderOnce for PrChip {
                     .weight(label_weight)
                     .color(label_color),
             )
-            .when_some(chip.checks, |this, glyph| {
-                this.child(glyph.render("pr-chip-checks", IconSize::Small))
+            .map(|this| {
+                // With work left, say how much of it: the failed count and the
+                // count still going. Everything finished reads as one glyph.
+                match chip.check_counts.filter(|counts| counts.unfinished()) {
+                    Some(counts) => this
+                        .when(counts.failed > 0, |this| {
+                            this.child(check_count_group(
+                                "pr-chip-failed",
+                                ChecksGlyph::settled(IconName::XCircle, Color::Error),
+                                counts.failed,
+                                label_size,
+                            ))
+                        })
+                        .when(counts.running > 0, |this| {
+                            this.child(check_count_group(
+                                "pr-chip-running",
+                                ChecksGlyph::running(IconName::LoadCircle, Color::Warning),
+                                counts.running,
+                                label_size,
+                            ))
+                        }),
+                    None => this.when_some(chip.checks, |this, glyph| {
+                        this.child(glyph.render("pr-chip-checks", IconSize::Small))
+                    }),
+                }
             })
             .map(|this| match chip.detail {
                 Some(detail) => this.tooltip(Tooltip::element(move |_, _| {
@@ -316,6 +395,16 @@ impl RenderOnce for PrChip {
                                             ),
                                     )
                                 })
+                                .when_some(
+                                    detail.check_counts.filter(|counts| counts.total() > 0),
+                                    |this, counts| {
+                                        this.child(
+                                            Label::new(counts.breakdown())
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
+                                        )
+                                    },
+                                )
                                 .child(
                                     Label::new(detail.review)
                                         .size(LabelSize::Small)

@@ -8,7 +8,7 @@ use anyhow::{Context as _, Result, bail};
 use collections::HashMap;
 use serde::Deserialize;
 
-use crate::{GhCheck, GhPr};
+use crate::{CheckCounts, GhCheck, GhPr};
 
 /// PRs sharing one head branch; `gh pr list` defaults to thirty, which is a node count worth not
 /// spending across a batch of fifty.
@@ -120,6 +120,8 @@ fragment pr on PullRequest {
         statusCheckRollup {
           state
           contexts(first: $checks) {
+            checkRunCountsByState { state count }
+            statusContextCountsByState { state count }
             nodes {
               __typename
               ... on CheckRun {
@@ -302,7 +304,28 @@ struct Rollup {
     #[serde(default)]
     state: Option<String>,
     #[serde(default)]
-    contexts: Option<Connection<ContextNode>>,
+    contexts: Option<Contexts>,
+}
+
+/// The rollup's contexts, plus the counts GitHub tallies over all of them rather than
+/// over the page `nodes` returns.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Contexts {
+    #[serde(default = "Vec::new")]
+    nodes: Vec<ContextNode>,
+    #[serde(default = "Vec::new")]
+    check_run_counts_by_state: Vec<StateCount>,
+    #[serde(default = "Vec::new")]
+    status_context_counts_by_state: Vec<StateCount>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StateCount {
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    count: usize,
 }
 
 /// A check run or a commit status. A shape GitHub adds later reads as a check with nothing set,
@@ -330,6 +353,17 @@ impl PrNode {
             .and_then(|commits| commits.nodes.into_iter().next())
             .and_then(|node| node.commit)
             .and_then(|commit| commit.status_check_rollup);
+        if let Some(rollup) = rollup.as_ref()
+            && let Some(contexts) = rollup.contexts.as_ref()
+        {
+            pr.check_counts = Some(CheckCounts::from_states(
+                contexts
+                    .check_run_counts_by_state
+                    .iter()
+                    .chain(contexts.status_context_counts_by_state.iter())
+                    .filter_map(|count| Some((count.state.as_deref()?, count.count))),
+            ));
+        }
         pr.status_check_rollup = rollup.map(|rollup| match rollup.contexts {
             Some(contexts) => contexts
                 .nodes
@@ -553,6 +587,98 @@ mod tests {
             "https://github.com/zed-industries/zed/pull/65043"
         );
         assert_eq!(merged.title.as_ref(), "");
+    }
+
+    /// GitHub counts the whole rollup, so the counts must come from its tallies
+    /// rather than from the `contexts` page, which `CHECKS_PER_PR` truncates.
+    #[test]
+    fn the_rollups_own_tallies_say_how_much_ci_is_left() {
+        const COUNTED: &str = r#"{
+ "data": {
+  "r0": {
+   "p0": {
+    "number": 65285,
+    "url": "https://github.com/zed-industries/zed/pull/65285",
+    "title": "Counted",
+    "state": "OPEN",
+    "isDraft": false,
+    "reviewDecision": null,
+    "mergeable": "MERGEABLE",
+    "mergeStateStatus": "BLOCKED",
+    "commits": {
+     "nodes": [
+      {
+       "commit": {
+        "statusCheckRollup": {
+         "state": "PENDING",
+         "contexts": {
+          "checkRunCountsByState": [
+           {"state": "SUCCESS", "count": 23},
+           {"state": "SKIPPED", "count": 25},
+           {"state": "FAILURE", "count": 1},
+           {"state": "IN_PROGRESS", "count": 7},
+           {"state": "QUEUED", "count": 3}
+          ],
+          "statusContextCountsByState": [
+           {"state": "SUCCESS", "count": 2},
+           {"state": "ERROR", "count": 1}
+          ],
+          "nodes": [
+           {
+            "__typename": "CheckRun",
+            "name": "tests",
+            "conclusion": "FAILURE",
+            "checkSuite": {"workflowRun": {"workflow": {"name": "CI"}}}
+           }
+          ]
+         }
+        }
+       }
+      }
+     ]
+    }
+   }
+  },
+  "rateLimit": {"cost": 1, "remaining": 4074, "resetAt": "2026-10-02T09:23:33Z"}
+ }
+}"#;
+
+        let asks = vec![(zed(), "p0".to_string(), Ask::Number(65285))];
+        let mut batch = parse_batch(COUNTED, &asks).expect("the counted answer parses");
+        assert!(batch.errors.is_empty());
+        let pr = only_pr(batch.answers.remove("p0").expect("the pull request"));
+
+        assert_eq!(
+            pr.check_counts,
+            crate::CheckCounts {
+                failed: 2,
+                running: 10,
+                passed: 25,
+                skipped: 25,
+            },
+            "both kinds of count are added up, and a status ERROR counts as failed"
+        );
+        assert_eq!(
+            pr.failing_checks.len(),
+            1,
+            "the names still come from the contexts the query listed"
+        );
+    }
+
+    /// Without the tallies there is only the flattened list `gh pr list` gives.
+    #[test]
+    fn a_rollup_with_no_tallies_is_counted_from_its_own_list() {
+        let asks = vec![(zed(), "p0".to_string(), Ask::Number(65077))];
+        let mut batch = parse_batch(SAMPLE, &asks).expect("the sample parses");
+        let pr = only_pr(batch.answers.remove("p0").expect("the pull request"));
+        assert_eq!(
+            pr.check_counts.total(),
+            10,
+            "every check the sample lists is counted once"
+        );
+        assert_eq!(pr.checks, ChecksState::Pending);
+        assert!(pr.check_counts.running > 0, "the sample's checks are queued");
+        assert_eq!(pr.check_counts.failed, 0);
     }
 
     #[test]

@@ -13,7 +13,7 @@ use gpui::{
     App, AppContext as _, BackgroundExecutor, Context, Entity, Global, Hsla, SharedString, Task,
 };
 use serde::{Deserialize, Serialize};
-use ui::{ChecksGlyph, Color, IconName, PrChipDetail, ThreadItemPrChip};
+use ui::{ChecksGlyph, Color, IconName, PrCheckCounts, PrChipDetail, ThreadItemPrChip};
 use util::ResultExt as _;
 
 use crate::graphql::{Answer, Ask, RepoId};
@@ -85,6 +85,72 @@ pub struct PrStatus {
     pub extra_failing_checks: usize,
     #[serde(default)]
     pub merge: MergeState,
+    /// How the checks divide up, so a chip can say how much CI is left.
+    #[serde(default)]
+    pub check_counts: CheckCounts,
+}
+
+/// How many checks are in each state. GitHub counts these over the whole rollup, so a
+/// truncated `contexts` page still reports the right totals; counted from the flattened
+/// list when that is all a `gh pr list` answer carries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckCounts {
+    #[serde(default)]
+    pub failed: usize,
+    #[serde(default)]
+    pub running: usize,
+    #[serde(default)]
+    pub passed: usize,
+    #[serde(default)]
+    pub skipped: usize,
+}
+
+impl CheckCounts {
+    /// `CheckRunState` and `StatusState` values. Only an explicitly finished value is
+    /// counted as finished, so a state GitHub adds later reads as still running rather
+    /// than making a pull request look greener than it is.
+    pub(crate) fn add(&mut self, state: &str, count: usize) {
+        match state {
+            "SUCCESS" | "NEUTRAL" | "STALE" => self.passed += count,
+            "SKIPPED" => self.skipped += count,
+            "FAILURE" | "ERROR" | "TIMED_OUT" | "STARTUP_FAILURE" | "ACTION_REQUIRED"
+            | "CANCELLED" => self.failed += count,
+            _ => self.running += count,
+        }
+    }
+
+    pub(crate) fn from_states<'a>(states: impl IntoIterator<Item = (&'a str, usize)>) -> Self {
+        let mut counts = Self::default();
+        for (state, count) in states {
+            counts.add(state, count);
+        }
+        counts
+    }
+
+    pub fn total(self) -> usize {
+        self.failed + self.running + self.passed + self.skipped
+    }
+
+    fn is_empty(self) -> bool {
+        self == Self::default()
+    }
+}
+
+/// The fallback: one pass over the rollup GitHub did flatten for us.
+fn counts_from_checks(checks: &[GhCheck]) -> CheckCounts {
+    let mut counts = CheckCounts::default();
+    for check in checks {
+        if check.conclusion.as_deref() == Some("SKIPPED") {
+            counts.skipped += 1;
+            continue;
+        }
+        match check.outcome() {
+            CheckOutcome::Failing => counts.failed += 1,
+            CheckOutcome::Pending => counts.running += 1,
+            CheckOutcome::Passing => counts.passed += 1,
+        }
+    }
+    counts
 }
 
 /// Whether GitHub will merge the PR, which green checks do not answer.
@@ -692,6 +758,7 @@ fn no_pr_chip() -> ThreadItemPrChip {
         state_icon: IconName::PullRequest,
         state_color: Color::Muted,
         checks: None,
+        check_counts: None,
         url: None,
         tooltip: "No pull request for this branch".into(),
         detail: None,
@@ -753,11 +820,22 @@ fn pr_chip(pr: &PrStatus) -> ThreadItemPrChip {
     .collect::<Vec<_>>()
     .join(", ");
     let failing = pr.checks == ChecksState::Failing;
+    // A merged pull request's CI is history, and an unknown rollup has nothing to count.
+    let check_counts = (pr.state != PrState::Merged
+        && pr.checks != ChecksState::Unknown
+        && pr.check_counts.total() > 0)
+        .then(|| PrCheckCounts {
+            failed: pr.check_counts.failed,
+            running: pr.check_counts.running,
+            passed: pr.check_counts.passed,
+            skipped: pr.check_counts.skipped,
+        });
     ThreadItemPrChip {
         label: SharedString::from(format!("#{}", pr.number)),
         state_icon: IconName::PullRequest,
         state_color,
         checks,
+        check_counts,
         url: Some(pr.url.clone()),
         tooltip: SharedString::from(format!("{} ({summary})", pr.title)),
         detail: Some(PrChipDetail {
@@ -767,6 +845,7 @@ fn pr_chip(pr: &PrStatus) -> ThreadItemPrChip {
             state_color,
             checks: checks_label.into(),
             checks_icon: checks,
+            check_counts,
             review: review_label.into(),
             failing_checks: if failing {
                 pr.failing_checks.clone()
@@ -1143,6 +1222,9 @@ pub(crate) struct GhPr {
     pub(crate) mergeable: Option<String>,
     #[serde(default)]
     pub(crate) merge_state_status: Option<String>,
+    /// Only the batched GraphQL query asks for these; `gh pr list` has no such field.
+    #[serde(default, skip)]
+    pub(crate) check_counts: Option<CheckCounts>,
 }
 
 /// A commit status reports `state`; a check run reports `conclusion` once complete.
@@ -1224,6 +1306,10 @@ impl PrStatus {
             failing_checks,
             extra_failing_checks,
             merge: merge_state(pr.mergeable.as_deref(), pr.merge_state_status.as_deref()),
+            check_counts: pr
+                .check_counts
+                .filter(|counts| !counts.is_empty())
+                .unwrap_or_else(|| counts_from_checks(rollup.unwrap_or(&[]))),
         }
     }
 }
@@ -1310,7 +1396,108 @@ mod tests {
             failing_checks: Vec::new(),
             extra_failing_checks: 0,
             merge: MergeState::Unknown,
+            check_counts: CheckCounts::default(),
         }
+    }
+
+    #[test]
+    fn a_state_is_only_finished_when_github_says_so() {
+        let counts = CheckCounts::from_states([
+            ("SUCCESS", 3),
+            ("NEUTRAL", 1),
+            ("STALE", 1),
+            ("SKIPPED", 4),
+            ("FAILURE", 1),
+            ("ERROR", 1),
+            ("TIMED_OUT", 1),
+            ("STARTUP_FAILURE", 1),
+            ("ACTION_REQUIRED", 1),
+            ("CANCELLED", 1),
+            ("QUEUED", 2),
+            ("IN_PROGRESS", 1),
+            ("PENDING", 1),
+            ("WAITING", 1),
+            ("REQUESTED", 1),
+            ("EXPECTED", 1),
+            // A state GitHub adds later must not read as green.
+            ("SOMETHING_NEW", 1),
+        ]);
+        assert_eq!(
+            counts,
+            CheckCounts {
+                failed: 6,
+                running: 8,
+                passed: 5,
+                skipped: 4,
+            }
+        );
+        assert_eq!(counts.total(), 23);
+    }
+
+    #[test]
+    fn the_hover_cards_breakdown_names_only_what_there_is() {
+        assert_eq!(
+            PrCheckCounts {
+                failed: 1,
+                running: 10,
+                passed: 23,
+                skipped: 25,
+            }
+            .breakdown(),
+            "1 failed, 10 running, 23 passed, 25 skipped"
+        );
+        assert_eq!(
+            PrCheckCounts {
+                passed: 2,
+                ..Default::default()
+            }
+            .breakdown(),
+            "2 passed"
+        );
+        assert_eq!(PrCheckCounts::default().breakdown(), "");
+    }
+
+    /// A chip says how much is left only while something is left to say.
+    #[test]
+    fn a_finished_green_pull_request_keeps_its_single_glyph() {
+        let mut green = pr(1, "https://github.com/org/repo/pull/1");
+        green.check_counts = CheckCounts {
+            passed: 7,
+            ..Default::default()
+        };
+        let chip = pr_chip(&green);
+        assert_eq!(chip.checks, Some(passing_glyph()));
+        assert_eq!(
+            chip.check_counts.map(|counts| (counts.failed, counts.running)),
+            Some((0, 0)),
+            "the counts ride along for the hover card but draw no glyph of their own"
+        );
+
+        let mut busy = pr(2, "https://github.com/org/repo/pull/2");
+        busy.checks = ChecksState::Failing;
+        busy.check_counts = CheckCounts {
+            failed: 1,
+            running: 10,
+            passed: 3,
+            skipped: 0,
+        };
+        let chip = pr_chip(&busy);
+        assert_eq!(
+            chip.check_counts.map(|counts| (counts.failed, counts.running)),
+            Some((1, 10))
+        );
+
+        let mut merged = pr(3, "https://github.com/org/repo/pull/3");
+        merged.state = PrState::Merged;
+        merged.check_counts = CheckCounts {
+            passed: 7,
+            ..Default::default()
+        };
+        assert_eq!(
+            pr_chip(&merged).check_counts,
+            None,
+            "a merged pull request's CI is history"
+        );
     }
 
     fn passing_glyph() -> ChecksGlyph {
@@ -1904,6 +2091,11 @@ mod tests {
         let mut expected = pr(10461, "https://github.com/org/repo/pull/10461");
         expected.title = "Fix things".into();
         expected.review = ReviewState::Approved;
+        // `gh pr list` carries no tallies, so the two are counted from the list itself.
+        expected.check_counts = CheckCounts {
+            passed: 2,
+            ..Default::default()
+        };
         assert_eq!(parse_pr_list(json).unwrap(), vec![expected]);
     }
 

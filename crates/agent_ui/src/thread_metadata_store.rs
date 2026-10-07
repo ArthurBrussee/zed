@@ -2414,6 +2414,7 @@ mod tests {
                 failing_checks: Vec::new(),
                 extra_failing_checks: 0,
                 merge: gh_status::MergeState::Unknown,
+                check_counts: Default::default(),
             }],
             ..Default::default()
         };

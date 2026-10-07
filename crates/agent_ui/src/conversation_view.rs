@@ -10437,6 +10437,7 @@ pub(crate) mod tests {
             failing_checks: Vec::new(),
             extra_failing_checks: 0,
             merge: gh_status::MergeState::Unknown,
+            check_counts: Default::default(),
         };
 
         // A branch poll is the only place a title comes from.

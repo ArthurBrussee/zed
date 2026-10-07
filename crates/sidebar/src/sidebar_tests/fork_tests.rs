@@ -2203,6 +2203,7 @@ async fn test_archived_thread_keeps_its_persisted_pr_badge(cx: &mut TestAppConte
                         failing_checks: Vec::new(),
                         extra_failing_checks: 0,
                         merge: gh_status::MergeState::Unknown,
+                        check_counts: Default::default(),
                     }],
                     ..Default::default()
                 },
