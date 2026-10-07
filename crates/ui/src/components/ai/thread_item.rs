@@ -843,8 +843,10 @@ impl RenderOnce for ThreadItem {
         } else {
             status_icon.map(|icon| icon.into_any_element())
         };
+        let status_id = format!("status-{}", self.id);
         let status_slot = h_flex()
-            .id(SharedString::from(format!("status-{}", self.id)))
+            .id(SharedString::from(status_id.clone()))
+            .debug_selector(move || status_id)
             .h_4()
             .min_w_4()
             .flex_none()
@@ -971,6 +973,9 @@ impl RenderOnce for ThreadItem {
                             .h_full()
                             .min_w_0()
                             .flex_1()
+                            // The label is not truncated in an opaque window, so
+                            // without this it paints past the box, under the pill.
+                            .overflow_hidden()
                             .gap_1p5()
                             .child(title_label)
                             .when(self.is_truncated && opaque_window, |this| {
@@ -1667,6 +1672,59 @@ mod tests {
                 surface.blend(color.ghost_element_active),
                 "the active colour is one active layer over the surface ({name})"
             );
+        }
+    }
+
+    /// Painted glyphs are not observable in these tests (the test text system
+    /// rasterizes nothing), so this asserts the clip the glyphs are subject to:
+    /// the title box ends at the pill and masks what it draws to itself.
+    #[gpui::test]
+    fn test_a_long_title_stops_at_the_activity_pill(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let (_view, cx) = cx.add_window_view(|_, _| LongTitleTestView);
+
+        let title = cx.debug_bounds("title-long").expect("title bounds");
+        let pill = cx.debug_bounds("status-long").expect("status slot bounds");
+        assert!(
+            title.right() <= pill.left(),
+            "the title box ends where the pill begins, got title {title:?} pill {pill:?}"
+        );
+
+        let scale = cx.update(|window, _| window.scale_factor());
+        let masked_to_title = cx.update(|window, _| {
+            window.painted_quads().into_iter().any(|quad| {
+                (quad.content_mask.bounds.right().0 - title.right().as_f32() * scale).abs() < 0.5
+                    && (quad.content_mask.bounds.left().0 - title.left().as_f32() * scale).abs()
+                        < 0.5
+            })
+        });
+        assert!(
+            masked_to_title,
+            "the title box clips what it draws to its own bounds, so a long \
+             label and its fade end at the pill rather than painting under it"
+        );
+    }
+
+    struct LongTitleTestView;
+
+    impl Render for LongTitleTestView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            v_flex().size_full().p(px(20.)).child(
+                div().w(px(300.)).child(
+                    ThreadItem::new(
+                        "long",
+                        "Backdrops auto/fixed distance model and a great deal more besides",
+                    )
+                    // An opaque row, so the fade is drawn and the label is left untruncated.
+                    .base_bg(hsla(0.6, 0.12, 0.15, 1.0))
+                    .status(AgentThreadStatus::Running)
+                    .running_subagents(2),
+                ),
+            )
         }
     }
 
