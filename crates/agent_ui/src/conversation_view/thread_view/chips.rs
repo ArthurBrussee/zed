@@ -1759,9 +1759,11 @@ impl ThreadView {
                     )
                     .into_any_element(),
             )
-        } else if subagent_state.is_some_and(|state| state.is_terminal()) {
+        } else if tool_call.subagent_session_info.is_some() {
+            // Past running, stopped and failed, a subagent reads as the agent that
+            // ran it rather than as a check or the generic tool glyph below.
             Some(
-                Icon::new(IconName::Check)
+                Icon::new(self.agent_icon)
                     .size(IconSize::Small)
                     .color(Color::Muted)
                     .into_any_element(),

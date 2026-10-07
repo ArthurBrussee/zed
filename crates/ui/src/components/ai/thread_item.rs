@@ -397,9 +397,13 @@ fn running_work_count(
 
 /// The spinner plus the commands still running and the subagents still out;
 /// a zero count is not drawn.
+/// `subagent_icon` is the logo of the agent whose subagents these are, so a
+/// pill reads "terminal 1, Claude 2" rather than naming Zed for someone else's
+/// subagents.
 pub fn agent_activity_pill(
     id: impl Into<SharedString>,
     work: RunningWorkCounts,
+    subagent_icon: IconName,
     cx: &App,
 ) -> AnyElement {
     let id = id.into();
@@ -427,7 +431,7 @@ pub fn agent_activity_pill(
         .when(subagents > 0, |this| {
             this.child(running_work_count(
                 SharedString::from(format!("{id}-subagents")),
-                IconName::ZedAgent,
+                subagent_icon,
                 subagents,
                 if subagents == 1 {
                     "1 subagent working".into()
@@ -838,6 +842,7 @@ impl RenderOnce for ThreadItem {
             Some(agent_activity_pill(
                 format!("status-{}", self.id),
                 running_work,
+                self.icon,
                 cx,
             ))
         } else {

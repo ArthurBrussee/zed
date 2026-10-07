@@ -7371,7 +7371,12 @@ impl ThreadView {
         if thread.status() == ThreadStatus::Idle && work.is_empty() {
             return None;
         }
-        Some(ui::agent_activity_pill("input-activity", work, cx))
+        Some(ui::agent_activity_pill(
+            "input-activity",
+            work,
+            self.agent_icon,
+            cx,
+        ))
     }
 
     fn render_input_run_indicator(&self, _cx: &mut Context<Self>) -> AnyElement {
