@@ -8022,6 +8022,51 @@ pub fn command_display_prefix(command: &str, max_chars: usize) -> String {
     prefix
 }
 
+/// A command too long for its chip, shortened by dropping leading directories from
+/// its longest path rather than cutting the end off: `wc …/flushcut-review.diff`
+/// keeps the file name, which is the part worth reading. Falls back to
+/// [`command_display_prefix`] when there is no path left to shorten.
+pub fn command_display_label(command: &str, max_chars: usize) -> String {
+    let trimmed = command.trim();
+    let first_line = trimmed.lines().next().unwrap_or("").trim_end();
+    let more_lines = trimmed.lines().nth(1).is_some();
+    if !more_lines && first_line.chars().count() <= max_chars {
+        return first_line.to_string();
+    }
+
+    let mut words: Vec<String> = first_line.split(' ').map(str::to_owned).collect();
+    while words.iter().map(|word| word.chars().count() + 1).sum::<usize>() > max_chars + 1 {
+        // The longest path first: shortening it buys the most room.
+        let Some(longest) = words
+            .iter()
+            .enumerate()
+            .filter(|(_, word)| word.contains('/'))
+            .max_by_key(|(_, word)| word.chars().count())
+            .map(|(index, _)| index)
+        else {
+            break;
+        };
+        let word = words[longest]
+            .trim_start_matches('…')
+            .trim_start_matches('/')
+            .to_owned();
+        let Some((_, rest)) = word.split_once('/') else {
+            break;
+        };
+        words[longest] = format!("…/{rest}");
+    }
+
+    let shortened = words.join(" ");
+    if shortened.chars().count() > max_chars {
+        // Nothing left to shorten: cut the end off, which says so with its own ellipsis.
+        command_display_prefix(&shortened, max_chars)
+    } else if more_lines {
+        format!("{shortened}…")
+    } else {
+        shortened
+    }
+}
+
 /// "Context compacted to fit the model's context window." The length cap keeps
 /// prose about compaction from matching.
 fn is_context_compaction_notice(text: &str) -> bool {
@@ -8376,6 +8421,49 @@ mod tests {
             "cargo build…"
         );
         assert_eq!(command_display_prefix("  spaced  ", 60), "spaced");
+    }
+
+    #[test]
+    fn a_long_command_loses_its_directories_before_its_file_names() {
+        // The complaint's own line, which used to come out `wc flushcut-review.dif…`.
+        assert_eq!(
+            command_display_label("wc flushcut-review.diff", 100),
+            "wc flushcut-review.diff"
+        );
+        assert_eq!(
+            command_display_label("wc flushcut-review.diff", 40),
+            "wc flushcut-review.diff"
+        );
+
+        // Directories go from the start, one at a time, until it fits.
+        assert_eq!(
+            command_display_label("wc crates/agent_ui/src/conversation_view/chips.rs", 40),
+            "wc …/src/conversation_view/chips.rs"
+        );
+        assert_eq!(
+            command_display_label("wc crates/agent_ui/src/conversation_view/chips.rs", 20),
+            "wc …/chips.rs"
+        );
+
+        // The longest path first, so the room comes from where there is most of it.
+        assert_eq!(
+            command_display_label("diff a/b.rs crates/agent_ui/src/conversation_view/chips.rs", 40),
+            "diff a/b.rs …/conversation_view/chips.rs"
+        );
+
+        // Nothing left to shorten: fall back to cutting the end off.
+        assert_eq!(
+            command_display_label("echo abcdefghijklmnop", 9),
+            "echo abcd…"
+        );
+        assert_eq!(
+            command_display_label("wc …/anextremelylongfilenameindeed.diff", 12),
+            "wc …/anextre…"
+        );
+        assert_eq!(
+            command_display_label("cargo build\ncargo test", 60),
+            "cargo build…"
+        );
     }
 
     #[test]

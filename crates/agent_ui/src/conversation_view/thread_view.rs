@@ -16191,6 +16191,57 @@ mod tests {
     }
 
     #[test]
+    fn a_chip_label_has_room_for_the_whole_command() {
+        // The 10-05 screenshot's own line. A chain draws a piece per act, and at the
+        // old 22-character cap the last one came out `wc flushcut-review.dif…`.
+        let pieces = collapsed_pieces("git add . && git log HEAD && wc flushcut-review.diff");
+        let counted = pieces
+            .iter()
+            .find(|piece| piece.label.text.contains("flushcut"))
+            .expect("the line's last act is one of its pieces");
+        assert!(
+            counted.label.text.ends_with("flushcut-review.diff"),
+            "the file name is the part worth reading, got {:?}",
+            counted.label.text
+        );
+
+        // Past the cap the directories go first, so the file name still survives.
+        let deep = collapsed_pieces(
+            "git add . && wc crates/agent_ui/src/conversation_view/thread_view/chips.rs",
+        );
+        let counted = deep
+            .iter()
+            .find(|piece| piece.label.text.contains("chips.rs"))
+            .expect("the deep path's act is one of its pieces");
+        assert!(
+            counted.label.text.ends_with("chips.rs"),
+            "a long path loses its directories, not its file name, got {:?}",
+            counted.label.text
+        );
+
+        // No piece runs past its own cap.
+        let long = collapsed_pieces(
+            "cargo build -p one --all-features --release && rg --fixed-strings \
+             SOMETHINGRATHERLONGINDEED crates/agent_ui/src/conversation_view/thread_view",
+        );
+        for piece in &long {
+            assert!(
+                piece.label.text.chars().count() <= 41,
+                "a piece stays within its cap, got {:?}",
+                piece.label.text
+            );
+        }
+        assert!(
+            long.iter()
+                .any(|piece| piece.label.text.chars().count() > 22),
+            "and at least one uses the room the old cap denied it: {:?}",
+            long.iter()
+                .map(|piece| piece.label.text.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn a_half_devshell_line_marks_the_acts_that_ran_in_it() {
         let pieces = collapsed_pieces(
             "cd .. && nix develop .#mapper --command bash -c \

@@ -14993,14 +14993,104 @@ pub(crate) mod tests {
 
         let short = label_width(SHORT, cx);
         let wide = label_width(LONG, cx);
+        // Not `* 2.`: these two labels ("Listed 1 directory" and the command
+        // itself) are 18 and 36 characters, so a 2x ratio passed or failed on
+        // sub-pixel rounding alone, and moving either chip flipped it.
         assert!(
-            wide > short * 2.,
+            wide > short * 1.5,
             "a long command's label should take the room it needs in a wide row, \
              got {wide:?} against {short:?} for `ls`"
         );
 
         // The cap is not asserted: the chip's own bounds are not exposed to
         // tests, and labels are truncated before layout.
+    }
+
+    /// A hover-only copy button used to sit in the chip's flow, so every command
+    /// chip reserved 21px it drew nothing in. Measured, not reasoned: the chip
+    /// must end one padding past its label.
+    #[gpui::test]
+    async fn test_a_command_chip_reserves_no_room_past_its_label(cx: &mut TestAppContext) {
+        use agent_client_protocol::schema::{MaybeUndefined, v2 as acp_v2};
+
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(StubAgentConnection::new()), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+
+        for (tool_id, terminal_id, command) in [
+            ("one", "one-terminal", "wc flushcut-review.diff"),
+            (
+                "three",
+                "three-terminal",
+                "git add . && git log HEAD && wc out.diff",
+            ),
+        ] {
+            thread.update(cx, |thread, cx| {
+                thread
+                    .upsert_tool_call_patch(
+                        acp_v2::ToolCallUpdate::new(tool_id)
+                            .title(command)
+                            .kind(acp_v2::ToolKind::Execute)
+                            .status(acp_v2::ToolCallStatus::Completed)
+                            .content(vec![acp_v2::ToolCallContent::Terminal(
+                                acp_v2::Terminal::new(terminal_id),
+                            )]),
+                        cx,
+                    )
+                    .expect("a finished command");
+                thread
+                    .upsert_display_terminal(
+                        terminal_id.into(),
+                        acp_thread::DisplayTerminalPatch {
+                            command: MaybeUndefined::Value(command.into()),
+                            output: MaybeUndefined::Value(acp_thread::DisplayTerminalOutput {
+                                data: b"ok".to_vec(),
+                                meta: None,
+                            }),
+                            exit_status: MaybeUndefined::Value(
+                                acp_v2::TerminalExitStatus::new().exit_code(0),
+                            ),
+                            ..Default::default()
+                        },
+                        cx,
+                    )
+                    .expect("the command's captured output");
+            });
+        }
+        cx.simulate_resize(size(px(1200.), px(800.)));
+        cx.run_until_parked();
+
+        // `action_chip_base`'s own `px_1p5`.
+        const PADDING: f32 = 6.;
+        for (chip_selector, label_selector) in [
+            ("COMMAND_CHIP-one", "COMMAND_CHIP_LABEL-one"),
+            ("COMMAND_CHIP-three", "COMMAND_CHIP_LABEL-three"),
+        ] {
+            let chip = cx
+                .debug_bounds(chip_selector)
+                .unwrap_or_else(|| panic!("{chip_selector} should render"));
+            let label = cx
+                .debug_bounds(label_selector)
+                .unwrap_or_else(|| panic!("{label_selector} should render"));
+            let tail = chip.right().as_f32() - label.right().as_f32();
+            assert!(
+                (tail - PADDING).abs() < 1.,
+                "{chip_selector} should end one padding past its label, \
+                 got {tail}px of it: chip {chip:?} label {label:?}"
+            );
+            // The glyphs and the gap before the label account for the rest, so the
+            // chip is exactly what it draws.
+            let lead = label.left().as_f32() - chip.left().as_f32();
+            assert!(
+                (chip.size.width.as_f32() - (lead + label.size.width.as_f32() + PADDING)).abs()
+                    < 1.,
+                "{chip_selector}'s width is its glyphs, gaps, label and padding and \
+                 nothing else: chip {chip:?} label {label:?}"
+            );
+        }
     }
 
     /// A run of actions is drawn by its first entry, so that is the item every

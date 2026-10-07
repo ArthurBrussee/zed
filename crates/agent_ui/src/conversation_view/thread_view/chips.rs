@@ -1602,6 +1602,10 @@ impl ThreadView {
                 // Auto basis; see the single-command branch below.
                 .flex_initial()
                 .min_w_0()
+                .debug_selector({
+                    let tool_call_id = tool_call.id.clone();
+                    move || format!("COMMAND_CHIP_LABEL-{tool_call_id}")
+                })
                 .gap_1()
                 .overflow_hidden()
                 .text_xs()
@@ -1833,6 +1837,10 @@ impl ThreadView {
         let chip_group = SharedString::from(format!("action-chip-{entry_ix}"));
         let chip = self
             .action_chip_base(("action-chip", entry_ix), is_expanded, cx)
+            .debug_selector({
+                let tool_call_id = tool_call.id.clone();
+                move || format!("COMMAND_CHIP-{tool_call_id}")
+            })
             .group(chip_group.clone())
             .when(command_pieces.is_some(), |this| this.max_w_full())
             .when(is_expanded && has_terminals, |this| {
@@ -1960,17 +1968,29 @@ impl ThreadView {
                         })),
                 )
             })
+            // Overlaid, not placed: in the flow a hover-only button reserves its
+            // width on every chip, which was the blank tail after every label.
             .when_some(full_command, |this, command| {
                 this.child(
-                    IconButton::new(("copy-command", entry_ix), IconName::Copy)
-                        .icon_size(IconSize::XSmall)
-                        .icon_color(Color::Muted)
-                        .visible_on_hover(chip_group.clone())
-                        .tooltip(Tooltip::text("Copy Command"))
-                        .on_click(move |_, _, cx| {
-                            cx.stop_propagation();
-                            cx.write_to_clipboard(ClipboardItem::new_string(command.clone()));
-                        }),
+                    h_flex()
+                        .absolute()
+                        .right_1()
+                        .top_0()
+                        .bottom_0()
+                        .items_center()
+                        .child(
+                            IconButton::new(("copy-command", entry_ix), IconName::Copy)
+                                .icon_size(IconSize::XSmall)
+                                .icon_color(Color::Muted)
+                                .visible_on_hover(chip_group.clone())
+                                .tooltip(Tooltip::text("Copy Command"))
+                                .on_click(move |_, _, cx| {
+                                    cx.stop_propagation();
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        command.clone(),
+                                    ));
+                                }),
+                        ),
                 )
             })
             .when_some(edit_stats, |this, stats| {
@@ -2047,8 +2067,8 @@ impl ThreadView {
         facts: &CommandFacts,
         outcome: Option<&str>,
     ) -> CollapsedCommand {
-        const WIDTH: usize = 60;
-        const PIECE_WIDTH: usize = 22;
+        const WIDTH: usize = 100;
+        const PIECE_WIDTH: usize = 40;
 
         let command = facts.command.as_str();
         let parsed = &facts.parsed;
@@ -2078,10 +2098,10 @@ impl ThreadView {
             .collect();
         match segments.len() {
             0 => CollapsedCommand::Label(CommandChipLabel::command(
-                acp_thread::command_display_prefix(command, WIDTH),
+                acp_thread::command_display_label(command, WIDTH),
             )),
             1 => CollapsedCommand::Label(CommandChipLabel::command(
-                acp_thread::command_display_prefix(segments[0].work_text(), WIDTH),
+                acp_thread::command_display_label(segments[0].work_text(), WIDTH),
             )),
             _ => {
                 let partial_environment = parsed.environment_is_partial();
@@ -2090,7 +2110,7 @@ impl ThreadView {
                         .iter()
                         .map(|segment| CommandChipPiece {
                             glyph: ChipGlyph::for_segment(segment),
-                            label: CommandChipLabel::command(acp_thread::command_display_prefix(
+                            label: CommandChipLabel::command(acp_thread::command_display_label(
                                 &segment.short_label(),
                                 PIECE_WIDTH,
                             )),
@@ -2114,7 +2134,10 @@ impl ThreadView {
             // `flex_shrink_0` makes a full row wrap rather than squeeze chips.
             .min_w_0()
             .flex_shrink_0()
-            .max_w(relative(0.75))
+            // The full row: chips wrap rather than squeeze, so a three-quarter cap
+            // only cost the label room it could have had.
+            .max_w_full()
+            .relative()
             .h(rems_from_px(24_f32))
             .gap_1()
             .px_1p5()
