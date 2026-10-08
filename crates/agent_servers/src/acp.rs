@@ -18,7 +18,8 @@ use agent_client_protocol::schema::{
 };
 use agent_client_protocol::{
     Agent, Builder, Client, ConnectionTo, HandleDispatchFrom, Handled, JsonRpcMessage,
-    JsonRpcResponse, Lines, Responder, UntypedMessage, V2Builder, V2ConnectionTo,
+    JsonRpcNotification, JsonRpcResponse, Lines, Responder, UntypedMessage, V2Builder,
+    V2ConnectionTo,
 };
 use anyhow::anyhow;
 use async_channel;
@@ -31,7 +32,7 @@ use project::agent_server_store::{
     AgentServerCommand, AgentServerStore, AllAgentServersSettings, CustomAgentServerSettings,
 };
 use project::{AgentId, Project};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use settings::{AgentConfigOptionValue, SettingsStore};
 use std::path::PathBuf;
 use std::process::ExitStatus;
@@ -767,6 +768,20 @@ fn client_capabilities_for_agent(
     let mut meta = acp::Meta::from_iter([
         ("terminal_output".into(), true.into()),
         ("terminal-auth".into(), true.into()),
+        // Without this the Claude adapter never reports detached commands or
+        // backgrounded subagents.
+        (
+            AIR_META_KEY.into(),
+            serde_json::json!({
+                AIR_EXTENSION_KEY: {
+                    "version": AIR_EXTENSION_VERSION,
+                    "capabilities": [
+                        AIR_ASYNC_TASKS_CAPABILITY,
+                        AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
+                    ],
+                }
+            }),
+        ),
     ]);
 
     if agent_id.as_ref() == CURSOR_ID {
@@ -1806,6 +1821,13 @@ impl AgentConnection for AcpConnection {
         self.agent_capabilities.load_session
     }
 
+    fn loading_thread(&self, session_id: &acp::SessionId, _cx: &App) -> Option<Entity<AcpThread>> {
+        self.sessions
+            .borrow()
+            .get(session_id)
+            .and_then(|session| session.thread.upgrade())
+    }
+
     fn supports_resume_session(&self) -> bool {
         self.agent_capabilities
             .session_capabilities
@@ -2063,6 +2085,25 @@ impl AgentConnection for AcpConnection {
         }
         let params = acp::CancelNotification::new(session_id.clone());
         self.connection.send_notification(params).log_err();
+    }
+
+    fn stop_async_task(
+        &self,
+        session_id: &acp::SessionId,
+        async_task_id: SharedString,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        let conn = self.connection.clone();
+        let params = serde_json::json!({
+            "sessionId": session_id,
+            "asyncTaskId": async_task_id,
+        });
+        cx.foreground_executor().spawn(async move {
+            let request = UntypedMessage::new(ASYNC_TASK_STOP_METHOD, params)
+                .map_err(|error| anyhow!(error))?;
+            conn.send_request(request).block_task().await?;
+            Ok(())
+        })
     }
 
     fn request_elicitations(&self) -> Option<Entity<ElicitationStore>> {
@@ -2396,6 +2437,15 @@ pub mod test_support {
 
         fn cancel(&self, session_id: &acp::SessionId, cx: &mut App) {
             self.inner.cancel(session_id, cx)
+        }
+
+        fn stop_async_task(
+            &self,
+            session_id: &acp::SessionId,
+            async_task_id: SharedString,
+            cx: &mut App,
+        ) -> Task<Result<()>> {
+            self.inner.stop_async_task(session_id, async_task_id, cx)
         }
 
         fn request_elicitations(&self) -> Option<Entity<ElicitationStore>> {
@@ -3023,7 +3073,7 @@ mod tests {
             assert_eq!(terminal.inner(), &renderer);
             assert_eq!(
                 terminal.command().read(cx).source(),
-                "```\nwire command\n```"
+                "```bash\nwire command\n```"
             );
             assert_eq!(
                 terminal.working_dir().as_deref(),
@@ -3683,6 +3733,84 @@ mod tests {
             .expect("expected client capabilities meta");
 
         assert!(!meta.contains_key(PARAMETERIZED_MODEL_PICKER_META_KEY));
+    }
+
+    #[test]
+    fn client_capabilities_advertise_the_air_async_tasks_extension() {
+        // The adapter checks this exact shape.
+        let capabilities = client_capabilities_for_agent(&AgentId::new("claude-code"), false);
+        let meta = capabilities
+            .meta
+            .expect("expected client capabilities meta");
+        let air = meta
+            .get(AIR_META_KEY)
+            .and_then(|jetbrains| jetbrains.get(AIR_EXTENSION_KEY))
+            .expect("the AIR extension should be advertised");
+        assert_eq!(
+            air.get("version").and_then(|version| version.as_u64()),
+            Some(AIR_EXTENSION_VERSION)
+        );
+        assert_eq!(
+            air.get("capabilities"),
+            Some(&serde_json::json!([
+                AIR_ASYNC_TASKS_CAPABILITY,
+                AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY
+            ])),
+        );
+    }
+
+    #[test]
+    fn an_extension_session_update_survives_being_parsed() {
+        let params = serde_json::json!({
+            "sessionId": "session-1",
+            "update": {
+                "sessionUpdate": "async_task_spawned",
+                "asyncTaskId": "task-1",
+                "name": "cargo test",
+                "canStop": true,
+            },
+        });
+        assert!(serde_json::from_value::<acp::SessionNotification>(params.clone()).is_err());
+        let raw = RawSessionNotification::parse_message(SESSION_UPDATE_NOTIFICATION, &params)
+            .expect("the raw shape keeps it");
+        assert_eq!(raw.session_id, acp::SessionId::new("session-1"));
+        assert_eq!(
+            raw.update.get("sessionUpdate").and_then(|k| k.as_str()),
+            Some("async_task_spawned")
+        );
+
+        let params = serde_json::json!({
+            "sessionId": "session-1",
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "hello" },
+            },
+        });
+        let raw = RawSessionNotification::parse_message(SESSION_UPDATE_NOTIFICATION, &params)
+            .expect("a standard update parses raw too");
+        assert!(matches!(
+            serde_json::from_value::<acp::SessionUpdate>(raw.update).expect("and then typed"),
+            acp::SessionUpdate::AgentMessageChunk(_)
+        ));
+    }
+
+    #[test]
+    fn the_backgrounded_marker_is_read_off_the_air_namespace() {
+        let meta: acp::Meta = serde_json::from_value(serde_json::json!({
+            "claudeCode": { "toolName": "Bash" },
+            "jetbrains": { "air": { "version": 1, "asyncTasks": { "backgrounded": true } } },
+        }))
+        .unwrap();
+        assert_eq!(
+            air_async_tasks_meta(Some(&meta))
+                .and_then(|async_tasks| async_tasks.get("backgrounded"))
+                .and_then(|backgrounded| backgrounded.as_bool()),
+            Some(true)
+        );
+        let meta: acp::Meta =
+            serde_json::from_value(serde_json::json!({ "claudeCode": { "toolName": "Bash" } }))
+                .unwrap();
+        assert!(air_async_tasks_meta(Some(&meta)).is_none());
     }
 
     #[test]
@@ -6622,7 +6750,8 @@ exit 7
                                         acp::SessionUpdate::ConfigOptionUpdate(
                                             acp::ConfigOptionUpdate::new(updated_options),
                                         ),
-                                    ),
+                                    )
+                                    .into(),
                                     handle_session_notification,
                                 );
                                 Ok(SessionConfigResponse {
@@ -6989,7 +7118,8 @@ exit 7
                                     acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
                                         "old replay".into(),
                                     )),
-                                ),
+                                )
+                                .into(),
                                 handle_session_notification,
                             );
                             Err(anyhow!("load failed"))
@@ -7573,11 +7703,228 @@ fn handle_read_text_file(
     .detach();
 }
 
+/// A `session/update` notification with its payload kept raw, so extension
+/// kinds that v1's `SessionUpdate` cannot parse still get through.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RawSessionNotification {
+    #[serde(rename = "sessionId")]
+    session_id: acp::SessionId,
+    update: serde_json::Value,
+    #[serde(default, rename = "_meta", skip_serializing_if = "Option::is_none")]
+    meta: Option<acp::Meta>,
+}
+
+impl JsonRpcMessage for RawSessionNotification {
+    fn matches_method(method: &str) -> bool {
+        method == SESSION_UPDATE_NOTIFICATION
+    }
+
+    fn method(&self) -> &str {
+        SESSION_UPDATE_NOTIFICATION
+    }
+
+    fn to_untyped_message(&self) -> Result<UntypedMessage, agent_client_protocol::Error> {
+        UntypedMessage::new(SESSION_UPDATE_NOTIFICATION, self)
+    }
+
+    fn parse_message(
+        method: &str,
+        params: &impl Serialize,
+    ) -> Result<Self, agent_client_protocol::Error> {
+        if method != SESSION_UPDATE_NOTIFICATION {
+            return Err(agent_client_protocol::Error::method_not_found());
+        }
+        serde_json::from_value(serde_json::to_value(params)?)
+            .map_err(agent_client_protocol::Error::into_internal_error)
+    }
+}
+
+impl JsonRpcNotification for RawSessionNotification {}
+
+impl From<acp::SessionNotification> for RawSessionNotification {
+    fn from(notification: acp::SessionNotification) -> Self {
+        Self {
+            session_id: notification.session_id,
+            update: serde_json::to_value(notification.update).unwrap_or(serde_json::Value::Null),
+            meta: notification.meta,
+        }
+    }
+}
+
+const SESSION_UPDATE_NOTIFICATION: &str = "session/update";
+
+/// `_meta.jetbrains.air`, the AIR extension's namespace.
+const AIR_META_KEY: &str = "jetbrains";
+const AIR_EXTENSION_KEY: &str = "air";
+const AIR_EXTENSION_VERSION: u64 = 1;
+const AIR_ASYNC_TASKS_CAPABILITY: &str = "asyncTasks";
+const AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY: &str = "nativeSubagentSessions";
+const ASYNC_TASK_STOP_METHOD: &str = "_session/async_task/stop";
+
+fn air_async_tasks_meta(
+    meta: Option<&acp::Meta>,
+) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    meta?
+        .get(AIR_META_KEY)?
+        .get(AIR_EXTENSION_KEY)?
+        .get(AIR_ASYNC_TASKS_CAPABILITY)?
+        .as_object()
+}
+
+/// A non-empty string field of an extension update.
+fn update_string_field(update: &serde_json::Value, name: &str) -> Option<SharedString> {
+    update
+        .get(name)
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(SharedString::from)
+}
+
+/// Every field but the task's id is optional on the wire: a progress report
+/// carries whichever has just become known.
+fn apply_async_task_update(
+    update: &serde_json::Value,
+    thread: &WeakEntity<AcpThread>,
+    cx: &mut AsyncApp,
+) {
+    let field = |name: &str| update_string_field(update, name);
+    let Some(id) = field("asyncTaskId") else {
+        return;
+    };
+    let tool_call_id = field("toolCallId").map(|id| acp::ToolCallId::new(id.as_ref()));
+    let output_file_path = field("outputFilePath");
+
+    match update.get("sessionUpdate").and_then(|kind| kind.as_str()) {
+        Some("async_task_spawned") => {
+            let task = acp_thread::AsyncTask {
+                name: field("name").unwrap_or_else(|| id.clone()),
+                description: field("description"),
+                id,
+                state: acp_thread::AsyncTaskState::Running,
+                summary: None,
+                tool_call_id,
+                output_file_path,
+                can_stop: update
+                    .get("canStop")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
+            };
+            thread
+                .update(cx, |thread, cx| thread.async_task_spawned(task, cx))
+                .log_err();
+        }
+        Some("async_task_progress") => {
+            let description = field("description");
+            let summary = field("summary");
+            thread
+                .update(cx, |thread, cx| {
+                    thread.async_task_progress(
+                        &id,
+                        description,
+                        summary,
+                        tool_call_id,
+                        output_file_path,
+                        cx,
+                    );
+                })
+                .log_err();
+        }
+        Some("async_task_state_update") => {
+            let state = update
+                .get("state")
+                .and_then(|value| value.as_str())
+                .map(acp_thread::AsyncTaskState::from_wire)
+                .unwrap_or(acp_thread::AsyncTaskState::Running);
+            let summary = field("summary");
+            thread
+                .update(cx, |thread, cx| {
+                    thread.async_task_state_updated(&id, state, summary, tool_call_id, cx);
+                })
+                .log_err();
+        }
+        _ => {}
+    }
+}
+
+fn apply_subagent_update(
+    update: &serde_json::Value,
+    thread: &WeakEntity<AcpThread>,
+    cx: &mut AsyncApp,
+) {
+    let field = |name: &str| update_string_field(update, name);
+    let Some(session_id) = field("subagentSessionId") else {
+        return;
+    };
+    let session_id = acp::SessionId::new(session_id.as_ref());
+
+    match update.get("sessionUpdate").and_then(|kind| kind.as_str()) {
+        Some("subagent_spawned") => {
+            let subagent = acp_thread::Subagent {
+                session_id,
+                name: field("name"),
+                task: field("task").or_else(|| field("prompt")),
+                state: acp_thread::AsyncTaskState::Running,
+            };
+            thread
+                .update(cx, |thread, cx| thread.subagent_reported(subagent, cx))
+                .log_err();
+        }
+        Some("subagent_state_update") => {
+            let state = update
+                .get("state")
+                .and_then(|value| value.as_str())
+                .map(acp_thread::AsyncTaskState::from_wire)
+                .unwrap_or(acp_thread::AsyncTaskState::Running);
+            thread
+                .update(cx, |thread, cx| {
+                    thread.subagent_state_updated(&session_id, state, cx);
+                })
+                .log_err();
+        }
+        _ => {}
+    }
+}
+
 fn handle_session_notification(
-    notification: acp::SessionNotification,
+    raw: RawSessionNotification,
     cx: &mut AsyncApp,
     ctx: &ClientContext,
 ) {
+    let session_update_kind = raw
+        .update
+        .get("sessionUpdate")
+        .and_then(|kind| kind.as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let is_async_task = session_update_kind.starts_with("async_task_");
+    if is_async_task || session_update_kind.starts_with("subagent_") {
+        let thread = {
+            let sessions = ctx.sessions.borrow();
+            let Some(session) = sessions.get(&raw.session_id) else {
+                return;
+            };
+            session.thread.clone()
+        };
+        if is_async_task {
+            apply_async_task_update(&raw.update, &thread, cx);
+        } else {
+            apply_subagent_update(&raw.update, &thread, cx);
+        }
+        return;
+    }
+    let update = match serde_json::from_value::<acp::SessionUpdate>(raw.update) {
+        Ok(update) => update,
+        Err(error) => {
+            log::warn!(
+                "Ignoring unreadable {session_update_kind:?} session update for {:?}: {error}",
+                raw.session_id
+            );
+            return;
+        }
+    };
+    let mut notification = acp::SessionNotification::new(raw.session_id, update);
+    notification.meta = raw.meta;
     // Extract everything we need from the session while briefly borrowing.
     let (thread, session_modes, config_opts_data) = {
         let sessions = ctx.sessions.borrow();
@@ -7684,6 +8031,22 @@ fn handle_session_notification(
             "Failed to handle session update for {:?}: {err:?}",
             notification.session_id
         );
+    }
+
+    // The marker rides the call's own update, so it is never out of order
+    // with the completion it qualifies.
+    if let acp::SessionUpdate::ToolCallUpdate(tcu) = &notification.update
+        && air_async_tasks_meta(tcu.meta.as_ref())
+            .and_then(|async_tasks| async_tasks.get("backgrounded"))
+            .and_then(|backgrounded| backgrounded.as_bool())
+            .unwrap_or(false)
+    {
+        let tool_call_id = tcu.tool_call_id.clone();
+        thread
+            .update(cx, |thread, cx| {
+                thread.mark_tool_call_backgrounded(tool_call_id, cx);
+            })
+            .log_err();
     }
 
     // Post-handle: stream terminal output/exit if present on ToolCallUpdate meta.

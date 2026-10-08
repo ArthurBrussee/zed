@@ -35,7 +35,7 @@ use gpui::{
     AnyElement, App, BorderStyle, Bounds, ClipboardItem, CursorStyle, DispatchPhase, Edges, Entity,
     FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId, Hitbox, Hsla, Image,
     ImageFormat, ImageSource, InputHandler, KeyContext, Length, MouseButton, MouseDownEvent,
-    MouseEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollHandle, Stateful,
+    MouseEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, Point, ScrollHandle, Stateful,
     StrikethroughStyle, StyleRefinement, StyledImage, StyledText, Subscription, Task, TextAlign,
     TextLayout, TextRun, TextStyle, TextStyleRefinement, UTF16Selection, WrappedLineLayout,
     actions, canvas, img, point, quad, relative, size,
@@ -133,6 +133,9 @@ pub struct MarkdownStyle {
     pub prevent_mouse_interaction: bool,
     pub table_columns_min_size: bool,
     pub soft_break_as_hard_break: bool,
+    /// A fixed height for inline images that don't declare one, for markdown inside a `ListState`,
+    /// which would otherwise paint an image that loads late over the entries below.
+    pub inline_image_height: Option<AbsoluteLength>,
 }
 
 impl Default for MarkdownStyle {
@@ -162,6 +165,7 @@ impl Default for MarkdownStyle {
             prevent_mouse_interaction: false,
             table_columns_min_size: false,
             soft_break_as_hard_break: false,
+            inline_image_height: None,
         }
     }
 }
@@ -1067,6 +1071,11 @@ impl Markdown {
         &self.parsed_markdown
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn renders_mermaid_diagrams(&self) -> bool {
+        self.options.render_mermaid_diagrams
+    }
+
     pub fn escape(s: &str) -> Cow<'_, str> {
         let output_len: usize = {
             let mut escaper = MarkdownEscaper::new();
@@ -1935,6 +1944,7 @@ impl MarkdownElement {
             .map(|link| link.destination_url.clone());
         let fallback_opens_image_url = enclosing_link_url.is_none();
 
+        let inline_image_height = self.style.inline_image_height.filter(|_| height.is_none());
         let image_element = {
             let image_start = range.start;
             let wrapper = div()
@@ -1979,24 +1989,29 @@ impl MarkdownElement {
             } else {
                 wrapper
             };
-            wrapper.child(
-                img(source)
-                    .id(("markdown-image", range.start))
-                    .min_w_0()
-                    .max_w_full()
-                    .rounded_md()
-                    .mr_1()
-                    .mb_1()
-                    .when_some(height, |this, height| this.h(height))
-                    .when_some(width, |this, width| this.w(width))
-                    .with_fallback(move || {
-                        image_fallback_element(
-                            dest_url.clone(),
-                            alt_text.clone(),
-                            fallback_opens_image_url,
-                        )
-                    }),
-            )
+            wrapper
+                .when_some(inline_image_height, |this, h| this.h(h))
+                .child(
+                    img(source)
+                        .id(("markdown-image", range.start))
+                        .min_w_0()
+                        .max_w_full()
+                        .rounded_md()
+                        // Margins on a `size_full` image would overflow a fixed-height wrapper.
+                        .when(inline_image_height.is_none(), |this| this.mr_1().mb_1())
+                        .when_some(height, |this, height| this.h(height))
+                        .when_some(width, |this, width| this.w(width))
+                        .when_some(inline_image_height, |this, _| {
+                            this.size_full().object_fit(ObjectFit::Contain)
+                        })
+                        .with_fallback(move || {
+                            image_fallback_element(
+                                dest_url.clone(),
+                                alt_text.clone(),
+                                fallback_opens_image_url,
+                            )
+                        }),
+                )
         };
 
         builder.push_image_child(image_element);

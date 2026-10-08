@@ -250,6 +250,13 @@ impl LanguageServerTree {
         if !settings.enable_language_server {
             return Default::default();
         }
+        if !crate::worktree_language_servers::worktree_runs_language_servers(
+            &self.manifest_tree.read(cx).worktree_store,
+            manifest_location.worktree_id,
+            cx,
+        ) {
+            return Default::default();
+        }
         let available_lsp_adapters = self.languages.lsp_adapters(language_name);
         let available_language_servers = available_lsp_adapters
             .iter()

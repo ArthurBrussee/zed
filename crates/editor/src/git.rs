@@ -166,6 +166,12 @@ pub(super) struct DiffHunkKey {
     pub(super) hunk_start_anchor: Anchor,
 }
 
+pub struct TakenReviewComment {
+    pub file_path: Arc<util::rel_path::RelPath>,
+    pub range: Range<Anchor>,
+    pub comment: String,
+}
+
 /// A review comment stored locally before being sent to the Agent panel.
 #[derive(Clone)]
 pub(super) struct StoredReviewComment {
@@ -211,6 +217,19 @@ impl DiffReviewDragState {
         let current = self.current_anchor.to_display_point(snapshot).row();
 
         (start..=current).sorted()
+    }
+}
+
+/// Lets the keymap bind enter to submit while shift-enter inserts a newline.
+struct DiffReviewPromptAddon;
+
+impl crate::Addon for DiffReviewPromptAddon {
+    fn to_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn extend_key_context(&self, key_context: &mut gpui::KeyContext, _: &App) {
+        key_context.add("diff_review_input");
     }
 }
 
@@ -625,24 +644,19 @@ impl Editor {
 
         // Create the prompt editor for the review input
         let prompt_editor = cx.new(|cx| {
-            let mut editor = Editor::single_line(window, cx);
+            let mut editor = Editor::auto_height(1, 6, window, cx);
             editor.set_placeholder_text("Add a review comment...", window, cx);
+            editor.register_addon(DiffReviewPromptAddon);
             editor
         });
 
-        // Register the Newline action on the prompt editor to submit the review
-        let parent_editor = cx.entity().downgrade();
-        let subscription = prompt_editor.update(cx, |prompt_editor, _cx| {
-            prompt_editor.register_action({
-                let parent_editor = parent_editor.clone();
-                move |_: &crate::actions::Newline, window, cx| {
-                    if let Some(editor) = parent_editor.upgrade() {
-                        editor.update(cx, |editor, cx| {
-                            editor.submit_diff_review_comment(window, cx);
-                        });
-                    }
+        let subscription = cx.subscribe_in(&prompt_editor, window, {
+            let hunk_key = hunk_key.clone();
+            move |editor, _prompt_editor, event: &EditorEvent, window, cx| {
+                if matches!(event, EditorEvent::BufferEdited) {
+                    editor.refresh_diff_review_overlay_height(&hunk_key, window, cx);
                 }
-            })
+            }
         });
 
         // Calculate initial height based on existing comments for this hunk
@@ -746,7 +760,7 @@ impl Editor {
     }
 
     /// Returns the total count of stored review comments across all hunks.
-    pub(super) fn total_review_comment_count(&self) -> usize {
+    pub fn total_review_comment_count(&self) -> usize {
         self.stored_review_comments
             .iter()
             .map(|(_, v)| v.len())
@@ -1018,8 +1032,18 @@ impl Editor {
         self.toggle_diff_hunks_in_ranges(ranges, cx);
     }
 
-    pub(super) fn show_diff_review_button(&self) -> bool {
-        self.show_diff_review_button
+    pub(super) fn show_diff_review_button(&self, cx: &App) -> bool {
+        if self.show_diff_review_button {
+            return true;
+        }
+        // Any project file can be commented on, but not mini editors or non-diff multibuffers.
+        if !self.mode.is_full() || self.project.is_none() {
+            return false;
+        }
+        self.buffer
+            .read(cx)
+            .as_singleton()
+            .is_some_and(|buffer| buffer.read(cx).file().is_some())
     }
 
     pub(super) fn render_diff_review_button(
@@ -1121,6 +1145,28 @@ impl Editor {
         cx.notify();
     }
 
+    pub(super) fn add_review_comment_action(
+        &mut self,
+        _: &zed_actions::agent::AddReviewComment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.show_diff_review_button(cx) {
+            cx.propagate();
+            return;
+        }
+        let snapshot = self.display_snapshot(cx);
+        let selection = self.selections.newest_display(&snapshot);
+        let range = selection.range();
+        let start_row = range.start.row();
+        let mut end_row = range.end.row();
+        // A full-line selection ends at column 0 of the next row.
+        if end_row > start_row && range.end.column() == 0 {
+            end_row.0 -= 1;
+        }
+        self.show_diff_review_overlay(start_row..end_row, window, cx);
+    }
+
     /// Action handler for SubmitDiffReviewComment.
     pub(super) fn submit_diff_review_comment_action(
         &mut self,
@@ -1128,7 +1174,51 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The overlay's prompt editor sees the action first; let the host editor handle it.
+        if self.diff_review_overlays.is_empty() {
+            cx.propagate();
+            return;
+        }
         self.submit_diff_review_comment(window, cx);
+    }
+
+    /// Includes text still unsubmitted in an overlay's input.
+    pub fn take_review_comments(&mut self, cx: &mut Context<Self>) -> Vec<TakenReviewComment> {
+        let pending: Vec<_> = self
+            .diff_review_overlays
+            .iter()
+            .filter_map(|overlay| {
+                let text = overlay.prompt_editor.read(cx).text(cx).trim().to_string();
+                (!text.is_empty())
+                    .then(|| (overlay.hunk_key.clone(), overlay.anchor_range.clone(), text))
+            })
+            .collect();
+        for (hunk_key, range, text) in pending {
+            self.add_review_comment(hunk_key, text, range, cx);
+        }
+
+        self.dismiss_all_diff_review_overlays(cx);
+
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let mut taken = Vec::new();
+        for (hunk_key, comments) in std::mem::take(&mut self.stored_review_comments) {
+            for comment in comments {
+                if comment.range.start.is_valid(&snapshot) && comment.range.end.is_valid(&snapshot)
+                {
+                    taken.push(TakenReviewComment {
+                        file_path: hunk_key.file_path.clone(),
+                        range: comment.range,
+                        comment: comment.comment,
+                    });
+                }
+            }
+        }
+        taken.sort_by(|a, b| a.range.start.cmp(&b.range.start, &snapshot));
+        self.next_review_comment_id = 0;
+
+        cx.emit(EditorEvent::ReviewCommentsChanged { total_count: 0 });
+        cx.notify();
+        taken
     }
 
     /// Returns comments for a specific hunk, ordered by creation time.
@@ -2465,7 +2555,9 @@ impl Editor {
 
         // Calculate new height
         let snapshot = self.buffer.read(cx).snapshot(cx);
-        let new_height = self.calculate_overlay_height(hunk_key, comments_expanded, &snapshot);
+        let prompt_lines = prompt_editor.update(cx, |editor, cx| editor.max_point(cx).row().0 + 1);
+        let new_height = self.calculate_overlay_height(hunk_key, comments_expanded, &snapshot)
+            + prompt_lines.min(6).saturating_sub(1);
 
         // Update the block height using resize_blocks (avoids flicker)
         let mut heights = HashMap::default();

@@ -1,0 +1,2693 @@
+# quiet-ui: a minimal Claude-first agent UI for Zed
+
+A long-running fork branch of Zed that makes agent threads the primary unit of work: quiet,
+tab-based, async-friendly. It carries one squashed commit on top of upstream main and is rebased
+nightly. Mood: minimalist — the editor should feel calm while several threads run.
+
+This file is the fork's whole written record. It holds, in order: what the fork is allowed to
+carry and why (**Upstream first**), one paragraph per feature naming its files (**The fork as it
+stands**), what to build next (**Work queue**), what still needs its tests run (**Verification
+queue**), and the rebase procedure plus the last ten nights (**Rebase log**). Function and file
+names are the stable anchors; line numbers drift with every rebase and are not used.
+
+## Never bail on time (from 2026-10-06)
+
+Arthur's rule: **the clock is never a reason to leave work undone.** The 00:45 build is not a
+deadline. A branch pushed after it starts is simply bundled by the next build, which costs a day
+of latency and nothing else. Build every item in the queue, gate it, and push when the gate is
+green, however late that is.
+
+The one deadline is the gate: a branch that has not passed `cargo test` and `./script/clippy`
+never gets pushed, because there is no way to compile a fix from the laptop. So the rule is
+"finish, then gate, then push", and if that runs past the build, say so in the report and push
+anyway. On 2026-10-05 the routine stopped at three of five items "to leave time to gate before
+the build"; Arthur had it finish the other two the same night, and both landed in the 00:45 build
+regardless.
+
+## Upstream first (from 2026-10-01)
+
+The fork stands at +37.5k / -11.3k lines across 109 files against upstream (the exact figures
+after the 2026-10-08 run were +37,532 / -11,310, against +37,495 / -11,382 after 10-07 and
++36,737 / -11,298 after the 10-06 reduction run). It was +45.8k / -11.4k before 10-06, after
+going **up** four nights running (+42.0k on 10-02, +42.9k on 10-04, +44.8k on 10-05), each time
+because a Work queue entry asked for the lines. The 10-06 run built nothing and cut 9.1k added
+lines, almost all of it comment paragraphs, duplicated tests and dead code (see its rebase log
+entry); 10-07 put 731 back, for four queue entries, and roughly two thirds of that is the tests
+they asked for. `README.md` carries the review banner `CLAUDE.md` requires of any session that
+touches source — not the fork's idea; it will conflict every rebase until removed by hand. Every
+line is still rebase cost and a place for bugs, and not all of it was asked for. Arthur's rule:
+**upstream wins by default, and the fork carries a change only with an explicit reason.** An
+explicit reason is that Arthur asked for it (a Work queue entry or a request recorded in this
+file), or that something he asked for needs it. Routine-invented restyles, refactors of upstream
+code that change its shape without changing what it does, and code left behind by removed
+features have no reason and go back.
+
+Explicitly requested, so it stays (not a complete list; the rebase log and past entries hold
+the rest):
+
+- **Worktree threads**: one click makes a new worktree off the default branch with a Claude
+  thread in it, fast (the spare pool and the creation speed work).
+- **The sidebar is the source of truth for open threads.** It shows each thread's live state
+  (running, including commands still running after the turn; needs input; unread; error) and
+  switches between them. Ctrl-tab switching and drag reordering stay. Archive takes the
+  worktree and restore brings it back without losing work (submodules included). **A thread
+  exists from the moment the user asks for one** (2026-10-02): there are no drafts to drop, and
+  nothing creates a thread on the user's behalf.
+- **Claude-first defaults**: Claude is the default agent and runs with `bypassPermissions`.
+- **The thread view**: command chips and the command parser behind them, the quiet one-line
+  cards, diff hover cards, the PR chips with their `+` menu and remove control, and PR mining.
+  A terminal tool call keeps its chip as the header and renders its output through upstream's
+  own terminal view (done 2026-10-01).
+- **PR and CI state** for a thread's branch, on its sidebar row and in the thread.
+- **Self-update** from the fork's release, and the nightly build.
+- **Reliability and performance fixes** for running many worktrees: fd limit, capped
+  environment capture, language servers off in worktrees, leak and focus-handle fixes. Shape
+  them as patches upstream could take.
+
+From here on:
+
+- **Rebase conflicts: take upstream's side unless the fork's side has an explicit reason.**
+  When it does, keep the smallest fork change that preserves it.
+- **When upstream ships something that does what a fork feature does, switch to upstream's and
+  delete the fork's.** Say so in the report.
+- **Keep the fork's changes to upstream-owned code small**: extend rather than rewrite, put
+  fork logic in the fork's own files, and leave upstream's tests alone where behaviour is
+  unchanged.
+- **Each rebase log entry reports the diff size**:
+  `git diff --diff-algorithm=histogram --shortstat $(git merge-base HEAD upstream/main) HEAD -- . ':!QUIET_UI.md'`.
+  It should go down. **The algorithm is not optional**: `git diff`'s default (myers) re-anchors
+  whenever upstream touches a file the fork has heavily patched, and on 2026-10-02 it reported
+  4,000 lines of change across a rebase whose content changed by nothing. Histogram gave the same
+  figure to the line on both sides of that rebase.
+
+## The fork as it stands
+
+One paragraph per feature, naming the files it lives in. Fork-only files are the fork's own and
+have no upstream counterpart; everywhere else the fork extends upstream rather than rewriting it.
+
+**Worktree threads.** One click makes a new git worktree off the default branch with a Claude
+thread already in it, fast enough to press without thinking. `git_ui_core/worktree_service.rs`
+creates and opens the workspace, `worktree_spares.rs` keeps a pool of ready worktrees so the
+click does not wait on git, and `created_worktrees.rs` remembers which ones this app made.
+`project/worktree_language_servers.rs` and `git_ui_core/worktree_language_server_switch.rs` hold
+the per-worktree language-server switch, which `project/manifest_tree/server_tree.rs` reads: a
+worktree runs no language servers until it is switched on, so restoring a dozen worktree windows
+does not start a dozen servers indexing copies of the same repository.
+
+**The sidebar is the source of truth for open threads.** The `sidebar` crate is upstream's, not
+the fork's (worth knowing before a rebase: upstream ships `sidebar.rs`, `sidebar_tests.rs` and
+`thread_switcher.rs`, and the fork extends them, with `sidebar_tests/` its own). What the fork
+makes of it is a worktree-shaped index of every thread: live state
+(running — including commands still running after the turn — needs input, unread, error), click
+to switch, drag to reorder across worktrees, close and archive from the row.
+`agent_ui/thread_metadata_store.rs` and `terminal_thread_metadata_store.rs` persist the rows,
+`thread_read_state.rs` tracks what has been read, and `agent_ui/thread_worktree_archive.rs`
+archives a thread's worktree and restores it without losing work, submodules included. Whether a
+message has ever been sent in a thread makes no difference to any of this (2026-10-02): a thread
+is real from the click that made it, keyed on its `ThreadId`, and its worktree stays until it is
+archived. The only worktree anything reclaims is a spare nobody was handed. A running thread says
+what it is running as one pill on its row — the spinner, the commands still going and the
+subagents still out, Claude's `Agent` and `Task` calls among them (2026-10-04) —
+`agent_activity_pill` in `ui/components/ai/thread_item.rs`, which the thread's own bottom bar
+draws too. A subagent Claude backgrounded is counted from its own lifecycle rather than from the
+call that launched it (2026-10-05): Zed advertises the AIR `nativeSubagentSessions` capability
+(`agent_servers/src/acp.rs`), `apply_subagent_update` there reads the reports back, and
+`AcpThread`'s `Subagent` records hold the state the pill counts and the chip spins on — which is
+what keeps three parallel reviews counted after the turn that launched them has ended.
+
+**Threads as tabs.** `agent_ui/thread_tab.rs` wraps a `ConversationView` as a pane item in the
+agent panel's own pane, `thread_tab_registry.rs` is the window-spanning ordered list the sidebar
+sorts by, and `agent_panel.rs` hosts the pane. The pane draws no tab bar (2026-09-28): the
+sidebar already says everything a tab strip would, so the conversation gets the full height. The
+pane stays the model underneath, which is where ordering, activation, keyboard nav, focus and
+close come from — all of it upstream's `Pane`, not fork code.
+
+**Claude-first defaults.** Claude is the default agent and runs with `bypassPermissions`.
+
+**The thread view.** `agent_ui/conversation_view/thread_view.rs` with
+`thread_view/chips.rs`: a tool call reads as a quiet one-line chip saying what happened rather
+than that a tool ran. A subagent is one of those chips too (2026-10-05), with the task it was
+given as its label and its status from its own reported lifecycle; it used to fall through to the
+full-width card that everything which is not a chip gets, which broke the run around it. The command parser behind the labels is `acp_thread/command_parse.rs`
+(what a shell line actually did: the acts in a pipeline, a devshell handover, a heredoc that is
+data and not shell) and `acp_thread/command_output.rs` reads results back out of what a command
+printed. `thread_view/bookmarks.rs` marks places in a long thread,
+`agent_ui/tool_call_diff.rs` and `conversation_view/branch_diff_stats.rs` back the diff hover
+cards, and `acp_thread/pr_mentions.rs` mines pull requests out of what the thread said. A
+terminal tool call keeps its chip as the header and renders its output through upstream's
+embedded terminal view below it (2026-10-01).
+
+**Review comments on diffs.** `agent_ui/diff_review.rs`, with the editor's gutter affordance in
+`editor/src/git.rs` and the surfaces that enable it in `git_ui/diff_multibuffer.rs`. Comments
+left on a diff attach to the next message sent. `git_ui/generated_file.rs` and
+`git_ui/branch_diff.rs` sort generated files last and fold them shut with a tag saying why.
+
+**PR and CI state.** The `gh_status` crate feeds the chips on a thread's sidebar row and in the
+thread itself: state, review decision, mergeability, and whether CI is running, passing or
+failing. One poll is one `gh api graphql` invocation asking about every watched branch and pull
+request at once (2026-10-04) — `graphql.rs` builds that query and reads the answer back, lowering
+it to the same shape the per-subject `gh pr list` path produces, which is still there as the
+fallback for a query that fails. The `rateLimit` the query asks for alongside says what each poll
+actually cost, which is what a spent budget now reports.
+
+**Self-update and the nightly build.** `auto_update/quiet_ui_update.rs` updates from the fork's
+own release; `.github/workflows/quiet_ui_build.yml` builds the macOS app and
+`script/install-quiet-ui` is the manual fallback. The schedule that fires the nightly build lives
+on the fork's `main`, which carries nothing else.
+
+**Reliability and performance for many worktrees.** Shaped as patches upstream could take: the
+fd-limit spawn error in `util/src/process.rs`, capped environment capture in
+`project/src/environment.rs`, the measurement lines in `zed/src/reliability.rs`, and in gpui
+`App::callback_counts` and `App::entity_counts_by_type` (`gpui/src/app.rs`, `app/entity_map.rs`,
+`subscription.rs`) plus focus-handle sweeping (`gpui/src/window.rs`). A thread tab off screen for
+thirty seconds drops its whole per-entry view tree and rebuilds it on return
+(`agent_ui/entry_view_state.rs`), which is what reclaims the view trees of threads left open all
+day. In gpui, `ListState::report_stale_measurements` (`gpui/src/elements/list.rs`) logs
+`quiet-ui layout: list item N painted Xpx, measured Ypx` for any item that lays out taller than
+the height the list had remembered; the thread's list is the only one that asks for it
+(2026-10-05).
+
+## Work queue
+
+What to build next, most wanted first. Entries are complaints, tidied: what is wrong and roughly
+where, written from using the app rather than from reading the code. They are not specifications.
+Nothing here has been compiled or checked against the code, because nothing is compiled on the
+laptop any more.
+
+The nightly routine builds them. It reads the code first, decides what the fix actually is, and
+where an entry disagrees with the code the code wins. An entry it decides is a bad idea once it
+can see the code gets said so in that night's report rather than built. Items are built in order,
+all of them, and each is removed as it lands; the build time is not a reason to stop (see **Never
+bail on time**).
+
+Anything added after about 20:45 local waits a night: the routine reads this section when it
+starts at 21:00.
+
+**The memory baselines: what it would take, and the one measurement that would justify it.**
+
+Decided on 2026-10-07 by reading the code; the 10-05 findings and the 10-07 rebase log entry hold
+the detail. The conclusion is that the remaining baseline (~8,000 terminal entities and ~17,925
+`Markdown` for a thread loaded from history) is thread data, and releasing it means
+`ToolCallContent::Terminal` holding a terminal id rather than an `Entity<Terminal>`, with
+`ToolCall::terminals()` resolving through the thread's own registry. That is ~46 `ToolCallContent::Terminal`
+sites and ~30 `terminals()` sites across `acp_thread`, `agent`, `agent_servers` and `agent_ui`,
+nearly all of it upstream's, in the file that conflicts on most rebases. **Upstream first** says
+no to carrying that in the fork, and nothing here can measure what it would buy.
+
+So the ball is with Arthur, and it is one line: **two `entities live` lines from a real session** —
+one just after launch, one after a day's threads have been opened — which say whether those 8,000
+entities are actually there and actually stay. With those numbers the shape to propose is a patch
+to the `terminal` crate rather than to thread data: `TerminalBuilder::new_display_only` not
+allocating its alacritty grid until something writes to it or reads it as a grid. That is
+self-contained, needs no change to the thread's data, and is the kind of patch upstream could
+take. Without the numbers, neither should be built.
+
+(Also settled on 10-05 and not worth rediscovering: `environment.rs:303` is not running twice for
+one directory, and the off-screen view sweep structurally cannot release the `Markdown`, because
+none of it is owned by `EntryViewState`.)
+
+## Verification queue
+
+Where the day's edits go unverified. `cargo check` and `script/clippy` run here as usual; what
+does not is the test suites, which rebuild the world in the test profile on the laptop that is
+also running the editor. Targeted runs still happen when a change turns on one, so an entry
+below means the crate's suite has not run in full, not that nothing was checked.
+
+The nightly routine is the gate. It runs the suites listed here after rebasing, fixes what
+broke, folds the findings into that night's rebase log entry, and empties this section. An empty
+section means everything committed has had its tests run.
+
+Each entry says which crates changed and what to watch for, since a failure after a rebase can
+come from either the queued edit or upstream drift, and the fix differs.
+
+**Empty.** Nothing is waiting on a suite.
+
+**A note on where entries land.** Every complaint written on 2026-08-31 was appended here rather
+than to the Work queue above — five commits, all inserting right after this preamble. They are
+plans, not unverified edits ("Make `+` fast enough to press without thinking" names no changed
+crate and describes no edit), so the 2026-08-31 run built them as Work queue items and moved the
+two it did not reach up there. If the insertion point is coming from habit or a snippet, it wants
+to be the Work queue's preamble instead; an entry filed here is read as "run this crate's suite
+and delete it", which would have thrown six feature requests away.
+
+## Rebase log
+
+Rebase weekly against upstream main. The per-rebase narrative lives in git history; what stays
+here is the part that repeats.
+
+**Procedure.** Squash the branch to one commit BEFORE rebasing. Resolving the base commit with
+final-state content makes every later fork commit replay as a conflict, which is how a merge
+ends up splicing upstream's opening onto our closing (unbalanced braces, phantom helpers). One
+commit means one resolution pass. Back up first (`quiet-ui-pre-rebase<N>-<date>`), and verify
+the squash is tree-identical before rebasing.
+
+**The recurring seam.** Nearly every conflict lands in `thread_view.rs`, in whatever upstream is
+currently adding to the thread-controls row or the terminal tool-call header: scroll-to-user
+buttons, turn-end gating, a richer `TerminalToolHeader`. This fork does not draw those surfaces —
+the command chip is the header — so the resolution is usually to take ours, then delete the
+upstream helper the merge left stranded (`cargo check` finds it as dead code). Note that
+`ui/terminal_tool_header.rs` itself is upstream's, unmodified: the fork replaces its *use* in the
+thread view, not the component, so a conflict there is in `thread_view.rs`, never in that file.
+A conflict inside a file only this branch edits is a same-branch replay artifact: take that
+commit's own copy of the file wholesale.
+
+**Markerless drift.** Signature changes carry no conflict markers, so `cargo check --all-targets`
+right after the replay is the real check, not the conflict count. Past examples:
+`render_sandbox_not_applied_warning` becoming a data struct, `DiffStats::single_file` losing its
+buffer/cx arguments, `RelPath` moving to its own crate. **A workspace check that fails early has
+not checked the workspace**: cargo stops at the broken crate and nothing downstream of it is
+looked at, so the fix is followed by another *workspace* check, never just the crate that failed
+(learned on 10-04, repeated on 10-05). And not all of it is a signature: an attribute the replay
+drops — a fork `#[ignore]`, say — compiles perfectly and surfaces only as a test failure that
+reads like new work (10-05).
+
+**Adopt rather than defend.** When upstream replaces one of our helpers with a richer equivalent,
+take theirs (test-gated if we do not surface it) — e.g. `scroll_to_user_message_index` replacing
+our `scroll_to_most_recent_user_prompt`. It shrinks the seam next time.
+
+**Not redundant, checked repeatedly.** Upstream's `SoloDiffView` (#60989) diffs a file against
+git; our edit-chip diff needs the agent's pre-edit content as the base, which git cannot supply.
+Upstream's staged/unstaged diff surfaces, branch-picker work, and elicitation un-flagging are
+enablers our features consume rather than duplicates to delete.
+
+**2026-09-22**: onto main 16c9aa7ea (16 upstream commits). A working night three times over: the
+Work queue held five items, the branch carried ten commits over the merge base, and the first
+queue entry was a crash in the build the updater was handing out. Squash-then-rebase folded all
+ten into one, reusing the squash's own message; tree-identical to the old tip (`2178ff364`) before
+rebasing.
+
+**What upstream has built that this fork had by hand: the ACP stdio launch.** One file conflicted,
+`agent_servers/src/acp.rs`, and it is the whole conflict story this round. Upstream's
+`agent_servers: Extract ACP stdio construction (#64598)` moved the remote-command build, the
+`ShellBuilder` spawn, the cwd choice and the stdout/stdin/stderr handoff into
+`acp/transport.rs::spawn_stdio`, returning a `StdioProcess`. That is exactly what this fork had
+inline, plus one line of its own. Upstream's helper is taken whole and the fork's line — the
+info-level `quiet-ui launch: spawned …` breadcrumb, which exists because Zed's default log level
+does not emit upstream's `debug!`/`trace!` equivalents — moved into the new helper, where `path`,
+`arguments` and the pid are already in scope. The fork's diff for that function is now one log
+call instead of fifty lines of spawning.
+
+**No markerless drift.** `cargo check --workspace --all-targets` came back with 0 errors after the
+replay and one warning, which was tonight's own unused helper rather than upstream's doing.
+
+**The crash, and why nothing here saw it.** The 09-21 build died on its first frame every launch:
+`WorktreeLanguageServerSwitch::set_active_pane_item` read the workspace, and the status bar calls
+that from inside the workspace's own `update`, so gpui panicked on the double lease. The fix is
+the house shape for a status item, which every upstream one already follows — take what you need
+from the active pane item, hold the project rather than the workspace, never read the workspace
+from that callback. `DiagnosticIndicator::new` is the template: `workspace.project()` at
+construction, and `set_active_pane_item` touches only the item.
+
+Worth keeping in mind next time, because it is a gate gap rather than a code one: the `zed`
+crate's own `init_test` already calls `initialize_workspace`, so `cargo test -p zed --bin zed`
+would have caught this on 09-21. That run touched `crates/zed/src/zed.rs` and did not gate the
+`zed` crate. **A run that edits `zed.rs` gates `zed`.** `zed` is a binary crate with no lib
+target, so it is `cargo test -p zed --bin zed`, not `-p zed` alone, which errors with "no library
+targets found". Linking that test binary also needs `libxkbcommon-dev`, `libxkbcommon-x11-dev` and
+`libx11-xcb-dev`; without them the link fails on `-lxkbcommon` and friends, which is a different
+failure from the `libasound2-dev` one and happens much later in the run.
+
+The new smoke test (`test_a_fresh_window_renders_its_status_bar`) opens a window with a real
+workspace, lets `initialize_workspace` build the whole status bar inside the workspace's update,
+and draws a frame. Reverted against the old code it fails with the exact panic from the crash
+report (`cannot read workspace::Workspace while it is already being updated`); against the fix it
+passes. `init_test` now also calls `worktree_language_server_switch::init`, so the fork's own
+status item is registered in tests the way `main.rs` registers it in the app — otherwise the
+switch renders empty and the frame proves nothing about it.
+
+**What was built: all five Work queue items, and the queue is empty.**
+
+- *The first-frame panic*, above, with the smoke test that would have caught it.
+- *Bookmarks in a thread.* A mark cannot be an entry index — entries are appended while the agent
+  works and a compaction can take a run of them away — so it is pinned to what the entry carries:
+  a tool call's own id, or a message's place in the thread's run of messages, resolved to an index
+  at jump time. A mark whose entry is gone resolves to nothing rather than to the wrong row.
+  Movement runs over marks and user messages as one sequence, so the existing
+  `ScrollOutputToNextMessage`/`PreviousMessage` now stop at both; that also answers the "buttons to
+  step between user messages" the fork deleted, without drawing the row back. Set from the keyboard
+  (`shift-alt-m`, free on all three keymaps) on whatever is at the top of the viewport, or by
+  right-clicking the entry. A marked entry carries a rule down its inside edge. Stored with the
+  thread's metadata, beside the PR snapshot. **Where the plan and the code disagreed:** the entry
+  says to hang the pointer affordance on "the context menu the chips already have", and the chips
+  had one only on images. Assistant messages have `render_message_context_menu`, which took the
+  entry; action chips got a right-click menu of their own, since a chip is what a thread is usually
+  scrolled back for.
+- *PRs as a watched set.* `WatchKey` is now a repo path plus a subject — a branch, or a number with
+  an optional `owner/name` — so `gh pr view <n> [--repo owner/name]` sits beside
+  `gh pr list --head`, and a PR nobody here has checked out can still be asked about. Mining reads
+  the transcript for GitHub PR URLs (`acp_thread::pr_mentions`, the `image_paths_in_output` shape
+  the entry pointed at, unit-tested against real `gh pr create` output, markdown links and prose
+  punctuation); a bare `#123` is deliberately not taken, since a wrong PR in the set is worse than
+  a missing one. **One decision the entry did not anticipate:** branch-found PRs are *not* copied
+  into the watched set. The entry lists the branch as one of three sources, but the branch watch
+  already asks about those PRs, and a second watch by number would double every poll that 09-21's
+  work cut down; instead dismissal is recorded whether or not there was a watch to remove, which
+  is what makes removal sticky for branch PRs too. Editing lives in the status bar above the
+  message box as the entry settled: an X on each chip, and a `+` offering the clipboard or a PR
+  this or any other thread has watched before. The `+` does not take a typed number — there is no
+  text field — which is the one part of that entry not built as written.
+- *Killing a running terminal from its chip.* `Terminal::stop_by_user` had been built and never
+  given a button; it has one now, on the chip, only while the command runs, and only for a
+  process-backed terminal. A killed command exits non-zero like any other, so the chip asks
+  `was_stopped_by_user()` before drawing the failure glyph and reads as stopped instead. The test
+  runs a real `sleep 60` headlessly (`HeadlessTerminal(true)` plus `allow_parking`, or the PTY
+  reader thread makes the scheduler non-deterministic), clicks the control, and checks the chip
+  does not then wear `terminal-tool-failed-Some(1)` — which it does wear with the change reverted,
+  so the assertion is load-bearing. Upstream's own `TerminalToolHeader::on_stop`, noted last night
+  as worth copying, gave the wiring.
+- *The sidebar rebuild storm.* A rebuild now compares what it built against what was already there
+  and stops when they match: rows are `Arc`s, so the comparison is two vectors of pointers. Two
+  things survive the early return on purpose — the gh watch sync, because a thread's watched PRs
+  are not drawn into its row and so cannot be seen in the comparison, and nothing else. Skipping
+  the repaint is safe because the gh store's own observer already calls `persist_pr_snapshots` and
+  `cx.notify()` itself when PR data moves; it never went through `schedule_update_entries`.
+  **Honest about what this does not do:** the request rate is untouched. 4.5 requests a second
+  still arrive; what each costs is now a rebuild plus a comparison rather than a rebuild plus the
+  worktree measurements, the snapshot write, two draft passes, the list's re-measurement and a
+  repaint. The slow-rebuild log now carries how many of the preceding rebuilds built the list that
+  was already there, so the next run has that number instead of having to instrument for it. On
+  the entry's third bullet: `schedule_update_entries` already collapses rather than discards — a
+  request dropped while a task is pending is answered by that task, which rebuilds from the state
+  at the time it runs — so there was nothing to fix there.
+
+**The gate, seven crates: the core three plus the four touched tonight.** `cargo test`:
+`acp_thread` 253, `agent_ui` 483 (32 intentionally `#[ignore]`d), `sidebar` 187, `gh_status` 34,
+`git_ui_core` 31, `ui` 83 plus 41 doctests, `zed` 93 (1 `#[ignore]`d). Zero failures, and
+`script/clippy` (`--release --all-targets --all-features -- --deny warnings`) clean across all
+seven. `cargo-shear`, `typos` and `buf` are not installed here, so `script/clippy` exits after the
+lint, as it has every night in this log. The Verification queue was empty, so there was nothing
+queued to check beyond tonight's own crates.
+
+**Two things the gate caught, both tonight's own.** Reading back the chip work turned up a cost
+rather than a bug: `is_bookmarked` resolves a mark by walking the thread's entries, and the chip
+was asking it every frame to label a right-click menu nobody had opened — visible rows times
+entries, per frame. It is asked when the menu opens now. And the new terminal test failed once in
+a full parallel run and passed alone: a real process takes as long as it takes to die, and one
+`run_until_parked` is not that long under load. It now polls for the exit against a deadline, the
+way `acp_thread`'s own kill test does. Worth remembering: the *only* two failures this run came
+from running the whole suite under load, so a green single-test run is not evidence.
+
+`thread_metadata_store::tests::test_migrate_thread_remote_connections_backfills_from_workspace_db`
+also failed once in that same loaded run and passed both alone and in the two full runs either
+side of it, with the same code. Not tonight's, not investigated further, but written down here so
+the next run that sees it knows it has been seen before.
+
+**Which workflow is the nightly build, because there are two and only one of them matters.**
+Checked after the fact, from the morning after: the build is
+`.github/workflows/quiet_ui_nightly.yml`, and it lives on `main` rather than on this branch,
+which is the only reason its `schedule:` fires at all. Run 43 started 05:12 UTC on 09-23,
+finished 07:13, built `quiet-ui` at `e2ec1c0`, published the dmg to the `quiet-ui-latest`
+release and moved the `quiet-ui-built` tag to the branch tip. The updater is therefore offering
+last night's work, crash fix included.
+
+Two stale things sent this run's own check down a false trail, so they are written down rather
+than rediscovered. **`.github/workflows/quiet_ui_build.yml`, on this branch, is not the nightly.**
+It is dispatch-only, last ran 2026-08-07, only uploads an artifact — it cuts no release and moves
+no tag — and its header comment still claims "the nightly rebase routine triggers it after
+pushing". That comment is wrong now: the routine triggers nothing, and a run that believes it
+would spend two hours of a runner on a duplicate build. And **the `45 0 * * 1-5` cron quoted in
+the 2026-08-22 and 2026-08-23 entries is stale** — those entries reason about a schedule this
+workflow no longer has, which is where the "00:45 build" in this run's own notes came from.
+The firing time to reason from is the nightly's, around 05:12 UTC, seven days a week; the check
+that actually answers the question is `quiet-ui-built` against the branch tip, plus the release
+body, which names the commit it was built from.
+
+**Environment: the standing prerequisites, one new one, and the disk again.**
+`CARGO_NET_GIT_FETCH_WITH_CLI=true` and `libasound2-dev` as always; `apt-get update` still 403s on
+the `deadsnakes` and `ondrej` PPAs baked into the image, and the install still succeeds off the
+cached lists when run on its own, so run it on its own. New this round, because this run was the
+first to build the `zed` test binary: `libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev` are
+needed to link it.
+
+The disk ran out four times. The duplicate sweep from 09-21 works and is the right tool — five
+sweeps freed 11.0, 8.7, 7.1, 7.5 and 5.1 GB without forcing a rebuild — but **sweep before a run,
+not between two runs of the same thing**: a sweep run between two `cargo test` invocations deleted
+artifacts the second one wanted and cost a full rebuild. The other lever that paid: the `zed` test
+binary alone is 3.6 GB, and `rm -rf target/debug` once the debug suites have passed is what makes
+room for `script/clippy`'s release build, which starts from nothing.
+
+**2026-09-23**: onto main 532532bb8 (25 upstream commits). Squash-then-rebase folded fifteen fork
+commits into one — the standing squash, the eight code commits from the 09-22 run, the workflow
+note, and the four queue entries written during the day — reusing the squash's own message;
+tree-identical to the old tip before rebasing.
+
+Two files conflicted. `markdown/src/markdown.rs`: a pure import union. Upstream's Markdown view
+gained text selection (#59297 and the work around it), which brought `InputHandler`, `Pixels`,
+`UTF16Selection`, `Bias` and `OffsetUtf16` into the same two `use` blocks this fork edits for its
+inline image sizing; took upstream's superset and put `ObjectFit` back into it.
+`sidebar/src/sidebar.rs`: the same-branch replay pattern the log already knows. #62141's
+project-header-grouped `render_workspace_header` is still upstream's, and this fork's flat
+`WorkspaceHeader` redesign replaced it wholesale; kept ours across the whole hunk, including the
+fold-the-group click the fork's header carries and upstream's has no equivalent for. No markerless
+drift: `cargo check --workspace --all-targets` came back with 0 errors and 0 warnings after the
+replay. Nothing upstream built this round that the fork can now delete in favour of; upstream's own
+new work (ACP session notices, subagent model selection, a copilot/opencode model refresh, LSP log
+stream refcounting) either sits outside the fork's surfaces or arrives as an enabler.
+
+**One stale suspect, recorded so it is not chased again.** The 09-23 freeze entry listed the
+language-server switch calling `set_local_settings` and re-running `migrator::migrate_settings` on
+a hot path. There is no such call: `worktree_language_server_switch` writes its choice to the
+key-value store and moves the servers for the open buffers, and touches no settings file. Whatever
+the sample saw came from somewhere else.
+
+**What was built.** Three of the four Work queue entries, in the order the entries themselves set
+(the general pass explicitly comes after the specific ones).
+
+- *PR mining.* Mining fed every entry's markdown to the URL reader, and a tool call's markdown
+  carries its whole output, which is how a `gh pr list` inside a collapsed chip put four PRs in the
+  set. Two sources count now: an assistant message's own prose (not its thinking), and the output
+  of a command the parser says created a PR. `gh pr view`, `gh pr checkout` and the rest are the
+  agent looking at a PR, and the parser decides from the command line rather than a substring, so a
+  `gh pr create` inside a chain or a devshell still counts and a `rg 'gh pr create'` does not. Three
+  or more distinct PRs in one piece of text is a list and none of it joins, replacing the cap that
+  took the first eight. **The part the entry did not spell out:** the sets already persisted were
+  mined under the old rules, so a snapshot now records which of its PRs the user asked for and which
+  rules mined the rest, and opening a thread re-reads its whole transcript under the current rules
+  and drops the mined ones those rules would not have taken. They are not dismissed, so a thread
+  that names one properly gets it back — and opening a thread is now a mining pass in its own right,
+  because a thread that never runs again would otherwise keep the wrong ones forever. The X moved
+  inside the chip, standing where the state icon does while the pointer is over it, so the bar is no
+  wider with the control than without; the `+` menu offers titles rather than numbers, from this
+  thread's repository, open PRs before finished ones, most recently seen first, six of them.
+
+- *The steady-state freeze.* The sample was right about where the time went and the suspects were
+  the wrong ones. The ~40-byte range past `App::finish_update` that called nothing is
+  `release_dropped_focus_handles`: gpui runs it once per effect inside the flush loop and it walks
+  every focus handle in the process looking for ones nobody holds. A flush of a few hundred effects
+  in a window holding thousands of handles is a million reference-count loads that almost never find
+  anything, and both numbers grow with uptime, which is the freezes getting longer. Dropping the
+  last handle for an entry is the only thing that gives that sweep work, so that is what arms it
+  now. The two fork-side leaks the entry named are real and are fixed beside it — the sidebar's
+  per-workspace subscriptions were detached and made again on every `WorkspaceAdded`, and the agent
+  panel's release observation for a tab thread was detached on every registration — but they were
+  feeding the flush, not being the flush. Counts of what gpui holds (observers, listeners, release
+  observers, focus handles) now log beside the memory line, which is the measurement the entry asked
+  for and the line to read first next time.
+
+  The same entry asked for the build's symbols to be shipped, so the next sample reads as function
+  names rather than addresses. **The half of that which is on `main` cannot be done from here:** the
+  nightly uploads the files its own workflow names, and that workflow lives on the default branch,
+  which this routine must never push. What is on this branch is that `script/bundle-mac` was
+  throwing the symbols away — it extracts a `.dwarf` for sentry and then runs `strip -x` over
+  `zed`, and the `.dwarf` dies with the runner. It no longer strips `zed` (`cli` and
+  `remote_server` still are, nobody samples those), so the app carries its own symbol table and a
+  `sample` of the next freeze is readable without anything else being published. **The dmg is
+  bigger for it**, which is the wrong half of the trade to take if the other half is available: one
+  more argument to the `gh release upload` line in `quiet_ui_nightly.yml` publishes the dSYM beside
+  the dmg, and then the strip can come back.
+
+- *The launch that saturates the machine.* Language servers are off in every worktree now, not only
+  the ones this fork creates: the store holds what was switched on rather than what was switched
+  off, `disable_for_created_worktree` is gone with the rule it encoded, and the remembered list
+  moved to a new key because the old one names the worktrees that were unusual under the old
+  default. And shell-environment captures take turns, two at a time across the process, with the
+  wait outside the capture's own timeout. **What the entry asked for and the code would not give:**
+  the capture cannot be made lazy, because the caller that makes it eager is a git repository's own
+  construction, which awaits the environment to find its git binary before it can build a backend —
+  there is no later moment to move it to. Capping it is what bounds the storm; language servers
+  going quiet removes the other half of it.
+
+**The general performance pass was not started, and not because of the clock.** The entry is
+defined by measurements taken from a running app — drive it through what it is used for, take the
+top offenders from each, report before and after — and this sandbox has no display, no macOS and no
+`sample`. Doing it by reading instead would be the one thing the entry says not to do. It wants a
+night that starts with a profile of the build that carries tonight's three fixes, and the
+instruments to start from are in the fork now: the subscription counts, the capture timings, and the
+sidebar's rebuild line.
+
+**The gate, eight crates: the core three plus the five touched tonight.** `cargo test`:
+`acp_thread` 261, `agent_ui` 490 (32 intentionally `#[ignore]`d), `sidebar` 188, `ui` 88 plus 41
+doctests, `git_ui_core` 31, `gpui` 360 plus 1, `project` 66 (1 `#[ignore]`d) plus 400 integration (3
+`#[ignore]`d), `zed` 93 (1 `#[ignore]`d). Zero failures.
+
+**Four things the gate caught.** Two were expectations to adapt and two were tests that only fail
+under load.
+
+`test_session_notices_scroll_without_hiding_composer` is upstream's own, arriving tonight with ACP
+session notices (#64606), and it asserts the composer sits entirely inside the viewport. Expanded,
+this fork's composer takes 80% of the window on purpose (`vh(0.8)`), so with a full notice area
+above it at 480×480 the box ends 58px past the bottom. Kept the fork's behaviour and narrowed the
+expectation to the expanded case: the composer's top and middle stay on screen, which is what the
+click and the typing the test goes on to do actually need. Worth knowing that the fork's expanded
+composer does not fit a small window with a notice stack above it — it is a real overflow, just one
+that needs a 480px window to see.
+
+`zed::tests::test_a_fresh_window_renders_its_status_bar` asserted `ICON-BoltFilled`, which is the
+language-server switch saying "on". A fresh window's worktree is off now, so it wears the outlined
+bolt; the assertion follows the new default. That is the fork's own test catching the fork's own
+change, which is what it is for.
+
+`test_a_running_command_can_be_stopped_from_its_chip` failed twice tonight in full parallel runs and
+passed alone every time, as it did once on 09-22. Both of its assertions about a real process — that
+the kill was recorded, and that the exit says it failed — now poll against a deadline the way the
+exit itself already did. And
+`thread_metadata_store::tests::test_migrate_thread_remote_connections_backfills_from_workspace_db`,
+written down on 09-22 as seen once and not investigated, came back. It is a real race: the migration
+reads the workspace database on a thread the test executor does not wait for, so one
+`run_until_parked` is enough on an idle machine and not in a loaded suite. It polls for the row now.
+Both were made worse tonight by a second real-process test joining the same binary. **The 09-22
+lesson held again: the only failures all night came from running whole suites under load, and every
+one of them passed alone.**
+
+**`script/clippy` green across all eight** (`--release --all-targets --all-features -- --deny
+warnings`). `cargo-shear`, `typos` and `buf` are not installed here, so the script exits after the
+lint, as it has every night in this log. Worth writing down against the instinct to skip it: the
+release build was expected to be the night's long pole and was not — nine minutes for the whole
+set, because clippy needs no codegen for what it is only checking. It fits, so run it.
+The same lint set had already been run in the debug profile first (the script's flags without
+`--release`, same eight crates) and was equally clean; that is the cheaper way to get a first
+answer while the suites still hold the disk.
+
+**Environment: two prerequisites, one of them a trap, and the disk five times.**
+`CARGO_NET_GIT_FETCH_WITH_CLI=true` and `libasound2-dev` as always — but **run the install on its
+own, never chained after `apt-get update` with `&&`**. `apt-get update` still 403s on the
+`deadsnakes` and `ondrej` PPAs baked into the image and exits non-zero, so the `&&` in the standing
+instructions silently skips the install; the first `cargo check` of the night got ten minutes in
+before `alsa-sys` failed for the exact reason the log has recorded three times. `libxkbcommon-dev
+libxkbcommon-x11-dev libx11-xcb-dev` are needed for the `zed` test binary, as noted on 09-22.
+
+The disk ran out five times, and the sweep that frees it is now a tool rather than a memory:
+`keep the newest artifact per crate name in target/debug/deps` freed 10.3, 8.1, 7.0, 5.7 and 8.9 GB
+across the night. **Two ways of freeing space that do not work, both learned the hard way tonight.**
+Sweeping *during* a build deletes artifacts that are live for a different feature set — the same
+crate is built twice under different hashes and both are current — and the build dies with "can't
+find crate for `gpui`". And deleting `.dwo` files while rustc is running breaks archive creation
+("failed to open object file"), because rustc puts those objects into the rlib; between runs they
+are 6 GB of pure reclaim, during one they are an input. Also: `cargo test -p gpui` builds gpui's
+examples, 2.7 GB of binaries nothing runs, so pass `--lib --tests`; and `zed` is a binary crate, so
+`--lib` fails there and it wants `--bins --tests`.
+
+**The build time, since last night's entry left it ambiguous.** The nightly is
+`.github/workflows/quiet_ui_nightly.yml` on `main` and its cron really is `45 0 * * 1-5`, so 00:45
+UTC is the schedule; the 05:12 start recorded last night was GitHub's scheduler running late, which
+the workflow's own header comment says it was written to absorb. Reason from 00:45 and expect the
+dmg to be later than two and a half hours after it.
+
+**2026-09-24**: onto main 2c4bc2d7b (15 upstream commits). Squash-then-rebase folded nine fork
+commits into one — the standing squash, the five from the 09-23 run (four code changes and the log
+entry that also corrected three tests), and the three queue entries written during the day —
+reusing the squash's own message; tree-identical to the old tip before rebasing.
+
+**Four files conflicted, and three of the four were the log's own patterns.**
+`threads_archive_view.rs` is the same-branch replay the log has recorded twice: upstream still
+carries the full `ThreadsArchiveView` modal this fork deleted when the archive surface merged into
+the sidebar list, so the fork's 118-line helpers-only file was taken wholesale. `acp_thread.rs`
+had four hunks. Two were the recurring seam in a new place: #64708 reshaped the "tool call not
+found" placeholder this fork deletes (it drops the update with a warning instead of pushing an
+entry that renders as a useless chip), and reshaped the test that asserts it; the fork's side won
+both. One was a pure append/append at the same `#[test]`, upstream's two new streaming-cursor
+tests against the fork's own — kept both, upstream's first. The fourth was a genuine two-sided
+hunk: `ToolCall::new_label` takes the call's locations in this fork and now also needs its
+language registry after the call, so it is the fork's argument and upstream's `.clone()`.
+`thread_view.rs` had four. An import union (the fork's list is the superset: it still uses both
+`AcpThreadEvent` and `PlanEntry`). The fork's `render_compaction_barrier` aligned against
+upstream's `render_plan_summary` and `render_plan_entries`, which this fork replaced with its own
+`render_plan` long ago — the fork's side, and the two upstream helpers went with it. Upstream's
+collapse-chevron button under a non-card tool output, which the fork deleted at the merge base and
+#64708 only moved — the fork's side again, with upstream's `content()` accessor adopted inside it.
+And the `CompletedPlan` arm, below.
+
+**What the fork can now delete because upstream built it.** `acp_thread: Remove completed plan
+cards from conversation history` (#64719) removes `AgentThreadEntry::CompletedPlan` outright:
+completed plans stay in the plan panel instead of gaining a second transcript presentation. That
+is exactly what this fork's `AgentThreadEntry::CompletedPlan(_) => Empty.into_any()` arm was doing
+by hand, so the arm and its `bookmarks.rs` counterpart are gone and the behaviour is upstream's
+now.
+
+**Markerless drift, four kinds of it, and the conflict count said nothing about any.** `cargo
+check --workspace --all-targets` after the replay found ten errors across three crates. #64719
+removed the `CompletedPlan` variant (`bookmarks.rs` still matched it). #64708 turned
+`ToolCall::content` from a field into a `content()` accessor over separate structured and raw
+content — five sites, including two test helpers that assigned to it, which now go through a
+`set_content_for_test` in the same `#[cfg(any(test, feature = "test-support"))]` block as the
+fork's existing `ToolCall::for_test`. #64708 also turned `ContentBlock` from an enum into an
+opaque struct over a private `RenderBlock`, so the fork's two matches on its `Markdown` variant
+became `plain_markdown()`, widened from private to `pub` — its public `markdown()` sibling also
+answers for embedded resources and unsupported blocks, which is a different question from the one
+the read-hover card asks. And #64667 moved a user message's blocks from `chunks` to
+`content.source_blocks()`, in the one place this fork filters review comments out of them. After
+those, 0 errors and 0 warnings.
+
+**What was built.** Two of the four Work queue entries in full, the first half of a third, and the
+first shape of the fourth.
+
+- *Chips.* Both symptoms, and they were two causes as the entry guessed. **Scattered:** only a
+  thoughts-only message was allowed to sit inside a run without breaking it, so an agent emitting
+  a blank text block between two tool calls — which upstream's ordered block list makes ordinary —
+  produced an entry that drew nothing and split one run of actions into two. What matters is that
+  an entry draws nothing, not that it thinks. **The trap in that**, which the gate caught and is
+  worth writing down: "draws nothing" is not "has no prose". A message whose only content is an
+  image has no markdown at all, so the first version of this hid an image-only reply inside an
+  empty run — upstream's own `visible_content` (nonblank markdown, a resource link, or an image)
+  is the right question and is what asks it now. **Narrow:** a chip's label and glyphs are its
+  width, and nothing said so, so a full row spent the chips' own `min_w_0` squeezing them below
+  their content instead of wrapping. Chips do not shrink now. The `min_w_0` stays and is
+  load-bearing for the other half: a flex item's default minimum is its content, a content minimum
+  beats a maximum, and without it a long label would push a chip past its 75% cap and out of the
+  row instead of truncating inside it.
+
+- *PR mining.* The old test was "not the last entry", and the entry was right that it is not the
+  same test. An entry is read once it has finished — a message when another entry follows it or
+  the turn ends, a call when every terminal it carries has exited — and mining resumes from the
+  first entry that had not. **A first version of this read unfinished entries too, with the
+  entry's "second guard" (a URL running to the end of what has arrived is not a mention yet)
+  making that safe, so a chip would appear while the agent was still talking. Reviewing it before
+  the gate found the guard does not cover the other half of reading half a message:** three
+  distinct URLs are a list and join nothing, but the first two of them, alone, are two pull
+  requests worth watching, and once mined they stay. Prompt chips are not worth that, so nothing
+  half-written is read at all, and the guard went with it. The prefix hazard is a test now rather
+  than a mechanism — read as it streams, one message naming `.../pull/15700` names five pull
+  requests. The gate then caught the first rule for "finished" being wrong about tool calls: it
+  asked the call's own status, and an agent reports a call completed some time after the command
+  it ran actually stopped, so a PR that `gh pr create` had already printed went unread. A call is
+  judged by its terminals — a terminal reports no output at all until its process exits, which is
+  the entry's own wording and also says nothing about the other commands running beside it. And
+  the already-watched prefixes clean themselves up, because 09-23 built the mechanism for exactly
+  this — `adopt_mining_rules` re-reads a thread's transcript under the current rules on open and
+  drops the mined PRs those rules would not have taken. It is gated on a rules version, so the
+  version is bumped to 2; a PR the user asked for stays, and a dropped one is not dismissed.
+
+- *The entity leak: the half that can be done from here.* The entry's own first instruction was
+  "make it name itself", and that is in: gpui counts live entities by concrete type (a `TypeId`
+  has no way back to a name, so the name is recorded when a type is first inserted; the walk is on
+  the diagnostics timer, never a frame), and the reliability line reports the ten largest and the
+  ten that grew since the previous line. **Both named candidates were read and neither is the
+  growth.** `render_any_thread_error` already caches its `Markdown` in `thread_error_markdown` and
+  has for a while — it is not a per-frame allocation. (It also never replaces that one when the
+  error text changes, so a second error shows the first one's words: small, real, unrelated, not
+  fixed here.) `command_file_diffs` was a genuine unbounded cache of `Editor`s — each with a
+  multibuffer, focus handles and two global observers — and is capped at the eight most recently
+  hovered now, but it only grows on hover and so was never eighty a minute. One more of the same
+  shape was found by reading and capped the same way: the scripts a command carried, a `Markdown`
+  per script per command ever expanded. **Nothing found by reading accounts for growth while the
+  app sits still,** which is why the entry now asks for the line rather than another read: two
+  consecutive by-type lines from a session that has been up a while name the type outright.
+
+- *The general pass, first shape only.* "Work repeated on every frame" through the chip layer, by
+  reading rather than by profiling, found two. The run an entry belongs to was walked to both ends
+  once per entry drawn inside it, so a screenful inside one run of N chips walked it once per
+  visible entry — the walk now records its answer for the whole run and for the two entries that
+  stopped it. And a multi-file edit worked out which files a call touched once per chip, which is
+  once per file per file, and that reads every diff the call carries and builds a path from each —
+  held for the frame now. No numbers for either: measuring them needs the running app, which is
+  the standing limit on this entry.
+
+**The gate, five crates: the core three plus gpui and zed.** The Verification queue was empty, so
+nothing was owed a suite beyond tonight's own work. `cargo test`: acp_thread 269, agent_ui 494 (32
+intentionally `#[ignore]`d), sidebar 188, gpui 420 plus 1, zed 93 (1 `#[ignore]`d). Zero failures
+on the run that counted.
+
+**Three failures across two passes, all of them this run's own code, and every one of them the
+test being right.** `test_empty_assistant_text_followed_by_image_is_rendered` and
+`blank_thoughts_are_not_chips` both failed on the first pass over the chip fix, and between them
+they say the same thing: the fix read "an entry that draws nothing" as "a message with no prose",
+and a message whose only content is a picture has no prose at all. The first is upstream's own,
+and it arrived with #64456, the very commit that made an agent message an ordered list of blocks —
+the change this whole entry is downstream of. It was right: an image-only reply was being folded
+into a run of chips and drawn by a group that had no chip to draw, which is to say it vanished.
+The second is the fork's own, and its expectation genuinely had moved: a blank thought is now
+inside the run rather than a boundary, which is the point of the change, and what it must still be
+is not a chip. It asserts that instead, and a run made only of those draws nothing because
+`render_action_group` already returns `Empty` when it built no chip.
+`test_a_created_pr_joins_from_the_command_that_made_it` failed on the pass after that, on the
+mining rule, and it too was right: it leaves its tool call `InProgress` after the command exits,
+which is exactly what a real agent does for a while, and the first rule would not read it. That is
+the correction recorded in the PR mining entry above.
+
+**`script/clippy` green across all five** (`--release --all-targets --all-features -- --deny
+warnings`), 0 warnings, 6m22s — the same surprise 09-23 recorded, that the release-profile lint is
+not the night's long pole because clippy needs no codegen for what it is only checking. It fits,
+so run it. `cargo-shear`, `typos` and `buf` are not installed here, so the script exits after the
+lint, as it has every night in this log.
+
+**Environment: the two prerequisites, and the disk as the night's real constraint.**
+`CARGO_NET_GIT_FETCH_WITH_CLI=true` and `libasound2-dev` as always, the install run on its own
+because `apt-get update` still 403s on the `deadsnakes` and `ondrej` PPAs baked into the image and
+exits non-zero — chaining it with `&&` silently skips the install, as 09-23 recorded.
+`libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev` for the `zed` test binary, as 09-22
+recorded.
+
+The disk is what shaped the gate. A `cargo clean` before the test pass (the standing note from
+three nights running) gave 27GB and was not enough: **the four lib crates and `zed` cannot be
+tested in one `cargo test` invocation in this container.** The combined run reached 100% full and
+died, and with it every background watcher, because the harness writes its task output to the same
+filesystem — so the failure arrived as tooling breaking rather than as a build error, which is
+worth knowing before diagnosing the wrong thing. What works is one batch per fill: the four lib
+crates together (peak ~26GB), `rm -rf target/debug`, then `zed` alone, then `rm -rf target/debug`
+again before the release-profile clippy, which shares nothing with the debug artifacts anyway.
+Deleting `.dwo` files between builds freed 2.4GB and is safe; during one it breaks archive
+creation, as 09-23 recorded. `~/.cargo/registry/cache` is another 123MB of pure reclaim (the
+sources are already extracted) and can go at any time.
+
+**2026-09-27**: onto main e683fd7b4 (20 upstream commits). Squash-then-rebase folded eighteen fork
+commits into one — the standing squash, the eight from the 09-24 run, and the six queue entries
+written during the three days since — reusing the squash's own message; tree-identical to the old
+tip before rebasing. The branch had last moved that morning, so nothing had drifted far.
+
+**One file conflicted, and it was the recurring seam again.** `thread_view.rs`, in
+`effort_menu_section`: upstream re-added an inline thinking-mode `IconButton` with an effort
+selector beside it, where this fork long ago turned that surface into a data struct
+(`EffortMenuSection`, an on/off toggle plus effort options handed to the model popover). The
+fork's side won, and upstream's `render_effort_selector` went with it — it exists nowhere in the
+tree now, and nothing was left stranded, which is the first time this seam has cost nothing
+afterwards. The `);` at the bottom of the hunk belonged to both sides (upstream's unterminated
+call, the fork's `Rc::new`), which is exactly the unbalanced-brace trap the procedure note warns
+about and the reason to take one side wholesale rather than merge within a hunk.
+
+**Markerless drift, one API and three call sites, and the conflict count said nothing about it.**
+`cargo check --workspace --all-targets` after the replay found it: #64750 (`language_model: Make
+LanguageModel plain data served by its provider`) flattened `ConfiguredModel` away, so
+`thread_summary_model` hands back a `LanguageModel` and `let model = model.model` no longer parses.
+Upstream's own `stream_thread_title` already looks the provider up from the model, so adopting the
+shape was deleting the unwrap; the fork's twin of this code in `sidebar.rs` had merged clean and
+was already written that way. The same commit moved the fake model's stream controls onto the
+provider — `model.as_fake()` is gone, and `pending_completions`, `send_last_text` and `end_last`
+belong to `FakeLanguageModelProvider` and take the model as an argument — so the fork's two
+title-generation tests take the provider from `LanguageModelRegistry::test` and ask it instead.
+After those, 0 errors and 0 warnings across the workspace.
+
+**Nothing to delete because upstream built it** this time. #64750 and #64794 reshape a surface the
+fork consumes rather than duplicates.
+
+**What was built: the first entry's second half, and the third entry's reported failure.**
+
+- *The view trees of threads nobody is looking at.* This was the half of the leak entry that did
+  not need numbers from Arthur's machine, and it is the baseline the entry called most of the fifty
+  thousand entities: every open thread kept a full view tree for every entry — a message editor per
+  user message, an editor per diff, a terminal view per terminal — drawn or not. A tab that has
+  been off screen for thirty seconds drops the lot now and builds it again from the same entries on
+  return. **The grace period is the design, not a hedge.** The entry's own measurement said the
+  largest thread costs 400ms to rebuild, and paying that on every tab switch would trade a memory
+  problem for a latency one; a sweep that restarts on every activation means a run of switches
+  never fires it and only a tab genuinely left alone loses what it was not showing.
+  What survives the drop is everything keyed by entry index or tool call id rather than by view, so
+  a thread returns with its expansions intact and at the scroll position it left. **Three things
+  had to be true for this to be safe, and two of them are the entry's own warning** that whatever
+  replaces the up-front build must survive a thread being opened, resumed, and truncated. The agent
+  keeps working on a dropped thread, so syncing an entry is a no-op while the views are down — that
+  gate is what stops a `NewEntry` for index 40 indexing past the end of an empty list — and the
+  rebuild covers every entry including the ones that arrived meanwhile. A truncation still reindexes
+  the expansions even with the views down, so a thread does not come back with a compaction expanded
+  that belongs to an entry that is gone. And a thread whose past message is being edited refuses to
+  drop at all, because that editor holds text the thread does not. Both of the first two are tests.
+  No before/after numbers: the counts this is meant to move are read on Arthur's machine, and the
+  entry above now says what to read them against. Two new `quiet-ui perf:` lines say what it costs
+  and what it reclaims.
+
+- *Unarchiving a worktree with submodules.* The reported failure reproduced exactly, error text and
+  all, as a real-git test: a submodule committed in the superproject, `submodule.recurse` on, and a
+  fresh linked worktree whose submodule has no git directory because nothing has run `git submodule
+  update --init` in it. `read-tree --reset -u` honours `submodule.recurse`, reaches into the
+  submodule to reset it, and aborts the whole restore with `could not reset submodule index`, which
+  rolls the worktree back. Both read-trees override the setting now instead of reading it, so a
+  checkpoint restore is the superproject's own business and does not depend on the user's config.
+  **This went where the entry said not to put it, and the reason is worth recording.** The entry
+  asked for the fix at the fork's call site in `thread_worktree_archive.rs`, not inside upstream's
+  `restore_archive_checkpoint`. The call site cannot do it: the `GitRepository` trait has no
+  submodule method and no general "run this git command" escape hatch, and `Repository` in
+  `git_store.rs` has no config write, so initialising the submodules or turning recursion off from
+  there means a new trait method, real and fake impls, a local/remote arm, and a new proto message
+  with collab and remote_server handlers — a far larger upstream diff, and one that conflicts every
+  rebase, than two config overrides inside the function whose own command is the thing recursing.
+  The entry's second half — the silent loss of work done *inside* a submodule when its worktree is
+  archived — is not built, and it is back in the queue as its own item with that plumbing finding
+  and a cheaper design to weigh first (keep the submodule git directory with the archive rather than
+  ask whether it is dirty). It was not started because the cheap design needs a column on the
+  archived-worktree record, and a schema change made blind with a gate still to run is the kind of
+  half-finished thing that breaks the morning's app.
+
+- *Sidebar drag reordering, on the third report.* The entry's diagnosis was exactly right and the
+  code confirmed both halves of it. `DraggedThreadRow` carried the workspace whose pane held the
+  thread and the drop was refused unless the target's workspace matched, so for anyone working one
+  thread per worktree — which is the whole point of this fork's worktree model — every row a drag
+  could reach belonged to a different workspace and no row ever accepted the drop. And
+  `move_thread_tab_to` searched only `ThreadTab` items in *that workspace's* pane, ignoring the
+  `ForeignThreadTab` proxies through which every other worktree's threads appear, so even a drop
+  that got through had nothing to move.
+  Both are gone. The payload carries only the thread now, because which pane to move it in was
+  never a property of the dragged row: it is this window's own strip, where every thread is a tab
+  or a proxy, and which is what the registry publishes. A drop inside a worktree moves the one
+  thread. A drop into another worktree moves the dragged thread's whole group, because the list
+  groups by worktree and a single thread shown inside another group's rows would land and snap
+  back. **A worktree with one thread has no header — it renders as a solo row — which is why the
+  group move is what Arthur's setup actually needed, not a refinement on top of it.** Headers are
+  drag handles for their own group, and take a drop the same way.
+  The group move is the single-thread move applied to each member against the target group's near
+  edge, in reverse when going down, because `move_item` removes before it inserts and each member
+  lands immediately against the anchor. Working that out on paper first was worth it: all five legs
+  of the test predicted correctly.
+  **The test is a real drag** — mouse down, two moves, up, over the rendered rows — in Arthur's
+  setup: three worktrees with one thread each and one with two. The entry asked for that
+  explicitly, and it is the reason this was missed twice: a test that called the drop handler
+  would have passed while the drag stayed broken. What it does not cover is the restart leg the
+  entry also asked for; the order lives in the registry published from the strip and the panel
+  serializes it, but no panel-restart harness exists in these tests, so the test asserts instead
+  that every pane in the window agrees on the order, which is the thing that gets persisted.
+
+**What was not built, and why.** The general performance pass is the one entry above the submodule
+work that went untouched tonight, and not for being hard: its two remaining shapes (foreground work
+that could be backgrounded, work that scales with worktrees) were read for and produced no
+confident finding, which is the point at which the entry itself asks for numbers rather than another
+read. Its third shape, scaling with threads rather than with the screen, turned out to be the leak
+entry's own second half and is what tonight built. The sidebar was read for the same shape and is
+already answered — virtualised rows, a debounced rebuild that early-outs when it produces the rows
+it already had. The tab bar entry itself is untouched, but it no longer waits on the drag, which was the thing it
+said to ship alongside. Everything from it down is the untouched tail of the queue, in order.
+
+**The gate, four crates: the core three plus `git`.** The Verification queue was empty, so nothing
+was owed a suite beyond tonight's own work. `cargo test`: acp_thread 269, agent_ui 496 (32
+intentionally `#[ignore]`d), sidebar 189, git 78. Zero failures on the run that counted.
+
+**Two failures across the passes, and they were different kinds.** The first was
+`test_a_running_command_can_be_stopped_from_its_chip`, which failed in the full-suite run and passed
+on its own in 0.77s. It is not a logic failure and it is not this run's code: it drives a real
+terminal process and waits on a **real-time** deadline — real rather than the executor's, because
+virtual time would run out before a real process could exit — and ten seconds was not enough inside
+528 tests on a loaded container. Rather than leave a test that is load-sensitive by construction,
+the deadline is sixty seconds now; it only ever waits as long as the exit actually takes, and the
+full-suite run passed after it.
+
+The second was `script/clippy` refusing a `redundant_clone` in the new header-drag code, which is
+the lint doing exactly its job: the group's member list was cloned for the hover closure while the
+original was dropped unused, so the closure takes it. **The gate is the reason that did not ship**
+— the clippy run is release-profile and runs after the tests, so a lint failure is the last thing
+between a night's work and a push, and it held.
+
+**`script/clippy` green across all four** (`--release --all-targets --all-features -- --deny
+warnings`), 0 warnings. `cargo-shear`, `typos` and `buf` are not installed here, so the script exits
+after the lint, as it has every night in this log.
+
+**Environment: the two prerequisites, and the disk again.** `CARGO_NET_GIT_FETCH_WITH_CLI=true` and
+`libasound2-dev` as always, the install run on its own because `apt-get update` still 403s on the
+`deadsnakes` and `ondrej` PPAs baked into the image and exits non-zero — chaining it with `&&`
+silently skips the install, as 09-23 recorded. `libxkbcommon-dev libxkbcommon-x11-dev
+libx11-xcb-dev` as 09-22 recorded, though nothing tonight needed the `zed` binary.
+
+**A push landed on the branch mid-run, at 22:46 local, and it is on the branch rather than under
+it.** `Queue offering removed PRs back in the add menu` arrived while the gate was running, so
+`--force-with-lease` refused the push as stale, which is the lease doing its job. It is a Work queue
+entry and nothing else, it cherry-picked onto the rebased branch cleanly, and it keeps its own
+authorship. It is not built: it was written well after the 20:45 cutoff this file's own preamble
+sets, so it waits a night, and tomorrow's run will find it where the queue order puts it. Worth
+knowing for next time: a refused lease here is far more likely to be a queue entry written during
+the evening than a conflict, and the answer is to fetch and cherry-pick it rather than to re-lease
+over it.
+
+The disk hit zero once and it is worth recording what it cost and what fixed it. Starting the test
+gate on top of a `target/debug` already holding incremental artifacts from the night's own checks
+ran it to 100% full mid-build, and the failure arrives as `failed to build archive … No space left
+on device` rather than as anything about the code. **Deleting the 9,114 `.dwo` files freed 2.2GB
+with no build running (during one it breaks archive creation, as 09-23 recorded), but the thing that
+actually worked was `rm -rf target/debug` outright**, which gave 28GB back and rebuilt clean. The
+shape of the night that fits: build and test the debug profile, then `rm -rf target/debug` before
+the release-profile clippy, which shares nothing with it anyway. Two full rebuilds is cheaper than
+one wedged container, and this container has about 38GB to play with in total.
+
+**2026-09-28**: onto main 72d28c32c (24 upstream commits). Squash-then-rebase folded six fork
+commits into one — the standing squash, the four from the 09-27 run, and the queue entry pushed
+that evening — reusing the squash's own message; tree-identical to the old tip before rebasing.
+
+**Nine files conflicted, in 67 hunks, and the count is real rather than replay noise this time.**
+Upstream reshaped `acp_thread` under the fork in one batch: #64765 adopted ACP v2 content values
+(the `acp` alias became `acp_v1`, with `acp_v2` beside it), #64875 gave tool calls shared state and
+diff previews, #64884 shared structured plan state, #64773 keyed message updates. Four of the nine
+files are the recurring seam and resolved the way the procedure note says.
+
+- *`threads_archive_view.rs`*: upstream still carries the full modal this fork deleted, so the
+  fork's 118-line helpers-only file wholesale. Upstream's only change to it this round adds
+  `hover_background` to buttons inside the deleted struct, so nothing was lost.
+- *`thread_item.rs`*: #62597 recolours rows through the `ghost_element_*` tokens and wraps the
+  action slot in its own padded row. Colours and shape adopted, the fork's running wash, accent
+  edge and always-drawn action slot kept.
+- *`sidebar.rs`*: four hunks, all upstream's `render_project_header` and `render_sticky_header`
+  landing inside the fork's `render_workspace_header` and section header. Fork's side throughout.
+  Upstream's own colour change in the same file (`title_bar_background` blended with
+  `panel_background` becoming `surface_background`) auto-merged, and the one button the fork keeps
+  on a thread row was given the `hover_background`/`active_background` upstream gave its siblings.
+- *`thread_view.rs`* (13 hunks) and *`conversation_view.rs`* (2): the alias rename against the
+  fork's own additions. Fork's side, then `acp::` renamed to `acp_v1::` across the file.
+
+**The one that was not a seam: upstream built a weaker version of the fork's central idea.**
+#64547 (`agent: Add configurable idle thread retention`) keeps a capped number of idle threads
+loaded and drops the oldest. This fork keeps every open thread as a tab, which is a superset and
+is the model the sidebar, the strip registry and the drag reordering are all built on, so **the
+deletion went the other way for once**: `retained_threads`, `retained_thread_subscriptions`, the
+settings observer that ran `cleanup_retained_threads` on every settings change, and upstream's
+four tests for them are gone from the fork. `max_idle_retained_threads` stays in `agent_settings`,
+where it is upstream's, and does nothing here. Ten of `sidebar_tests.rs`'s twelve conflicts were
+the same thing: `set_max_idle_retained_threads(1, cx)` in test setup, which went with the machinery
+along with its helper.
+
+Upstream's new `test_sidebar_action_hover_contrasts_with_row` went too, with its three helpers. It
+asserts hover contrast on a project-header ellipsis menu, per-row rename and archive buttons, and a
+`SidebarView::Archive` modal — none of which this fork draws; rename and archive live on the row's
+context menu here, and the archive surface merged into the sidebar list.
+
+**Markerless drift was most of the night, and the conflict count said nothing about it.** Eight
+API changes, all found by `cargo check --workspace --all-targets` after the replay:
+`ToolCall::kind` and `status` became accessors and `kind()` hands back an `&acp_v2::ToolKind`;
+`ToolCallContent::ContentBlock` and `Terminal` became struct variants; `AcpThread::plan()` returns
+an `Option` and `PlanEntry` moved its status under `source`; `MessageContent::new` and both
+`AssistantMessageChunk` variants take v2 blocks and an `identity`/`meta` pair in place of `id`;
+`Entry::UserMessage` became a struct variant carrying `synced_source_version`, fed by
+`set_source_message`; `ToolCall::from_acp` takes an `Option<ToolCallStatus>`; and
+`MessageContent::source_blocks()` hands back v2, which the fork's review-chip helpers read. Those
+last two take either version through a one-method trait now, because the queue still composes v1
+blocks while a sent message carries v2.
+
+**Two places where the merge would have quietly undone the fork, and neither carried a marker.**
+Upstream's new `label_text` returns an Execute call's title as plain text; this fork's is a
+bash-tagged fenced code block, so it has to keep parsing as markdown — `is_plain_text` stays "the
+call has no title of its own" rather than gaining upstream's `|| kind == Execute`. And this fork
+derives an edit's label from the files the call touches, so `apply_patch` now applies the update's
+locations *before* it rebuilds the label instead of after, and counts new locations as a reason the
+label changed. Both are covered by the fork's own expectations, which is how they were caught.
+
+**What was built: the submodule half of the archive entry, the part 09-27 stopped in front of.**
+That run's finding was that nothing in the tree can ask a submodule whether it is dirty — no trait
+method, no escape hatch — and it weighed a cheaper design that asks no questions. The cheaper
+design turned out to be half an answer, and the full one needed no new plumbing after all.
+
+- *Keeping the git directory is necessary but not sufficient.* Commits made in a submodule and
+  never pushed live in its object store under the worktree's `…/.git/worktrees/<name>/modules/`,
+  which `git worktree remove` deletes. Uncommitted edits do not: they live in the submodule's
+  working tree, inside the checkout, which the same command deletes. Moving `modules` aside saves
+  the first and not the second.
+- *A submodule is a repository, so it can be check pointed.* `find_or_create_repository` takes any
+  path, and a submodule's identity is its own working directory — `resolve_git_worktree_to_main_repo`
+  says so in as many words. So each initialised submodule gets the same two WIP commits the
+  worktree itself gets, which puts the edits into its object store, and moving `modules` aside then
+  saves both. No trait method, no proto message, no collab handler: the wall 09-27 described was
+  in front of *asking a question about* a submodule, not in front of opening one.
+- The tree is kept under `…/.git/zed-archived-worktrees/<id>/`, keyed by the archived-worktree row,
+  so nothing extra has to be stored to find it again. The schema change 09-27 called too risky to
+  make blind is one nullable `submodules` column holding the per-submodule records; a row written
+  before it, or one whose JSON will not parse, reads as a worktree with no submodules rather than a
+  restore that refuses to run. Restoring moves the tree back, recreates each submodule's `.git`
+  file verbatim from the record — which is how it avoids having to work out the name a submodule's
+  git directory is filed under, since that is its `.gitmodules` name and not its path — and then
+  replays each checkpoint, attempting every submodule even when one fails.
+- **Failing to set the tree aside fails the archive**, because carrying on would delete exactly the
+  work the checkpoint was taken to save. A failure on the way back only logs: the worktree is
+  already restored and holds the user's work.
+- *The other three complications the entry asked about.* **LFS restores cleanly** and was never at
+  risk: its objects live in the repository's common git directory, which `commondir` points at and
+  which the worktree's removal does not touch. **Sparse checkout did not** — the patterns live in
+  the admin directory's `info/`, so a sparse worktree came back dense; `info` now rides along with
+  `modules` and there is a test. **A nested repository that is not a submodule does not**, and
+  cannot: nothing references its history, so a checkpoint has nowhere to put it. Where
+  `.gitmodules` declares a path and that path holds a real `.git` directory, archiving now refuses
+  and says what it found, which is `verify_created_by_zed`'s shape and the only honest answer. A
+  nested clone somewhere else in the tree is still lost, and finding one would mean walking the
+  whole worktree for `.git` directories — expensive, and a source of false refusals on anything
+  vendored — so it is not guarded.
+- *Tests cover the filesystem half only.* The archive-and-restore round trip, the sparse patterns
+  and the refusal are tests. The checkpoint half is not: the fake filesystem does not model a
+  submodule as a repository, so a test of it would assert nothing. Said here rather than faked.
+
+**And the tab bar is gone, which the reading made much smaller than the entry expected.** Two of
+the things the entry said to arrange were already true, and the code is what said so.
+`activate_draft` goes through `set_base_view`, which routes an `AgentThread` view straight to
+`open_thread_tab` — so "make the `draft_thread` slot a pane item like any other thread" has been
+the case for a while, and the slot is only a pointer marking which open thread is unsent. And
+ctrl-tab in the panel is `agents_sidebar::ToggleThreadSwitcher`, the fork's own switcher, which
+renders `ThreadItem` off the sidebar's rows; it never touched the pane's tab bar or `tab_content`.
+What was actually left:
+
+- The bar stops being drawn (`set_should_display_tab_bar(|_, _| false)`), and the pane keeps
+  everything else: an open pane item is still what "open in Zed" means and the sidebar still reads
+  its order from pane item order.
+- **Every open thread now keeps its sidebar row, empty drafts included.** `rebuild_contents` used
+  to drop an empty draft the moment it stopped being active, which was survivable while a tab bar
+  existed and strands the thread now. That retain is gone, and its test is the one that would have
+  caught it. **This is the visible change:** a workspace with no thread open at all is given an
+  empty draft at load (`ensure_pane_has_thread_tab`), and that draft now has a row, so the Active
+  section gains one "New Thread" row per worktree that has nothing else open. It was always a real
+  open thread; it was just hidden, which is precisely what the entry says not to do.
+- Closing without archiving needed somewhere to live, so the row's context menu gets "Close" above
+  Archive, and a middle-click on a row does the same thing it did on the tab it replaced. Both go
+  through a new `AgentPanel::close_thread`, which closes the tab and leaves the thread in history
+  — the distinction from Archive, and what the test pins. (Closing an *empty draft* still deletes
+  its metadata row, on purpose, so that it does not linger as a ghost; the first version of the
+  test used a draft and was right to fail.)
+- A draft restored at startup that the pane did not restore as a tab now opens one, unfocused,
+  behind whatever was last being read. Without it the retain's removal would not be enough: the
+  draft would exist with no tab and no row.
+- **The fork's diff loses two files outright.** `Pane::set_tabs_fit_content` and
+  `Tab::fit_to_content` existed only to narrow tabs that drew no close button, so
+  `crates/workspace/src/pane.rs` and `crates/ui/src/components/tab.rs` are byte-identical to
+  upstream again, about 97 lines of seam gone. `ThreadTab`'s inline rename editor and
+  `tab_extra_context_menu_actions` went with them — `RenameThread` had no keybinding, so the tab
+  bar's context menu was its only caller, and the sidebar row's menu has carried "Rename Title"
+  all along. `tab_content` stays, because `Item` requires it.
+
+Not tested: that the bar does not draw. `Pane` exposes no accessor for it and adding one for a
+test would be the test asserting its own fixture; what matters behaviourally is that no thread
+becomes unreachable, which is what the two new tests cover.
+
+**The gate found three upstream expectations to adapt, and one of them was a real inconsistency
+in the fork.** `test_skipped_legacy_tool_enums_preserve_current_state` and
+`test_tool_patch_retries_creation_and_does_not_relabel_terminal_on_error` both assert an Execute
+call's label is its bare title, which it is upstream and is a bash-tagged fenced code block here;
+both expectations moved, which is the same adaptation this log has recorded before. The third was
+not an adaptation: the same test asserts a terminal's *command* markdown, and it came back
+untagged before the title update and bash-tagged after it. `Terminal::new` tags the fence `bash`
+and so does `update_command_label`, but `new_display` — the constructor for a terminal the agent
+reported rather than one Zed spawned — did not, so the same terminal changed highlighting the
+first time its tool call's title moved. It is tagged now, like every other command in the fork.
+
+`agent_ui` then found two more, and **one of them was a crash, not an expectation**.
+`test_message_editing_regenerate` died in `generate_title_if_needed` on
+`LanguageModelRegistry::read_global`, which panics when no registry has been installed. Generating
+a title for an agent that supplies none is this fork's own courtesy, and it was hard-requiring a
+global that a host need not have: any Zed with no model registry configured would have panicked on
+the first message of every external-agent thread. `try_read_global` is a four-line addition beside
+upstream's own `global`/`read_global`, and the feature now does without rather than take the app
+down. The other was `test_plan_panel_dismissal_and_status_updates`, upstream's new test for the
+activity bar's plan panel — its summary row, expand disclosure and Clear Plan button — which this
+fork replaced with one line inside the working indicator. Rewritten against the plan *model* the
+panel was reading (which plan is visible, what dismissing does, that a no-op update leaves it
+dismissed and a real one brings it back, that a status change reuses the entry's markdown), which
+is the substance of #64884 and the part the fork consumes; the drawing assertions went with the
+panel.
+
+**`sidebar` then found six, five of them the same moved expectation and one a real defect the
+change exposed.** Five were the empty draft's new row: three tests that count "real thread rows"
+needed to skip it the way they already skip a generated default title (it reads `New thread`,
+which is *not* `DEFAULT_THREAD_TITLE`'s `New Thread` — a constant now says so in one place), the
+remote-integration helper panics on any row it did not expect and had to learn that one, and
+`test_only_actively_viewed_empty_draft_is_visible_in_sidebar` was the old rule written down. That
+last one is rewritten rather than deleted, as `test_every_open_empty_draft_keeps_its_sidebar_row`:
+same two workspaces, same drafts, opposite invariant.
+
+The sixth was `test_archive_thread_active_entry_management`, and it was not an expectation: after
+archiving the active thread the user landed in **another worktree**. `neighboring_activatable_entry`
+looks below the removed row and then above it, across the flat list — and the list is grouped by
+worktree with an empty draft sorted to the top of its group, so scanning downwards walked out of
+the group entirely and found the *next worktree's* draft before ever reaching the draft sitting
+one row above. The draft rows made it visible; the rule was already wrong for any worktree whose
+rows ran out below. It tries the removed row's own worktree first now.
+
+**The three suites cannot share one `cargo test` invocation in this container**, as 09-24 recorded:
+linking `agent_ui` and `sidebar` together ran the disk to zero again. Each was run and is green on
+this tree — acp_thread 321, agent_ui 515 (32 intentionally `#[ignore]`d), sidebar 190, zero
+failures — and `acp_thread` depends on neither of the crates edited after its run, nor `agent_ui`
+on `sidebar`, so the order the fixes landed in does not leave any of them stale.
+
+**What was not built.** The two entries above the submodule one are both waiting on numbers from
+Arthur's machine and neither moved. The leak entry's own instruction is now to read two consecutive
+`quiet-ui perf: N entities live` lines from a session that has been up a while, against the
+baseline the 09-27 view-tree drop moved; nothing in this container can produce them. The general
+pass is in the same place: its two remaining shapes were read for on 09-27 and produced no
+confident finding, which is where the entry itself asks for numbers instead of another read.
+Everything from the sidebar-icon entry down is the untouched tail, in order.
+
+**2026-09-29**: onto main 017f9b89aa (15 upstream commits). Squash-then-rebase: **one** conflict,
+in `thread_view.rs`, and it was the recurring seam in its mildest form. Upstream moved
+`should_be_following` into the `Ok` arm of the send's own `this.update`, which made the fork's copy
+of it in the outer `else` redundant; the fork's `generate_title_if_needed` in that same `else` is
+the behaviour, so the resolution kept the call and dropped the duplicated assignment — upstream's
+API shape, the fork's behaviour. **No markerless drift at all this time**: `cargo check --workspace
+--all-targets` after the replay was clean first go, in 13 minutes. Nothing upstream built that the
+fork can now delete.
+
+**What was built: the three entries at the top of the queue, and the one below them.**
+
+- *Empty drafts.* The regression from the tab-bar removal was that deleting the "only the active
+  draft shows" filter surfaced every empty draft the store had ever kept, not every *open* one —
+  and the store keeps one per workspace per restore, because `ensure_pane_has_thread_tab` hands a
+  fresh draft to any workspace that restores with no tab and nothing deleted one never typed into.
+  The filter is back, keyed on the Active section's own membership (tabbed threads plus each
+  panel's current view) rather than on which draft is active, and the backlog is dropped once per
+  run on the first rebuild that knows what is open. Draft rows also stop carrying their worktree's
+  "no PR" pill. **What the entry asked for and did not get**: "don't write a row for an empty draft
+  until something is typed into it". The code says no — sidebar rows *are* the store's entries, so
+  an open empty draft needs its row to be visible at all, which the same entry requires. With
+  closing an empty draft already deleting its row and the load-time purge bounding the rest, there
+  is nothing left for the deferral to fix.
+- *Right-click and closing.* The cause was one early return: `render_thread` returned before
+  building a menu whenever the row was a draft or had no session — and it sat in front of the drag
+  wrapper too, so those rows had no middle-click either. Both of the three promised ways were dead
+  for exactly the rows that had multiplied. Every row builds a menu now, and what a row offers for
+  getting rid of its thread moved into `thread_row_disposals`, so the rules are in one place and
+  every row kind can be asked what it offers — a row that offers nothing was the defect, and that
+  is what the new test pins across seven row kinds. Archiving is keyed on a `ThreadId` now (the
+  session-id path is a thin wrapper over it), which is what lets a draft row reach it.
+  **`cmd-w` needed no fix**: it already closed the thread from the message editor and from the
+  conversation, and there are now tests saying so — the pane is in the focus chain and registers
+  `CloseActiveItem` unconditionally, tab bar or not. What it did *not* do was work from the
+  sidebar, where it walked past `ThreadsSidebar` to the workspace and closed a file in the editor
+  pane instead; that is `agents_sidebar::CloseSelectedThread` now.
+- *Sidebar row layout.* The title takes the whole first line and the agent glyph leads the
+  metadata line, in place of the spacer that was holding that column open. Every row draws the
+  second line now, so the icons stay in one column; the line holds itself open with a zero-width
+  label of the metadata text's own size rather than a hard-coded pixel height, which keeps it
+  right at any UI font size. Tested through `debug_bounds`: the icon is below the title, in the
+  title's column, and a row with nothing else to say is the same height as one with a timestamp.
+- *Work a thread detached.* Both halves. The row and the input pill counted only a running turn
+  and now count a thread as working whenever `running_work` is non-empty too. And the work was
+  invisible because the adapter reports detached tasks only to a client carrying AIR's
+  `asyncTasks`, which Zed never advertised. **The adapter's own package settled every field name**:
+  `npm pack @agentclientprotocol/claude-agent-acp@0.81.2` fetches through this sandbox, so
+  `dist/air-extension.js` and `dist/async-tasks.js` were read rather than guessed —
+  `_meta.jetbrains.air = { version: 1, capabilities: [...] }`, the three `async_task_*` kinds with
+  their exact payloads, `_session/async_task/stop`, and `AsyncTaskState`'s five values. **The
+  entry's warning about the schema was right and worse than it looked**: v1's `SessionUpdate` has
+  no variant for an unknown kind (v2's does), and a notification that fails to parse returns `Err`
+  from its handler rather than falling through to the next one, so an extension kind would have
+  been dropped silently. `session/update` is therefore read through a fork-local
+  `RawSessionNotification` that keeps the payload raw and does the typed parse afterwards, which
+  leaves every standard update on the path it was already on. The `backgrounded` marker holds a
+  Bash chip reading as running until the task carrying its command's lifecycle reaches a terminal
+  state; the chip's Stop control sends the stop request when there is no terminal of ours behind
+  the command. **Not covered by a test**: that a detached task whose terminal edge never arrives
+  stops being counted. The adapter sends one on session end and on failure, and everything
+  detached is dropped if the agent becomes unusable, but an agent that dies mid-command would
+  leave the count standing until the thread is closed.
+
+- *A removed PR, and the `+` menu.* `dismiss` moves a pull request into `dismissed`, and nothing
+  else ever read `dismissed`, so a mined PR that only this thread watched left every source at
+  once. This thread's own removed PRs are candidates now, first, under their own header and
+  outside the six-long limit — which was the second way they were lost, since the limit ranks by
+  recency across every thread. They carry titles, written into the snapshot when a PR is watched
+  or dismissed by hand, that being the last moment a title is reliably knowable: after the branch
+  stops resolving nothing is polling for it and no other thread need ever have seen it.
+- *`sed -i '' …` chips.* `paths(rest).skip(1)` assumed the first non-flag word is the script,
+  which on macOS is the empty backup suffix. Both programs now have their arguments parsed: the
+  script is an operand only when `-e`/`-f` did not supply one, `-i` takes its suffix attached and
+  (BSD sed only) as a following word that reads like a suffix, and clusters like `-Ei`/`-ni`/`-pi`
+  are walked rather than prefix-matched. **`is_in_place` had the same defect and a second one**:
+  it missed `-Ei` entirely, so a combined flag was not an in-place edit at all, and it matched
+  `node --inspect` as one because that starts with `-i`.
+- *The GitHub burst.* Three of the entry's four bullets. The watch set was every unarchived
+  thread's branches and PRs rather than the open ones, which made the request count the size of
+  the history; at most four `gh` invocations are in flight at a time now, longest-waiting first,
+  which is what lets one refusal stop the ones behind it rather than arriving after the flood; the
+  hold runs to the reset GitHub gives (`gh api rate_limit` costs nothing against the budget) with
+  the fixed ten minutes as the fallback; and the "say it once" guard compared the stored deadline
+  against `now + backoff`, which is later than it by construction, which is why one spent budget
+  wrote 118 identical lines. The app also counts its own requests over GitHub's own hour and
+  reports the total beside the refusal — the budget is per account, so an exhausted one never said
+  who spent it. **The fourth bullet, the GraphQL batching, is not built and the entry now says
+  what would let it be**: it replaces the mechanism behind every PR chip and nothing here can
+  exercise it, so a query written blind passes every test that can run in this container and
+  blanks every chip in the morning.
+
+**The gate found one real thing, and it was a test starving the process it was waiting for.**
+`test_a_created_pr_joins_from_the_command_that_made_it` waited for a real command to exit by
+parking the executor in a tight loop with no yield, which spins every core it can reach; it failed
+its ten-second deadline inside a full-suite run and passed alone in under a second. That is the
+same failure the stop-from-chip test had on 2026-09-27, and it got the same fix — a wait between
+polls, the same generous deadline. It was also starving its neighbour: the stop-from-chip test
+failed beside it and passes now, and `agent_ui` went from 159s to 84s. Nothing else failed. On the
+final tree: acp_thread 325, ui 89 + 41, gh_status 38, agent_servers 45, sidebar 194, agent_ui 518
+with 32 intentionally `#[ignore]`d, zero failures; `script/clippy` clean over all six crates.
+
+**The disk ran out, and the fix is worth keeping.** The container's writable allowance is about
+38GB and `target/debug/deps` reached 24GB of it — 12.6GB of that duplicated between the
+`test-support` and plain feature sets — which killed a `cargo test` mid-link with "No space left on
+device" twice. Building with `CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_SPLIT_DEBUGINFO=off`
+after a `cargo clean` is what made the rest of the gate fit: the same graph came to 15GB with every
+suite built, against 27GB before, and a test binary went from 880MB to a fraction of it. Nothing in
+the gate needs a backtrace with line numbers. **Start there next time** rather than discovering it
+at the point a link fails; and note that the three suites then ran fine one after another in the
+same container, which the 09-24 note said they could not.
+
+**What was not built.** The two performance entries are both still waiting on numbers from
+Arthur's machine and neither moved, for the third run running: the leak entry wants two consecutive
+`quiet-ui perf: N entities live` lines from a session that has been up a while, and nothing in this
+container can produce them. The queue is otherwise empty but for the GraphQL half of the
+rate-limit entry, which is rewritten in place with the one thing that would unblock it.
+
+**2026-09-30**: onto main 66432e4ca (18 upstream commits). Squash-then-rebase folded four fork
+commits into one, tree-identical to the old tip before rebasing. **Seven files conflicted**, which
+is the most since 08-04, because this was the night upstream landed its own big move through the
+exact surfaces this fork patches: +4,499 lines across `acp_thread`, `agent_servers`, `agent_ui` and
+`ui`, `acp_thread.rs` alone gaining 1,946. Most of the resolutions were ordinary unions of two
+import lists or two appends. Three were judgements:
+
+- `agent_panel.rs`: upstream extended the retained-threads machinery this fork deleted when threads
+  became tabs (98 mentions upstream, 1 here). Took ours — the empty side — and `cargo check` found
+  nothing stranded.
+- `conversation_view.rs` and `thread_view.rs`, the recurring seam: upstream's new **reported
+  activity** mechanism calls `sync_reported_activity` beside the `sync_generating_indicator` this
+  fork deleted. Adopted the new call, dropped the deleted one, kept the fork's `cx.notify()` —
+  upstream's API shape, the fork's behaviour. Same shape for the send path: upstream's
+  `this.current_submission = Some(submission_id)` kept, its generating-indicator call not.
+- `conversation_view.rs` tests: upstream's `test_terminal_snapshots_reuse_the_read_only_tool_view`
+  and the fork's `test_a_running_command_can_be_stopped_from_its_chip` were spliced into one
+  another (a shared four-line setup prefix merged clean, the bodies did not). Both were extracted
+  from their own blobs and written back whole rather than reconciled in the merge output.
+
+**Three markerless drifts, all found by `cargo check --workspace --all-targets`.**
+`Terminal::new_display`'s `command_label` became `Option<&str>`, which left
+`command_may_write(command_label)` a type error — resolved as `is_none_or(command_may_write)`, since
+this fork's own rule is that a command it cannot read might write. `AcpThreadEvent::Stopped` became
+a struct variant carrying `activity_generation`, `activity_duration` and `stop_reason`, so the
+fork's two `Stopped(_)` arms had to become `Stopped { .. }`. And `conversation_view.rs` needed
+`v2 as acp_v2` in an import the fork owns, because upstream's new `Stopped` arm reads
+`acp_v2::StopReason`. Clean after that, zero warnings.
+
+**One thing upstream's new code took away, and it is worth watching for.** Upstream's v2
+display-terminal patch writes a terminal's command markdown itself, with a plain fence; this fork
+tags those fences `bash` so commands highlight as shell. It had two writers and upstream added a
+third, so a terminal renamed by patch silently lost its highlighting. The three are one
+`command_markdown` function now, which is what would have caught it. Upstream's expectations moved
+to the tagged form, along with the one asserting an `Execute` call's label is the bare title — this
+fork renders those as fenced commands on purpose. **Nothing upstream built that the fork can now
+delete**; the reported-activity work is an enabler the fork's own indicators sit beside rather than
+a duplicate of them.
+
+**What was built: the one queued entry that was not blocked, and one thing found by reading.**
+
+- *A PR whose CI is running.* All three bullets, and the first one was worse than the entry
+  guessed. Last night's poll change did widen the gap, catastrophically: `needs_rollup` only
+  returned true while the checks were already `Pending`, and the rollup is the only thing in the
+  answer that reports CI, so a PR that had ever reached green or red was **never asked about
+  again** — through a push, a re-run, a broken build — for the life of the process, with
+  `carry_over_checks` faithfully copying the stale answer forward. The split is gone and every
+  poll carries the rollup. The saving it bought was never much: a settled branch polls once every
+  five minutes and a branch whose every PR is merged or closed is not polled at all.
+  "Not fetched yet" is now `ChecksState::Unknown`, distinct from `None` (an empty rollup, which is
+  an answer), so a PR nobody has looked at no longer has a hover card claiming it has no CI; it
+  draws no glyph and says nothing. `GhCheck::outcome` returns a three-way `CheckOutcome` instead of
+  a string: only an explicitly good conclusion passes and only an explicitly bad one fails, so
+  `WAITING`, `REQUESTED`, `EXPECTED` and an empty outcome are pending rather than green, and
+  `CANCELLED`, `TIMED_OUT`, `ACTION_REQUIRED` and `STARTUP_FAILURE` are failures rather than green.
+  `status` is no longer parsed at all — the absence of a conclusion says the same thing for every
+  value GitHub has. And the glyph turns: `ChecksGlyph` carries whether it spins, the pending state
+  is `LoadCircle` on the fork's rotate animation in the warning colour, and both surfaces get it
+  from the one shared `PrChip`. The entry's exact test inputs are pinned, including the last one —
+  a rollup fetch that failed after a pending answer keeps the running glyph, through
+  `finish_refresh`.
+- *A command the agent leaves running made the PR miner reread the thread.* Found by reading, in
+  the general performance entry's first named shape ("work repeated on every event that could be
+  cached or done once"). The miner's resume point was one watermark set to the lowest entry that
+  had not finished arriving, and a tool call whose terminal is still running never finishes — which
+  is exactly what last night's detached-work entry made ordinary. So the watermark stuck there and
+  every pass re-read the whole thread behind it, allocating each assistant message's markdown and
+  cloning each PR-creating command's output; passes run on every entry added, entry updated, status
+  change and turn end, so that is once per streamed chunk over a transcript that only grows. The
+  entries still arriving are their own small set now. Two things fell out: the found set is
+  accumulated until the reading is complete, because the comparison that drops what the current
+  rules would not have mined needs the whole thread and no incremental pass sees it; and a thread
+  that shrank is read from the start rather than trusting an index across the removal, which the
+  watermark could not do at all — clamped past the end it skipped every entry there was, so a
+  thread that lost an entry would never have been mined again. The test fails on the old watermark
+  and passes on the new one, which was checked both ways. A pass that reads more than 32 entries
+  now writes `quiet-ui perf: mined N thread entries (M left unread) in Xms`, which is the
+  instrumentation the performance entry asks for where numbers are missing: the first pass over a
+  long thread is expected to land there once, and a later one landing there names a thread still
+  doing this. Two more suspects in the same per-chunk path — `running_work`, walked on every frame
+  since 09-29 even for an idle thread, and `sync_branch_diff_work_dirs` — were sized and cleared
+  rather than changed. The Work queue entry records why, because the reasoning is the reusable
+  part: a walk is only worth caching when what it does per item is expensive, and a cache that can
+  go stale is a behaviour bug.
+
+**Gate green, nothing failed.** acp_thread 332, agent_servers 56, gh_status 43, sidebar 194,
+ui 89 + 41 doc-tests, agent_ui 526 with 32 intentionally `#[ignore]`d — zero failures. The only
+test failures of the night were upstream's own two, from the bash-fence drift above, and they were
+expectations to adapt rather than breakage. `script/clippy` over all six crates (`--release
+--all-targets --all-features -- --deny warnings`): clean, zero warnings, in 6 minutes off a cold
+`cargo clean`.
+The disk note from 09-29 held and is worth repeating in stronger form: `CARGO_PROFILE_DEV_DEBUG=0
+CARGO_PROFILE_DEV_SPLIT_DEBUGINFO=off` from the first command is right, and it is still not enough
+to hold the dev graph and a release `script/clippy` at once — 23.6GB of dev artifacts against about
+38GB of allowance. Run every suite first, then `cargo clean`, then clippy.
+
+**What was not built, and why.** Three entries, all blocked on something outside this container,
+and none of them moved.
+
+- The *entity leak* entry wants two consecutive `quiet-ui perf: N entities live` lines from a
+  session that has been up a while. Fourth run running. Nothing here can produce them.
+- The *general performance pass* got the finding above, which is the first confident one to come
+  out of reading in three runs — but its two remaining shapes (foreground work that could be
+  background, work that scales with worktrees) still want a log from the running app.
+- The *GraphQL batching* entry: this container has a `GITHUB_TOKEN` in its environment, and using
+  it to fetch the one sample response the entry asks for was **refused by the sandbox's own
+  permission classifier** as credential exploration. That is the correct call and it is not worked
+  around. The entry's two unblocking conditions stand unchanged: the `gh api graphql` output pasted
+  in, or a say-so that try-GraphQL-then-fall-back is wanted. Neither is here, so a query written
+  blind would still blank every chip in the morning.
+
+**2026-10-01**: onto main 95cd535a5 (13 upstream commits). Squash-then-rebase folded nine fork
+commits into one, tree-identical to the old tip before rebasing. **Three files conflicted**, all
+small, and one of them was the most useful thing in the batch.
+
+- `gpui/src/app.rs`: #65043 (`gpui: Make test-support safe to enable in every build`) moved leak
+  detection from `feature = "leak-detection"` to a `gpui_leak_detection` cfg set by `build.rs`
+  from `GPUI_LEAK_DETECTION` or the feature. **Took upstream's side.** Worth recording because
+  the fork looked, at a glance, like the author of this machinery — it is not: `leak-detection`,
+  `leak_detector_snapshot`, `assert_no_new_leaks` and the per-type names were all upstream's at
+  the merge base, and the fork's only change here was `parking_lot::RwLock` spelled inline
+  because the fork drops the `use parking_lot::RwLock` import (its `focus_handles` is a
+  `FocusMap` now). Kept exactly that one word. The fork's own gpui additions —
+  `App::callback_counts`, `App::entity_counts_by_type`, `FocusMap::take_dropped` — are untouched
+  and still the instruments the leak entry wants.
+- `agent_ui/src/agent_panel.rs`, twice. In `draft_has_content`, upstream's new
+  `has_pending_selections()` check (from #64252, `Fix selection loss while an agent thread is
+  loading`) landed on the same line as the fork's unstarted-draft editor check: **union**, with
+  upstream's first, so a queued selection counts as content before the fork's early return
+  decides on the editor's text. The other was the recurring one from 09-30: upstream extended
+  `retain_running_thread` / `insert_retained_thread` / `cleanup_retained_threads` again, which
+  this fork deleted when threads became tabs. **Took ours — the empty side**; grep confirmed the
+  fork keeps only upstream's own `is_idle_for_retention` and the `max_idle_retained_threads`
+  setting, both untouched.
+- `agent_ui/src/conversation_view.rs`, twice. The struct literal: kept the fork's
+  `ConnectionStart::Immediate`/`OnFirstSend` match (the draft that starts no server until first
+  send) and added upstream's new `pending_selections: Vec::new()` field in upstream's position.
+  Then the connect path, where upstream drains those pending selections into the new thread's
+  editor inside a block the fork had extracted into `enter_connected` (two call sites — the
+  replay re-entry needs it). **Took the fork's call and ported upstream's drain into
+  `enter_connected`**, so upstream's fix works here too.
+
+**Markerless drift, in the tests rather than the code, and the conflict count said nothing about
+it.** `cargo check --workspace --all-targets` came back with zero errors and zero warnings, but
+only after two things it found, neither of which carried a marker:
+
+- #64252 also added `test_loading_selection_survives_draft_retention`,
+  `test_loading_selection_is_discarded_with_active_draft` and their shared
+  `assert_loading_selection_removal` helper, all of which assert that a draft with pending
+  selections lands in the retained-thread cache this fork deleted. 97 lines, removed — the same
+  resolution as the machinery itself, and the fork already carries the rewritten replacement
+  (`test_open_thread_tabs_are_never_evicted`). Upstream's `test_pending_selections_survive_connection_retry`
+  in `conversation_view.rs` does not depend on retention, goes through the drain that was ported
+  into `enter_connected`, and passes — so the fix is covered where it matters.
+- The fork's own `a_command_that_has_printed_nothing_has_no_line_for_the_band` tested
+  `ChipCache::tail`, deleted by 2 of 4 below; it went with it.
+
+Two more fell out of the sidebar split rather than the rebase and are worth knowing for next
+time: the file interleaves `const EMPTY_DRAFT_PLACEHOLDER` with its `use` lines, so a naive
+"preamble ends at the first item" split truncated the imports; and in the child module
+`use super::*` makes `pretty_assertions::assert_eq` ambiguous against the prelude's through a
+second glob, so `fork_tests.rs` names it explicitly.
+
+**The walk, one line per upstream-owned file still carrying a diff** (fork-only files are out of
+scope; `Cargo.lock` is mechanical). Reason codes: *R* = Arthur asked for it; *N* = something he
+asked for needs it; *P* = reliability/performance for many worktrees, shaped as an upstream patch.
+
+- `agent_ui/conversation_view/thread_view.rs` 5891/1696 — *R* the thread view: chips, quiet cards, diff hovers, PR chips, bookmarks, the message bar.
+- `sidebar/src/sidebar.rs` 3442/3039 — *R* the sidebar is the source of truth: flat worktree-shaped list, live state, drag, archive.
+- `agent_ui/agent_panel.rs` 3064/999 — *R* threads as tabs in the panel's own pane; *N* the retained-thread cache deleted because open tabs supersede it.
+- `agent_ui/conversation_view.rs` 2367/377 — *R* the draft that starts no server until first send, worktree-switch carry, replay-while-loading.
+- `acp_thread/acp_thread.rs` 1834/163 — *N* command facts, detached work, PR mining and the per-thread state the chips and sidebar read.
+- `git_ui_core/worktree_service.rs` 1115/204 — *R* one-click worktree threads: foreground creation, spare handover, base fetch.
+- `sidebar/src/sidebar_tests.rs` 934/1914 — *N* the 103 upstream tests the fork's behaviour required adapting, plus 20 dropped (see above).
+- `ui/components/ai/thread_item.rs` 879/172 — *R* the sidebar row: worktree chips, PR/CI chips, agent logo, age token, unread dot.
+- `acp_thread/terminal.rs` 710/8 — *N* captured output, timing and exit facts the command chips read.
+- `agent_ui/thread_worktree_archive.rs` 608/2 — *R* archive takes the worktree and restore brings it back, submodules included.
+- `agent_ui/thread_metadata_store.rs` 570/33 — *R* the persisted sidebar rows, worktree paths, PR snapshots.
+- `agent_ui/config_options.rs` 537/753 — *R* the combined effort/fast-mode/config menu; a net deletion, and the one place the fork replaced an upstream render path wholesale rather than extending it (no smaller version exists — the surface itself changed).
+- `agent_servers/acp.rs` 357/6 — *N* the async-task extension behind detached work and `loading_thread`.
+- `agent_ui/model_selector_popover.rs` 348/31 — *N* a draft grows a selector from its preview session before it is sent.
+- `agent_ui/entry_view_state.rs` 222/9 — *P* dropping and rebuilding an off-screen thread's per-entry view tree.
+- `workspace/workspace.rs` 213/33 — *N* globally-scoped panel size (one sidebar width across worktrees) and the sidebar toggle wiring.
+- `agent_ui/agent_diff.rs` 199/1 — *N* review comments stay pending with no live thread; the toolbar buttons that assumed one are gone.
+- `project/agent_server_store.rs` 160/13 — *N* agent display names and ids the sidebar and tabs render.
+- `agent_ui/agent_connection_store.rs` 143/6 — *N* the shared connection a draft previews a model on.
+- `editor/git.rs` 130/19 — *R* the diff-review gutter affordance and its comment blocks.
+- `agent_ui/agent_ui.rs` 128/4 — *N* module wiring and actions for the fork's own modules.
+- `git_ui/diff_multibuffer.rs` 111/6 — *R* diff review enabled on every diff surface.
+- `git/repository.rs` 104/4 — *N* worktree and default-branch queries the worktree flow needs.
+- `git_ui/project_diff.rs` 99/0 — *R* generated files sort last and start folded.
+- `gpui/window.rs` 88/3 — *P* focus-handle sweeping only when one was dropped.
+- `zed/reliability.rs` 81/1 — *P* the `quiet-ui perf:` measurement lines.
+- `project/environment.rs` 78/12 — *P* capped environment capture (many worktrees).
+- `gpui/app/entity_map.rs` 76/1 — *P* live entity counts by concrete type.
+- `project/tests/integration/project_tests.rs` 75/0 — *N* tests for the per-worktree language-server switch.
+- `workspace/dock.rs` 73/12 — *N* `Panel::size_is_global`; only the agent panel opts in.
+- `util/process.rs` 70/13 — *P* a spawn failure says why, and names running out of file handles.
+- `git_ui_core/created_worktrees.rs` 64/6 — *R* remembering which worktrees this app made.
+- `gpui/app.rs` 60/3 — *P* `callback_counts`, `entity_counts_by_type`, the `FocusMap` swap.
+- `agent_ui/test_support.rs` 58/5 — *N* helpers the fork's own tests and the sidebar crate's tests use.
+- `title_bar/title_bar.rs` 54/17 — *N* the open-sidebar toggle while the sidebar is closed, and no duplicate in-window workspace list in the recents menu.
+- `markdown/markdown.rs` 51/19 — *R* `inline_image_height` (a list measures an entry once, so an image that grows paints over its neighbours); *N* a `renders_mermaid_diagrams` test hook.
+- `editor/editor_tests.rs` 49/2 — *N* expectations adapted to the header trim.
+- `zed/zed.rs` 45/3 — *N* initialising the fork's own modules.
+- `agent_servers/custom.rs` 36/3 — *N* the async-task extension for custom agents.
+- `auto_update/auto_update.rs` 35/10 — *R* self-update from the fork's own release.
+- `acp_thread/connection.rs` 35/1 — *N* `loading_thread` (watch a long session replay) and `stop_async_task` (stop detached work).
+- `fs/fs.rs`, `fs/fake_git_repo.rs` 36/2 — *N* `set_fetch_error`/`fetched_remotes` for the worktree base-fetch tests.
+- `git_ui/branch_diff.rs` 20/0 — *R* the "generated" tag on a folded header.
+- `acp_thread/diff.rs` 19/0 — *N* `buffer_and_diff` for the edit-chip diff stats.
+- `assets/keymaps/default-{macos,windows,linux}.json` 45/28 — *R* the fork's own bindings (sidebar toggle, thread close, review comment).
+- `gpui/subscription.rs` 17/0 — *P* the counts behind `callback_counts`.
+- `workspace/status_bar.rs` 16/2 — *N* the status bar does not draw the sidebar toggle when the title bar does.
+- `agent_ui/threads_archive_view.rs` 16/1600 — *R* the dedicated archive modal is gone; the sidebar list holds archived rows. Only `format_age` remains.
+- `agent_ui/terminal_thread_metadata_store.rs` 15/8 — *R* terminal threads appear in the sidebar too.
+- `agent_ui/mention_set.rs` 14/2 — *R* an `@`-mention's image hover gets a definite box instead of growing over what sat under it.
+- `agent_ui/message_editor.rs` 14/1 — *N* a transparent background so a bubble's tint shows through.
+- `script/bundle-mac` 13/1 — *P* keep symbols in `zed` so a `sample` of a freeze names functions.
+- `project/manifest_tree/server_tree.rs` 11/0 — *R* a worktree runs no language servers until switched on.
+- `gpui_macros/property_test.rs` 10/2 — *N* the generated teardown must flush the effect cycle, or the fork's own property test reports a false leak.
+- `language_model/registry.rs` 8/0 — *N* `try_read_global`, so an optional feature does without rather than panicking.
+- `agent_servers/acp/transport.rs` 7/0 — *N* the async-task extension's client capability.
+- `sidebar/thread_switcher.rs` 6/4 — *P* `Arc<ThreadMetadata>` so a few hundred rows share one allocation.
+- `editor/editor.rs` 6/1 — *N* the `diff_review` key context and `TakenReviewComment`.
+- `Cargo.toml` 5/1 — *N* the `gh_status` member; *P* `incremental = false` (the cache regrew to 80GB+ and filled the disk).
+- `.zed/settings.json` 5/0 — *P* no rust-analyzer on this repository, with the reason in a comment. The fork's own repo config, not product code.
+- `agent_ui/draft_prompt_store.rs` 4/17 — *N* a draft has no agent until it is sent, so its row reads "New thread".
+- `agent_ui/ui/sandbox_status_tooltip.rs` 4/1 — *R* the worktree-language decision (see above).
+- `editor/element/header.rs` 3/48 — *R* the Open File button removal (queued 2026-08-06).
+- `editor/element.rs`, `element/mouse.rs` 3/9 — *N* the `DiffReviewFeatureFlag` gate removed so the requested gutter affordance is discoverable.
+- `zed_actions/lib.rs` 2/0 — *N* the `AddReviewComment` action.
+- `zed/main.rs`, `project/project.rs`, `git_ui/git_ui.rs`, `git_ui_core/git_ui_core.rs` 6/0 — *N* module declarations and init for the fork's own modules.
+- `agent_ui/Cargo.toml`, `acp_thread/Cargo.toml`, `zed/Cargo.toml`, `sidebar/Cargo.toml` 5/1 — *N* dependencies the fork's modules need.
+- `picker/picker.rs` 1/1 — *N* `set_popover` public so the picker embeds in the combined menu.
+- `agent_ui/completion_provider.rs` 1/0 — *P* follows the `Arc<ThreadMetadata>` change.
+- `agent_ui/conversation_view/thread_search_bar.rs` 1/1 — *R* the worktree-language decision (see above).
+
+**What was built: the four Upstream-first entries, which is all of them.**
+
+*1 of 4, every hunk needs a reason.* The two examples the entry named were already gone — no
+`ui/src/components/tab.rs` diff, no `set_tabs_fit_content` anywhere — so the walk was over the 81
+upstream-owned files that remain. The dead-code sweep found nothing: every function the fork adds
+to an upstream-owned file has a caller (the one exception, `GhStatusStore::fetched_ago`, is in the
+fork's own crate, out of this entry's scope, and is a `pub` API with no caller yet — worth a look
+next pass). **Four hunks had no reason and went back:**
+
+- `README.md` carried `> [!IMPORTANT]` / `> Remove this line to confirm you've reviewed this PR
+  before submitting.` at the very top. That is not a fork change and never was requested; it reads
+  like text pasted in from somewhere else. Reverted to upstream, and **worth knowing it was there
+  at all** — nothing in this file explains it, and it had survived every rebase since.
+- `theme_settings`: `agent_ui_font_size` defaulted to the UI font size **+1px**. A restyle with no
+  request behind it; back to upstream's plain fallback. That file now matches upstream exactly.
+- `markdown`: `MarkdownStyle::web_link_globe` prefixed a globe glyph to every http/https link in
+  agent prose. Also a restyle, and it changed rendered text, not just styling. Deleted, field and
+  all. **The reason it survived the last pass is worth recording:** the 09-28 log kept it on the
+  grounds that there was "nothing upstream to adopt instead", which was the old standard. The
+  Upstream-first section replaced that with a stricter one — Arthur asked for it, or something he
+  asked for needs it — and under the new rule it does not qualify. Other hunks kept on that old
+  ground are worth re-reading for the same reason.
+- `title_bar.rs` had dropped one blank line for nothing. Put back.
+
+**One family that looked unreasoned and is not,** so nobody reverts it next time: the UI strings
+that say "conversation" where upstream says "thread" (`thread_search_bar.rs`,
+`sandbox_status_tooltip.rs`, the sandbox labels, the token-limit notices). That is the recorded
+"Worktree language: UI strings stop saying thread" decision, which this file carries as a request.
+Reverting half of it would leave the app saying both.
+
+*2 of 4, terminal output closer to upstream.* The command chip stays the terminal's header; below
+it the output is now upstream's: upstream's embedded terminal view at upstream's sizing (`h_72`
+when the content mode is scrollable, its natural height otherwise, `h_full` on the wrapper). The
+fork's own sizing rules are gone — the `max_h_96` + `overflow_y_scroll` + `occlude` scroll box it
+wrapped static captured output in. So is the fork's last-output-line row: the second row a running
+chip grew for the last line the command printed, the band that reserved 44px for it, and the
+pytest progress bar that row rendered when the line stated a fraction. With it went the code that
+only fed it — `ChipCache::tail`, the `tails` cache and `CommandTail` in `thread_view.rs`,
+`Terminal::last_output_line` and `output_line_excerpt` in `acp_thread/terminal.rs`, and
+`progress_fraction`/`pytest_percent` in `command_parse.rs` — each with its own unit tests
+(`a_running_commands_last_line_is_shown_as_it_stands`, `pytest_states_a_real_fraction`,
+`a_count_without_a_denominator_is_not_progress`,
+`a_trailing_bracket_that_is_not_a_percentage_is_ignored`, and the fork's own
+`a_command_that_has_printed_nothing_has_no_line_for_the_band`), which went with the code they
+tested rather than being left asserting nothing. Stopping a running
+command from the thread view still works and is still tested
+(`test_a_running_command_can_be_stopped_from_its_chip`): the stop control is the chip's, because
+upstream's lives in the `TerminalToolHeader` the chip replaces. **What this costs, plainly:** a
+running command no longer says what it is doing until you expand it, which is exactly what that
+row was added for ("a long test run and a hung one look the same without it"). That is the trade
+the entry asked for. **No new test**: the removal's only observable effect is the chip's height
+and the absence of a row, neither of which this crate's tests can reach without adding a debug
+selector for the purpose, so none was invented.
+
+*3 of 4, the open-thread model — measured, and deliberately not replaced.* The entry allows for
+this outcome ("if nothing smaller keeps the behaviour, leave the model as it is and say why"), and
+the measurements say it is the right one. Three findings, in the order they settle it:
+
+- **The pane is upstream's machinery, not the fork's.** Of the 3,064 lines the fork adds to
+  `agent_panel.rs`, **240** mention `thread_pane`, `ThreadTab`, `ForeignThreadTab` or a pane item
+  at all. Ordering, activation, keyboard nav, the focus chain, close, `workspace::move_item` and
+  "a pane that is empty does not close" all come from upstream's `Pane` for free. A global list
+  would have to hand-write every one of them as fork code, so the diff against upstream goes
+  **up**, not down.
+- **`ForeignThreadTab` is not vestigial, which is what the entry suspected.** Its rendering is
+  dead — the pane sets `should_display_tab_bar` to false, so `tab_content` and `tab_content_text`
+  are never called, and its `Render` says so itself ("Normally never visible"). But it is
+  load-bearing as a *pane item*: `thread_strip` enumerates real tabs and proxies alike, and
+  `move_thread_tab_to` / `move_thread_group_to` reorder by calling `workspace::move_item` on that
+  strip. Cross-worktree drag reordering — required behaviour — **is** the proxy. The registry is
+  published *from* the strip, not the other way round.
+- **The fork cannot fall back on upstream's own model.** Upstream's `BaseView::AgentThread` plus
+  `retained_threads` caps retention at `max_idle_retained_threads` (default five) and drops the
+  oldest idle thread. This fork's rule is that an open thread stays open, which
+  `test_open_thread_tabs_are_never_evicted` exists to pin. So the candidate is not "delete fork
+  code in favour of upstream's" — it is "replace borrowed upstream machinery with hand-written
+  fork machinery", while still needing a fork-owned uncapped store, its own ordering, its own
+  activation and its own serialization.
+
+Two things it would also have to rebuild that are easy to miss: the off-screen view-tree dropping
+from 09-27 keys on a tab being off screen, and the thread pane's membership in `workspace.items()`
+is what `diff_review` scans for editors. **Left as it is.** The one piece of this worth doing
+separately is deleting `ForeignThreadTab`'s dead tab-strip rendering, but that is in a fork-only
+file and so moves the diff against upstream by nothing; it is noted here rather than done.
+
+*4 of 4, cut this file down.* 5,483 lines to 1,705. The design sections (the layout decision,
+threads as tabs, running indicators, quiet cards, single stop, new thread based on master, mark as
+done, PR + CI status, and the 670-line "Implementation notes (as built)") are replaced by **The
+fork as it stands**: one paragraph per feature naming its files. Upstream first, the Work queue and
+the Verification queue keep their preambles verbatim. The rebase log keeps the procedure, the
+recurring seam, the markerless-drift note, "adopt rather than defend", the standing "not redundant,
+checked repeatedly" list, and the last ten nights (2026-09-21 onward); the
+forty-odd older entries are in git history.
+
+**And the other half of 4 of 4, which is the biggest single number tonight:
+`sidebar_tests.rs` stops conflicting.** It was the fork's worst file by churn — 12,127 added /
+9,176 deleted against upstream, out of a 50,236 / 18,589 total — because upstream appends new tests
+at the end of it and so did the fork, which is a guaranteed append/append conflict (it is the
+documented 08-04 one) and also because the fork had reordered what it kept. Classified
+mechanically: 72 items byte-identical to upstream, 103 upstream items the fork had to adapt, 59
+fork-only items, 20 upstream items the fork's behaviour does not have (retention, project headers
+and collapse, sticky headers, archive-hides-from-sidebar, the action-hover styling helpers). The
+53 fork-only **tests** moved to `crates/sidebar/src/sidebar_tests/fork_tests.rs`, a child module
+that reaches the parent's imports and helpers through `use super::*`, so nothing had to be made
+public and the 5 fork-only helpers stayed where both sides use them. What remains in
+`sidebar_tests.rs` is upstream's file in upstream's order, with the fork's version of the 103
+adapted items and the 20 dropped. **934 / 1,914**, from 12,127 / 9,176. All 189 tests still exist:
+136 in the parent, 53 in the child.
+
+**The gate found a real bug, and it was upstream's new code meeting a fork feature.**
+`test_add_selection_to_loading_thread` is new tonight from #64252 and had never run here. It
+failed, and the first read — "upstream's expectation, adapt it" — was only half right.
+
+The other half: #64252's `insert_selection` inserts into `active_thread()`'s editor and otherwise
+**queues** into `pending_selections`, and a draft that starts no server until its first send has no
+active thread. So "Add Selection To Thread" on an ordinary new panel thread put the selection into
+a queue that drains on connect, which for that kind of draft is *after* the message has been sent:
+it vanished from the editor the reader was looking at. Fixed where upstream's own branch is, as one
+more arm — the draft's own `unstarted_message_editor` takes the selection, and the queue stays the
+last resort — and pinned by a fork test,
+`test_a_selection_on_an_unstarted_draft_lands_in_its_editor`, which fails on the old code.
+
+Upstream's test itself stays upstream's and is **`#[ignore]`d with the reason**, rather than
+rewritten: it drives a gated agent server and expects selections queued across the load to arrive
+in the loaded thread's editor, and a panel thread here never enters that flow. That was checked
+rather than assumed — at the point the test reads the draft, nothing is queued and the draft holds
+its own empty editor, so the selections never reach it at all. Leaving the body alone keeps this a
+one-line fork change at the next rebase. The behaviour the test is about is covered twice over:
+the new fork test for an unstarted draft, and upstream's own
+`test_pending_selections_survive_connection_retry` for the queue's drain through `enter_connected`.
+
+**Worth noting for the method:** the expectation was wrong *and* the code was wrong. Stopping at
+the expectation — which is what the rebase log's own "expectation adapted" shorthand invites —
+would have shipped the bug.
+
+**Gate green after that.** `cargo test --lib --tests` over the fork's three core crates plus every
+crate touched tonight: **acp_thread 328, agent_ui 527 (33 `#[ignore]`d — the 32 standing ones plus
+tonight's), gpui 444 + 1, markdown 168, sidebar 194, theme_settings 8, title_bar 7. 1,677 passed,
+0 failed.** `sidebar` is 194, exactly what it was on 09-30, which is the useful number: the test
+split moved 53 tests into a new file and lost none of them. The Verification queue was already
+empty, so nothing was carried in from the laptop.
+
+`./script/clippy -p acp_thread -p agent_ui -p sidebar -p markdown -p theme_settings -p title_bar -p gpui` (`--release --all-targets --all-features -- --deny warnings`): **clean, exit
+0, zero warnings**. `cargo-shear`, `typos` and `buf` are not installed in this container, so
+`script/clippy` skipped them, as on previous nights.
+**Environment, and one thing to fix for next time.** The usual two were needed again in this fresh
+container (`CARGO_NET_GIT_FETCH_WITH_CLI=true` because libgit2 times out fetching a git dependency
+through the proxy, and `libasound2-dev` for `alsa-sys`). A third turned up because tonight's gate
+covers more crates than previous nights': linking any gpui test binary that pulls in the X11
+backend needs **`libxkbcommon-dev`, `libxkbcommon-x11-dev` and `libx11-xcb-dev`**, without which
+`cargo test -p title_bar` and `markdown`'s examples die at `rust-lld: unable to find library
+-lX11-xcb` before a single test runs. `acp_thread`, `agent_ui` and `sidebar` happen not to need
+them, which is why four months of gates never hit it. Installed and the gate re-run; **worth adding
+to the container's setup script beside `libasound2-dev`**, since every night that gates a crate
+outside the usual three will need it. Not a code problem, and nothing was worked around silently.
+
+**Diff size.** `git diff --shortstat $(git merge-base HEAD upstream/main) HEAD -- . ':!QUIET_UI.md'`
+is **103 files, +42,987 / -11,695**, from 104 files / +50,236 / -18,589 at the start of the night:
+**7,249 fewer added lines and 6,894 fewer deleted**. Most of it is the sidebar test split; the rest
+is the four reverted hunks and the terminal-rendering deletions, against which the selection fix
+and its test add back a few dozen. Without this file and the sidebar test files it is
++38,130 / -9,801.
+
+**What upstream now provides that the fork could delete:** nothing new this round, but the
+`gpui/src/app.rs` conflict is worth re-reading in that light — leak detection with per-type names
+and a snapshot API is upstream's and always was, so the leak entry's instrument work should keep
+extending upstream's rather than growing a parallel one. The fork's three gpui additions
+(`callback_counts`, `entity_counts_by_type`, `FocusMap::take_dropped`) are the only parts that are
+genuinely the fork's.
+
+**What was not built, and why.** The same three entries as last night, all still blocked outside
+this container, and none of them moved:
+
+- The *entity leak* entry still wants two consecutive `quiet-ui perf: N entities live` lines from a
+  session that has been up a while. Fifth run running. Nothing here can produce them.
+- The *general performance pass* wants a log from the running app for its two remaining shapes
+  (foreground work that could be background, work that scales with worktrees). Not read again
+  tonight: the night went on the four Upstream-first entries, which were ahead of it in the queue.
+- The *GraphQL batching* entry: unchanged. The `gh api graphql` sample pasted in, or a say-so that
+  try-GraphQL-then-fall-back is wanted. The `GITHUB_TOKEN` route is settled and is not worth
+  another attempt.
+
+**2026-10-02**: onto main 9dd6993e2 (24 upstream commits). Squash-then-rebase folded eleven
+fork commits into one, tree-identical to the old tip (`be159e194`) before rebasing. **Two
+conflicts, neither in `thread_view.rs`** — the first night in a while that the recurring seam
+stayed quiet — and no markerless drift: `cargo check --workspace --all-targets` came back with
+zero errors and zero warnings in 12m20s.
+
+- `acp_thread/src/acp_thread.rs`, twice, both append/append. #65039 (`Scope permission
+  lifetimes to requests`) added `IndexMap` to the `collections` import where the fork adds its
+  own `pub use`s, and a `canceled_requests` accumulator at the top of
+  `mark_pending_entries_as_canceled`, where the fork settles in-progress plan entries. **Union
+  both**, with the fork's loop ahead of upstream's declaration so the declaration stays next to
+  the loop that uses it.
+- `gpui/src/window.rs`, one marker region at the end of the test module. #64958 and #65057
+  (journalling platform frame requests, and not sealing empty intervals on idle skips) appended
+  two profiler tests where the fork appends its focus-handle sweep test. **Kept both**, written
+  out whole from their own sides rather than reconciled line by line.
+
+**The diff-size command is unstable under upstream churn, and tonight is the proof.** The
+number it printed jumped from 42,987 / 11,695 to **47,072 / 15,780** across a rebase whose
+content changed by nothing: `git diff` defaults to the myers algorithm, upstream's 350/149
+lines of `thread_view.rs` edits moved its anchor points, and 4,000 lines of that file flipped
+from matched to added-and-deleted. Asking for `--diff-algorithm=histogram` gives **42,005 /
+10,713 on both sides, identical to the line** — before the rebase and after it. The figure to
+read is the histogram one; myers will keep inventing thousands of lines whenever upstream
+touches a file the fork has heavily patched.
+
+**What was built: the Work queue's first five entries, in order, which is everything above the
+GraphQL item.** Each is its own commit.
+
+*The entity leak.* Three findings, and the first one explains why the 09-27 sweep had never
+written a single line to either of Arthur's logs. The sweep was armed only by a thread tab
+being activated in the panel's own pane, and it ran once per arming — so a panel nobody touched
+again never swept, and threads opened behind the one being read kept their whole view tree for
+as long as the app was up. Worse, its idea of "off screen" was "not the active tab of this
+pane": with one worktree per window, the single thread in a window at the back *is* that
+window's active tab, so even when the sweep ran it had nothing to drop. It now runs on a clock
+of its own and re-arms after every pass, is armed by a tab being added and by the window coming
+forward or going to the back, and treats everything in a window the user is not looking at as
+off screen, its active tab included.
+
+The second finding is the one the sweep can never reach: the thread that *is* on screen held a
+`TerminalView` and a `BlinkManager` for every command in its history, and the entry's own
+alternative — "never create a `TerminalView` for a command until its output is expanded" — is
+what was built. It needed one more thing to be worth anything, because `expand_terminal_card`
+defaults to true and every terminal was therefore marked expanded on arrival: a command that
+had already finished the first time its entry was synced, which is every command in a thread
+restored from history, no longer counts as a card to open. A failure still opens itself.
+
+The third is smaller and was found by reading rather than from the numbers: a process-backed
+command kept its whole alacritty scrollback after exiting, with its output already captured
+into the chip. Both display paths already truncate the grid at that point; the process path had
+simply been missed.
+
+*The general performance pass, from Arthur's own numbers.* Four of the five findings were
+code; the fifth (resident memory) is a measurement that follows the leak fix.
+
+- **The sidebar rebuild storm.** The line said how many rebuilds there had been and never which
+  caller asked, and because it only fired when one rebuild crossed 16ms, what the quiet
+  thousands cost between those lines was never a number at all. Rebuilds are now counted per
+  call site — `#[track_caller]` on both entry points, so no call site had to change — and the
+  line names the top four along with the foreground time spent since the last line; it also
+  fires once that time passes a second, so a thousand rebuilds of 2ms and a thousand of 15ms
+  stop looking the same. The source of the noise, found by reading: a thread entry changing asks
+  for a rebuild, which is once per streamed chunk for every thread in every open window, and a
+  row carries only a thread's status, its running work, its title and its diff stats. That is
+  compared before rebuilding now.
+- **Environment capture twice per directory, and separately for submodules.** The cache was per
+  `ProjectEnvironment` and every window has one, so two windows on the same checkout captured
+  it twice at the same moment; it is the app's cache now, and the second asker joins the capture
+  in flight. And the git store captured per *repository* work directory, which is once per
+  submodule, once per worktree: a submodule shares its superproject's checkout and all the git
+  store wants is a `git` on PATH, so it asks for the containing worktree's environment.
+- **The spare worktree, where the entry's reading of its own log was the wrong way round.**
+  "worktree claimed from the spare, not checked out" is the good news — that creation did no
+  checkout at all. The 8233ms checkout logged next to it was a *replacement* spare: claiming a
+  spare changes the repository's worktree list, the sidebar watches that, and it answers by
+  asking for a new spare immediately. So the replacement's checkout ran against the window being
+  opened, and the 12-to-14-second window open was waiting on it. The deferral the creation
+  already had for its own refill now covers everything else that asks.
+- **The hang detector's blind spot.** Thirteen background tasks of 115 to 310ms reported at
+  `executor.rs:143:27`, which is where `BackgroundExecutor::scoped` spawns what a caller handed
+  it — so every fan-out in the app read as that line. `#[track_caller]` cannot fix it from
+  inside, because **the attribute is a no-op on an `async fn`** (with a compiler warning that
+  says so, which is worth knowing for next time); `scoped` and `scoped_priority` are ordinary
+  fns returning a future now, and pass their caller's location down to a spawn attributed where
+  they say.
+
+*Many sidebar rows reading as busy with nothing running.* `running_work` counted every terminal
+whose output had not arrived, and a terminal's output is only filled by its exit — so every
+terminal rebuilt from history counted, which with a few thousand commands behind a thread was
+almost all of it. The call that owns a terminal knows more but not enough on its own either: a
+call can be left reading `InProgress` by an agent that died, by a cancellation, or by a
+transcript recording a turn that never finished. What settles all of those at once is that no
+turn is running — there is then nobody left to finish the call. Outside a turn the only evidence
+a command is alive is the agent having said it detached.
+
+*Command chips collapsing to a glyph and an ellipsis.* Exactly as the entry diagnosed: `flex_1`
+means a basis of zero, so with `min_w_0` and hidden overflow the label contributed nothing to a
+content-sized chip's intrinsic width. `flex_initial` gives it an auto basis that may still
+shrink, so the chip is as wide as its command up to the cap and truncates only beyond it. Two
+other labels inside content-sized chips had the same pattern and got the same treatment; the one
+`flex_1` left is inside a `w_full` row, where a zero basis is correct.
+
+*No more drafts — with two places where the code won.* The hiding of unopened empty drafts, the
+startup purge, the archive-time deletions, "Discard Draft", and the reclaim of worktrees whose
+only thread is empty are all gone; reclaim keeps only spares, and Shift-Backspace on an unsent
+thread archives it through the same `ThreadId`-keyed path as any other. Two things the entry
+asked for were not done, because reading the code said otherwise:
+
+- **`restore_new_draft` creates nothing.** The entry has it as one of the two sources of
+  "threads nobody created", but it reads `tab_threads` first and reuses the restored tab when
+  there is one, and otherwise builds a view for a thread that is already in the store. It stays,
+  and with it `new_draft_thread_id`: removing them loses the new-draft slot across restarts,
+  which `test_...draft...reload` exists to pin. `ensure_pane_has_thread_tab` was the whole of the
+  problem and is gone.
+- **The ordering of an unsent thread was left alone.** An empty draft is pinned above its
+  section, which with persistent drafts looked wrong; but the pinning only applies among *open*
+  threads, a fork test asserts it, and the entry says nothing about ordering. Changing it would
+  have been a restyle with no request behind it.
+
+**Environment: the disk, and a note for next time that is not about the code.** The usual two
+prerequisites were needed again (`CARGO_NET_GIT_FETCH_WITH_CLI=true` because libgit2 times out
+fetching a git dependency through the proxy, `libasound2-dev` for `alsa-sys`), plus 10-01's
+`libxkbcommon-dev`, `libxkbcommon-x11-dev` and `libx11-xcb-dev` installed up front.
+
+Then the session's writable allowance ran out mid-way through a test build: `No space left on
+device`, with `target` at 27GB. **Cargo keeps one artifact per rebuild and never collects the
+old ones**, and a night with a dozen edit-and-compile cycles on `agent_ui` leaves several
+copies of an 839MB test binary and three of a 445MB `libproject.rlib`. Pruning
+`target/debug/deps` down to the newest artifact per crate freed 12GB and cost nothing. Worth
+knowing beside 10-01's `incremental = false`: that stopped the cache regrowing, this is the
+other half, and a night that compiles often wants a prune between phases rather than at the
+end. `script/clippy` builds the **release** profile, which is a second target directory
+entirely, so it wants the debug one gone first.
+
+**The gate, seven crates, and it earned its keep three times over.** `cargo test` over the fork's
+three core crates plus every crate touched tonight: **acp_thread 342, agent_ui 541 (34
+`#[ignore]`d — the 32 standing ones, 10-01's, and tonight's), sidebar 194, gpui 381, scheduler 29,
+git_ui_core 31, project 68 plus 408 integration (1 and 3 `#[ignore]`d). 1,994 passed, 0 failed.**
+`sidebar` is 194, exactly what it was on 09-30 and 10-01, which is the useful number: ten of its
+tests moved with tonight's behaviour and none was lost. It had to be run in groups rather than one
+invocation, for the disk reason below.
+
+Three things it found, in rising order of how glad I am it ran:
+
+- **An upstream test for a surface this fork does not draw.** #65080's
+  `test_embedded_child_permission_selection_uses_conversation_and_cleans_up` drives the permission
+  *granularity* dropdown, which `render_permission_buttons_with_dropdown` deliberately does not
+  render — Claude runs with `bypassPermissions`, so a prompt that does appear is a plain
+  Allow/Deny, and that decision predates tonight. `#[ignore]`d with the reason, body untouched, so
+  it stays a one-line fork change at the next rebase. Everything else the test asserts (the
+  embedded child's buttons, selections written to the shared conversation) is covered by the
+  assertions before the dropdown is opened, which all pass.
+- **A fork test that was racing itself.** `test_migrate_thread_remote_connections_backfills_from_workspace_db`
+  polls because the migration reads the workspace database on a real thread, and the 10-01 log
+  records it coming back empty on two separate nights. The poll waited for the metadata *row* —
+  which the test's own `save` puts there before the migration runs — so it broke out immediately
+  and raced the assertion instead. It polls for the connection the migration writes now. Not a
+  flake and never was: a test that waited for the wrong thing.
+- **A bug in tonight's own sidebar change, which is the one that would have shipped.** The rebuild
+  skip compared only live thread state, and a terminal ringing its bell also emits
+  `EntryChanged` — so a notification could have been skipped along with the rebuild, and the
+  sidebar would have stayed quiet about a terminal asking for attention. The snapshot now covers
+  everything an agent panel contributes to a row, taken from every read of a panel in
+  `rebuild_contents`: its threads' live state, which of its terminals are ringing, and which
+  threads it holds open. **The lesson is the one the entry itself warned about**: "compare inputs
+  before rebuilding" is only safe once you have enumerated the inputs, and `EntryChanged` is
+  emitted from thirteen places.
+
+`./script/clippy -p acp_thread -p agent_ui -p sidebar -p project -p git_ui_core -p gpui -p
+scheduler` (`--release --all-targets --all-features -- --deny warnings`): **clean, exit 0, zero
+warnings**, and a second run of it finishes in 1.5s, which is how a cold release build of 3,256
+crates is told from a run that exited early. `cargo-shear`, `typos` and `buf` are not installed
+here, so `script/clippy` stops after the lint, as it has every night in this log.
+
+One extra check, worth keeping in the procedure: `cargo check --workspace --all-targets
+--release` — **exit 0, zero errors, zero warnings**. The gate's seven crates are not the whole
+workspace, and tonight changed two signatures used far outside them
+(`BackgroundExecutor::scoped`, which has 20-odd callers and is no longer an `async fn`, and
+`ProjectEnvironment`). `script/bundle-mac` compiles the release profile, so a break outside the
+gated crates is a night with no app at all rather than a failing test.
+
+**One test the entry asked for that was not written, rather than written to assert nothing.** The
+chip entry wants "one in a narrow row that asserts it truncates at the cap rather than
+collapsing". The wide-row half is in and fails on the old code. The narrow half is not, and the
+reason is in the test: the chip summarises a command to its first hundred characters before any
+layout happens, so two commands long enough to clamp against the cap already differ in label
+width before the cap is reached; the chip's own bounds are not exposed to tests; and the row the
+chips sit in is whatever the fixture makes it, so resizing the window does not reliably move it.
+Asserting the cap wants a debug selector on `action_chip_base`, which is fork code added for a
+test and was not worth it tonight.
+
+**Diff size.** `git diff --diff-algorithm=histogram --shortstat $(git merge-base HEAD
+upstream/main) HEAD -- . ':!QUIET_UI.md'` is **106 files, +42,940 / -11,176**, from 42,005 /
+10,713 at the start of the night: **935 more added lines and 463 more deleted**, which is
+tonight's eight commits — six fixes, a lifecycle change, and eleven new or rewritten tests.
+Without this file and the sidebar test files it is +38,068 / -9,255. The myers figure, which this
+file used to report, reads 45,342 / 13,578; see the note in **Upstream first** for why that
+number moved by thousands tonight without the content moving at all.
+
+**What upstream now provides that the fork could delete: nothing this round.** The two conflicts
+were both append/append in test modules, and the 24 commits are gpui frame-journalling and debug
+selectors, permission-prompt plumbing in `acp_thread` (which the fork consumes rather than
+duplicates), git-panel multi-selection and file counts, settings and docs. #65039's scoping of
+permission lifetimes is the one worth re-reading in that light next time: it is moving toward
+something the fork's own permission handling might eventually sit on top of rather than beside.
+
+**What was not built: the GraphQL batching entry, and nothing else.** It is the queue's tail and
+stayed there. The night went on the five entries above it, and the two things that made the
+difference were not thinking time: ten sidebar tests moved with the drafts change and each had to
+be read rather than flipped, and the session's disk allowance ran out twice, which cost a full
+test rebuild each time. The entry is unchanged and unblocked — the sample response is still in it,
+and the fallback it asks for is still the right shape.
+
+**2026-10-04**: onto main a84689073 (15 upstream commits). Squash-then-rebase folded eleven fork
+commits into one, tree-identical to the old tip (`6e29b3ae8`) before rebasing. **Five conflicts,
+none of them in `thread_view.rs`** — the recurring seam has now stayed quiet three nights
+running — but the conflict count was again the wrong thing to read: the night's real cost was
+upstream moving session configuration options to the SDK's v2 shapes, which conflicted in one
+file and drifted silently in two others.
+
+- `assets/keymaps/default-{linux,macos,windows}.json`, one marker region each, all
+  append/append: #64916's `TableView` cell-navigation block landed exactly where the fork
+  appends its two `diff_review` contexts. **Union**, upstream's block closed off first. The
+  three files differ only in `use_key_equivalents` and the modifier, so all three resolved the
+  same way.
+- `crates/acp_thread/src/acp_thread.rs`, one region, append/append in the module list: #65093
+  added `pub mod config_options;` where the fork adds `command_output` and `command_parse`.
+  **Union**, in the sorted order the rest of the list is already in.
+- `crates/agent_ui/src/config_options.rs`, **seven regions, and the one place this fork
+  replaced an upstream render path wholesale** (the combined effort/fast-mode/config menu, *R*).
+  Upstream's change to the file is a data-model migration — `v1 as acp` becomes `v2 as acp`,
+  `option.id` becomes `option.config_id`, `SessionConfigOptionValue::value_id` becomes `::id` —
+  plus guards for option kinds it will not draw a control for. The fork's change is a different
+  *surface*: one popover with a section per option, in place of upstream's per-option trigger
+  button and fuzzy-search picker. **Took the fork's file whole and ported upstream's migration
+  into it by hand**, which is the smallest fork change that keeps the requested surface: the
+  type move applies to the fork's code line for line, while upstream's new guards live almost
+  entirely in the picker machinery the fork does not have.
+
+**Markerless drift, and a lesson about the check that is supposed to find it.** `cargo check
+--workspace --all-targets` was started immediately after the replay, and it came back with
+three errors — all of them in `gh_status`, all of them mine, because the run raced an edit I was
+making to that crate at the time. **A workspace check that fails early has not checked the
+workspace**: cargo stopped at `gh_status`, so nothing that depends on it was compiled, and
+`agent_ui` — which did have drift — was never reached. The drift surfaced an hour later from a
+`cargo check -p agent_ui`, which is an hour it did not need to take. Start the workspace check on
+a tree nothing else is touching, and read "could not compile X" as "and nothing downstream of X
+was looked at".
+
+The drift itself is #65093 again, in two files and carrying no markers:
+
+- `agent_ui/src/conversation_view.rs`: the fork's worktree-switch carry copies a preview
+  session's configuration onto the thread it starts, and the fork's model-offer check asks
+  whether an agent advertises a `Model` category at all. Both read the shared boundary, which is
+  v2 now. Four type declarations, two category comparisons, two `SessionConfigKind` matches, one
+  `option.id` and two `value_id` constructors.
+- `agent_ui/src/agent_panel.rs`: the same carried configuration, three more declarations. The
+  file's own `acp` alias is still v1 and everything else in it still wants v1, so it gained a
+  second alias rather than a migration.
+
+Run on its own at the end of the night, on a tree nothing else was touching, `cargo check
+--workspace --all-targets` came back **exit 0, zero errors and zero warnings in 11m37s** — which
+is the figure the first run was supposed to produce and could not.
+
+**What upstream now provides that the fork could delete: nothing this round, but #65093 is worth
+reading again next time.** Its new `acp_thread/src/config_options.rs` is a shared v1-to-v2
+adaptation at the model/UI boundary — `from_v1`, `value_to_v1`, and an explicit refusal of value
+shapes v1 cannot carry. The fork duplicates none of it and now consumes it, which is the right
+side of that trade; what it does mean is that the fork's combined menu sits on upstream's shared
+boundary rather than beside it, so the next change to that boundary will reach the fork's menu
+without a conflict marker. The other fourteen commits are a `PathStyle` reimplementation on
+`std::path` (which touched nothing the fork reads), git-graph and git-tag UI, two git hosting
+providers, headless windowing in gpui, and #65090's streamed tool-call content appending — which
+is in `acp_thread` and merged clean.
+
+**What was built: both of the Work queue's buildable entries, each its own commit.**
+
+*Ask GitHub about many pull requests in one query.* The entry's remaining bullet, and the one it
+always said was most of the work. Every watched branch and pull request was its own `gh`
+invocation and so its own GitHub request; one `gh api graphql` now carries an alias per subject,
+grouped under a `repository` alias each, with the fields named once as a fragment so the query
+does not grow a copy of them per subject. `graphql.rs` is new and holds the whole of it — query
+building, the wire types, and the lowering to the same `GhPr` the `gh pr list` path produces, so
+what a check amounts to is still decided in exactly one place and the fifteen tests that pin
+those judgements did not have to move.
+
+Three things the entry did not ask for, which the reading made necessary:
+
+- **A window opening was never the poll loop's problem.** The entry is written about poll ticks,
+  but `watch_key` asked its own question the moment a watch was registered — so a window opening
+  with a hundred threads made a hundred requests before the poll loop was involved at all. A new
+  watch now arms one batch and waits 150ms for the watches arriving beside it, which is what
+  turns that hundred into one. A newly watched subject has never been polled and is therefore
+  due, so the armed batch picks it up with no second code path.
+- **GraphQL has to be told which repository a question is about.** `gh pr list` takes it from the
+  directory; a query cannot. `gh repo view --json nameWithOwner` answers it with `gh`'s own
+  resolution rather than a second guess at parsing remote URLs, and the answer is cached per
+  checkout for the life of the process. A checkout it will not name is held off for half an hour
+  rather than asked again every poll, because those subjects fall back to the per-subject path,
+  which resolves from the directory and so works where this does not.
+- **A fallback that always fails is worse than the flood.** The entry asks for a fall back to
+  `gh pr list` when the query fails, and accepts that a wrong query "costs an extra request".
+  Taken literally that is one wasted request *plus* the per-subject flood, on every poll,
+  forever. Three consecutive failures now leave the batched query alone for ten minutes. A
+  refusal is handled separately and never falls back at all: the budget is the whole store's, so
+  asking the same hundred subjects one at a time would only collect the same refusal a hundred
+  times, which is precisely what this entry replaced.
+
+`rateLimit { cost remaining resetAt }` rides along, as the entry asks, and a spent budget now
+reports what GitHub charged the last poll instead of how many invocations this app made. `resetAt`
+also replaces the `gh api rate_limit` call the hold used to spend to find out when the window
+turns over — it is in every answer now.
+
+**The one thing the sandbox could not check, and why it is safe anyway.** `gh` is installed here
+but its token is invalid, so the query was never run against GitHub. What is checked: the
+generated text was read (it is one anonymous operation plus one fragment, and the test asserts
+the grouping, the substituted check limit and the escaping), and the parser is tested against the
+response in the Work queue entry itself, byte for byte inside the two pull requests, re-keyed only
+to the alias names this query generates. What is not checked is the live round-trip, and
+`mergeStateStatus` is the field to suspect if it fails — it wanted a preview `Accept` header
+historically. It was left off deliberately: overriding `Accept` on the GraphQL endpoint is the
+riskier of the two, the entry's own sample came back from a real `gh` with that field populated,
+and a query GitHub refuses is exactly what the fallback and the log line are for.
+
+*The activity pill: no gradient behind it, a pill shape, and Claude's subagents counted.* All
+three, and one of them turned out to be already done.
+
+- **The gradient.** Exactly as the entry diagnosed, and the fix is structural rather than
+  cosmetic. The title's truncation fade was a *sibling* of the status slot and positioned
+  `right: -10px` against a distant relative ancestor, so its 64px sat over the status slot and
+  the action slot rather than over the end of the title. It is now a child of the title's own
+  box, which is `relative()` and given a definite height so the fade is as tall as the row and
+  not merely as tall as the label. It dissolves the title and stops where the title's box does,
+  which is the entry's "one that ends before the pill starts".
+- **The pill.** `agent_activity_pill` is a fully rounded container with a solid fill and
+  horizontal padding now, sized to the 16px status slot it sits in. One component, so the
+  sidebar row and the thread's bottom bar both changed; the bottom bar's call site only needed
+  `cx` passed, which the pill now wants for the theme colour.
+- **The subagents, where the code had already done half of it.** `is_subagent` recognised
+  Codex's `spawn_agent` and Zed's own subagent metadata; Claude names its tools in its own
+  `claudeCode` namespace, which nothing in the workspace read outside two test fixtures, so a
+  running Claude subagent was never counted. Only `is_subagent` consults that namespace —
+  deliberately not `tool_name`, which also feeds labels, wait detection and tool-lookup
+  detection, and widening it would have changed how every Claude call reads for the sake of
+  counting two. **The settling the entry asks for needs no code**: the subagent count already
+  sits inside the guard the 10-02 stale-busy fix put there, so a subagent left `InProgress` by a
+  cancelled or dead turn settles with the turn exactly as a command does. The test the entry
+  asked for pins both halves — two subagents running in parallel read as 2, the count drops as
+  each finishes, a Claude `Bash` call is not counted as a subagent, and ending the turn settles
+  the one still in flight.
+
+**No test for the pill's shape, rather than one that asserts nothing.** The same wall 10-02 hit
+with the command chip: a rendered element's background, radius and padding are not exposed to
+gpui's tests, and asserting the fade's new parent would mean giving the fade a debug selector —
+fork code added for a test, which that night judged not worth it and this one agrees. Both halves
+compile and the subagent half is tested; the visual half is read, not measured.
+
+**What was not built: the leak-and-perf measurement entry, and nothing else.** It is the queue's
+remaining item and it stays there, because what it asks for cannot be produced in a sandbox —
+"two consecutive `entities live` lines from a session that has been up a while" is Arthur's own
+app's log and nothing here can stand in for it. What was done instead is the half that *can* be
+done from here: every log line the entry is waiting on was traced to a live emitter that can
+still fire. `agent_panel.rs` logs `dropped the views of N off-screen threads` whenever a sweep
+drops anything, and `sidebar.rs` logs the rebuild line with the per-call-site trigger names and
+the foreground total, both in the shape the entry describes. So a number that has not moved is
+the code's answer rather than a log line that was never wired, which is the one way that entry
+could have wasted another night. The entry is annotated to say so and is otherwise unchanged.
+
+**Environment: the two prerequisites, and the disk again.** `CARGO_NET_GIT_FETCH_WITH_CLI=true`
+and `libasound2-dev` were both needed as usual; 10-01's `libxkbcommon-dev` and friends were not,
+because nothing this night built the crates that want them. 10-02's note about the writable
+allowance was right and the remedy it suggested was not quite enough. The session gets a fixed
+allowance, `target/debug` reached 24GB across a night of edit-and-compile rounds, and the gate
+ran out of it part way through `agent_ui` — `No space left on device` while archiving
+`libterminal_view`, with the other four crates already green. **What works is one phase per
+clean slate rather than a prune between phases**: `cargo test` for the remaining crate,
+`script/clippy` (which is the release profile and so a second target directory entirely), and the
+workspace check each ran on their own with the previous phase's directory deleted first. Pruning
+inside a live `target` buys a gigabyte or two and risks deleting something the build in flight is
+reading; deleting the whole directory between phases buys all of it and risks nothing. The one
+prune worth doing mid-build is the test *binaries* of crates whose suites have already run —
+nothing links against those, and they were 1.5GB of the four.
+
+**The gate, five crates, and it caught two things in my own new code.** `cargo test` over the
+fork's three core crates plus the two others tonight touched: **acp_thread 347, agent_ui 542 (34
+`#[ignore]`d — the same 34 as 10-02, so nothing new had to be silenced), sidebar 194, gh_status
+59, ui 41. 1,183 passed, 0 failed.** `sidebar` is 194 again, the fourth night at exactly that
+number, which is the useful reading: nothing moved under it. `gh_status` went from 43 to 59 —
+sixteen new, ten of them on the query and the answer and six on the scheduling — and
+`acp_thread` from 342 to 347, one of those tonight's Claude-subagent test and four upstream's.
+
+`./script/clippy -p acp_thread -p agent_ui -p sidebar -p gh_status -p ui` (`--release
+--all-targets --all-features -- --deny warnings`) **failed the first time, on two lints in code
+written tonight**: a `sort_by` in `graphql.rs` that wanted `sort_by_key`, and a `key.clone()` in
+`watch_key` that became redundant the moment that function stopped passing the key on to a fetch
+of its own. Both fixed and the gate re-run; `cargo-shear`, `typos` and `buf` are not installed
+here, so `script/clippy` stops after the lint as it has every night in this log. Worth noting for
+next time that clippy stopped at `gh_status` and so never reached `agent_ui` or `sidebar` — the
+same early-exit trap as the workspace check above, in a second tool.
+
+**Diff size.** `git diff --diff-algorithm=histogram --shortstat $(git merge-base HEAD
+upstream/main) HEAD -- . ':!QUIET_UI.md'` is **107 files, +44,775 / -11,324**, from 106 files and
++42,941 / -11,176 at the start of the night: **1,834 more added lines and 148 more deleted, and
+one more file.** That is the wrong direction for this section's rule and it is where the night's
+work went: `gh_status/src/graphql.rs` is 948 of those lines, the batched poll and its tests in
+`gh_status.rs` are most of the rest, and the activity pill cost 34. The whole of it is one
+fork-only crate answering a Work queue entry, so none of it is new seam against upstream — the
+rebase cost of `gh_status` is zero, because upstream has no such crate. Without this file and the
+sidebar test files it is 105 files, +39,903 / -9,403. The myers figure, which this file no longer
+reports, reads 47,232 / 13,781; see the note in **Upstream first** for why that number is not the
+one to read.
+
+**Next time, two things worth having in hand before the gate.** Both of tonight's gate failures
+were the same shape: a tool that stops at the first crate it cannot compile, read as if it had
+checked everything. The workspace check cost an hour that way and clippy cost three rounds.
+`cargo check --workspace --all-targets` should be run on a tree nothing else is editing, and
+`script/clippy` is worth running once early on the crates already written rather than only at the
+end — it is the release profile, so it is the one check nothing else in the night exercises.
+
+**2026-10-05**: onto main cac9d17a6 (34 upstream commits). Squash-then-rebase folded twelve fork
+commits into one, tree-identical to the old tip (`015dfde93`) before rebasing. Seven of those
+twelve were Arthur's own queue entries written during the day, so the night's starting point was
+five plans and no unverified edits. **Five conflicts, and `thread_view.rs` is back in them after
+three quiet nights** — but once again the conflict count was the wrong thing to read: the night's
+real cost was upstream continuing the SDK's v1-to-v2 migration into `ContentBlock`, which
+conflicted nowhere and broke ten things.
+
+- `crates/acp_thread/src/acp_thread.rs`, one region, append/append in the module list: upstream's
+  new `pub mod commands;` landed where the fork adds `command_output` and `command_parse`.
+  **Union**, in the list's existing sorted order. Worth saying what that module is, because the
+  name invites a wrong conclusion: `commands.rs` is the *slash*-command v1-to-v2 adaptation, a
+  sibling of 10-04's `config_options.rs`, and has nothing to do with the fork's shell-line
+  parser. Nothing to delete.
+- `crates/sidebar/src/sidebar_tests.rs`, one region, append/append: upstream added two imports
+  where the fork declares `EMPTY_DRAFT_PLACEHOLDER`. **Union.**
+- `crates/agent_ui/src/draft_prompt_store.rs`, one region at the imports, and the clearest
+  small example of the rule this file opens with. Upstream's change to the file is a mechanical
+  v1-to-v2 migration; the fork's is that an empty draft's row reads neutral instead of naming an
+  agent. **Both**: upstream's migration taken whole (the body merged to v2 clean on its own), the
+  fork's neutral label kept, and `ZED_AGENT_ID` dropped because the fork had already removed its
+  only user.
+- `crates/agent_ui/src/agent_panel.rs`, three regions. In `draft_prompt_blocks_if_in_memory`
+  upstream's only change is the v2 type, and the merge base already held the inlined lookup the
+  fork replaced with `conversation_view_for_id` plus its `unstarted_message_editor` early
+  return — so **upstream's type on the fork's body**, which is the smallest change that keeps
+  "the composer is the single source of truth for an unstarted draft" (2026-10-02). The other two
+  regions are upstream seeding a stale prompt onto an `AcpThread` in a test whose own comment
+  says an unstarted draft has none; the fork had removed the binding, so upstream's blocks would
+  not have compiled. **Took ours.**
+- `crates/agent_ui/src/conversation_view/thread_view.rs`, three regions, and the recurring seam is
+  one of them. (1) The empty-input send path: upstream added a queue-validation guard where the
+  fork sends pending review comments as the message. **Union**, review comments first — pressing
+  send with comments pending is a send of those comments, which should win over draining the
+  queue. (2) The thread-controls row, which is the seam exactly as this log describes it: upstream
+  added a `discard_draft_button` to a row this fork does not draw at all, the status bar above the
+  message box being that surface. **Took ours**, and then deleted the two stranded upstream
+  bindings (`discard_draft_button`, `composer_is_read_only`) that `cargo check` named as unused —
+  the `render_send_button` the fork deleted long ago came back with the replay and went again with
+  the row. (3) A thousand-line append/append in the test module, where upstream migrated
+  `native_command` to v2 and the fork appends its own tests ahead of it. **Union**: the fork's
+  tests, then upstream's signature.
+
+**Markerless drift: the v1-to-v2 migration reached the fork's review-comment path, and the review
+path alone.** `cargo check --workspace --all-targets` came back with ten errors in eleven minutes,
+all in `agent_ui`, none carrying a marker. Upstream moved `ContentBlock` to v2 across the send and
+queue path (`send`, `add_to_queue`, `send_content`, `MessageEditor::set_message`), and the fork
+composes review comments into blocks of its own:
+
+- `agent_ui/src/diff_review.rs` composed them as v1 — three sites, now v2. The file's own
+  `ReviewBlockText` trait, which existed precisely because "a message the user has sent carries v2
+  blocks; the queue still composes v1 ones", has had that straddle collapse out from under it:
+  both impls are still there, and the v1 one is now the unused half to watch.
+- `thread_view.rs`'s `take_pending_review_blocks` followed, and
+  `conversation_view.rs`'s two `set_message` calls for an external-source prompt.
+- `agent_diff.rs`'s two test modules read review blocks back and aliased v1.
+- `conversation_view.rs`'s `ReplayingConnection::prompt` is the one to remember: the trait now
+  takes a **v2 request** and still answers with a **v1 response**. Migrating both, which is the
+  obvious thing to do, fails; the signature is genuinely mixed.
+
+Re-run on a quiet tree, `cargo check -p agent_ui --all-targets` came back clean, and the workspace
+check had already passed everything else on the first run.
+
+**Nothing to delete this round.** Upstream's `commands.rs` is an adaptation the fork consumes
+rather than duplicates (above), and the other thirty-three commits are git-tag and git-graph UI,
+`PathStyle`, hosting providers and the v2 migration itself.
+
+**What was built: the Work queue's first three entries, each its own commit.**
+
+*The `+` that opened a worktree with no thread in it.* The entry's diagnosis was right to the
+line: `create_new_worktree_thread` creates the workspace and nothing else, having relied on the
+panel load path making a draft, which fca3d9dcc6 removed. It now creates the thread in the new
+workspace's own panel once the creation task resolves — the panel is registered by then, because
+`open_worktree_workspace` awaits `take_panels_task`, which is the same assumption the
+`create_thread` tool's worktree path already documents. **The other paths the entry asked about
+are fine and were left alone**: the worktree header's `+` and the sidebar row's menu both go
+through `Sidebar::create_new_thread`, which already parks the request in
+`pending_new_thread_workspace` and fulfils it from `PanelAdded` when the panel loads late. The
+second half of the entry — "a pane must never show a `ForeignThreadTab` as its active item" —
+turned out to have a smaller answer than the activation handling it points at. `ForeignThreadTab`
+activations were already re-routed; what was missing is that a pane of *only* proxies counted as
+visible, so `thread_pane_is_visible` now requires one local `ThreadTab` and a workspace with no
+thread of its own falls through to upstream's empty panel state. Syncing the proxies also puts a
+local tab in front when nothing restored the active item.
+
+**The one thing the test cannot reach, and why.** The entry asks the test to press `+` and then
+assert on the new workspace's panel. A worktree workspace gets its agent panel from
+`initialize_workspace`, which lives in the `zed` crate, so a workspace created inside `agent_ui`'s
+tests never has one — the test confirms `+` opens the second workspace, and then asserts both
+halves of the fix against a panel it adds itself: a pane holding only proxies is not shown, and
+the thread `+` asks for lands as that workspace's own active tab with a persisted row. The
+end-to-end press belongs in `cargo test -p zed --bin zed`, which 09-22 established needs
+`libxkbcommon-dev` and friends to link.
+
+*Every thread remeasure now goes through `drawn_item_for_entry`.* Three sites still named a list
+index by hand. `read_image_shape` is the one that was provably wrong: it remeasured the picture's
+own entry, which for a picture that is not first in its run is an item that draws nothing, so the
+item that *does* draw the picture kept the placeholder height it was measured at. `NewEntry` and
+`EntriesRemoved` named nothing at all, and the compaction toggle named its own entry. All four go
+through the one function now, as the entry asked, and the guard it asked for exists: the list
+reports `quiet-ui layout: list item N painted Xpx, measured Ypx` when an item lays out taller than
+the height it remembered, opt-in per list so nothing else in the app says anything.
+
+**But the sixth report is not forestalled, and this is the important line in this entry.** Two
+tests were written for this item and *both passed against the unfixed code* before being thrown
+away — which is the same trap the entry says the four previous attempts fell into, caught this
+time only because each new test was run against a reverted fix on purpose. The first streamed
+pictures into an already-measured run, exactly the scenario the entry specifies, and passed with
+the `NewEntry` remeasure deleted. The reason is in `StateInner::layout_items`: an item inside the
+visible region is re-rendered and re-measured **every frame** regardless of what the sum tree
+holds, and `item_layouts` positions from those fresh sizes. So for a visible item a stale
+remembered height does not cause the overlap, and a test window in which everything is visible
+cannot reproduce it. **The entry's diagnosis is accurate about the code and does not explain the
+screenshot.** What is committed is correct and small — `read_image_shape` was remeasuring an empty
+item — but it should not be taken as the cause being found. The mechanism is still open, and the
+places left to suspect are the ones where a tree height is used instead of a fresh one: a run
+whose first entry has scrolled above the viewport, the `overdraw` region, and the scroll-top
+arithmetic that accumulates `rendered_height` from remembered heights. The committed test pins
+what the fix actually establishes: all three actions of a run report item 0 as the item that draws
+them, and the entries that draw nothing carry none of the run's height, so remeasuring one of them
+could never have fixed anything.
+
+*The sidebar row's fades are painted in the colour the row is painted in.* The entry's diagnosis
+was right in full. The row sets one background per state rather than stacking them —
+`.when(running && !self.selected, ..)` drops the running wash once a row is selected, and the
+`.hover()` and `.active()` styles replace the base outright, wash and selection included — while
+the fades were handed a blend of every layer at once. One function now works out the opaque colour
+for each of rest, hover and active from exactly the layers the row paints in that state, and the
+row's own background and every `GradientFade` on it are given those same three values, so they
+cannot disagree.
+
+**Worth recording for any future test in `ui`: the test theme's ghost colours are fully opaque.**
+`ghost_element_selected`, `_hover` and `_active` all come back with `a: 1.0` under
+`LoadThemes::JustBase`, and an opaque layer discards whatever it is blended onto — so the right
+and the wrong composition agree exactly, and the first version of this test passed against the old
+formula. It now overrides those three with translucent values, as every real theme has them, and
+fails against the old formula on the first assertion.
+
+**Both remaining entries were then taken on after all, at Arthur's word.** The night had stopped
+at three items with the clock as the reason, and that reasoning was wrong in a way worth writing
+down: **the deadline is the gate, not the build.** A branch pushed after 00:45 is not a branch
+that misses — it is a branch the *next* build bundles, which costs a day of latency. A branch
+pushed ungated is the only thing that cannot be undone from the laptop. So "not enough time to
+gate it before the build" is a reason to push later, never a reason to leave an item unbuilt.
+
+*Claude's subagents, counted from their own lifecycle and drawn as chips.* The entry was right in
+every particular, including which mechanism to use. Zed now advertises
+`nativeSubagentSessions` beside `asyncTasks` in the AIR extension's capability array, which is
+what makes the adapter send anything at all, and `handle_session_notification` routes a raw
+`subagent_*` kind to a new `apply_subagent_update` exactly as it already routed `async_task_*`.
+`AcpThread` keeps a `Subagent` per reported session and counts the live ones whether or not a turn
+is running.
+
+Two decisions the entry did not have to make:
+
+- **The two ways of knowing about a subagent must not both count.** An agent that reports
+  lifecycles and a call that is still `InProgress` are the same subagent seen twice, and the pill
+  would have said two. A call whose subagent is reported on is counted from the report; a call
+  nobody reports on still has its own status read, which is all there was before and is what keeps
+  Codex's `spawn_agent` and Zed's own subagents counted. There is a test for exactly this, because
+  it is the kind of thing that reads correct and double-counts in practice.
+- **The chip's one icon slot carries the status, not an agent glyph.** The entry asks for "the agent
+  glyph, the subagent's task name, and its status". A chip has one icon slot, and which agent ran a
+  subagent is the same for every subagent in a run while whether it has finished is not — so the
+  slot spins while the subagent works and shows a check when it is done, and the glyph is the part
+  that went. Removing `!tool_call.is_subagent()` from `is_chip_entry` is the whole of the "stop
+  drawing them as full-width cards" half; the card was never chosen, it was what everything that is
+  not a chip falls through to.
+
+*The memory baselines: nothing built, and all three parts resolved by reading.* This is the one
+place the queue entry turned out to be wrong rather than merely hard, so the Work queue entry has
+been rewritten around what the code says instead of being left as Arthur wrote it. In short: the
+sweep **cannot** release the 17,925 `Markdown`, because `EntryViewState` holds none of them and
+every one hangs off the thread's own entries; `environment.rs:303` is **not** running twice for one
+directory, because the capture is cached on `(shell, path)` and inserted before it is awaited; and
+the terminals are real but the fix is not small — `acp_thread::Terminal::terminal()` has 44 callers
+outside the terminal crate, so making it optional is a change to the shape of upstream's thread
+data rather than a patch, and whether 8,000 entities actually go cannot be checked from here
+anyway. What the three share is the finding worth keeping: **the fork's remaining baseline is
+thread data, not view data**, and one mechanism for a thread entry to drop what it derived and
+rebuild it on demand would serve the terminals and the markdown both. That is a night with a design
+decision in it, which is what the rewritten entry now says.
+
+**One line of fork diff that is not the fork's idea.** `CLAUDE.md` carries a hard rule that any
+session touching source files must prepend a two-line review-confirmation banner to `README.md`,
+and it is explicit that the agent must never remove it — that is the human author's step. So
+`README.md` now carries those two lines on this branch. It is upstream-owned and it will conflict
+every rebase until Arthur removes it, which is worth knowing before wondering where it came from.
+
+**The gate: green, and it found three things the checks had not.** `cargo test` and
+`./script/clippy` for `acp_thread`, `agent_ui`, `sidebar`, `ui` and `gpui` — the three core crates
+plus the three the night touched. 1,695 tests pass (acp_thread 352, agent_servers 58, agent_ui 545
+with 35 ignored, sidebar 194, ui 91, gpui 454 plus its one integration target with 2 ignored) and
+clippy comes back **exit 0 with no warnings at all** under `--deny warnings`. Those are the
+figures after the subagent work; the gate was run twice, the first time over the first three
+items. The Verification queue was empty when
+the night started and is empty now.
+
+Everything the gate caught was the rebase's, not the night's work, and each was attributed by
+reverting the three built items and re-running the two failures against the bare replay — both
+still failed, which is what makes that claim worth anything.
+
+- **`sidebar`'s suite would not compile.** `draft_prompt_store::write` takes v2 blocks after the
+  night's drift fix and the fork's own tests handed it v1, in two places. **And this is the 10-04
+  lesson repeating itself in the same shape**: the first workspace check stopped at `agent_ui`, so
+  nothing downstream of `agent_ui` was compiled, and `sidebar` is downstream. After fixing
+  `agent_ui` the check that was re-run was `cargo check -p agent_ui`, not the workspace — so the
+  gate was the first thing to look at this crate, forty minutes later. **The rule is not "re-run
+  the failing crate"; it is "re-run the workspace", because a crate that fails to compile hides
+  everything that depends on it.** Run on a quiet tree at the end,
+  `cargo check --workspace --all-targets` came back exit 0 with zero errors and zero warnings.
+- **The `sidebar_tests.rs` union put back an import the fork had deliberately removed.**
+  Upstream's side of that region was two imports and only one of them was new;
+  `agent_settings::AgentSettings` has been there since before the merge base and serves
+  `set_max_idle_retained_threads`, a helper the fork dropped along with the nine tests that call
+  it (the fork's copy of that file is some 986 lines shorter than upstream's, and has been since
+  before tonight). A union is the right resolution for an append/append, but it takes *upstream's
+  new line*, not everything on upstream's side of the marker.
+- **A replayed `#[ignore]` went missing with no marker and no compile error.**
+  `test_external_file_drop_on_thread_does_not_paste_into_later_terminal` carried
+  `#[ignore = "pre-existing base-view degradation on the quiet-ui fork (threads live in tabs, not
+  the panel base view)"]`, the same note five other tests in that file carry, and the replay
+  dropped the attribute while keeping the test. It reads exactly like a new failure. **Worth
+  adding to the markerless-drift list above: a lost attribute is the quietest kind, because
+  `cargo check` cannot see it and the test it belongs to starts failing for a reason that looks
+  like tonight's work.** Restored.
+
+And one thing the gate turned into a decision rather than a fix.
+`test_unsupported_composer_draft_preserves_source_until_discard` is **new in upstream this round**
+and it tests a feature, not a detail: a draft whose resolution fails leaves the composer read-only,
+and the only way back out is an explicit "Discard draft" control, which upstream puts in the
+thread-controls row — the one surface this fork replaces wholesale. Deleting the stranded binding,
+which is what this log says to do with that seam, would have deleted a way out of a stuck composer
+and left the user with no way back. **Adopted instead**, into the status bar the fork draws in that
+row's place, keeping upstream's `discard-protected-draft` selector so upstream's test is the test.
+That is the seam rule's other half earning its place: take ours for the *surface*, but look at what
+upstream put in it before throwing the contents away.
+
+**2026-10-06, reduction run** (no rebase; on top of the 10-05 tip `704ff0b`, merge base
+cac9d17a6). Arthur's ask: make the fork substantially smaller without losing anything he asked
+for, build nothing. **Diff size, histogram: 109 files, +45,792 / -11,354 before; 109 files,
++36,737 / -11,298 after** — 9,055 added lines gone. Without this file and the sidebar test files:
++40.9k / -9.4k before, +33.1k / -9.4k after. Eight agents cut in parallel, one per area, each owning
+its own files; seven commits, one per area plus the test fix below.
+
+**What was cut, by category.**
+
+- *Upstream provides it.* Only one case: chips.rs carried a moved copy of upstream's
+  `highlight_code_runs`; thread_view.rs has upstream's again and chips.rs uses it. Nothing else
+  the fork carries has an upstream equivalent yet (re-checked: `Repository::diff_stat` has no
+  merge-base variant, so `branch_diff_stats.rs` still parses its own patch).
+- *No reason.* `worktree_service`'s `WorktreeWorkspaceActivation` enum back to upstream's
+  `activate: bool`; upstream's `title_override`, `activate_new_thread` and a dozen other reshaped
+  or reworded upstream lines and comments put back (editor/git.rs, agent_diff, model selector,
+  sidebar, thread_item); `ThreadItem`'s unrequested "PR Chips" component-preview example.
+- *Leftovers of removed features.* The tab bar (09-28): `ThreadTab`/`ForeignThreadTab`'s tab
+  content, tooltips, status indicator and the observations that only repainted them. Drafts and
+  the retained cache: `CreateThreadOptions::activate` (always false) and the `discard_empty_draft`
+  branch it guarded, a `session_config` parameter every caller passed empty, `clear_draft_message`,
+  a no-op flag in the sidebar's `close_terminal_entry`.
+- *Dead and duplicated code.* diff_review is v2-only: the `ReviewBlockText` trait and both impls
+  are gone, and thread_view renders review comments with diff_review's parser instead of a second
+  one of its own. gh_status: unused pub API (`global`, `fetched_ago`, `last_error`,
+  `pr_chips_for_branches`, `set_prs_for_test`), and the GraphQL answer deserializes into the CLI
+  path's `GhPr`/`GhCheck` via `serde(flatten)` instead of mirroring them field by field.
+  acp_thread: `Subagent::display_label`, `is_plumbing`, and `pub` on crate-internal items; acp.rs
+  shares one field reader for the AIR updates. `ActionChipId::EditFile` (built and discarded),
+  `ThreadBookmarks::is_empty`, `ToolCallDiff::deploy` folded into `open_tool_call_diff`,
+  `activate_additional_new_thread` reduced to an alias, shared helpers for tab-thread bookkeeping
+  and submodule admin entries.
+- *Tests.* command_parse 45 → 26 (tables), pr_mentions 12 → 5, gh_status 59 → 43, sidebar fork
+  tests share one fixture and setup and lose five that another test covers, acp_thread's fork tests
+  use upstream's `new_test_thread`. Every requested behaviour keeps at least one test; no
+  `#[ignore]` was touched.
+- *Comments*, the largest single category: the fork's paragraphs cut to the non-obvious why
+  across every file (command_parse 562 → ~127 comment lines, chips.rs 481 → ~80, thread_view.rs
+  ~930 lines). Several stacked orphan doc comments from earlier rewrites went, and three
+  misattached ones were fixed (`persist_worktree_state`, an orphan action doc that had merged into
+  `ChatWithFollow`'s, `ThreadPrSnapshot::dismiss`).
+
+**Bugs found on the way.** A duplicated `#[gpui::test]` on git's submodule checkpoint test; a
+misplaced `#[cfg(unix)]` that sat on the chip-width test while the `sleep 60` stop test ran on
+every platform; and the fork's tests inserted into acp_thread.rs had taken the `#[cfg(unix)]` off
+upstream's terminal-kill test. All three fixed. And `test_a_spare_worktree_is_handed_over_and_replaced`
+**fails whenever it runs in parallel with the other spare test, on the old code too**:
+`CREATIONS_IN_FLIGHT` is process-wide, so one test's creation stops the other starting its
+replacement spare. The counter is thread-local under `cfg(test)` now; production is unchanged.
+
+**Kept although it looked cuttable.** `config_options.rs` (recorded as the requested combined
+menu; comments only), the "conversation" wording (recorded request), `ForeignThreadTab`
+(cross-worktree reorder), `ask_when_the_budget_returns` (the only reset source when no batch has
+answered recently), the npm-install dedupe in `agent_server_store.rs` (looks like a reliability fix;
+the 10-01 audit line for that file is stale), the executor `#[track_caller]` changes (a finding of
+the performance pass, missing from the audit), and the sidebar's remaining diff (compared function
+by function: ~85 are identical to upstream, the rest need their changes).
+
+**For Arthur to decide** (kept, none recorded as requested):
+- Unknown tool-call updates are dropped with a warning instead of upstream's "Tool call not found"
+  entry (`update_tool_call`).
+- Codex-oriented polish in acp_thread: generic edit labels, usage-limit error parsing and
+  linkifying, wait/lookup/stdin chip filters, compaction notices, plan entries reset on cancel.
+- thread_view: the "N subagents" chip in `render_generating` (the pill already counts them from
+  their lifecycle), `render_compaction_barrier`'s restyle, the diff-stat chip tinting.
+- agent_ui: back/forward thread navigation, `ToggleReviewLayout`, `agent_brand_color` tints,
+  opening `.html` links in the system browser, the model selector's working glimmer and its -2px
+  offset, the launch-deadline logs in `agent_connection_store.rs`; `NewAdditionalThread` now does
+  exactly what `NewThread` does and could go.
+- Empty-draft handling that sits oddly with "no drafts to drop": `local_thread_tab_removed`
+  deletes an empty thread's row on close, `redirect_activation_off_empty_draft`, and
+  `discard_empty_draft` before a worktree carry; the sidebar tests' `EMPTY_DRAFT_PLACEHOLDER`
+  filters may be unnecessary.
+- Outside agent_ui: upstream's carry of open files into a new worktree is dropped (~65 lines to
+  restore); the status bar renders in the centre column; `BranchDiffToolbar` is no longer
+  registered; `quiet_ui_build.yml`'s header comment is wrong (fix or delete the workflow).
+
+**The gate: green for everything this run changed.**
+`cargo check --workspace --all-targets` on a quiet tree: 0 errors, 0 warnings. `cargo test`:
+acp_thread 306, agent_servers 58, gh_status 43, ui 91 plus 41 doctests, agent_ui 534 (35
+`#[ignore]`d, the same 35), sidebar 189, gpui 382 plus 1 (2 ignored), project 68 plus 408, zed 93,
+git_ui_core 31, git_ui 176, workspace 278, title_bar 7, editor 1,177, plus scheduler, util, fs, git,
+language_model and markdown; zero failures except three, each shown not to be this fork's by
+running upstream's own source for that crate on the same tree and getting the same failure:
+`auto_update::test_auto_update_downloads` ("database not initialized", after installing `rsync`,
+which the sandbox lacks and the test needs), the two `gpui_macros` doctests for `property_test`
+(they need features a doctest doesn't get), and `editor`'s
+`code_lens::tests::test_code_lens_resolve_only_visible` (a viewport-boundary assertion that resolves
+row 60 as well; three of three runs). This run changed only comments in those crates and in
+everything `editor` depends on, so all three fail identically at `704ff0b`; none of them was in a
+previous night's gate. `./script/clippy` over all 22 crates touched (`--release --all-targets
+--all-features -- --deny warnings`): clean. The `cargo test` counts that went down are the merged
+tests above, not lost ones.
+
+**Environment.** `rsync` joins the list of things to install (for `auto_update`'s suite). The disk
+ran out twice, both times from several agents building test binaries at once — **parallel agents
+get `cargo check` only; the coordinator runs the suites**, one crate group at a time with
+`target/debug` deleted between groups, and `cargo test --no-fail-fast` across several crates or a
+failure in one hides the rest (it did here: `auto_update` failing stopped `git_ui_core`, `git_ui`,
+`title_bar` and `workspace` from running until they were re-run).
+
+**2026-10-07**: onto main da0a7a78c (52 upstream commits). A working night four times over: the
+Work queue held four buildable items and one design note, the branch carried 21 commits over the
+merge base, and the branch had last moved the same day. Squash-then-rebase folded all 21 into one,
+reusing the squash's own message; tree-identical to the old tip (`6e9d7cc88`) before rebasing.
+Backup at `quiet-ui-pre-rebase46-2026-10-07`.
+
+**What upstream has built that this fork had by hand: resolving a file link outside every
+worktree.** `agent_ui.rs`'s `open_abs_path_at_point` conflicted, and that is the find of the
+round. The fork took the `fs` out of the project, checked a path existed and only then opened it,
+so a broken agent link would not create an empty buffer. Upstream now does the whole thing itself:
+`project_path_for_file_link` picks the worktree-relative path and `Project::resolve_abs_file_link`
+resolves anything outside every worktree. Upstream's version is taken whole and the fork's `fs`
+line is gone; the only fork code left in that function is the four lines that send an `.html`
+report to the browser instead of the editor.
+
+**Adopted: `scroll_to_user_message_index`.** The 09-22 entry said to take it when it next
+conflicted, and it did. The fork's `scroll_to_most_recent_user_prompt` is deleted and upstream's
+richer version kept behind `#[cfg(test)]`, since the fork does not draw the button that calls it;
+its two call sites in `conversation_view.rs` pass `None`. Upstream's predicate
+(`AcpThread::is_user_authored_scroll_target`) comes with it, in place of the fork's
+`matches!(entry, UserMessage(_))`.
+
+**Seven files conflicted, seventeen hunks.** Ten of them in `thread_view.rs`, as ever. The fork's
+side was taken for the turn-end gating and the per-turn thread-controls row (the fork draws one
+set of controls on the last entry, not a row per turn), for the bookmarks waypoint navigation that
+`ScrollOutputToNextMessage` runs over, and for `render_thinking_block`, which the fork replaced
+with thought chips and which the replay left stranded. Upstream's side was taken for its four new
+file-link tests, and the fork's three tests in that region were re-appended beside them.
+Elsewhere: upstream's reworded doc comment over the fork's fd-limit helpers in `util/process.rs`,
+import and module unions in `acp_thread`, and upstream's own enriched
+`RestoredAvailableCommandsConnection` in place of the fork's stale copy, keeping the fork's
+`ReplayingConnection` test next to it.
+
+**`crates/sidebar` is upstream's, not the fork's.** Worth writing down, because the fork's own
+description of it reads as though the crate were fork-only. Upstream changed
+`workspace_menu_worktree_labels` for `path_style`, which conflicted with the fork having deleted
+that whole workspace-menu block together with both its call sites. The deletion stands: restoring
+upstream's version would have put three dead items back in a file the fork heavily patches.
+
+**Markerless drift: one, and it was upstream's test calling the fork's constructor.** Upstream's
+`test_restores_available_commands_from_a_loaded_session` calls `ConversationView::new`, which the
+fork has given two extra parameters (`session_config` and `start: ConnectionStart`), so the
+replayed call was two arguments short — no conflict marker, and `cargo check --workspace
+--all-targets` is the only thing that found it. `ConnectionStart::Immediate`, since the test
+asserts the load started. Also one self-inflicted replay artifact worth noting for next time: the
+three fork tests re-appended to `thread_view.rs` went in after the file's last brace, which is
+not the test module's — that file carries top-level functions after `mod tests`, so they landed
+inside `reset_fast_mode_warnings` and read as "cannot test inner items". A restored test belongs
+before the closing brace of the module it came from, found by counting braces, never at the end
+of the file. After both fixes the workspace check came back with 0 errors and 0 warnings.
+
+**What was built: all four buildable Work queue items, and the fifth decided.**
+
+- *The sidebar title under the pill.* The plan's diagnosis was right to the line: the title box
+  (`id("content")` in `ThreadItem::render`) had `min_w_0` and `flex_1` but no `overflow_hidden`,
+  and in an opaque window the label is deliberately left untruncated so the fade can dissolve it,
+  so the text ran past the box and under the status slot, which was already `flex_none`. One
+  `overflow_hidden` is the whole fix. **Where the plan and the test harness disagreed:** the plan
+  asks for a test on the title's painted bounds, and painted glyphs are not observable in gpui
+  tests — the test text system's `glyph_raster_bounds` returns zero-size bounds, so every glyph
+  sprite is culled before it reaches the scene. The test asserts the clip the glyphs are subject
+  to instead: a painted quad masked to the title box, whose right edge is at or before the pill's
+  left. Reverted against the old code it fails on exactly that line.
+- *The subagent glyph.* `agent_activity_pill` takes the glyph from its caller now, so the sidebar
+  row passes its own agent icon and the thread's bottom bar passes `agent_icon`. **Where the plan
+  and the code disagreed:** the plan says a subagent's chip draws `tool_kind_icon`, and a chip
+  with a reported lifecycle never reaches that branch — it draws the spinner while running and a
+  check once finished, and only a subagent whose lifecycle was never reported falls through to the
+  generic glyph. Either way it said nothing about whose subagent it was, so the chip now draws the
+  agent's logo past running, stopped and failed, keyed on `subagent_session_info` rather than on
+  reported state. No test: the icon a chip picks is not observable in these tests and there is no
+  branch to unit-test.
+- *Command chip labels and the blank space.* Pieces 22 → 40 characters, a single command 60 → 100,
+  and the chip's cap from three quarters of the row to all of it. Past the cap a line now loses
+  directories rather than file names (`command_display_label` in `acp_thread`). **The blank space
+  was measured, and it was not what the plan thought.** A chip measured 155px drawing 134px:
+  21.5px of padding, glyph and gap, a 106.5px label, 6px of padding, and 21px of nothing. The 21px
+  was the copy button — hidden until the chip is hovered, but still holding its place in the flow,
+  so every command chip reserved it. It is overlaid now, the way the PR chip's remove control
+  already overlays its state icon. The plan's suspect, a size mismatch between the label's runs
+  and its container, does not exist: `rems_from_px(12.)` and `text_xs()` are both `rems(0.75)`.
+  The gaps measure 4px between chips, 4px between wrapped rows and 2px around the run, which is
+  already tight, so they are left alone.
+- *The PR chip's counts.* `checkRunCountsByState` and `statusContextCountsByState` added to the
+  batched query, lowered into a `CheckCounts` on `PrStatus`, drawn as `✗ n  ◌ m` on the row's chip
+  and the thread's, with the full breakdown in the hover card. Counted from the flattened rollup
+  when `gh pr list` is all there is. Only an explicitly finished state counts as finished, so a
+  state GitHub adds later lands in "running" rather than making a chip read green.
+- *The memory baselines: decided, not built.* See the Work queue entry this leaves. The short of
+  it is that the 10-05 finding is right about where the memory is and its cost figure names the
+  wrong method: `Terminal::terminal()` no longer exists, the accessor is `Terminal::inner()`, and
+  its production callers are few. The cost is elsewhere — `ToolCallContent::Terminal` holds an
+  `Entity<Terminal>` directly, not an id, so releasing a finished command's terminal means that
+  enum field becoming an id and `ToolCall::terminals()` resolving through the thread's registry:
+  ~46 and ~30 sites, nearly all upstream's, in the file that conflicts on most rebases. **Upstream
+  first** decides it: the fork does not carry that, and nothing in this sandbox can measure what
+  it would buy. The queue entry now holds the one measurement Arthur can take that would, and the
+  smaller patch to propose if the numbers say so.
+
+**The gate.** `cargo test` and `./script/clippy` for the fork's three core crates and the two more
+this run touched (`ui`, `gh_status`); the Verification queue was empty. The suites: `acp_thread`
+313, `ui` 92 plus 41 doctests, `gh_status` 48, `sidebar` 189, `agent_ui` 547 with its 35
+deliberate `#[ignore]`s left alone. Two failures, both upstream drift from tonight's replay rather
+than tonight's code, and the first of them a feature the fork had silently lost:
+
+- **`test_open_link_html_file_opens_in_the_browser`.** Upstream rewrote `open_link` to resolve a
+  file link and open it itself instead of handing the path to `open_abs_path_at_point`. No
+  conflict, because the fork does not touch `open_link` — but the fork's "an HTML report opens in
+  the browser, not the editor" lives in `open_abs_path_at_point`, so every agent link to an
+  `.html` file had started opening in an editor. This is the strongest argument yet for the fork
+  keeping a test per fork behaviour, however small: nothing else in the gate noticed, and the diff
+  looked clean. The predicate is shared now and `open_link` checks it against the candidates it
+  has already worked out.
+- **`test_thinking_preview_copies_selected_content`**, new from upstream in these 52 commits,
+  drives upstream's thinking block. The fork draws thoughts as chips and the replay left
+  `render_thinking_block` stranded (taken out with the rest of that seam), so there is no
+  `message-content-{entry}-{chunk}-{block}` for a thinking chunk to select in and the test cannot
+  pass here. Removed, with a note in its place. `thinking_block_state` stays: the thread search bar
+  still reads it.
+
+Clippy came back clean for all five crates under `--deny warnings` in 7m57s, and nothing in the
+replay left a stranded helper behind: the workspace check after the replay reported 0 warnings as
+well as 0 errors, so `render_thinking_block` and the per-turn controls row went without residue.
+
+**A note on how clippy was run.** `script/clippy` forces `--release`, and this container's disk
+allowance cannot hold a debug dependency tree and a release one at once, so the suites ran first
+and `target/debug` was deleted before clippy. The release profile's `lto = "thin"` and
+`codegen-units = 1` were overridden for the run (`CARGO_PROFILE_RELEASE_LTO=false`,
+`CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16`, `CARGO_PROFILE_RELEASE_DEBUG=0`), which changes how the
+dependencies are compiled and not one lint clippy reports.
+
+**Diff against upstream: +37,495 / -11,382**, against +36,737 / -11,298 after the 10-06 reduction
+run. Up 758 added lines, four fifths of it the four queue entries (59, 16, 268 and 415 lines) and
+the rest the replay repair; roughly two thirds of what the entries cost is their tests. The 84 new
+deletions are mostly upstream's thinking-preview test.
+
+**An environment failure worth writing down: the container ran out of disk in the middle of the
+gate.** `sidebar`'s test binary died with `ar` taking SIGBUS while archiving `webrtc-sys` object
+files, which reads like a toolchain fault and is not one: `df` said 488MB available on a 99%-full
+filesystem. `target` had reached 27GB, 23GB of it `target/debug/deps`, because a night of repeated
+`cargo test -p agent_ui` runs leaves a copy of every rlib per feature configuration — five of
+`libgpui`, four of `libsettings_content`, four of `libcranelift_codegen`, two of `libproject` at
+448MB each. Deleting all but the newest artifact per crate freed **12.5GB** and the build carried
+on. Two things for next time: sweep `target/debug/deps` for duplicates before the gate rather than
+after it fails, and remember that `script/clippy` forces `--release`, so the gate needs a debug
+dependency tree and a release one that cannot both be held at once — run the suites, then delete
+`target/debug`, then run clippy.
+
+**2026-10-08**: onto main 9ab071596 (16 upstream commits). A working night on the branch's shape
+rather than the queue: the Work queue's one entry is the memory-baseline design note, which is
+waiting on Arthur and not buildable here, and the Verification queue was empty — but the branch
+carried six commits over the merge base, so the squash and replay were due. Squash-then-rebase
+folded all six into one, reusing the squash's own message; tree-identical to the old tip
+(`17800cb56`, tree `aeda199f`) before rebasing. Backup at `quiet-ui-pre-rebase47-2026-10-08`.
+
+**Nothing this round that upstream has built and the fork had by hand** — and the near-miss is
+worth recording, because it looked like one. `entry_view_state.rs`'s `sync_entry` conflicted, and
+upstream's new `AcpThread::can_rewind_to(client_id, cx)` is exactly the three conditions the code
+there used to spell out: `client_id.is_some() && self.parent_session_id.is_none() &&
+self.supports_truncate(cx)`. The tempting reading is that the fork had been computing that by
+hand; it had not. `git show da0a7a78c:crates/agent_ui/src/entry_view_state.rs` has `has_client_id`,
+`is_subagent` and the four-term `is_editable` already — they were upstream's own lines, and
+upstream folded them into one predicate. The fork's only change in that arm was and is the
+`diff_review::without_review_blocks` wrapper on `source_blocks`, which is a fork feature and
+stays. Resolution: upstream's `can_rewind_to`, upstream's two now-redundant bindings gone with it,
+the fork's wrapper kept. **Check whose line it was before claiming the find**, against the old
+merge base rather than against the fork's pre-rebase tip, which carries upstream's code too.
+
+**Inherited for free: upstream's transparent-sidebar fix (#65343).** The fork draws its own
+sidebar rows, but it had kept upstream's `surface_background` lines verbatim, so upstream's fix
+merged straight into fork code: `render_thread` and the terminal row now take `sidebar_bg` from
+`panel_background`, and `Render for Sidebar` paints `color.background.blend(color.panel_background)`.
+No conflict and no fork change — the fork simply stops being transparent in the themes this fixed.
+Upstream's own test for it is adopted below, so it is guarded here now.
+
+**Five files conflicted, seven hunks**, and `thread_view.rs` was not among them for the first time
+in this log — the recurring seam held this round. Three were the fork replacing an upstream
+surface, where the merge spliced a fragment of upstream's function into the fork's: upstream's
+`render_project_header` into `render_workspace_header` and its sticky-header path into
+`render_section_header` (both in `sidebar.rs`, both referencing parameters the fork's signatures
+do not have — `key`, `is_sticky`, `highlight_positions`, `header_idx`), and upstream's whole
+`ThreadsArchiveView` into `threads_archive_view.rs`, which this fork has reduced to three helpers
+(`fuzzy_match_positions`, `format_history_entry_timestamp`, `format_age`) because the sidebar is
+the source of truth for open threads. The fork's side was taken for all three; upstream's only
+change inside that 900-line view was one `base_bg` line from #65343, and nothing references
+`ThreadsArchiveView` any more. `acp_thread.rs`'s one hunk was `plain_markdown`, which upstream
+narrowed to `#[cfg(test)]` and the fork's chip layer calls from production
+(`thread_view/chips.rs`): kept `pub`, which is a one-line fork diff.
+
+**Upstream's side was taken for `sidebar_tests.rs`**, both hunks: three new tests
+(`test_sidebar_background_with_transparent_panel`, `test_sidebar_action_hover_contrasts_with_row`,
+`test_thread_metadata_update_preserves_sticky_header_measurements`) and the three helpers they
+need. Two of them needed work to run here, and both were worth it rather than dropping:
+- *The sticky-header measurement test* finds its subject through
+  `contents.project_header_indices`, which the fork has no equivalent field for. It scans
+  `contents.entries` for `ListEntry::WorkspaceHeader` instead. The property it tests — a same-shape
+  metadata update must not reset the list's measured bounds — is the fork's own sidebar-rebuild
+  early return, so this is upstream covering fork behaviour.
+- *The hover-contrast test* ends by opening Thread History (`show_archive`, `SidebarView`), which
+  has zero occurrences in this fork. That half is removed with a note in its place; the first half,
+  which hovers the fork's own workspace-header and thread rows at four panel alphas, is kept and is
+  what guards the #65343 fix above.
+
+**Markerless drift: one, and a way to prove there was only one.** Upstream's
+`acp_thread: Share v2 compaction updates (#65254)` changed `ContextCompaction`: `summary` went from
+a `Vec` of blocks to a `MessageContent`, and a `meta` field arrived. The fork builds one of those
+itself — when an external agent announces compaction as prose rather than as a protocol update,
+`push_assistant_content_block_with_message_id` synthesises a completed compaction entry — so there
+was no conflict marker, and `cargo check --workspace --all-targets` was the only thing that found
+it. Fixed to upstream's own idiom at its other construction site (`MessageContent::default()`,
+`meta: None`), and the fork's `test_compaction_notice_becomes_a_compaction_entry` covers that path,
+so the gate proves the fix rather than just the compile.
+
+The useful part is the check that followed, which is worth repeating every rebase. Extract the
+fork's added lines on both sides of the replay and diff the two sets:
+
+    git diff --diff-algorithm=histogram <old-merge-base> <pre-rebase-backup> -- . ':!QUIET_UI.md' \
+      | grep '^+' | grep -v '^+++' | sed 's/^+//;s/[[:space:]]*$//' | grep -v '^$' | sort > old_added
+    git diff --diff-algorithm=histogram upstream/main HEAD -- . ':!QUIET_UI.md' \
+      | grep '^+' | grep -v '^+++' | sed 's/^+//;s/[[:space:]]*$//' | grep -v '^$' | sort > new_added
+    comm -23 old_added new_added   # fork lines the replay dropped
+    comm -13 old_added new_added   # fork lines the replay introduced
+
+`comm -23` came back with exactly two lines, both deliberate (`summary: Vec::new(),` and the old
+`gpui` import), and `comm -13` with nothing that was not one of the four edits below. That is the
+direct answer to the question a clean `cargo check` cannot answer — whether the replay quietly took
+upstream's side of a fork behaviour, which is how the `.html` report link was lost on 10-07 and
+noticed only by its test. It is cheap, it needs no build, and it would have caught that one.
+
+**What was built: nothing from the Work queue, because its one entry is not buildable here.** The
+memory-baseline entry is a design note waiting on two `entities live` lines from Arthur, and
+`ToolCallContent::Terminal` still holds an `Entity<Terminal>` directly with upstream untouched in
+that area this round, so the 10-07 conclusion stands unchanged: **Upstream first** says the fork
+does not carry a ~76-site change through upstream-owned code, and nothing in this sandbox can
+measure what it would buy. The entry stays in the queue. Tonight's four edits are all replay
+repair, described above: the `ContextCompaction` shape, the adapted sticky-header lookup, the
+trimmed hover test, and the `gpui` imports those adopted tests need.
+
+**What adopting upstream's tests found: the archived row's delete button had no hover feedback.**
+`test_sidebar_action_hover_contrasts_with_row` could not run as written — a workspace header only
+appears once a thread is open under a worktree, a thread row carries an action only while it is
+restoring or archived, and Thread History does not exist here — so it was retargeted at the one row
+action this fork draws unconditionally, the archived row's delete button, across the same three
+panel alphas. It then failed on its actual assertion rather than on a missing selector:
+`IconButton::new("delete-thread", IconName::Trash)` sets neither `hover_background` nor
+`active_background`, while `cancel-restore` three lines above it in the same `contextual_action`
+branch sets both. Hovering delete gave no feedback at all, and on a transparent panel that is the
+same class of bug #65343 fixed elsewhere. Two lines, copied from its sibling. The test is
+load-bearing: it fails on the exact assertion with those two lines removed and passes with them.
+This is the second night running that an adopted upstream test caught a fork defect nothing else
+noticed — last night the `.html` report link, tonight this.
+
+**The gate, the fork's three core crates and nothing more** — every file touched tonight is in
+`acp_thread`, `agent_ui` or `sidebar`, and the Verification queue was empty, so the union is just
+those three. `cargo test`: `acp_thread` 315, `sidebar` 191, `agent_ui` 547 with its 35 deliberate
+`#[ignore]`s left alone. Zero failures on the final run. `sidebar` is 191 against 189 on 10-07:
+upstream's three new tests in, the duplicate measurement one out. `script/clippy` (`--release
+--all-targets --all-features -- --deny warnings`) came back clean for all three in 6m58s, 0
+warnings and 0 errors, and the workspace check after the replay reported 0 warnings as well as 0
+errors, so nothing in the replay left a stranded helper behind.
+
+Two things the gate caught, both of them upstream's tests meeting this fork rather than tonight's
+own code: the two `sidebar` failures described above. Nothing failed intermittently this run, and
+the `thread_metadata_store` flake the 09-22 entry recorded did not reappear.
+
+**A note on how the gate was sequenced, since disk is the binding constraint and not time.**
+`cargo check --workspace --all-targets` plus three test binaries took `target` to 36G with 3.2G
+left, which is the same wall the 10-07 run hit mid-gate. Two things kept it clear. Between the
+`sidebar` and `agent_ui` suites, sweeping every rlib in `target/debug/deps` but the newest per
+crate family removed 586 files and freed 3.5G — worth doing *before* a suite rather than after one
+dies, as 10-07 concluded, though it does make the next suite rebuild a few of them. Then
+`target/debug` went entirely (24G) before clippy, because `script/clippy` forces `--release` and
+this allowance holds a debug dependency tree or a release one, never both. The release profile's
+`lto` and `codegen-units` were overridden for the run as on 10-07, which changes how dependencies
+compile and no lint clippy reports. `cargo-shear`, `typos` and `buf` are still not installed here,
+so `script/clippy` exits after the lint.
+
+
+
+**Nothing the fork can delete tonight because upstream provides it.** Worth stating, since the
+last two entries each had one. The three candidates all turned out not to be: `can_rewind_to`
+replaced upstream's own lines rather than the fork's (above), the transparent-sidebar fix changed
+lines the fork had kept verbatim from upstream so there was no fork version to remove, and
+upstream's new painted-background test helpers duplicate no fork helper — `sidebar_tests.rs` had
+none of its own.
+
+**Diff against upstream: +37,532 / -11,310**, against +37,495 / -11,382 after 10-07. Added lines up
+37, removed lines down 72, so the fork's footprint is flat to slightly smaller. The 37 are the
+night's four repairs and two notes plus the two-line hover fix; the 72 fewer deletions are mostly
+the three upstream sidebar tests and their helpers now being carried instead of absent, partly
+offset by newly deleting upstream's measurement test and the archive half of the hover test.
+
+**Pushed to `quiet-ui` with `--force-with-lease`**, gate green, in time for the 00:45 build.

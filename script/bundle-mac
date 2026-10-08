@@ -350,9 +350,10 @@ upload_debug_symbols
 # Sentry receives the extracted zed.dwarf, not the binary, so debug symbols
 # must be extracted before the binaries are stripped below. The .dwarf files
 # also keep symbols recoverable when the sentry upload is skipped.
+# quiet-ui keeps symbols in `zed` so a `sample` of a freeze names functions; the
+# extracted .dwarf is discarded with the runner.
 if [[ "$target_dir" == "release" && "$local_install" != true ]]; then
     extract_debug_symbols
-    strip -x "target/${target_triple}/${target_dir}/zed"
     strip -x "target/${target_triple}/${target_dir}/cli"
     strip -x "target/${target_triple}/${target_dir}/remote_server"
 fi
