@@ -183,6 +183,34 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**Give the git diff UI back to upstream.**
+
+Arthur, 2026-10-08: the git diff UI is broken in places (things overlap), and he doesn't want
+to maintain the fork's changes to it. Revert them all to upstream's versions, and drop the
+"explicit reason" these features had in the Upstream first section (generated files sorted
+last and folded, diff review on every diff surface). The fork's own diff-related changes, as of
+`402baae7f4` against its merge base:
+- `crates/editor`: `git.rs` (+126, the diff-review gutter affordance and comment blocks),
+  `element/header.rs` (buffer header controls, the "generated" tag), `element.rs`, `editor.rs`
+  (the `diff_review` key context), `element/mouse.rs` (the `DiffReviewFeatureFlag` gate removed),
+  and their tests in `editor_tests.rs`. Diff review goes back behind upstream's
+  `DiffReviewFeatureFlag`, off by default.
+- `crates/git_ui`: `generated_file.rs` (delete the file and its `mod`), `project_diff.rs`,
+  `diff_multibuffer.rs`, `branch_diff.rs`.
+- `crates/agent_ui`: `diff_review.rs` (delete) and the review-comment additions in
+  `agent_diff.rs`.
+
+Not part of this:
+- `project/src/git_store.rs`'s environment change (submodules share their worktree's capture),
+  which is a perf fix;
+- everything in `git_ui_core` (worktrees, spares, the language-server switch);
+- the thread view's own diff hover cards on command chips, which Arthur wants. If a chip
+  depended on something deleted here, switch it to upstream's equivalent (`open_uncommitted_diff`,
+  upstream's diff multibuffer) rather than keeping the fork's piece.
+
+Delete the fork tests that covered the reverted behaviour, restore upstream's where the fork
+changed them, and update the Upstream first section and the per-file reasons list.
+
 **The memory baselines: what it would take, and the one measurement that would justify it.**
 
 Decided on 2026-10-07 by reading the code; the 10-05 findings and the 10-07 rebase log entry hold
