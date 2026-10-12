@@ -174,3 +174,65 @@ jobs:
       - name: Mark this commit as built
         if: steps.freshness.outputs.build == 'true'
         run: git push --force origin "HEAD:refs/tags/quiet-ui-built"
+
+  # The half of Zed that runs on a dev box over SSH. A client looks for a
+  # server built from its own commit, so every build that ships a dmg also
+  # ships these, under fixed names, with the commit they came from beside them.
+  # Separate from the mac job so a failure here never costs the dmg.
+  remote-server:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    env:
+      CARGO_INCREMENTAL: 0
+      ASSET: zed-remote-server-linux-${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: quiet-ui
+          fetch-depth: 1
+
+      # Skip a commit this arch already has a server for, unless asked by hand.
+      - id: freshness
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          head=$(git rev-parse HEAD)
+          echo "sha=$head" >> "$GITHUB_OUTPUT"
+          built=$(gh release download quiet-ui-latest --repo "$GITHUB_REPOSITORY" \
+            --pattern "$ASSET.json" --output - 2>/dev/null | jq -r .sha 2>/dev/null || true)
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ] && [ "$head" = "$built" ]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build
+        if: steps.freshness.outputs.build == 'true'
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          triple=${{ matrix.arch }}-unknown-linux-musl
+          rustup target add "$triple"
+          # The same separate, musl-linked build script/bundle-linux does.
+          export "CC_$(echo "$triple" | tr '-' '_')"=musl-gcc
+          cargo --config .cargo/bundle-config.toml build --release --target "$triple" --package remote_server
+          gzip -c "target/$triple/release/remote_server" > "$ASSET.gz"
+          printf '{"sha":"%s","built_at":"%s"}\n' "${{ steps.freshness.outputs.sha }}" \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$ASSET.json"
+
+      - name: Publish
+        if: steps.freshness.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload quiet-ui-latest "$ASSET.gz" "$ASSET.json" \
+            --repo "$GITHUB_REPOSITORY" --clobber
