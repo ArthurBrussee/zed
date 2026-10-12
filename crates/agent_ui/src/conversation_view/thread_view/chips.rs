@@ -2544,7 +2544,7 @@ impl ThreadView {
     ) -> AnyElement {
         let file = match &image {
             ChipImage::File(path) => Some(path.clone()),
-            ChipImage::Data { .. } => None,
+            ChipImage::Data { path, .. } => path.clone(),
         };
         let copyable = image.clone();
         let box_height = match &image {

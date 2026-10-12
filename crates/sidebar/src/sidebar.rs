@@ -2393,11 +2393,46 @@ impl Sidebar {
         store.update(cx, |store, cx| store.refresh_now(cx));
     }
 
+    /// Tells the PR store what each open repository is called on GitHub. The store otherwise
+    /// discovers that by running `gh` inside the checkout, which a project on a dev box has no
+    /// local directory for; the git store reports its remotes over RPC either way.
+    fn note_gh_remotes(&self, store: &Entity<GhStatusStore>, cx: &mut Context<Self>) {
+        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+            return;
+        };
+        let workspaces: Vec<_> = multi_workspace.read(cx).workspaces().cloned().collect();
+        let mut remotes: Vec<(PathBuf, String)> = Vec::new();
+        for workspace in workspaces {
+            let project = workspace.read(cx).project().clone();
+            let project = project.read(cx);
+            for repo in project.repositories(cx).values() {
+                let snapshot = repo.read(cx).snapshot();
+                let Some(url) = snapshot.remote_origin_url.clone() else {
+                    continue;
+                };
+                remotes.push((snapshot.work_directory_abs_path.to_path_buf(), url.clone()));
+                // A linked worktree is watched under its own path and shares the remote.
+                for linked in snapshot.linked_worktrees() {
+                    remotes.push((linked.path.to_path_buf(), url.clone()));
+                }
+            }
+        }
+        if remotes.is_empty() {
+            return;
+        }
+        store.update(cx, |store, _| {
+            for (path, url) in remotes {
+                store.note_remote_url(path, &url);
+            }
+        });
+    }
+
     /// Collapsed rows included: the thread view's PR badges read this store.
     fn sync_gh_watches(&mut self, cx: &mut Context<Self>) {
         let Some(store) = GhStatusStore::try_global(cx) else {
             return;
         };
+        self.note_gh_remotes(&store, cx);
         // Only open threads: watching every stored one spends GitHub's hourly
         // budget at launch. The rest show their PR snapshot.
         let watchable = |thread: &&Arc<ThreadEntry>| {

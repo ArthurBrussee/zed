@@ -618,16 +618,9 @@ impl AutoUpdater {
         })?;
 
         set_status("Fetching remote server release", cx);
-        let release = Self::get_release_asset(
-            &this,
-            release_channel,
-            version,
-            "zed-remote-server",
-            os,
-            arch,
-            cx,
-        )
-        .await?;
+        let release =
+            Self::remote_server_release_asset(&this, release_channel, version, os, arch, cx)
+                .await?;
 
         let servers_dir = paths::remote_servers_dir();
         let channel_dir = servers_dir.join(release_channel.dev_name());
@@ -674,10 +667,28 @@ impl AutoUpdater {
         })?;
 
         let release =
-            Self::get_release_asset(&this, channel, version, "zed-remote-server", os, arch, cx)
-                .await?;
+            Self::remote_server_release_asset(&this, channel, version, os, arch, cx).await?;
 
         Ok(Some(release.url))
+    }
+
+    /// quiet-ui serves its own remote server from the fork's release, matched to the commit the
+    /// running client was built from. Every other channel asks zed.dev as upstream does.
+    async fn remote_server_release_asset(
+        this: &Entity<Self>,
+        release_channel: ReleaseChannel,
+        version: Option<Version>,
+        os: &str,
+        arch: &str,
+        cx: &mut AsyncApp,
+    ) -> Result<ReleaseAsset> {
+        if quiet_ui_update::is_quiet_ui_build(release_channel) {
+            let http = this.read_with(cx, |this, _| this.client.http_client());
+            let sha = cx.update(|cx| AppCommitSha::try_global(cx).map(|sha| sha.full()));
+            return quiet_ui_update::fetch_remote_server_release(http, os, arch, sha).await;
+        }
+        Self::get_release_asset(this, release_channel, version, "zed-remote-server", os, arch, cx)
+            .await
     }
 
     async fn get_release_asset(

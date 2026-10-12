@@ -689,6 +689,8 @@ pub struct ThreadView {
     /// Image chips start expanded, so this records the ones collapsed.
     collapsed_image_chips: HashSet<ActionChipId>,
     chip_cache: ChipCache,
+    /// Only used when the project is not this machine's; see [`RemoteChipImage`].
+    remote_chip_images: HashMap<ProjectPath, RemoteChipImage>,
     /// Keyed by entry as well as path: two commands that touched one file each
     /// changed something different about it.
     command_file_diffs: RefCell<CommandFileDiffs>,
@@ -1221,7 +1223,24 @@ enum ChipImage {
     Data {
         image: Arc<gpui::Image>,
         dimensions: Option<gpui::Size<u32>>,
+        /// Where it came from, for the chip's open-the-file affordance. `None` for an image the
+        /// agent sent inline, which is not a file anywhere.
+        path: Option<std::path::PathBuf>,
     },
+}
+
+/// An image a command wrote on a dev box. The path the agent reports is the box's, so nothing on
+/// this machine's disk answers it; the bytes come through the project, which is what upstream's
+/// image store already does over RPC.
+enum RemoteChipImage {
+    /// Held so the fetch is not cancelled by dropping it.
+    Loading { _task: Task<()> },
+    Loaded {
+        image: Arc<gpui::Image>,
+        dimensions: Option<gpui::Size<u32>>,
+    },
+    /// Asked for and refused: not retried, so a deleted file does not cost a request a frame.
+    Unavailable,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1637,6 +1656,7 @@ impl ThreadView {
             command_script_markdown: RefCell::default(),
             collapsed_image_chips: HashSet::default(),
             chip_cache: ChipCache::default(),
+            remote_chip_images: HashMap::default(),
             command_file_diffs: RefCell::default(),
             displayed_thought: None,
             thought_hold_timer: None,
@@ -12707,6 +12727,69 @@ impl ThreadView {
             .when(!is_edit, |this| this.child(gradient_overlay))
     }
 
+    /// Fetches the images this thread's chips want but cannot read off this machine's disk,
+    /// because the project is on a dev box. Nothing to do for a local project, which is the
+    /// case this returns on before looking at anything.
+    fn load_remote_chip_images(&mut self, cx: &mut Context<Self>) {
+        let Some(project) = self.project.upgrade() else {
+            return;
+        };
+        if project.read(cx).is_local() {
+            return;
+        }
+        // Every entry, every frame: a command that writes an image updates the tool call it is
+        // already on, so the entry count says nothing about whether there is a new image to
+        // fetch. This is the same walk `has_visible_conversation` already does each frame, and
+        // in the steady state it finds nothing and allocates nothing.
+        let wanted: Vec<ProjectPath> = self
+            .thread
+            .read(cx)
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                AgentThreadEntry::ToolCall(tool_call) => Some(tool_call),
+                _ => None,
+            })
+            .filter_map(|tool_call| {
+                let location = tool_call.locations.first()?;
+                Self::path_is_image(&location.path).then_some(location)
+            })
+            .filter_map(|location| project.read(cx).find_project_path(&location.path, cx))
+            .filter(|path| !self.remote_chip_images.contains_key(path))
+            .collect();
+
+        for project_path in wanted {
+            let open = project.update(cx, |project, cx| project.open_image(project_path.clone(), cx));
+            let for_task = project_path.clone();
+            let task = cx.spawn(async move |this, cx| {
+                let loaded = open.await.ok().map(|item| {
+                    item.read_with(cx, |item, _| {
+                        (
+                            item.image.clone(),
+                            item.image_metadata
+                                .map(|metadata| gpui::size(metadata.width, metadata.height)),
+                        )
+                    })
+                });
+                this.update(cx, |this, cx| {
+                    this.remote_chip_images.insert(
+                        for_task,
+                        match loaded {
+                            Some((image, dimensions)) => {
+                                RemoteChipImage::Loaded { image, dimensions }
+                            }
+                            None => RemoteChipImage::Unavailable,
+                        },
+                    );
+                    cx.notify();
+                })
+                .ok();
+            });
+            self.remote_chip_images
+                .insert(project_path, RemoteChipImage::Loading { _task: task });
+        }
+    }
+
     /// A screenshot usually lands outside the project, so a path no worktree
     /// claims still counts.
     fn tool_call_image(&self, tool_call: &ToolCall, cx: &App) -> Option<ChipImage> {
@@ -12718,6 +12801,7 @@ impl ThreadView {
             return Some(ChipImage::Data {
                 image: image.clone(),
                 dimensions,
+                path: None,
             });
         }
 
@@ -12725,6 +12809,23 @@ impl ThreadView {
         if !Self::path_is_image(&location.path) {
             return None;
         }
+        if let Some(project) = self.project.upgrade()
+            && !project.read(cx).is_local()
+        {
+            // The path is the box's, so an absolute-path fallback would read this machine's
+            // disk at the same path. Only what came through the project counts.
+            let project_path = project.read(cx).find_project_path(&location.path, cx)?;
+            return match self.remote_chip_images.get(&project_path) {
+                Some(RemoteChipImage::Loaded { image, dimensions }) => Some(ChipImage::Data {
+                    image: image.clone(),
+                    dimensions: *dimensions,
+                    // The box's path: `open_image_file` resolves it through the project.
+                    path: Some(location.path.clone()),
+                }),
+                _ => None,
+            };
+        }
+
         let path = self
             .project
             .upgrade()
@@ -15071,6 +15172,7 @@ impl Render for ThreadView {
         self.sync_local_commands(cx);
 
         self.chip_cache.begin_frame();
+        self.load_remote_chip_images(cx);
 
         let has_messages = self.has_visible_conversation(cx);
         let list_state = self.list_state.clone();
@@ -15961,6 +16063,169 @@ mod tests {
             .write_to(&mut bytes, image::ImageFormat::Png)
             .expect("a blank image encodes as a png");
         bytes.into_inner()
+    }
+
+
+    /// The chip for an image a command wrote on a dev box. The path the agent reports only
+    /// exists on the box, so nothing on this machine's disk answers it: the bytes have to come
+    /// through the project, and the chip has to be a data chip rather than a file one.
+    #[gpui::test]
+    async fn an_image_written_on_a_dev_box_shows_in_its_chip(
+        cx: &mut gpui::TestAppContext,
+        server_cx: &mut gpui::TestAppContext,
+    ) {
+        crate::conversation_view::tests::init_test(cx);
+
+        // The box's filesystem, which this machine cannot see.
+        let server_fs = FakeFs::new(server_cx.executor());
+        server_fs
+            .insert_tree(path!("/on-the-box/repo"), json!({ "src": {} }))
+            .await;
+        server_fs
+            .insert_file(path!("/on-the-box/repo/shot.png"), png_bytes(800, 600))
+            .await;
+
+        let (opts, server_session, _) = remote::RemoteClient::fake_server(cx, server_cx);
+        server_cx.update(|cx| {
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+        });
+        server_cx.update(remote_server::HeadlessProject::init);
+        let server_executor = server_cx.executor();
+        let headless = server_cx.new(|cx| {
+            remote_server::HeadlessProject::new(
+                remote_server::HeadlessAppState {
+                    session: server_session,
+                    fs: server_fs.clone(),
+                    http_client: Arc::new(http_client::BlockedHttpClient),
+                    node_runtime: node_runtime::NodeRuntime::unavailable(),
+                    languages: Arc::new(language::LanguageRegistry::new(server_executor.clone())),
+                    extension_host_proxy: Arc::new(extension::ExtensionHostProxy::new()),
+                    startup_time: std::time::Instant::now(),
+                },
+                false,
+                cx,
+            )
+        });
+
+        let remote_client = remote::RemoteClient::connect_mock(opts, cx).await;
+        let project = cx.update(|cx| {
+            let project_client = client::Client::new(
+                Arc::new(clock::FakeSystemClock::new()),
+                http_client::FakeHttpClient::with_404_response(),
+                cx,
+            );
+            let user_store = cx.new(|cx| client::UserStore::new(project_client.clone(), cx));
+            project::Project::remote(
+                remote_client,
+                project_client,
+                node_runtime::NodeRuntime::unavailable(),
+                user_store,
+                Arc::new(language::LanguageRegistry::test(cx.background_executor().clone())),
+                FakeFs::new(cx.background_executor().clone()),
+                false,
+                cx,
+            )
+        });
+        project
+            .update(cx, |project, cx| {
+                project.find_or_create_worktree(path!("/on-the-box/repo"), true, cx)
+            })
+            .await
+            .expect("the box's worktree should open");
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            assert!(
+                !project.read(cx).is_local(),
+                "the harness has to give a project this machine does not own, \
+                 or the test proves nothing about a dev box"
+            );
+        });
+
+        let (conversation_view, cx) = crate::conversation_view::tests::setup_conversation_view_on(
+            crate::test_support::StubAgentServer::new(
+                acp_thread::StubAgentConnection::new(),
+            ),
+            project,
+            cx,
+        )
+        .await;
+        let thread_view = crate::conversation_view::tests::active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+
+        // The command starts with nothing to show, as a real one does.
+        thread.update(cx, |thread, cx| {
+            thread
+                .upsert_wire_tool_call(
+                    acp_v2::ToolCallUpdate::new("shot")
+                        .title("screenshot")
+                        .kind(acp_v2::ToolKind::Execute)
+                        .status(acp_v2::ToolCallStatus::InProgress),
+                    cx,
+                )
+                .expect("a tool call with no content to resolve");
+        });
+        cx.run_until_parked();
+        thread_view.update(cx, |view, cx| view.load_remote_chip_images(cx));
+        cx.run_until_parked();
+
+        // Then it finishes and names the file it wrote. This updates the tool call that is
+        // already there, so the thread's entry count never changes: a scan that watched the
+        // count rather than the entries would never look again, and the chip would stay empty.
+        thread.update(cx, |thread, cx| {
+            thread
+                .upsert_wire_tool_call(
+                    acp_v2::ToolCallUpdate::new("shot")
+                        .status(acp_v2::ToolCallStatus::Completed)
+                        .locations(vec![acp_v2::ToolCallLocation::new(path!(
+                            "/on-the-box/repo/shot.png"
+                        ))]),
+                    cx,
+                )
+                .expect("a tool call with only a location to resolve");
+        });
+        cx.run_until_parked();
+
+        // What `render` does every frame; the fetch is async, so it is the parking after it
+        // that produces the image.
+        thread_view.update(cx, |view, cx| view.load_remote_chip_images(cx));
+        cx.run_until_parked();
+
+        thread_view.read_with(cx, |view, cx| {
+            let tool_call = view
+                .thread
+                .read(cx)
+                .entries()
+                .iter()
+                .find_map(|entry| match entry {
+                    AgentThreadEntry::ToolCall(tool_call) => Some(tool_call),
+                    _ => None,
+                })
+                .expect("the tool call should be in the thread");
+            match view.tool_call_image(tool_call, cx) {
+                Some(ChipImage::Data {
+                    dimensions, path, ..
+                }) => {
+                    assert_eq!(
+                        dimensions,
+                        Some(gpui::size(800, 600)),
+                        "the box's own header should say how big it is"
+                    );
+                    assert_eq!(
+                        path.as_deref(),
+                        Some(std::path::Path::new(path!("/on-the-box/repo/shot.png"))),
+                        "the chip keeps the box's path so opening the file still resolves \
+                         through the project"
+                    );
+                }
+                Some(ChipImage::File(path)) => panic!(
+                    "a path on the box ({path:?}) would be read off this machine's disk"
+                ),
+                None => panic!("the image should have come through the project"),
+            }
+        });
+
+        drop(headless);
     }
 
     #[gpui::test]

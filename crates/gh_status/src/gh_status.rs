@@ -253,6 +253,30 @@ impl GhStatusStore {
             .and_then(|watched| watched.prs.as_ref())
     }
 
+    /// What this store will ask GitHub about for a given checkout, once something has named it.
+    pub fn repo_name_for(&self, repo_path: &Path) -> Option<String> {
+        self.repo_ids.get(repo_path).map(RepoId::name_with_owner)
+    }
+
+    /// What a repository is called on GitHub, for a checkout this machine does not have. Asking
+    /// `gh` inside the checkout stays the way a local one is named — it is `gh`'s own resolution,
+    /// which is what every other call here agrees with — but a checkout on a dev box has no
+    /// directory to ask in, and the remote URL the git store reports over RPC is enough to name
+    /// it from here.
+    pub fn note_remote_url(&mut self, repo_path: PathBuf, remote_url: &str) {
+        if is_local_dir(&repo_path) {
+            return;
+        }
+        let Ok(repo) = RepoId::from_remote_url(remote_url) else {
+            return;
+        };
+        if self.repo_ids.get(&repo_path) == Some(&repo) {
+            return;
+        }
+        self.unresolvable_repos.remove(&repo_path);
+        self.repo_ids.insert(repo_path, repo);
+    }
+
     /// Watches are refcounted; the branch is polled until a matching number of `unwatch` calls.
     pub fn watch(&mut self, repo_path: PathBuf, branch: String, cx: &mut Context<Self>) {
         self.watch_key(
@@ -569,9 +593,10 @@ impl GhStatusStore {
             return;
         };
         watched.last_polled = Some(Instant::now());
+        let repo = self.repo_ids.get(&key.repo_path).cloned();
         watched.refresh_task = Some(cx.spawn(async move |this, cx| {
             let executor = cx.background_executor().clone();
-            let result = fetch_prs(&key.repo_path, &key.subject, &executor).await;
+            let result = fetch_prs(&key.repo_path, &key.subject, repo.as_ref(), &executor).await;
             this.update(cx, |this, cx| this.finish_refresh(&key, result, cx))
                 .ok();
         }));
@@ -1127,8 +1152,12 @@ async fn fetch_batch(
     command
         .args(["api", "graphql", "-f"])
         .arg(format!("query={query}"));
-    // Still reads this checkout's own `gh` configuration, as every other invocation does.
-    if let Some(key) = asked_about.first() {
+    // Still reads this checkout's own `gh` configuration, as every other invocation does, for
+    // whichever of the batch's repositories is one this machine has.
+    if let Some(key) = asked_about
+        .iter()
+        .find(|key| is_local_dir(&key.repo_path))
+    {
         command.current_dir(&key.repo_path);
     }
     let stdout = match run_gh(command, "gh api graphql", executor).await {
@@ -1150,7 +1179,15 @@ async fn fetch_batch(
 }
 
 /// Asks `gh` rather than parsing remote URLs, so this agrees with every other `gh` call here.
+/// Only for a checkout this machine has: a remote project's repository is named from the URL
+/// the git store reports instead (`GhStatusStore::note_remote_url`).
 async fn fetch_repo_id(repo_path: &Path, executor: &BackgroundExecutor) -> Result<RepoId> {
+    anyhow::ensure!(
+        is_local_dir(repo_path),
+        "{} is not a directory on this machine, so gh cannot name its repository; \
+         waiting for the project to report its remote",
+        repo_path.display()
+    );
     let mut command = util::command::new_command("gh");
     command
         .args([
@@ -1166,25 +1203,47 @@ async fn fetch_repo_id(repo_path: &Path, executor: &BackgroundExecutor) -> Resul
     RepoId::parse(&stdout)
 }
 
+/// `gh` reads the checkout's own configuration when run inside it, which is worth keeping for a
+/// local project. A path that lives on a dev box is not a directory here, and handing it to a
+/// child process as its working directory only makes the spawn fail.
+fn set_local_working_dir(command: &mut util::command::Command, repo_path: &Path) {
+    if is_local_dir(repo_path) {
+        command.current_dir(repo_path);
+    }
+}
+
+fn is_local_dir(path: &Path) -> bool {
+    !path.as_os_str().is_empty() && path.is_dir()
+}
+
 async fn fetch_prs(
     repo_path: &Path,
     subject: &WatchSubject,
+    repo_id: Option<&RepoId>,
     executor: &BackgroundExecutor,
 ) -> Result<Vec<PrStatus>> {
     let mut command = util::command::new_command("gh");
     match subject {
         WatchSubject::Branch(branch) => {
             command.args(["pr", "list", "--head", branch, "--state", "all", "--json"]);
+            // Naming the repository is what lets a branch on a dev box be asked about: there
+            // is no local checkout for `gh` to infer it from.
+            if let Some(repo) = repo_id {
+                command.args(["--repo", &repo.name_with_owner()]);
+            }
         }
         WatchSubject::Number { number, repo } => {
             command.args(["pr", "view", &number.to_string()]);
             if let Some(repo) = repo {
                 command.args(["--repo", repo]);
+            } else if let Some(repo) = repo_id {
+                command.args(["--repo", &repo.name_with_owner()]);
             }
             command.arg("--json");
         }
     }
-    command.arg(GH_JSON_FIELDS).current_dir(repo_path);
+    command.arg(GH_JSON_FIELDS);
+    set_local_working_dir(&mut command, repo_path);
     let stdout = run_gh(command, "gh", executor).await?;
     match subject {
         WatchSubject::Branch(_) => parse_pr_list(&stdout),
@@ -1531,6 +1590,58 @@ mod tests {
         let chips = thread_pr_chips([], &[], &[], None, || None);
         assert_eq!(chips.len(), 1);
         assert!(chips[0].url.is_none());
+    }
+
+    /// A checkout on a dev box has no directory here for `gh` to look at, so the repository has
+    /// to be named from the remote the git store reports instead.
+    #[gpui::test]
+    fn a_repository_is_named_from_the_remote_the_project_reports(cx: &mut gpui::TestAppContext) {
+        let on_the_box = PathBuf::from("/home/arthur/src/zed");
+        let store = cx.new(|cx| {
+            let mut store = GhStatusStore::new(cx);
+            store.note_remote_url(
+                on_the_box.clone(),
+                "git@github.com:ArthurBrussee/zed.git",
+            );
+            store
+        });
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.repo_ids.get(&on_the_box).map(RepoId::name_with_owner),
+                Some("ArthurBrussee/zed".to_string()),
+                "a path this machine does not have should still name its repository"
+            );
+        });
+
+        // A remote that is not GitHub leaves the repository unnamed rather than recording a
+        // wrong one, and a later good remote still lands.
+        let other = PathBuf::from("/home/arthur/src/other");
+        store.update(cx, |store, _| {
+            store.note_remote_url(other.clone(), "git@gitlab.com:someone/thing.git");
+        });
+        store.read_with(cx, |store, _| {
+            assert!(!store.repo_ids.contains_key(&other));
+        });
+        store.update(cx, |store, _| {
+            store.note_remote_url(other.clone(), "https://github.com/someone/thing");
+        });
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.repo_ids.get(&other).map(RepoId::name_with_owner),
+                Some("someone/thing".to_string())
+            );
+        });
+    }
+
+    /// `gh` is given the checkout as its working directory only when there is one here; a path
+    /// that lives on a dev box would only make the spawn fail.
+    #[test]
+    fn only_a_directory_on_this_machine_is_handed_to_gh() {
+        assert!(!is_local_dir(Path::new("/home/arthur/on-the-box/zed")));
+        assert!(!is_local_dir(Path::new("")));
+        assert!(is_local_dir(Path::new(
+            std::env::temp_dir().to_str().unwrap()
+        )));
     }
 
     #[gpui::test]

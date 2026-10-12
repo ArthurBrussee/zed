@@ -9075,6 +9075,25 @@ pub(crate) mod tests {
     ) -> (Entity<ConversationView>, &mut VisualTestContext) {
         let fs = FakeFs::new(cx.executor());
         let project = Project::test(fs, [], cx).await;
+        setup_conversation_view_on_with_initial_content(agent, project, initial_content, cx).await
+    }
+
+    /// For a project the caller built: a test that needs one this machine does not own hands in
+    /// a remote project rather than a `Project::test`.
+    pub(crate) async fn setup_conversation_view_on(
+        agent: impl AgentServer + 'static,
+        project: Entity<Project>,
+        cx: &mut TestAppContext,
+    ) -> (Entity<ConversationView>, &mut VisualTestContext) {
+        setup_conversation_view_on_with_initial_content(agent, project, None, cx).await
+    }
+
+    async fn setup_conversation_view_on_with_initial_content(
+        agent: impl AgentServer + 'static,
+        project: Entity<Project>,
+        initial_content: Option<AgentInitialContent>,
+        cx: &mut TestAppContext,
+    ) -> (Entity<ConversationView>, &mut VisualTestContext) {
         let (multi_workspace, cx) =
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
@@ -10088,7 +10107,7 @@ pub(crate) mod tests {
         });
     }
 
-    fn active_thread(
+    pub(crate) fn active_thread(
         conversation_view: &Entity<ConversationView>,
         cx: &TestAppContext,
     ) -> Entity<ThreadView> {

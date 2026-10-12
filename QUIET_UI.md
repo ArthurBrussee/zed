@@ -26,9 +26,11 @@ regardless.
 
 ## Upstream first (from 2026-10-01)
 
-The fork stands at +36.2k / -11.3k lines across 96 files against upstream (the exact figures
-after the 2026-10-11 run were +36,199 / -11,256, against +37,532 / -11,310 after 10-08 and
-+37,495 / -11,382 after 10-07). It was +45.8k / -11.4k before 10-06, after
+The fork stands at +36.9k / -11.3k lines across 97 files against upstream (the exact figures
+after the 2026-10-12 run were +36,905 / -11,277, against +36,199 / -11,256 after 10-11 and
++37,532 / -11,310 after 10-08). The 706 added lines 10-12 put back, and the file that joined
+(`remote/src/transport/ssh.rs`), are the remote-development entry Arthur filed that day; a little
+over a third of them are its tests. It was +45.8k / -11.4k before 10-06, after
 going **up** four nights running (+42.0k on 10-02, +42.9k on 10-04, +44.8k on 10-05), each time
 because a Work queue entry asked for the lines. The 10-06 run built nothing and cut 9.1k added
 lines, almost all of it comment paragraphs, duplicated tests and dead code (see its rebase log
@@ -152,6 +154,31 @@ own release; `.github/workflows/quiet_ui_build.yml` builds the macOS app and
 `script/install-quiet-ui` is the manual fallback. The schedule that fires the nightly build lives
 on the fork's `main`, which carries nothing else.
 
+**Remote development over SSH (2026-10-12).** Zed on the laptop, the code and agents on a dev
+box, through upstream's `remote_server`. Three fork-shaped pieces sit on top of upstream's
+transport. The server binary: `auto_update/quiet_ui_update.rs` resolves
+`zed-remote-server-<os>-<arch>` out of the fork's own release and refuses a server built from a
+different commit than the client, and `remote/src/transport/ssh.rs` names the installed binary
+after that commit (`zed-remote-server-dev-quiet-ui-<sha>`) instead of upstream's `build`, so an
+updated client never inherits the server the last one left. Everything after that — download on
+the box or upload over SSH, extract, run — is upstream's. PR and CI chips: `gh` runs on the
+laptop, where the credentials are, so `gh_status` names each repository from the remote URL the
+git store reports over RPC (`RepoId::from_remote_url`, fed by `Sidebar::note_gh_remotes`) and
+passes it as `--repo owner/name`; a checkout that only exists on the box is never handed to a
+child process as its working directory. Image chips: an image a command wrote on the box comes
+through upstream's image store over RPC rather than off this machine's disk — `RemoteChipImage`
+in `thread_view.rs` holds what `Project::open_image` returned, and the chip is a `ChipImage::Data`
+carrying the box's path so opening the file still resolves through the project. The agents needed
+nothing: `client_capabilities_for_agent` and the Claude `bypassPermissions` default are computed
+from the agent id and settings rather than from the transport, and upstream's `spawn_stdio`
+already wraps the command for the host and surfaces a failed launch as `LoadError::Exited` with
+the box's stderr. What is still laptop-only, by design or for want of a mechanism: `install-quiet-ui`
+and auto-update; thread-worktree archive and restore, which move git admin directories through
+`app_state.fs` and have no remote equivalent to move them through (nothing implements `Fs` over
+RPC — only `RealFs` and `FakeFs` do); and the per-worktree language-server switch, which is a
+client-side gate on a decision `remote_server` makes in its own process, where the store is
+absent and upstream's behaviour stands.
+
 **Reliability and performance for many worktrees.** Shaped as patches upstream could take: the
 fd-limit spawn error in `util/src/process.rs`, capped environment capture in
 `project/src/environment.rs`, the measurement lines in `zed/src/reliability.rs`, and in gpui
@@ -179,54 +206,6 @@ bail on time**).
 
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
-
-**Make the fork work on a remote dev box over SSH.**
-
-Arthur wants to develop on a dev box: Zed on the laptop as the UI, with the code, git,
-language servers, terminals and agents on the box. Upstream Zed does this through
-`remote_server`. The client connects over SSH, installs `zed-remote-server-…` in `~/.zed_server`
-on the box, and the project, worktrees, LSP, git, tasks, terminals and ACP agents all run there.
-Three things stop the fork from doing it, plus an audit:
-
-1. **The server binary.** The fork ships on the Dev channel. On Dev, `ensure_server_binary`
-   (`crates/remote/src/transport/ssh.rs`) names the binary `zed-remote-server-dev-build`, and a
-   release build (no `debug_assertions`, no `build-remote-server-binary`) then bails with
-   "ZED_BUILD_REMOTE_SERVER is not set and no remote server exists" unless one is already on the
-   box. Even then, "build" doesn't say which commit, so the next update would talk to a stale
-   server. The nightly workflow on the fork's `main` now also builds `remote_server` for Linux
-   (musl, `x86_64` and `aarch64`) and publishes `zed-remote-server-linux-<arch>.gz` plus
-   `zed-remote-server-linux-<arch>.json` (`{sha, built_at}`) to the `quiet-ui-latest` release. That
-   job was added on 2026-10-12. For a `quiet-ui.<sha>` build:
-   - name the binary after the build's commit;
-   - download it from that release via `get_download_url` / `AutoUpdater` (the fork's
-     `quiet_ui_update.rs` already reads that release);
-   - refuse, with a clear message, when the published server's sha is not the client's;
-   - otherwise follow upstream's install path (upload over SSH or download on the box,
-     `upload_binary_over_ssh`).
-2. **PR and CI chips.** `gh_status` runs `gh` locally with the repository's path as its working
-   directory. For a remote project that path only exists on the box, so every PR fetch fails.
-   Resolve each repository to `owner/name` from its GitHub remote URL through the git store
-   (it already knows remotes over RPC), and run `gh` / GraphQL locally with `-R owner/name` and
-   the branch name. GitHub credentials stay on the laptop.
-3. **Agents.** Upstream starts external ACP agents (Claude Code, Codex) on the remote host
-   through `remote_server`, so they need Node and their own login on the box. Make sure the
-   fork's agent defaults (Claude with `bypassPermissions`, the Codex mode) and `AIR`
-   capabilities (`asyncTasks`, native subagents) also reach a remote agent. Where installation
-   fails on the box, surface the error in the thread, not a silent empty panel.
-4. **Audit every fork feature that assumes a local path**, and make it go through the project
-   (or say why it can't):
-   - worktree creation, spares, `created_worktrees`;
-   - archive and restore, including submodules;
-   - environment capture and the language-server switch;
-   - command chips' diff hovers and changed-files lists;
-   - image chips (`ChipImage::File` reads a local path; a picture on the box has to come through
-     the project's fs);
-   - `install-quiet-ui` and auto-update, which stay laptop-only.
-
-   Upstream's remote tests (`remote_server` integration tests with the fake SSH transport) are
-   where most of this can be exercised. Test at least: `+` on a remote project creates the
-   worktree on the box and opens a thread there, PR chips resolve for a remote repository, and
-   an image a command wrote on the box shows in its chip.
 
 **The memory baselines: what it would take, and the one measurement that would justify it.**
 
@@ -2895,3 +2874,196 @@ down 1,333 and removed lines up 54 — the fork's footprint is smaller by a clea
 first time since the 10-06 reduction run, and this time it came out of a feature Arthur asked to
 give back rather than out of comment paragraphs. Fourteen files left the diff and one joined it
 (`editor/src/code_lens.rs`, the adapted expectation above).
+
+**2026-10-12**: onto main c66312b20 (8 upstream commits). A working night on the queue's first
+entry, Arthur's ask for remote development over SSH, which he filed earlier the same day together
+with the `remote_server` build job on the fork's `main`. Three reasons over: the Work queue held
+it, the branch carried six commits over the merge base, and the fork's own container had none of
+the branch — `git clone` had left only `main`, so `quiet-ui` was fetched before anything else.
+Squash-then-rebase folded all six into one, reusing the squash's own message; tree-identical to
+the old tip (`759526b4c`, tree `f74c1f84`) before rebasing. Backup at
+`quiet-ui-pre-rebase49-2026-10-12`.
+
+**Two files conflicted, two hunks**, the quietest round in this log. `acp_thread.rs` was a pure
+insertion-against-insertion: upstream's `local_execution_error` and
+`report_local_execution_error` (from `agent: Prepare shared receipt lifecycle support (#65504)`)
+landed on the same line as the fork's `running_work` block, both sides ending mid-function and
+sharing the closing brace after the marker, so the resolution is the union with a brace between
+them. `thread_view.rs` was the recurring seam once more and the smallest version of it: #65504
+replaced `list_state.item_count() > 0` with a new `has_visible_conversation(cx)` helper at three
+sites, two of which merged clean, and the third conflicted only because the fork's
+`chip_cache.begin_frame()` sits on the line above. Upstream's line taken, the fork's kept.
+
+**Markerless drift: two, and the first one is why a backgrounded `cargo check` cannot be
+believed.** The replay's `cargo check --workspace --all-targets` was run in the background, came
+back **exit code 0 with an empty output file**, and was wrong: run in the foreground the same
+command reported two errors. Treat a backgrounded cargo run's exit code as no evidence at all;
+read its output, and if the output is empty, the run told you nothing. The two errors:
+- `path: Distinguish is_absolute and has_root in PathStyle (#65468)` gave `PathStyle::is_absolute`
+  a `&Path` where it took a `&str`, so the fork's one caller in `thread_view.rs` drops the
+  `to_string_lossy()` it only ever had to satisfy the old signature.
+- Upstream's new `has_visible_conversation` reads `generating_indicator_in_list`, a field this
+  fork **removed** along with the in-list generating indicator (the activity pill replaced it).
+  The helper is kept as upstream's minus that one disjunct, which is the smallest fork change that
+  preserves the removal. Worth noting the shape, because it is the inverse of the usual drift:
+  upstream added a helper that depends on something the fork deleted, so taking upstream's side
+  wholesale does not compile.
+The fix was followed by another *workspace* check, per 10-04, which came back 0 errors and
+0 warnings.
+
+**What was built: remote development over SSH, the queue's first entry, in full.** The paragraph
+in **The fork as it stands** names the files; what is worth recording here is the four parts and
+how two of them turned out not to need code.
+
+- *The server binary.* `quiet_ui_update.rs` grew a second manifest reader beside the dmg's:
+  `zed-remote-server-<os>-<arch>.json` from the `quiet-ui-latest` release gives the commit, and
+  the `.gz` beside it the bytes. Both delegate implementations in `remote_connection.rs` already
+  funnel through `AutoUpdater::get_remote_server_release_url` and
+  `download_remote_server_release`, so one fork helper (`remote_server_release_asset`) behind
+  those two call sites serves every path, and no delegate changed. A server whose published
+  commit is not the client's is refused by name rather than left to fail later as an RPC error
+  that says nothing. In `ssh.rs`, Dev's `version_str` becomes `quiet-ui-<short sha>` on a bundled
+  build, which is what stops an updated client from finding and talking to the server the
+  previous one installed, and the Dev bail now fires only when there is no commit to ask for —
+  which is still someone's local `cargo run`, where upstream's message is the right one.
+  `AppCommitSha::short` already existed, so the two names derive from one upstream helper.
+- *PR and CI chips.* `gh` stays on the laptop with the credentials, so the repository has to be
+  named without it: `RepoId::from_remote_url` reads `owner/name` out of a GitHub remote in any of
+  its five spellings, `Sidebar::note_gh_remotes` feeds it from each open project's
+  `RepositorySnapshot::remote_origin_url` (which the git store already syncs over RPC, linked
+  worktrees included), and `--repo owner/name` goes on the branch query as well as the
+  by-number one. The three `current_dir` calls are now gated on the path being a directory this
+  machine actually has; `fetch_repo_id`, which asks `gh` inside the checkout, says so plainly
+  instead of spawning into a path that is not here.
+- *Agents: nothing to build, and that is the finding.* The entry asks to make sure the fork's
+  Claude `bypassPermissions` default and its AIR capabilities reach a remote agent. They already
+  do, because neither is transport-dependent: `client_capabilities_for_agent` is a function of
+  the agent id alone, and `default_mode` in `custom.rs` reads settings. Upstream's `spawn_stdio`
+  builds the remote command through `RemoteClient::build_stdio_command`, skips the local cwd for a
+  non-local project, and a launch that dies on the box (no Node, no login) is drained into
+  `LoadError::Exited` carrying its stderr, which is the surfacing the entry asked for. The fork's
+  only line in that function is still the `quiet-ui launch:` breadcrumb.
+- *The audit.* One architectural fact decides most of it: **nothing implements `Fs` over RPC** —
+  `RealFs` and `FakeFs` are the only implementations — so "make it go through the project" is
+  available only where the project already has a specific mechanism. Where it does, it was used:
+  worktree creation, spares and `created_worktrees` do their git work through
+  `Entity<Repository>` and already thread `RemoteConnectionOptions`, with no `std::fs` or
+  `Command` anywhere in those three files; environment capture needs nothing because
+  `remote_server` is built from this same commit, so the fork's own capture cap applies on the box
+  as the fork's patch rather than as an RPC; and image chips had upstream's `RemoteImageStore`
+  waiting for them. Where it does not: archive and restore move git admin directories
+  (`modules`, `info`) through `app_state.fs`, and there is no remote `Fs` to move them through —
+  expressing it as shell commands on the box via `RemoteClient` is a different design and was not
+  built; and the per-worktree language-server switch is a client-side gate on a decision
+  `remote_server` makes in its own process, where the store is never initialised and
+  `worktree_runs_language_servers` returns `true`, so servers run on the box as upstream would run
+  them. That last one fails safe but means the switch does not apply to a dev box, which is
+  exactly where many worktrees live; carrying the enabled set over RPC is the shape of the fix and
+  wants Arthur's say, since it is new proto surface for a feature whose reason was laptop memory.
+  The command chips' diff hovers were already right and are worth recording as such:
+  `branch_diff_stats.rs` takes its patch from `Repository::diff` over RPC and already filters its
+  untracked-file pass on `project.is_local()`, with a comment saying why, so a remote project's
+  hover is correct except that untracked files are not counted — a deliberate degradation that
+  was there before tonight. `tool_call_diff.rs` touches no filesystem at all.
+  `install-quiet-ui` and auto-update stay laptop-only as the entry says.
+
+**The image chip, and the one place a `Data` chip was poorer than a `File` one.** Routing a
+remote image through `Project::open_image` lands it in the fork's existing `ChipImage::Data`
+variant, whose `Arc<gpui::Image>` is exactly what `ImageItem` holds, and every `Data` arm in
+`chips.rs` was already written — dimensions from the stored value, `img(image)` for the picture.
+One arm was not: `render_inline_image`'s `file`, which drives the open-the-file affordance, was
+`None` for every `Data` chip because an agent's inline image is not a file anywhere. A remote
+image *is* one, so `Data` now carries `Option<PathBuf>` and `open_image_file` resolves the box's
+path through the project, which it already did first before falling back to an absolute path.
+Loading is driven from `render` beside `chip_cache.begin_frame()` and returns on a local project
+before looking at anything, so nothing changes for a laptop checkout; the scan is gated on the
+thread's entry count rather than run per frame.
+
+**Three things about the gate's own plumbing, none of them this fork's code, all worth not
+rediscovering.**
+- *`cargo test -p` must include `agent_ui` or `sidebar`, or `workspace` does not compile.*
+  `remote`'s `test-support` adds `RemoteConnectionIdentity::Mock`, but the arm for it in
+  upstream's `workspace/src/persistence.rs` is gated on **`workspace`'s own** `test-support`,
+  which only gets switched on because `agent_ui` and `sidebar` dev-depend on it that way. A
+  narrower selection (`-p acp_thread -p auto_update -p remote -p gh_status`) therefore fails with
+  a non-exhaustive match in a file this fork does not touch. Gate the union in one invocation, as
+  every night here has, rather than splitting it to go faster.
+- *`auto_update` tested alone fails the same way, for the same reason.* `cargo test -p auto_update`
+  on its own ends with `test_auto_update_downloads` panicking "database not initialized" from
+  `KeyValueStore::global`, because `auto_update`'s dev-dependencies enable `test-support` for
+  `clock` and `gpui` but not for `db`, whose `TEST_APP_DATABASE` fallback is behind exactly that
+  feature. Verified pre-existing by stashing tonight's `auto_update` and `remote` changes and
+  re-running: identical failure. In the union it passes — all 17 — because `agent_ui` enables
+  `db/test-support`. So both of these are one lesson rather than two: **this workspace's crates
+  are not independently testable, and the gate's union is what makes them pass.** Nothing to fix
+  in either case, and nothing worth a fork line in an upstream `Cargo.toml`. There is a cost
+  attached that is worth knowing before chasing one test: narrowing to `-p agent_ui` resolves a
+  different feature set than the union, so cargo refingerprints and **rebuilds most of the
+  workspace** — a single-test run that way took over twelve minutes and still had not got to the
+  test. Debug one failure by filtering the union's own invocation, never by narrowing its package
+  list.
+- *`rsync` is not installed in this container*, and `AutoUpdater::check_dependencies` requires it
+  on Linux, so `auto_update`'s suite fails on that first before it gets to the `db` problem.
+  `sudo apt-get install -y rsync` fixes it and belongs beside `libasound2-dev` in the run's
+  opening commands.
+
+**And a correction to the 10-11 entry's disk advice, which cost this run a build.** That entry
+says to "sweep dwo freely". It is only safe between builds. Deleting `*.dwo` **while** a build is
+running breaks it: with split debug info the `.dwo` files are inputs to the archive step that
+creates a crate's rlib, so a sweep landing between codegen and archive kills the crate outright —
+`failed to build archive at .../libmerman_core-….rlib: failed to open object file` and the same
+for `cranelift-codegen`, neither of which this fork touches. It is not corruption and a plain
+re-run fixes it, but it costs the whole build. The rule that actually holds is: **sweep nothing in
+`target` while cargo is running**, dwo included; between runs, dwo is still the safe thing to
+sweep and rlibs still are not. Worth saying because the sweep bought only 0.2G here and cost
+several minutes.
+
+**Disk was the binding constraint for the third night running, and the lever that works is not
+sweeping.** The container starts with about 7.7G free of a 252G volume, `target/debug` reached 23G
+and 95% full, and the six crates' test binaries alone are 1.9G of that (`agent_ui` 934MB,
+`acp_thread` 451MB). Sweeping does not save a run at that point: `*.dwo` was 0.2G and the registry
+tarball cache 122M, neither of them the problem, and the rlibs that *are* the problem cannot be
+touched. What works is **`rm -rf target/debug` and rebuild with
+`CARGO_PROFILE_DEV_DEBUG=line-tables-only`** — the clear alone took the volume from 1.9G free to
+27G, and line tables keep backtraces while dropping most of what made it 23G. Done at the start
+of the gate rather than in the middle, that also leaves room for clippy's release build, which is
+what the night otherwise has no space for. Next run should set that variable from the outset
+instead of discovering the wall at 95%.
+
+**The gate, six crates: the core three plus the three touched tonight.** `cargo test`:
+`acp_thread` 334, `agent_ui` 552 with its 35 deliberate `#[ignore]`s left alone, `sidebar` 192,
+`auto_update` 17, `remote` 52 and `gh_status` 53. Zero failures on the final run. The Verification
+queue was empty when the run started and is empty now. `script/clippy`
+(`--release --all-targets --all-features -- --deny warnings`) came back clean for all six.
+`cargo-shear`, `typos` and `buf` are still not installed here, so `script/clippy` exits after the
+lint, as it has every night in this log.
+
+**Upstream's drift reached the suites not at all this round**, which is the quietest this log has
+recorded: the two markerless items above were both caught by the replay's workspace check, and no
+upstream expectation needed adapting. The two red tests on the way there were tonight's own.
+- *`a_remote_repository_is_named_for_the_pr_chips`*, the new sidebar test, was missing
+  `init_test(cx)` and a client-side `release_channel::init` that every other remote test in that
+  file does first. A harness omission in the new test, not a problem in what it tests.
+- *`test_migrate_thread_remote_connections_backfills_from_workspace_db`*, upstream's, failed in
+  one union run and passed in the run before it and the run after. It is worth a note rather than
+  a shrug, because the shape is recognisable: it polls on a **ten-second wall-clock deadline**
+  against a migration that runs on a real thread the test executor does not wait for, which is
+  exactly what gives way when the machine is loaded — and this one shared the machine with 550
+  other `agent_ui` tests. Its message was not captured, so the deadline is the likely cause
+  rather than a confirmed one. If it recurs, that loop is where to look, not the migration.
+
+**Clippy found one thing and it was tonight's own**: `store.repo_ids.get(&other).is_none()` in a
+new `gh_status` test, which wants `!contains_key`. Worth noting that the 10-04 lesson about a
+workspace check that fails early applies to `script/clippy` too — it stopped at `gh_status` and
+had looked at none of the five crates after it, so the fix was followed by a full second pass,
+which came back clean in 28s on the warm release cache.
+
+**Diff against upstream: +36,905 / -11,277**, against +36,199 / -11,256 after 10-11. Added lines
+up 706 and removed lines up 21, which is the first rise since the 10-06 reduction run and an
+asked-for one: a Work queue entry wanted remote development, and a little over a third of what it
+cost is the four tests that came with it. One file joined the diff
+(`remote/src/transport/ssh.rs`, 18 lines, the commit-named server binary and the Dev bail) and
+none left it, so the fork now touches 97 files against 96 after 10-11. Nothing became deletable
+this round, but two of the entry's four parts cost no lines at all because upstream already had
+them: `RemoteImageStore` for the image chips, and a remote agent launch that needed nothing
+because the fork's capabilities were never transport-dependent in the first place.

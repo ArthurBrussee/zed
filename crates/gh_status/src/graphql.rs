@@ -37,6 +37,28 @@ impl RepoId {
             name: name.to_string(),
         })
     }
+
+    /// How `gh --repo` wants a repository named.
+    pub(crate) fn name_with_owner(&self) -> String {
+        format!("{}/{}", self.owner, self.name)
+    }
+
+    /// Reads `owner/name` out of a git remote URL. This is how a repository on a dev box gets
+    /// named: the checkout's path only exists there, so `gh` cannot be run in it from here,
+    /// but the git store reports its remotes over RPC.
+    pub(crate) fn from_remote_url(url: &str) -> Result<Self> {
+        let url = url.trim();
+        let rest = url
+            .strip_prefix("git@github.com:")
+            .or_else(|| url.strip_prefix("ssh://git@github.com/"))
+            .or_else(|| url.strip_prefix("https://github.com/"))
+            .or_else(|| url.strip_prefix("http://github.com/"))
+            .or_else(|| url.strip_prefix("git://github.com/"))
+            .with_context(|| format!("{url:?} is not a GitHub remote"))?;
+        let rest = rest.strip_suffix('/').unwrap_or(rest);
+        let rest = rest.strip_suffix(".git").unwrap_or(rest);
+        Self::parse(rest).with_context(|| format!("reading owner/name out of {url:?}"))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -397,6 +419,58 @@ impl PrNode {
 mod tests {
     use super::*;
     use crate::{ChecksState, MergeState, PrState, PrStatus, ReviewState};
+
+    #[test]
+    fn a_github_remote_url_names_its_repository() {
+        let expected = RepoId {
+            owner: "ArthurBrussee".to_string(),
+            name: "zed".to_string(),
+        };
+        for url in [
+            "git@github.com:ArthurBrussee/zed.git",
+            "git@github.com:ArthurBrussee/zed",
+            "ssh://git@github.com/ArthurBrussee/zed.git",
+            "https://github.com/ArthurBrussee/zed.git",
+            "https://github.com/ArthurBrussee/zed",
+            "https://github.com/ArthurBrussee/zed/",
+            "git://github.com/ArthurBrussee/zed.git",
+            "  https://github.com/ArthurBrussee/zed.git\n",
+        ] {
+            assert_eq!(
+                RepoId::from_remote_url(url).unwrap(),
+                expected,
+                "reading {url:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_remote_that_is_not_github_names_nothing() {
+        for url in [
+            "git@gitlab.com:ArthurBrussee/zed.git",
+            "https://example.com/ArthurBrussee/zed.git",
+            "https://github.com/ArthurBrussee",
+            "https://github.com/",
+            "",
+        ] {
+            assert!(
+                RepoId::from_remote_url(url).is_err(),
+                "{url:?} should not name a repository"
+            );
+        }
+    }
+
+    /// A repository whose name itself ends in `.git` keeps it: only the suffix git adds to a
+    /// clone URL comes off.
+    #[test]
+    fn only_one_git_suffix_comes_off_a_remote_url() {
+        assert_eq!(
+            RepoId::from_remote_url("https://github.com/owner/dotfiles.git.git")
+                .unwrap()
+                .name_with_owner(),
+            "owner/dotfiles.git"
+        );
+    }
 
     /// A real `gh api graphql` answer, re-keyed to the aliases `build_query` generates.
     const SAMPLE: &str = r#"{

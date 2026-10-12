@@ -2877,3 +2877,78 @@ async fn test_dragging_a_tab_reorders_every_pane_and_the_sidebar(cx: &mut TestAp
         "and the worktree groups reorder with them"
     );
 }
+
+/// PR chips for a project on a dev box. `gh` runs here, where the credentials are, so it needs
+/// the repository's name: the checkout's path is the box's and there is nothing here to run `gh`
+/// inside. The name comes from the remote the git store reports over RPC, and the sidebar is
+/// what feeds it to the store.
+#[gpui::test]
+async fn a_remote_repository_is_named_for_the_pr_chips(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    cx.update(|cx| {
+        release_channel::init(semver::Version::new(0, 0, 0), cx);
+    });
+    let app_state = cx.update(|cx| {
+        let app_state = workspace::AppState::test(cx);
+        workspace::init(app_state.clone(), cx);
+        gh_status::init(cx);
+        app_state
+    });
+    server_cx.update(|cx| {
+        release_channel::init(semver::Version::new(0, 0, 0), cx);
+    });
+
+    let server_fs = FakeFs::new(server_cx.executor());
+    server_fs
+        .insert_tree(
+            "/on-the-box/repo",
+            serde_json::json!({ ".git": {}, "src": { "main.rs": "fn main() {}" } }),
+        )
+        .await;
+    server_fs.set_branch_name(Path::new("/on-the-box/repo/.git"), Some("main"));
+    server_fs.set_remote_for_repo(
+        Path::new("/on-the-box/repo/.git"),
+        "origin",
+        "git@github.com:ArthurBrussee/zed.git",
+    );
+
+    let (project, _headless, _opts) = start_remote_project(
+        &server_fs,
+        Path::new("/on-the-box/repo"),
+        &app_state,
+        None,
+        cx,
+        server_cx,
+    )
+    .await;
+    project.update(cx, |p, cx| p.git_scans_complete(cx)).await;
+    cx.run_until_parked();
+
+    cx.update(|cx| {
+        assert!(
+            !project.read(cx).is_local(),
+            "the harness has to give a project this machine does not own"
+        );
+    });
+
+    cx.update(|cx| <dyn fs::Fs>::set_global(app_state.fs.clone(), cx));
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let _sidebar = setup_sidebar(&multi_workspace, cx);
+    cx.run_until_parked();
+
+    cx.update(|_, cx| {
+        let store = gh_status::GhStatusStore::try_global(cx).expect("the store should be set up");
+        assert_eq!(
+            store
+                .read(cx)
+                .repo_name_for(Path::new("/on-the-box/repo")),
+            Some("ArthurBrussee/zed".to_string()),
+            "the box's checkout should be named from its origin remote, since gh cannot be \
+             run in a directory this machine does not have"
+        );
+    });
+}
