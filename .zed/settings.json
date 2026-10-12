@@ -38,6 +38,8 @@
       "formatter": "prettier",
     },
     "Rust": {
+      // Indexing this workspace costs more CPU and disk than it's worth on the fork's dev machine.
+      "language_servers": ["!rust-analyzer"],
       "tasks": {
         "variables": {
           "RUST_DEFAULT_PACKAGE_RUN": "zed",
