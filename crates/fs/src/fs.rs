@@ -2301,6 +2301,18 @@ impl FakeFs {
         .unwrap();
     }
 
+    pub fn set_fetch_error(&self, dot_git: &Path, message: Option<&str>) {
+        self.with_git_state(dot_git, true, |state| {
+            state.simulated_fetch_error = message.map(ToString::to_string);
+        })
+        .unwrap();
+    }
+
+    pub fn fetched_remotes(&self, dot_git: &Path) -> Vec<String> {
+        self.with_git_state(dot_git, false, |state| state.fetched_remotes.clone())
+            .unwrap()
+    }
+
     pub fn insert_branches(&self, dot_git: &Path, branches: &[&str]) {
         self.with_git_state(dot_git, true, |state| {
             if let Some(first) = branches.first()

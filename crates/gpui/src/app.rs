@@ -16,7 +16,6 @@ use anyhow::{Context as _, Result, anyhow};
 use derive_more::{Deref, DerefMut};
 use futures::{Future, FutureExt, channel::oneshot, future::LocalBoxFuture};
 use itertools::Itertools;
-use parking_lot::RwLock;
 use slotmap::SlotMap;
 
 pub use async_context::*;
@@ -912,7 +911,7 @@ pub struct App {
     // We need to ensure the leak detector drops last, after all tasks, callbacks and things have been dropped.
     // Otherwise it may report false positives.
     #[cfg(any(test, gpui_leak_detection))]
-    _ref_counts: Arc<RwLock<EntityRefCounts>>,
+    _ref_counts: Arc<parking_lot::RwLock<EntityRefCounts>>,
 }
 
 impl App {
@@ -967,7 +966,7 @@ impl App {
                 windows: SlotMap::with_key(),
                 window_update_stack: Vec::new(),
                 window_handles: FxHashMap::default(),
-                focus_handles: Arc::new(RwLock::new(SlotMap::with_key())),
+                focus_handles: Arc::new(FocusMap::default()),
                 keymap: Rc::new(RefCell::new(Keymap::default())),
                 keyboard_layout,
                 keyboard_mapper,
@@ -2087,6 +2086,9 @@ impl App {
 
     /// Repeatedly called during `flush_effects` to handle a focused handle being dropped.
     fn release_dropped_focus_handles(&mut self) {
+        if !self.focus_handles.take_dropped() {
+            return;
+        }
         self.focus_handles
             .clone()
             .write()
@@ -3041,6 +3043,29 @@ impl App {
             .expect("asset cache entries are keyed by their asset type")
     }
 
+    /// Counts that climbing while idle indicate leaked subscriptions or focus handles. Walks the
+    /// sets, so call it on a timer rather than per frame.
+    pub fn callback_counts(&self) -> CallbackCounts {
+        let (observers, observed_entities) = self.observers.counts();
+        let (event_listeners, emitting_entities) = self.event_listeners.counts();
+        let (release_listeners, _) = self.release_listeners.counts();
+        let (global_observers, _) = self.global_observers.counts();
+        CallbackCounts {
+            observers,
+            observed_entities,
+            event_listeners,
+            emitting_entities,
+            release_listeners,
+            global_observers,
+            focus_handles: self.focus_handles.read().len(),
+        }
+    }
+
+    /// Live entities per concrete type, largest first. Walks the entity map, so call it on a timer.
+    pub fn entity_counts_by_type(&self) -> Vec<(&'static str, usize)> {
+        self.entities.counts_by_type()
+    }
+
     /// Obtain a new [`FocusHandle`], which allows you to track and manipulate the keyboard focus
     /// for elements rendered within this window.
     #[track_caller]
@@ -3219,6 +3244,25 @@ impl App {
         };
         self.to_async()
     }
+}
+
+/// See [`App::callback_counts`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CallbackCounts {
+    /// Live `observe` callbacks.
+    pub observers: usize,
+    /// Entities those observers watch.
+    pub observed_entities: usize,
+    /// Live `subscribe` callbacks.
+    pub event_listeners: usize,
+    /// Entities those listeners watch.
+    pub emitting_entities: usize,
+    /// Live `observe_release` callbacks.
+    pub release_listeners: usize,
+    /// Live `observe_global` callbacks.
+    pub global_observers: usize,
+    /// Live focus handles.
+    pub focus_handles: usize,
 }
 
 impl AppContext for App {
