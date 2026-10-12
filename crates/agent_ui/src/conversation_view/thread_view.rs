@@ -1873,12 +1873,13 @@ impl ThreadView {
         self.parent_session_id.is_some()
     }
 
+    // Upstream also counts its in-list generating indicator here; this fork draws
+    // activity as a pill instead and removed that flag, so only entries count.
     fn has_visible_conversation(&self, cx: &App) -> bool {
-        self.generating_indicator_in_list
-            || self.thread.read(cx).entries().iter().any(|entry| {
-                !matches!(entry, AgentThreadEntry::UserMessage(message)
-                    if message.content.source_blocks().is_empty())
-            })
+        self.thread.read(cx).entries().iter().any(|entry| {
+            !matches!(entry, AgentThreadEntry::UserMessage(message)
+                if message.content.source_blocks().is_empty())
+        })
     }
 
     pub(super) fn can_edit_user_message(&self, index: usize, cx: &App) -> bool {
@@ -15471,7 +15472,7 @@ pub(crate) fn open_link(
             // `open_abs_path_at_point`, so an HTML report has to be caught here as well.
             if is_html_path(Path::new(path))
                 && let Some(abs_path) = candidates.iter().find_map(|(candidate, _)| {
-                    if path_style.is_absolute(&candidate.to_string_lossy()) {
+                    if path_style.is_absolute(candidate) {
                         Some(candidate.clone())
                     } else {
                         roots.iter().find_map(|root| {
