@@ -26,9 +26,12 @@ regardless.
 
 ## Upstream first (from 2026-10-01)
 
-The fork stands at +36.9k / -11.3k lines across 97 files against upstream (the exact figures
-after the 2026-10-12 run were +36,905 / -11,277, against +36,199 / -11,256 after 10-11 and
-+37,532 / -11,310 after 10-08). The 706 added lines 10-12 put back, and the file that joined
+The fork stands at +38.1k / -11.3k lines across 98 files against upstream (the exact figures
+after the 2026-10-13 run were +38,057 / -11,282, against +36,905 / -11,277 after 10-12,
++36,199 / -11,256 after 10-11 and +37,532 / -11,310 after 10-08). The 1,152 added lines 10-13
+put back, and the file that joined (`workspace/src/multi_workspace.rs`, one additive accessor),
+are the three Work queue entries it built; a little under half of them are their tests.
+The 706 added lines 10-12 put back, and the file that joined
 (`remote/src/transport/ssh.rs`), are the remote-development entry Arthur filed that day; a little
 over a third of them are its tests. It was +45.8k / -11.4k before 10-06, after
 going **up** four nights running (+42.0k on 10-02, +42.9k on 10-04, +44.8k on 10-05), each time
@@ -104,7 +107,16 @@ the fork's (worth knowing before a rebase: upstream ships `sidebar.rs`, `sidebar
 makes of it is a worktree-shaped index of every thread: live state
 (running — including commands still running after the turn — needs input, unread, error), click
 to switch, drag to reorder across worktrees, close and archive from the row.
-`agent_ui/thread_metadata_store.rs` and `terminal_thread_metadata_store.rs` persist the rows,
+Above the worktree grouping sits a machine grouping (2026-10-13): "This Mac" and one group per
+remote host, named by the nickname or host name upstream's
+`RemoteConnectionOptions::display_name` derives, local first and the hosts in the order they
+were connected. `Sidebar::open_machines` reads them off `MultiWorkspace::project_group_keys`
+and `group_rows_by_machine` nests the worktree groups inside them; one machine draws no header,
+so a laptop-only sidebar is as it was. Each machine header's `+` makes a worktree thread on
+that machine (`machine_repositories`, ordered by the additive
+`MultiWorkspace::project_group_keys_by_recency`, then `new_worktree_thread_in`, which is also
+what the top `+` now calls), with a menu of repositories when that machine has more than one
+open. `agent_ui/thread_metadata_store.rs` and `terminal_thread_metadata_store.rs` persist the rows,
 `thread_read_state.rs` tracks what has been read, and `agent_ui/thread_worktree_archive.rs`
 archives a thread's worktree and restores it without losing work, submodules included. Whether a
 message has ever been sent in a thread makes no difference to any of this (2026-10-02): a thread
@@ -206,80 +218,6 @@ bail on time**).
 
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
-
-**The message box fills the whole panel when Zed is unfocused.**
-
-Arthur, 2026-10-13: the message input randomly becomes full-screen and covers the thread
-whenever Zed loses focus. Cause: the off-screen view sweep, `AgentPanel::drop_offscreen_thread_views`
-in `agent_panel.rs`, treats an inactive window as "at the back, nothing on screen" (`let
-on_screen = if window.is_window_active() { … } else { None }`) and drops the view tree of
-every thread in it, *including the one on screen*. An unfocused window is still visible: Arthur
-switched to another app, not away from Zed. With the views dropped, the thread's `list_state`
-is empty, and the thread view lays out as if the thread had no conversation. The message editor
-takes the empty-state full height (`render_input_status_bar` reads `is_draft` from
-`list_state.item_count() == 0`, `callout_border_position` likewise, and the empty-state layout
-gives the editor the panel).
-
-Fix both halves:
-- Never drop the window's active thread for being unfocused. Drop it only when the window is
-  actually not visible (minimised, hidden, or fully occluded, if gpui exposes that), or keep
-  the active thread always and sweep only the others. Losing focus to another app must not
-  change what is drawn.
-- Layout must not depend on whether views happen to be built. Decide "this thread has a
-  conversation" from the thread's entries (`has_visible_conversation`), not from
-  `list_state.item_count()`, everywhere it is used for layout or mode (`is_draft` in
-  `render_input_status_bar`, `callout_border_position`, and any other `item_count` checks in
-  `thread_view.rs`), so a thread whose views are dropped and rebuilding still lays out as a
-  conversation.
-
-Test: a thread with messages, the window deactivated, the sweep fired. The message editor keeps
-its auto-height mode and the list is still there (or rebuilds) when the window is reactivated,
-with no frame where the editor is full height.
-
-**Another efficiency pass on the thread view.**
-
-Arthur, 2026-10-13: make the thread view as efficient as it can be. The view tree sweep and
-lazy terminal views landed, and the memory baselines entry covers terminals and `Markdown`
-counts. This one is about **CPU per frame and per event** in `thread_view.rs`, `chips.rs` and
-`conversation_view.rs`. Measure first, in the app: add a `quiet-ui perf: thread view frame` line
-that reports, every N frames or when one is slow, the time in `ThreadView::render`, in
-`render_entry` per visible item, and in `render_action_group`, plus the slowest item. Add a line
-for event handlers (`NewEntry` / `EntryUpdated`) that take over a millisecond. Then read the hot
-paths for work done per frame or per streamed chunk that could be cached or done once:
-- `action_run_bounds` and `drawn_item_for_entry`, called per entry per frame and per event, each
-  walking entries;
-- `running_work`'s walk for the activity pill;
-- `chip_cache.begin_frame` and the per-chip label building (`collapsed_command`, highlight runs);
-- markdown re-parsing on streamed chunks;
-- `render_input_status_bar` and its diff stats;
-- anything that clones a terminal's output or an entry's text in render.
-
-Fix what the numbers and the reading point at, with before and after numbers on a long thread
-(several hundred entries, many command chips, a few images) while a turn streams. Keep the
-lines in, so Arthur's log can confirm.
-
-**Group the sidebar by machine, with a `+` per machine.**
-
-Arthur develops on the laptop and on a dev box over SSH, and needs to see and choose where each
-thread runs. Group the sidebar's thread list by machine first: "This Mac" (local) and one group
-per remote host, named by the SSH connection's nickname or else its host name. The existing
-worktree grouping stays inside each machine group. Local comes first, then remote hosts in the
-order they were connected. A machine with no open project or thread doesn't get a group.
-
-Each machine group's header has its own `+`. It creates a new worktree thread on *that*
-machine, using the same flow as today's top `+` (`AgentPanel::create_new_worktree_thread`, the
-default-branch base, the spare pool), run against that machine's repository. Which repository:
-the one most recently active on that machine. When that machine has more than one repository
-open, the `+` opens a small menu of them, most recent first. The top `+` keeps its current
-meaning (the active workspace's machine and repository).
-
-The sidebar already knows each row's machine (`ThreadEntryWorkspace::is_remote`, and the
-`project_group_key.host()` it reads), and `ThreadItem::is_remote` is passed but never drawn.
-With the grouping, the row itself needs no host label. Drop the unused field, or use it only
-where a row appears outside its machine group (search results). Spares are per repository, so
-a remote machine's `+` uses that machine's spare. Test: with a local and a remote project open,
-the groups render in that order, and each `+` creates its worktree and thread on its own machine
-(the fake remote transport in upstream's tests).
 
 **The memory baselines: what it would take, and the one measurement that would justify it.**
 
@@ -3141,3 +3079,189 @@ none left it, so the fork now touches 97 files against 96 after 10-11. Nothing b
 this round, but two of the entry's four parts cost no lines at all because upstream already had
 them: `RemoteImageStore` for the image chips, and a remote agent launch that needed nothing
 because the fork's capabilities were never transport-dependent in the first place.
+
+**2026-10-13**: onto main 36682547b (21 upstream commits). A working night three times over: the
+Work queue held three buildable entries, the branch carried five commits over the merge base, and
+upstream had moved 21 commits. **For the second run running, the container had none of the
+branch** — `git clone` left only `main`, which carries the build schedule and nothing else, so
+`quiet-ui` was fetched from `origin` before anything else. That is now a reliable property of
+this container rather than a one-off: expect to fetch the branch, and do not read a missing
+`QUIET_UI.md` as a quiet night. Squash-then-rebase folded all five into one, reusing the squash's
+own message; tree-identical to the old tip (`b3c688fe0`, tree `4876e402`) before rebasing. Backup
+at `quiet-ui-pre-rebase49-2026-10-13` (the number collides with what the 10-12 entry claims it
+used; `origin` carried nothing above `48`, so 10-12's backup push evidently never landed).
+
+**Three files conflicted, four hunks**, and two of the three are the usual seam.
+- `agent_servers/src/custom.rs`: `agent_servers: Route v2 configuration and usage updates
+  (#65556)` renamed `acp::SessionModeId` to `acp_v2::SessionConfigValueId` and changed what
+  `default_mode` returns. The fork's side is the Claude-first default (`bypassPermissions` when
+  nothing is configured), which is an explicit request, so it is kept on upstream's type: four
+  lines, and the type name is upstream's throughout.
+- `agent_ui/src/conversation_view.rs`: upstream replaced the `downcast::<AuthRequired>()` error
+  path with `AuthRequired::from_error(&error)`, and the fork's replay-poll loop — the one that
+  shows a resuming thread as soon as it has entries rather than a "Loading…" label — sits exactly
+  on that line. The fork's loop is kept and upstream's error shape adopted, which the code
+  *after* the conflict already expected: the surviving tail referred to `auth_required` and
+  `Err(error)`, so taking the fork's old `downcast` arm would not have compiled. Worth the note:
+  when a conflict's two sides open a `match` whose arms live below the marker, the tail decides
+  which opening is correct, and it is not always ours.
+- `thread_view.rs`, the recurring seam, twice. One is an import union (upstream's new
+  `entry_view_state::TERMINAL_CONTENT_TOP_PADDING` beside the fork's `is_html_path` and
+  `WatchedPr`). The other is upstream restyling the terminal tool-call body into a bordered card
+  where this fork draws its own one-line row — the command scripts and the sandbox warning the
+  chip header replaces. Ours taken, as the seam almost always resolves; upstream's new constant
+  is used by the shared tail below the marker, so the import it needed stays.
+
+**Markerless drift: none**, for the first time in this log. `cargo check --workspace
+--all-targets` after the replay came back 0 errors and 0 warnings in 17m22s, with nothing to
+adapt.
+
+**What upstream already provides, so the fork did not write it.**
+`RemoteConnectionOptions::display_name()` prefers an SSH connection's nickname over its host name
+and handles WSL and Docker besides — exactly what the machine-group entry asked for, so the
+machine labels call it instead of carrying a helper. Nothing the fork already carries became
+deletable this round. And one thing the queue expected to delete is *not* the fork's:
+`ThreadItem::is_remote` is upstream's field (it is in the merge base, untouched by the fork's
+diff), so dropping it as "dead fork code" would have been a fork change to upstream-owned code
+with no reason behind it. It stays.
+
+**What the night actually costs, because this surprised the run.** The three cargo passes are
+three different builds, and only the first is cheap. `cargo check --workspace --all-targets` is
+metadata-only: 17 minutes cold. `cargo test` needs full debug codegen and linking of every test
+binary — the first `sidebar` test binary alone took 18 minutes — and `script/clippy` is
+`--release`, a third full build of the same graph. Cargo locks the target directory, so these
+cannot overlap. Plan the night as "code against the cheap check, then pay twice at the gate", and
+start the gate with hours in hand rather than minutes.
+
+**A formatting trap, found the expensive way.** `cargo fmt -p <crate>` reformats *every*
+non-conforming line in that crate, not the ones this run wrote, and the fork has plenty committed
+unformatted. Running it on `agent_ui` silently reflowed five pre-existing hunks, and on
+`workspace` it touched `dock.rs` and `workspace.rs`, neither of which this run had opened — all
+of it pure diff growth against upstream. Format, then read `git diff` for removals you did not
+make and revert them; the fork is not fmt-gated, so leaving those lines alone is correct.
+
+**What was built: all three buildable Work queue entries, and the queue is down to the one
+entry that is waiting on Arthur.**
+
+- *The message box filling the panel when Zed is unfocused.* The entry's diagnosis was right to
+  the line. `AgentPanel::drop_offscreen_thread_views` read `window.is_window_active()` and
+  treated a merely unfocused window as one showing nothing, dropping the view tree of every
+  thread in it including the one on screen. gpui already draws the distinction the entry wanted:
+  `Window::is_visible` is false only when the platform has stopped presenting the window
+  (minimised, hidden, fully occluded), which is what the sweep now asks, and residency is
+  re-synced on `observe_window_visibility` as well as activation so a window presented again
+  rebuilds what it gave up. The second half is the one that matters for the symptom: with the
+  views dropped `list_state.item_count()` is 0, and the two layout decisions reading it —
+  `is_draft` in `render_input_status_bar` and `callout_border_position` — now read the thread's
+  own entries through `has_visible_conversation`, which the main empty-state layout was already
+  using. Those two were the only `item_count` call sites left in the file. The existing test
+  `test_a_window_at_the_back_drops_the_views_of_the_thread_it_showed` **asserted the bug**, so it
+  is replaced by `test_an_unfocused_window_keeps_the_views_of_the_thread_it_shows`: deactivating
+  keeps the views, hiding drops them, and the thread lays out as a conversation either way.
+- *Another efficiency pass on the thread view.* The instrumentation the entry asked for is in and
+  staying: a `quiet-ui perf: thread view frame` line every 120 frames or at once for a frame over
+  8ms, carrying the time in `ThreadView::render`, the time in `render_entry` and
+  `render_action_group` with the number of each drawn, and the dearest single entry; plus a line
+  for any entry-change handler over a millisecond, named by its event. The timers are scope
+  guards, so the builder chain `render` returns is measured without being taken apart — which
+  matters in this file above all others. What the reading then found was repetition rather than
+  one slow path: `has_visible_conversation` and `AcpThread::running_work` each walk every entry,
+  and a frame asks for them about ten times between the layout decisions, the activity pill and
+  the bottom bar. Both are answered once a frame now, from a memo dropped at the top of each
+  frame *and* whenever the entries change, so it cannot go stale. `load_remote_chip_images`
+  walked every entry and resolved project paths on every frame of a remote project — now Arthur's
+  usual case — and runs on entry changes instead, which is the only time an image can appear.
+  Measured in the test harness at 402 entries and ten asks a frame: 0.183ms a frame of walking
+  before, 0.020ms after (`measure_the_per_frame_memo_on_a_long_thread`, `#[ignore]`d, run it with
+  `--ignored --nocapture`). **The honest limit on that number**: it is a debug-profile
+  measurement of the walks, not a release build of the app under a streaming turn, which this
+  sandbox cannot run. The frame lines are what will answer that, from Arthur's log. One
+  optimisation was considered and rejected: `ChipCache::highlight_label` clones a `Vec<TextRun>`
+  per chip per frame, but `StyledText::with_runs` takes the vector by value, so avoiding it means
+  patching gpui — upstream-owned, for a marginal win.
+- *Grouping the sidebar by machine, with a `+` per machine.* Threads group by machine above the
+  worktree grouping, "This Mac" first and then each host, with a machine that has nothing open
+  getting no group. **One decision the entry did not make**: with only one machine, no header is
+  drawn at all. The entry's rule ("a machine with no open project or thread doesn't get a group")
+  does not cover the ordinary laptop-only case, and a lone "This Mac" header above every sidebar
+  would be new chrome for a question nobody is asking — where a thread runs is only worth saying
+  when there is more than one answer. Each machine header's `+` goes through the same flow as the
+  top `+` (`AgentPanel::create_new_worktree_thread` against a workspace on that machine, so the
+  default-branch base and that repository's spare pool come for free), against the repository most
+  recently active there, or a menu of them when the machine has more than one open. The top `+`
+  keeps its meaning and now shares the helper. The menu's ordering is the only thing that needed
+  something upstream did not expose: `MultiWorkspace::project_group_keys_by_recency`, twenty
+  additive lines in `multi_workspace.rs`, which the fork had not touched before tonight — the
+  activation times are that type's own and there is no other door to them. Four tests: three over
+  the grouping itself (two machines group and order correctly, one machine draws no header, a
+  thread whose machine has closed is still listed) and one on the real harness with a local and a
+  mock-remote project open, asserting the machine order and that each machine's `+` offers only
+  its own repositories.
+
+**Not built, and why: the memory baselines.** Unchanged from 10-07 — it is one line of Arthur's
+measurement, not code, and the 10-07 entry explains why nothing here can supply it. It stays at
+the top of the queue.
+
+**The gate.** The union is the fork's core (`acp_thread`, `agent_ui`, `sidebar`) plus
+`workspace`, which tonight's machine grouping made a fork-touched crate for the first time; the
+Verification queue was already empty. **Green on the final tree: 1,368 tests passed, 0 failed**
+(`acp_thread` 336, `agent_ui` 558 with its 36 `#[ignore]`d left alone, `sidebar` 196,
+`workspace` 278), and `script/clippy` 0 errors, 0 warnings.
+
+**It caught one real bug, and it was tonight's own.**
+`conversation_view::tests::test_hidden_command_marker_keeps_empty_editor_mode` failed on the
+per-frame memo. `sync_editor_mode` reads `has_visible_conversation`, and it is called from
+`ConversationView`'s *own* thread subscription, which can run before `ThreadView`'s — so the
+handler this run had trusted to clear the memo had not run yet, `sync_editor_mode` read the
+answer from before the message, and the message editor stayed at its empty-state full height.
+Which is the very bug the night's first entry was about, reintroduced by the second entry's
+optimisation through a different door. The fix is not a better invalidation hook but a smaller
+scope: the memo is valid **only inside one `Render::render` call**, opened and closed by the same
+frame guard that times the frame, and every reader outside a render pass walks. Nothing cached
+can go stale while it is readable, because no thread mutation can interleave with a render. The
+lesson generalises past this fork: a cache whose correctness depends on "some handler clears it
+first" is only as good as the subscription order, which is not ours to choose.
+
+**Clippy found two, both in tonight's new code**: `unnecessary_sort_by` on the new accessor's
+comparator (clippy's own machine-applicable suggestion taken — `sort_by_key` with
+`std::cmp::Reverse`, identical ordering, both sorts stable) and a `redundant_clone` in two of
+tonight's tests. Because that second fix landed in `workspace` after its suite had already gone
+green, the whole gate was re-run on the final tree rather than argued past; the figures above are
+that run.
+
+**Environment, not code — and the disk is now the binding constraint on a gate night.** The
+session's writable allowance is about 39G, *not* the 252G `df` reports, and `df` shows `Avail`
+collapsing to nothing while `Used` still looks small. Linking the four test binaries ran it out
+and `ld` died with `fatal error: ld terminated with signal 7 [Bus error]`, which reads like a
+toolchain crash and is nothing of the kind. What it cost and what works:
+- 774 stale duplicate `.rlib`s had accumulated in `target/debug/deps` (cargo keeps a copy per
+  fingerprint, and a night of `check` then `test` then edits makes several per crate): 7.4G.
+  Deleting all but the newest of each freed the space but forced a large rebuild, because some
+  of them were current. A fair trade once, not a habit.
+- **A release tree and a debug tree do not both fit**, so the gate's two halves cannot share the
+  container. The order that works is: `cargo test` to completion, then delete `target/debug`,
+  then `script/clippy`. Plan for it rather than discovering it at 22:00.
+- Build the test profile with `CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`. Those four
+  test binaries are ~1GB each with debuginfo and the tree did not fit in what was left; without
+  it the same run fits with room spare and links faster, and a test passes or fails identically
+  either way.
+- `script/clippy` is `--release`, and this workspace's release profile is `lto = "thin"` with
+  `codegen-units = 1` — hours of backend work to run a lint. Overriding
+  `CARGO_PROFILE_RELEASE_LTO=false`, `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16` and
+  `CARGO_PROFILE_RELEASE_DEBUG=0` is safe for this purpose: lints are frontend analysis, so the
+  findings are identical, and the dmg is built by the workflow rather than here. The last clippy
+  pass finished in 32 seconds.
+
+**Two flags that pay for themselves at twenty minutes a run**: `--no-fail-fast` for `cargo test`
+and `--keep-going` for clippy. Without them a run reports its first failure and stops, so three
+independent problems cost three full rebuilds; tonight that happened before the flags went on.
+
+**And the exit code is worthless — confirmed three more times.** The 10-12 entry recorded it for
+a backgrounded `cargo check`; tonight a `cargo test` whose link had died of SIGBUS, and both
+failing `script/clippy` runs, **all exited 0**. Read the output every time and grep it for
+`test result`, `^error` and `Bus error`. A green status from a cargo run in this container is
+evidence of nothing at all.
+
+**Diff size**: 98 files, +38,057 / -11,282 against the merge base, from 97 files,
++36,905 / -11,277 after 10-12. Up 1,152 added lines and one file for three queue entries that
+each asked for lines; a little under half of the 1,152 are their tests.
