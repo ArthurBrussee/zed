@@ -1202,7 +1202,7 @@ pub struct AgentPanel {
     offscreen_view_sweep: Option<Task<()>>,
     _thread_tabs_registry_observation: Subscription,
     /// A window at the back shows none of its threads.
-    _view_residency_observation: Subscription,
+    _view_residency_observations: [Subscription; 2],
     terminals: HashMap<TerminalId, AgentTerminal>,
     pending_terminal_spawn: Option<TerminalId>,
     #[cfg(test)]
@@ -1722,10 +1722,14 @@ impl AgentPanel {
             },
         );
 
-        let _view_residency_observation =
+        let _view_residency_observations = [
             cx.observe_window_activation(window, |this, window, cx| {
                 this.sync_thread_view_residency(window, cx);
-            });
+            }),
+            cx.observe_window_visibility(window, |this, _visibility, window, cx| {
+                this.sync_thread_view_residency(window, cx);
+            }),
+        ];
 
         let mut panel = Self {
             workspace_id,
@@ -1756,7 +1760,7 @@ impl AgentPanel {
             pending_foreign_activation: None,
             offscreen_view_sweep: None,
             _thread_tabs_registry_observation,
-            _view_residency_observation,
+            _view_residency_observations,
             terminals: HashMap::default(),
             pending_terminal_spawn: None,
             #[cfg(test)]
@@ -1908,7 +1912,7 @@ impl AgentPanel {
     /// Gives the thread on screen its views back and restarts the clock on
     /// dropping the others'.
     fn sync_thread_view_residency(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if window.is_window_active()
+        if window.is_visible()
             && let Some(active) = self.active_tab_thread.clone()
         {
             active.update(cx, |conversation, cx| {
@@ -1934,8 +1938,10 @@ impl AgentPanel {
     /// Drops the view trees of every thread tab that is not on screen. A
     /// thread refuses while a past message is being edited.
     fn drop_offscreen_thread_views(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // A window at the back has nothing on screen, its active tab included.
-        let on_screen = if window.is_window_active() {
+        // Losing focus to another app leaves the window on screen; only one the
+        // platform has stopped presenting (minimised, hidden, fully occluded)
+        // is showing nothing, its active tab included.
+        let on_screen = if window.is_visible() {
             // No active tab means the thread on screen is unknown (a proxy
             // being re-routed), so drop nothing.
             let Some(active) = self.active_tab_thread.clone() else {
@@ -13447,9 +13453,11 @@ mod tests {
         });
     }
 
-    /// A background window's active tab is off screen too.
+    /// Losing focus is not going off screen: the thread the user is looking at
+    /// keeps its views, and only a window the platform has stopped presenting
+    /// gives them up.
     #[gpui::test]
-    async fn test_a_window_at_the_back_drops_the_views_of_the_thread_it_showed(
+    async fn test_an_unfocused_window_keeps_the_views_of_the_thread_it_shows(
         cx: &mut TestAppContext,
     ) {
         let (panel, mut cx) = setup_panel(cx).await;
@@ -13476,12 +13484,56 @@ mod tests {
             "the thread on screen should keep its views however long it sits there"
         );
 
+        let lays_out_as_conversation = |panel: &Entity<AgentPanel>, cx: &mut VisualTestContext| {
+            panel.read_with(cx, |panel, cx| {
+                panel
+                    .active_tab_thread
+                    .as_ref()
+                    .expect("the opened thread should be the active tab")
+                    .read(cx)
+                    .active_thread()
+                    .expect("the active tab should hold a thread view")
+                    .read(cx)
+                    .lays_out_as_conversation(cx)
+            })
+        };
+
+        // Arthur switched to another app, not away from Zed: the window is
+        // still on screen and must still draw the thread.
         cx.deactivate_window();
         cx.executor().advance_clock(OFFSCREEN_VIEW_GRACE * 2);
         cx.run_until_parked();
         assert!(
+            views_are_built(&panel, &mut cx),
+            "an unfocused window is still visible, so its thread should keep its views"
+        );
+        assert!(
+            lays_out_as_conversation(&panel, &mut cx),
+            "a thread with messages lays out as a conversation while unfocused"
+        );
+
+        // A window the platform has stopped presenting really is showing
+        // nothing, and there the views are still worth releasing.
+        cx.simulate_visibility_change(gpui::WindowVisibility::Hidden);
+        cx.executor().advance_clock(OFFSCREEN_VIEW_GRACE * 2);
+        cx.run_until_parked();
+        assert!(
             !views_are_built(&panel, &mut cx),
-            "a window at the back is showing nothing, so its thread's views should go"
+            "a hidden window is showing nothing, so its thread's views should go"
+        );
+        // The layout reads the thread, not whether its views happen to be
+        // built, so a thread rebuilding never lays out as an empty draft.
+        assert!(
+            lays_out_as_conversation(&panel, &mut cx),
+            "a thread whose views were dropped still has a conversation to lay out"
+        );
+
+        // Back on screen, the views come back.
+        cx.simulate_visibility_change(gpui::WindowVisibility::Visible);
+        cx.run_until_parked();
+        assert!(
+            views_are_built(&panel, &mut cx),
+            "a window that is presented again should rebuild its thread's views"
         );
     }
 

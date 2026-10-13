@@ -1903,6 +1903,12 @@ impl ThreadView {
         })
     }
 
+    /// Whether the thread lays out as a conversation rather than as a draft.
+    #[cfg(test)]
+    pub(crate) fn lays_out_as_conversation(&self, cx: &App) -> bool {
+        self.has_visible_conversation(cx)
+    }
+
     pub(super) fn can_edit_user_message(&self, index: usize, cx: &App) -> bool {
         let thread = self.thread.read(cx);
         let Some(message) = thread
@@ -4608,8 +4614,8 @@ impl ThreadView {
         cx.notify();
     }
 
-    fn callout_border_position(&self) -> CalloutBorderPosition {
-        if self.list_state.item_count() > 0 {
+    fn callout_border_position(&self, cx: &App) -> CalloutBorderPosition {
+        if self.has_visible_conversation(cx) {
             CalloutBorderPosition::Top
         } else {
             CalloutBorderPosition::Bottom
@@ -4667,7 +4673,7 @@ impl ThreadView {
 
         Some(
             Callout::new()
-                .border_position(self.callout_border_position())
+                .border_position(self.callout_border_position(cx))
                 .icon(IconName::Warning)
                 .severity(Severity::Warning)
                 .title(state.last_error.clone())
@@ -6896,7 +6902,7 @@ impl ThreadView {
         }
         let branch_diff_stats = self.branch_diff_stats.read(cx);
         let is_generating = self.thread.read(cx).status() != ThreadStatus::Idle;
-        let is_draft = self.list_state.item_count() == 0;
+        let is_draft = !self.has_visible_conversation(cx);
         let diff_stats = branch_diff_stats.stats();
         let diff_tooltip = match branch_diff_stats.base() {
             DiffStatsBase::DefaultBranch(base) => {
@@ -14012,7 +14018,7 @@ impl ThreadView {
             ),
         };
 
-        Some(div().child(callout.border_position(self.callout_border_position())))
+        Some(div().child(callout.border_position(self.callout_border_position(cx))))
     }
 
     fn render_refusal_error(&self, cx: &mut Context<'_, Self>) -> Callout {
@@ -14510,7 +14516,7 @@ impl ThreadView {
 
     fn render_codex_windows_warning(&self, cx: &mut Context<Self>) -> Callout {
         Callout::new()
-            .border_position(self.callout_border_position())
+            .border_position(self.callout_border_position(cx))
             .icon(IconName::Warning)
             .severity(Severity::Warning)
             .title("Codex on Windows")
@@ -14572,7 +14578,7 @@ impl ThreadView {
     }
 
     fn render_skill_loading_issues(&self, cx: &mut Context<Self>) -> Vec<Callout> {
-        let border_position = self.callout_border_position();
+        let border_position = self.callout_border_position(cx);
 
         let description_warnings = self
             .skill_loading_issues
@@ -14746,7 +14752,7 @@ impl ThreadView {
 
     fn render_external_source_prompt_warning(&self, cx: &mut Context<Self>) -> Callout {
         Callout::new()
-            .border_position(self.callout_border_position())
+            .border_position(self.callout_border_position(cx))
             .icon(IconName::Warning)
             .severity(Severity::Warning)
             .title("Review Before Sending")
@@ -14805,7 +14811,7 @@ impl ThreadView {
                     "It currently only operates by default on \"{}\".",
                     active_dir
                 ))
-                .border_position(self.callout_border_position())
+                .border_position(self.callout_border_position(cx))
                 .dismiss_action(
                     IconButton::new("dismiss-multi-root-callout", IconName::Close)
                         .icon_size(IconSize::Small)
@@ -14902,7 +14908,7 @@ impl ThreadView {
 
         Some(
             Callout::new()
-                .border_position(self.callout_border_position())
+                .border_position(self.callout_border_position(cx))
                 .severity(severity)
                 .icon(icon)
                 .title(title)
