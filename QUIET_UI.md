@@ -207,16 +207,79 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
-**Show where a thread runs: a host marker on remote rows.**
+**The message box fills the whole panel when Zed is unfocused.**
 
-With threads on the laptop and on a dev box, the sidebar gives no way to tell them apart. The
-sidebar already works it out per row (`ThreadEntryWorkspace::is_remote`) and passes it to
-`ThreadItem::is_remote` (`crates/ui/src/components/ai/thread_item.rs`), but nothing in
-`ThreadItem::render` reads the field. Draw it: a remote row gets a small muted host label on its
-metadata line (the SSH connection's nickname, or the host name if it has none), before the PR
-chip. A worktree group header on a remote host gets the same label. Local rows show nothing.
-Terminal rows (`render_terminal`, which also sets `is_remote`) follow the same rule. Test: a
-remote row renders the host label and a local one doesn't.
+Arthur, 2026-10-13: the message input randomly becomes full-screen and covers the thread
+whenever Zed loses focus. Cause: the off-screen view sweep, `AgentPanel::drop_offscreen_thread_views`
+in `agent_panel.rs`, treats an inactive window as "at the back, nothing on screen" (`let
+on_screen = if window.is_window_active() { … } else { None }`) and drops the view tree of
+every thread in it, *including the one on screen*. An unfocused window is still visible: Arthur
+switched to another app, not away from Zed. With the views dropped, the thread's `list_state`
+is empty, and the thread view lays out as if the thread had no conversation. The message editor
+takes the empty-state full height (`render_input_status_bar` reads `is_draft` from
+`list_state.item_count() == 0`, `callout_border_position` likewise, and the empty-state layout
+gives the editor the panel).
+
+Fix both halves:
+- Never drop the window's active thread for being unfocused. Drop it only when the window is
+  actually not visible (minimised, hidden, or fully occluded, if gpui exposes that), or keep
+  the active thread always and sweep only the others. Losing focus to another app must not
+  change what is drawn.
+- Layout must not depend on whether views happen to be built. Decide "this thread has a
+  conversation" from the thread's entries (`has_visible_conversation`), not from
+  `list_state.item_count()`, everywhere it is used for layout or mode (`is_draft` in
+  `render_input_status_bar`, `callout_border_position`, and any other `item_count` checks in
+  `thread_view.rs`), so a thread whose views are dropped and rebuilding still lays out as a
+  conversation.
+
+Test: a thread with messages, the window deactivated, the sweep fired. The message editor keeps
+its auto-height mode and the list is still there (or rebuilds) when the window is reactivated,
+with no frame where the editor is full height.
+
+**Another efficiency pass on the thread view.**
+
+Arthur, 2026-10-13: make the thread view as efficient as it can be. The view tree sweep and
+lazy terminal views landed, and the memory baselines entry covers terminals and `Markdown`
+counts. This one is about **CPU per frame and per event** in `thread_view.rs`, `chips.rs` and
+`conversation_view.rs`. Measure first, in the app: add a `quiet-ui perf: thread view frame` line
+that reports, every N frames or when one is slow, the time in `ThreadView::render`, in
+`render_entry` per visible item, and in `render_action_group`, plus the slowest item. Add a line
+for event handlers (`NewEntry` / `EntryUpdated`) that take over a millisecond. Then read the hot
+paths for work done per frame or per streamed chunk that could be cached or done once:
+- `action_run_bounds` and `drawn_item_for_entry`, called per entry per frame and per event, each
+  walking entries;
+- `running_work`'s walk for the activity pill;
+- `chip_cache.begin_frame` and the per-chip label building (`collapsed_command`, highlight runs);
+- markdown re-parsing on streamed chunks;
+- `render_input_status_bar` and its diff stats;
+- anything that clones a terminal's output or an entry's text in render.
+
+Fix what the numbers and the reading point at, with before and after numbers on a long thread
+(several hundred entries, many command chips, a few images) while a turn streams. Keep the
+lines in, so Arthur's log can confirm.
+
+**Group the sidebar by machine, with a `+` per machine.**
+
+Arthur develops on the laptop and on a dev box over SSH, and needs to see and choose where each
+thread runs. Group the sidebar's thread list by machine first: "This Mac" (local) and one group
+per remote host, named by the SSH connection's nickname or else its host name. The existing
+worktree grouping stays inside each machine group. Local comes first, then remote hosts in the
+order they were connected. A machine with no open project or thread doesn't get a group.
+
+Each machine group's header has its own `+`. It creates a new worktree thread on *that*
+machine, using the same flow as today's top `+` (`AgentPanel::create_new_worktree_thread`, the
+default-branch base, the spare pool), run against that machine's repository. Which repository:
+the one most recently active on that machine. When that machine has more than one repository
+open, the `+` opens a small menu of them, most recent first. The top `+` keeps its current
+meaning (the active workspace's machine and repository).
+
+The sidebar already knows each row's machine (`ThreadEntryWorkspace::is_remote`, and the
+`project_group_key.host()` it reads), and `ThreadItem::is_remote` is passed but never drawn.
+With the grouping, the row itself needs no host label. Drop the unused field, or use it only
+where a row appears outside its machine group (search results). Spares are per repository, so
+a remote machine's `+` uses that machine's spare. Test: with a local and a remote project open,
+the groups render in that order, and each `+` creates its worktree and thread on its own machine
+(the fake remote transport in upstream's tests).
 
 **The memory baselines: what it would take, and the one measurement that would justify it.**
 
