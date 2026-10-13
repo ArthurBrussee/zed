@@ -219,7 +219,8 @@ jobs:
       - name: Build
         if: steps.freshness.outputs.build == 'true'
         run: |
-          sudo apt-get update && sudo apt-get install -y musl-tools
+          # lld: .cargo/config.toml links aarch64-unknown-linux-musl with -fuse-ld=lld.
+          sudo apt-get update && sudo apt-get install -y musl-tools lld
           triple=${{ matrix.arch }}-unknown-linux-musl
           rustup target add "$triple"
           # The same separate, musl-linked build script/bundle-linux does.
