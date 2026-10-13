@@ -45,8 +45,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use theme::{ActiveTheme, CLIENT_SIDE_DECORATION_ROUNDING};
 use ui::{
-    AgentThreadStatus, ContextMenu, Disclosure, Divider, KeyBinding, PopoverMenuHandle,
-    ProjectEmptyState, ScrollAxes, Scrollbars, ThreadItem, ThreadItemPrChip,
+    AgentThreadStatus, ContextMenu, Disclosure, Divider, KeyBinding, PopoverMenu,
+    PopoverMenuHandle, ProjectEmptyState, ScrollAxes, Scrollbars, ThreadItem, ThreadItemPrChip,
     ThreadItemWorktreeInfo, Tooltip, WithScrollbar, prelude::*, right_click_menu,
 };
 use unicode_segmentation::UnicodeSegmentation as _;
@@ -223,6 +223,22 @@ impl ThreadEntryWorkspace {
             ThreadEntryWorkspace::Closed {
                 project_group_key, ..
             } => project_group_key.host().is_some(),
+        }
+    }
+
+    /// Which machine this entry's project is on, as the machine groups key
+    /// themselves. `None` is this one. Narrower than [`Self::is_remote`],
+    /// which is true for any project that is not this process's.
+    fn host(&self, cx: &App) -> Option<RemoteConnectionOptions> {
+        match self {
+            ThreadEntryWorkspace::Open(workspace) => workspace
+                .read(cx)
+                .project()
+                .read(cx)
+                .remote_connection_options(cx),
+            ThreadEntryWorkspace::Closed {
+                project_group_key, ..
+            } => project_group_key.host(),
         }
     }
 }
@@ -410,7 +426,9 @@ fn entry_folder_paths(entry: &ListEntry) -> Option<&PathList> {
     match entry {
         ListEntry::Thread(thread) => Some(thread.metadata.folder_paths()),
         ListEntry::Terminal(terminal) => Some(terminal.metadata.folder_paths()),
-        ListEntry::SectionHeader(_) | ListEntry::WorkspaceHeader(_) => None,
+        ListEntry::SectionHeader(_)
+        | ListEntry::MachineHeader(_)
+        | ListEntry::WorkspaceHeader(_) => None,
     }
 }
 
@@ -420,7 +438,9 @@ fn entry_identity(entry: &ListEntry) -> Option<EntryIdentity> {
         ListEntry::Terminal(terminal) => {
             Some(EntryIdentity::Terminal(terminal.metadata.terminal_id))
         }
-        ListEntry::SectionHeader(_) | ListEntry::WorkspaceHeader(_) => None,
+        ListEntry::SectionHeader(_)
+        | ListEntry::MachineHeader(_)
+        | ListEntry::WorkspaceHeader(_) => None,
     }
 }
 
@@ -472,6 +492,7 @@ impl SidebarSection {
 #[derive(Clone, PartialEq)]
 enum ListEntry {
     SectionHeader(SidebarSection),
+    MachineHeader(Arc<MachineHeaderEntry>),
     WorkspaceHeader(Arc<WorkspaceHeaderEntry>),
     Thread(Arc<ThreadEntry>),
     Terminal(TerminalEntry),
@@ -494,9 +515,32 @@ impl RenameTarget {
                 Self::Terminal(terminal.metadata.terminal_id),
                 terminal.metadata.editable_title(),
             )),
-            ListEntry::SectionHeader(_) | ListEntry::WorkspaceHeader(_) => None,
+            ListEntry::SectionHeader(_)
+            | ListEntry::MachineHeader(_)
+            | ListEntry::WorkspaceHeader(_) => None,
         }
     }
+}
+
+/// A machine with something open, in the order the groups are drawn.
+#[derive(Clone)]
+struct MachineGroup {
+    label: SharedString,
+    /// `None` is this one.
+    host: Option<RemoteConnectionOptions>,
+    /// Whether a new worktree thread could be made here.
+    can_create_thread: bool,
+}
+
+/// A machine's group header: the threads under it run there. Drawn only when
+/// more than one machine has threads, so a laptop-only sidebar is unchanged.
+#[derive(Clone, PartialEq)]
+struct MachineHeaderEntry {
+    label: SharedString,
+    /// The machine this heads; `None` is this one.
+    host: Option<RemoteConnectionOptions>,
+    /// Whether this machine has a project a new worktree thread could go in.
+    can_create_thread: bool,
 }
 
 #[derive(Clone, PartialEq)]
@@ -535,7 +579,9 @@ impl ActivatableEntry {
                 metadata: terminal.metadata.clone(),
                 workspace: terminal.workspace.clone(),
             }),
-            ListEntry::SectionHeader(_) | ListEntry::WorkspaceHeader(_) => None,
+            ListEntry::SectionHeader(_)
+            | ListEntry::MachineHeader(_)
+            | ListEntry::WorkspaceHeader(_) => None,
         }
     }
 }
@@ -547,6 +593,7 @@ impl ListEntry {
             ListEntry::Thread(thread_entry) => thread_entry.metadata.session_id.as_ref(),
             ListEntry::Terminal(_)
             | ListEntry::SectionHeader(_)
+            | ListEntry::MachineHeader(_)
             | ListEntry::WorkspaceHeader(_) => None,
         }
     }
@@ -565,7 +612,9 @@ impl ListEntry {
                 ThreadEntryWorkspace::Open(workspace) => vec![workspace.clone()],
                 ThreadEntryWorkspace::Closed { .. } => Vec::new(),
             },
-            ListEntry::SectionHeader(_) | ListEntry::WorkspaceHeader(_) => Vec::new(),
+            ListEntry::SectionHeader(_)
+            | ListEntry::MachineHeader(_)
+            | ListEntry::WorkspaceHeader(_) => Vec::new(),
         }
     }
 }
@@ -602,6 +651,7 @@ struct SidebarContents {
 #[derive(Debug, PartialEq, Eq)]
 enum EntryShape {
     SectionHeader(SidebarSection),
+    MachineHeader(SharedString),
     WorkspaceHeader(SharedString),
     Thread(ThreadId),
     Terminal(TerminalId),
@@ -1657,6 +1707,7 @@ impl Sidebar {
             terminals = matched_terminals;
         }
 
+        let machines = Self::open_machines(mw, &workspaces, cx);
         let all_entries = Self::sectioned_entries(
             terminals,
             threads,
@@ -1664,6 +1715,8 @@ impl Sidebar {
             &tab_positions,
             &mut current_session_ids,
             &mut current_thread_ids,
+            &machines,
+            cx,
         );
         let entries = Self::visible_entries(
             &all_entries,
@@ -1703,6 +1756,12 @@ impl Sidebar {
                     hiding_section = collapsed_sections.contains(section);
                     hiding_worktree = false;
                     visible.push(entry.clone());
+                }
+                ListEntry::MachineHeader(_) => {
+                    hiding_worktree = false;
+                    if !hiding_section {
+                        visible.push(entry.clone());
+                    }
                 }
                 ListEntry::WorkspaceHeader(header) => {
                     hiding_worktree = collapsed_worktrees.contains(&header.key);
@@ -1921,6 +1980,100 @@ impl Sidebar {
 
     /// A cluster is emitted where its first row appears. Tabs interleaved
     /// across worktrees (A, B, A) are grouped anyway.
+    /// Groups rows by the machine their project is on — this one first, then
+    /// remote hosts in the order they were connected — keeping the worktree
+    /// grouping inside each machine. One machine is the ordinary case and gets
+    /// no header: where a thread runs is only worth saying when there is more
+    /// than one answer.
+    /// The machines something is open on, this one first and remote hosts in
+    /// the order their project group was added.
+    fn open_machines(
+        mw: &MultiWorkspace,
+        workspaces: &[Entity<Workspace>],
+        cx: &App,
+    ) -> Vec<MachineGroup> {
+        let mut machines: Vec<MachineGroup> = Vec::new();
+        for key in mw.project_group_keys() {
+            let host = key.host();
+            if machines
+                .iter()
+                .any(|seen| same_remote_connection_identity(seen.host.as_ref(), host.as_ref()))
+            {
+                continue;
+            }
+            let can_create_thread = workspaces.iter().any(|workspace| {
+                let workspace_host = workspace
+                    .read(cx)
+                    .project()
+                    .read(cx)
+                    .remote_connection_options(cx);
+                same_remote_connection_identity(workspace_host.as_ref(), host.as_ref())
+                    && !workspace_path_list(workspace, cx).paths().is_empty()
+            });
+            machines.push(MachineGroup {
+                label: match &host {
+                    // Upstream already prefers an SSH connection's nickname
+                    // over its host name.
+                    Some(host) => host.display_name().into(),
+                    None => "This Mac".into(),
+                },
+                host,
+                can_create_thread,
+            });
+        }
+        // This machine first; the rest keep the order they were connected in.
+        machines.sort_by_key(|machine| machine.host.is_some());
+        machines
+    }
+
+    fn group_rows_by_machine(
+        rows: Vec<ListEntry>,
+        machines: &[MachineGroup],
+        cx: &App,
+    ) -> Vec<ListEntry> {
+        if machines.len() < 2 {
+            return Self::group_rows_by_workspace(rows);
+        }
+        let host_of = |entry: &ListEntry| match entry {
+            ListEntry::Thread(thread) => Some(thread.workspace.host(cx)),
+            ListEntry::Terminal(terminal) => Some(terminal.workspace.host(cx)),
+            _ => None,
+        };
+        let mut out: Vec<ListEntry> = Vec::with_capacity(rows.len() + machines.len());
+        let mut grouped = vec![false; rows.len()];
+        for machine in machines {
+            let mut mine: Vec<ListEntry> = Vec::new();
+            for (row, taken) in rows.iter().zip(&mut grouped) {
+                let Some(host) = host_of(row) else { continue };
+                if same_remote_connection_identity(host.as_ref(), machine.host.as_ref()) {
+                    *taken = true;
+                    mine.push(row.clone());
+                }
+            }
+            // A machine with nothing open gets no group.
+            if mine.is_empty() {
+                continue;
+            }
+            out.push(ListEntry::MachineHeader(Arc::new(MachineHeaderEntry {
+                label: machine.label.clone(),
+                host: machine.host.clone(),
+                can_create_thread: machine.can_create_thread,
+            })));
+            out.extend(Self::group_rows_by_workspace(mine));
+        }
+        // A row whose machine is no longer open still has to be reachable.
+        let orphans: Vec<ListEntry> = rows
+            .into_iter()
+            .zip(&grouped)
+            .filter(|(_, taken)| !**taken)
+            .map(|(row, _)| row)
+            .collect();
+        if !orphans.is_empty() {
+            out.extend(Self::group_rows_by_workspace(orphans));
+        }
+        out
+    }
+
     fn group_rows_by_workspace(rows: Vec<ListEntry>) -> Vec<ListEntry> {
         // Derived once: inside the member scan it was quadratic in allocations.
         let keys: Vec<Option<String>> = rows
@@ -2017,6 +2170,8 @@ impl Sidebar {
         tab_positions: &HashMap<agent_ui::ThreadId, usize>,
         current_session_ids: &mut HashSet<acp::SessionId>,
         current_thread_ids: &mut HashSet<agent_ui::ThreadId>,
+        machines: &[MachineGroup],
+        cx: &App,
     ) -> Vec<ListEntry> {
         fn display_time(entry: &ListEntry) -> DateTime<Utc> {
             match entry {
@@ -2026,7 +2181,9 @@ impl Sidebar {
                 }
                 ListEntry::Thread(thread) => Sidebar::thread_display_time(&thread.metadata),
                 ListEntry::Terminal(terminal) => terminal.metadata.created_at,
-                ListEntry::SectionHeader(_) | ListEntry::WorkspaceHeader(_) => unreachable!(),
+                ListEntry::SectionHeader(_)
+                | ListEntry::MachineHeader(_)
+                | ListEntry::WorkspaceHeader(_) => unreachable!(),
             }
         }
 
@@ -2035,7 +2192,9 @@ impl Sidebar {
             match entry {
                 ListEntry::Thread(thread) => thread.metadata.display_title(),
                 ListEntry::Terminal(terminal) => terminal.metadata.display_title(),
-                ListEntry::SectionHeader(_) | ListEntry::WorkspaceHeader(_) => unreachable!(),
+                ListEntry::SectionHeader(_)
+                | ListEntry::MachineHeader(_)
+                | ListEntry::WorkspaceHeader(_) => unreachable!(),
             }
         }
 
@@ -2095,28 +2254,38 @@ impl Sidebar {
         let sections = [
             (
                 SidebarSection::OpenInZed,
-                Self::group_rows_by_workspace(sort_by_tab(
-                    open_threads.into_iter().map(ListEntry::Thread).collect(),
-                )),
+                Self::group_rows_by_machine(
+                    sort_by_tab(open_threads.into_iter().map(ListEntry::Thread).collect()),
+                    machines,
+                    cx,
+                ),
             ),
             (
                 SidebarSection::AllThreads,
-                Self::group_rows_by_workspace(sort(
-                    terminals
-                        .into_iter()
-                        .map(ListEntry::Terminal)
-                        .chain(history_threads.into_iter().map(ListEntry::Thread))
-                        .collect(),
-                )),
+                Self::group_rows_by_machine(
+                    sort(
+                        terminals
+                            .into_iter()
+                            .map(ListEntry::Terminal)
+                            .chain(history_threads.into_iter().map(ListEntry::Thread))
+                            .collect(),
+                    ),
+                    machines,
+                    cx,
+                ),
             ),
             (
                 SidebarSection::Archived,
-                Self::group_rows_by_workspace(sort(
-                    archived_threads
-                        .into_iter()
-                        .map(ListEntry::Thread)
-                        .collect(),
-                )),
+                Self::group_rows_by_machine(
+                    sort(
+                        archived_threads
+                            .into_iter()
+                            .map(ListEntry::Thread)
+                            .collect(),
+                    ),
+                    machines,
+                    cx,
+                ),
             ),
         ];
 
@@ -2710,6 +2879,7 @@ impl Sidebar {
     fn entry_shapes<'a>(&'a self) -> impl Iterator<Item = EntryShape> + 'a {
         self.contents.entries.iter().map(|entry| match entry {
             ListEntry::SectionHeader(section) => EntryShape::SectionHeader(*section),
+            ListEntry::MachineHeader(header) => EntryShape::MachineHeader(header.label.clone()),
             ListEntry::WorkspaceHeader(header) => EntryShape::WorkspaceHeader(header.label.clone()),
             ListEntry::Thread(thread) => EntryShape::Thread(thread.metadata.thread_id),
             ListEntry::Terminal(terminal) => EntryShape::Terminal(terminal.metadata.terminal_id),
@@ -2827,6 +2997,7 @@ impl Sidebar {
 
         match entry {
             ListEntry::SectionHeader(section) => self.render_section_header(*section, ix, cx),
+            ListEntry::MachineHeader(header) => self.render_machine_header(ix, header, cx),
             ListEntry::WorkspaceHeader(header) => {
                 let row = self.render_workspace_header(ix, header, cx);
                 self.wrap_group_drag(ix, header, row, cx)
@@ -2958,6 +3129,172 @@ impl Sidebar {
             .into_any_element()
     }
 
+    /// The repositories open on a machine, most recently active first, as the
+    /// machine's `+` offers them.
+    fn machine_repositories(
+        &self,
+        host: Option<&RemoteConnectionOptions>,
+        cx: &App,
+    ) -> Vec<(SharedString, Entity<Workspace>)> {
+        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+            return Vec::new();
+        };
+        let mw = multi_workspace.read(cx);
+        mw.project_group_keys_by_recency(cx)
+            .into_iter()
+            .filter(|key| same_remote_connection_identity(key.host().as_ref(), host))
+            .filter_map(|key| {
+                let workspace = mw.last_active_workspace_for_group(&key, cx)?;
+                let paths = workspace_path_list(&workspace, cx);
+                // A workspace with no folder has nothing to branch from.
+                let first = paths.paths().first()?;
+                let label = first
+                    .as_path()
+                    .file_name()
+                    .map(|name| SharedString::from(name.to_string_lossy().into_owned()))
+                    .unwrap_or_else(|| {
+                        SharedString::from(first.as_path().to_string_lossy().into_owned())
+                    });
+                Some((label, workspace))
+            })
+            .collect()
+    }
+
+    /// A new worktree thread on whichever machine `workspace` is on: the same
+    /// flow as the top `+`, against a chosen workspace rather than the active
+    /// one.
+    fn new_worktree_thread_in(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.selection = None;
+        if let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
+            panel.update(cx, |panel, cx| {
+                panel.create_new_worktree_thread(window, cx);
+            });
+            workspace.update(cx, |workspace, cx| {
+                workspace.focus_panel::<AgentPanel>(window, cx);
+            });
+        }
+    }
+
+    fn render_machine_header(
+        &self,
+        ix: usize,
+        header: &MachineHeaderEntry,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let group = SharedString::from(format!("machine-header-{ix}"));
+        h_flex()
+            .id(("machine-header", ix))
+            .group(group.clone())
+            .w_full()
+            .px_2p5()
+            .map(|this| if ix > 0 { this.pt_3() } else { this.pt_1() })
+            .pb_0p5()
+            .gap_1()
+            .items_center()
+            .child(
+                Icon::new(match header.host {
+                    Some(_) => IconName::Server,
+                    None => IconName::Screen,
+                })
+                .size(IconSize::XSmall)
+                .color(Color::Muted),
+            )
+            .child(
+                Label::new(header.label.clone())
+                    .size(LabelSize::Small)
+                    .weight(gpui::FontWeight::SEMIBOLD)
+                    .color(Color::Muted)
+                    .truncate(),
+            )
+            .child(h_flex().flex_1())
+            .children(self.render_machine_new_thread_button(ix, header, &group, cx))
+            .into_any_element()
+    }
+
+    /// Makes a worktree thread on this machine. Which repository: the one most
+    /// recently active there, or a menu of them when more than one is open.
+    fn render_machine_new_thread_button(
+        &self,
+        ix: usize,
+        header: &MachineHeaderEntry,
+        group: &SharedString,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !header.can_create_thread {
+            return None;
+        }
+        let repositories = self.machine_repositories(header.host.as_ref(), cx);
+        let tooltip = match header.host {
+            Some(_) => "New Thread in New Worktree on This Machine",
+            None => "New Thread in New Worktree",
+        };
+        let button = |id| {
+            IconButton::new(id, IconName::Plus)
+                .icon_size(IconSize::XSmall)
+                .icon_color(Color::Muted)
+                .visible_on_hover(group.clone())
+        };
+        match repositories.len() {
+            0 => None,
+            1 => {
+                let workspace = repositories[0].1.clone();
+                Some(
+                    button(("new-thread-on-machine", ix))
+                        .tooltip(Tooltip::text(tooltip))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.new_worktree_thread_in(&workspace, window, cx);
+                        }))
+                        .into_any_element(),
+                )
+            }
+            // More than one repository open there, so which one is a choice.
+            _ => {
+                let sidebar = cx.weak_entity();
+                Some(
+                    PopoverMenu::new(("new-thread-on-machine-menu", ix))
+                        .trigger(
+                            button(("new-thread-on-machine", ix)).tooltip(Tooltip::text(
+                                "New Thread in New Worktree on This Machine",
+                            )),
+                        )
+                        .menu(move |window, cx| {
+                            let sidebar = sidebar.clone();
+                            let repositories = repositories.clone();
+                            Some(ContextMenu::build(
+                                window,
+                                cx,
+                                move |mut menu, _window, _cx| {
+                                    for (label, workspace) in &repositories {
+                                        let sidebar = sidebar.clone();
+                                        let workspace = workspace.clone();
+                                        menu =
+                                            menu.entry(label.clone(), None, move |window, cx| {
+                                                let workspace = workspace.clone();
+                                                sidebar
+                                                    .update(cx, |sidebar, cx| {
+                                                        sidebar.new_worktree_thread_in(
+                                                            &workspace, window, cx,
+                                                        );
+                                                    })
+                                                    .ok();
+                                            });
+                                    }
+                                    menu
+                                },
+                            ))
+                        })
+                        .into_any_element(),
+                )
+            }
+        }
+    }
+
     fn render_section_header(
         &self,
         section: SidebarSection,
@@ -3028,18 +3365,10 @@ impl Sidebar {
                 Tooltip::for_action_in("New Thread in New Worktree", &NewThread, &focus_handle, cx)
             })
             .on_click(cx.listener(move |this, _, window, cx| {
-                this.selection = None;
                 let Some(workspace) = this.active_workspace(cx) else {
                     return;
                 };
-                if let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
-                    panel.update(cx, |panel, cx| {
-                        panel.create_new_worktree_thread(window, cx);
-                    });
-                    workspace.update(cx, |workspace, cx| {
-                        workspace.focus_panel::<AgentPanel>(window, cx);
-                    });
-                }
+                this.new_worktree_thread_in(&workspace, window, cx);
             }))
             .into_any_element()
     }
@@ -3386,7 +3715,9 @@ impl Sidebar {
         };
 
         match entry {
-            ListEntry::SectionHeader(_) | ListEntry::WorkspaceHeader(_) => {}
+            ListEntry::SectionHeader(_)
+            | ListEntry::MachineHeader(_)
+            | ListEntry::WorkspaceHeader(_) => {}
             ListEntry::Thread(thread) => {
                 let metadata = thread.metadata.clone();
                 match &thread.workspace {
@@ -4152,7 +4483,9 @@ impl Sidebar {
                     terminal.metadata.remote_connection.as_ref(),
                     remote_connection,
                 ),
-                ListEntry::SectionHeader(_) | ListEntry::WorkspaceHeader(_) => false,
+                ListEntry::SectionHeader(_)
+                | ListEntry::MachineHeader(_)
+                | ListEntry::WorkspaceHeader(_) => false,
             })
             .find_map(ActivatableEntry::from_list_entry)
     }
@@ -5795,7 +6128,9 @@ impl Sidebar {
             .all_entries
             .iter()
             .filter_map(|entry| match entry {
-                ListEntry::SectionHeader(_) | ListEntry::WorkspaceHeader(_) => None,
+                ListEntry::SectionHeader(_)
+                | ListEntry::MachineHeader(_)
+                | ListEntry::WorkspaceHeader(_) => None,
                 ListEntry::Thread(thread) => {
                     if thread.draft == Some(DraftKind::Empty) {
                         return None;
@@ -7006,7 +7341,9 @@ impl Sidebar {
                 let workspace = terminal.workspace.clone();
                 self.activate_terminal_entry(metadata, workspace, true, window, cx);
             }
-            ListEntry::SectionHeader(_) | ListEntry::WorkspaceHeader(_) => {}
+            ListEntry::SectionHeader(_)
+            | ListEntry::MachineHeader(_)
+            | ListEntry::WorkspaceHeader(_) => {}
         }
     }
 

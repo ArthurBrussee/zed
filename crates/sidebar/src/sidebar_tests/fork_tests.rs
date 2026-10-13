@@ -39,6 +39,34 @@ fn test_thread_entry(title: &str, folder: &str, updated_at: DateTime<Utc>) -> Th
     }
 }
 
+/// A thread whose project sits on `host`, for the machine grouping.
+fn test_thread_entry_on(
+    title: &str,
+    folder: &str,
+    repo: &str,
+    host: Option<remote::RemoteConnectionOptions>,
+    updated_at: DateTime<Utc>,
+) -> ThreadEntry {
+    let mut entry = test_thread_entry(title, folder, updated_at);
+    entry.workspace = ThreadEntryWorkspace::Closed {
+        folder_paths: PathList::new(&[Path::new(folder)]),
+        project_group_key: ProjectGroupKey::new(host, PathList::new(&[Path::new(repo)])),
+    };
+    entry
+}
+
+fn mock_host(id: u64) -> remote::RemoteConnectionOptions {
+    remote::RemoteConnectionOptions::Mock(remote::MockConnectionOptions { id })
+}
+
+fn machine(label: &str, host: Option<remote::RemoteConnectionOptions>) -> MachineGroup {
+    MachineGroup {
+        label: label.to_string().into(),
+        host,
+        can_create_thread: true,
+    }
+}
+
 fn archived(mut entry: ThreadEntry) -> ThreadEntry {
     Arc::make_mut(&mut entry.metadata).archived = true;
     entry
@@ -1143,6 +1171,7 @@ async fn test_typing_a_rename_does_not_end_it(cx: &mut TestAppContext) {
                     thread.metadata.display_title(),
                 )),
                 ListEntry::SectionHeader(_)
+                | ListEntry::MachineHeader(_)
                 | ListEntry::WorkspaceHeader(_)
                 | ListEntry::Terminal(_) => None,
             })
@@ -2275,7 +2304,7 @@ fn test_a_worktree_archive_stops_once_nothing_is_left_to_archive(_cx: &mut TestA
 }
 
 #[gpui::test]
-fn test_a_live_thread_does_not_pull_its_worktree_siblings_into_active(_cx: &mut TestAppContext) {
+fn test_a_live_thread_does_not_pull_its_worktree_siblings_into_active(cx: &mut TestAppContext) {
     let make_entry = |title: &str, folder: &str, is_live: bool| {
         Arc::new(ThreadEntry {
             is_live,
@@ -2291,14 +2320,18 @@ fn test_a_live_thread_does_not_pull_its_worktree_siblings_into_active(_cx: &mut 
 
     let mut session_ids = HashSet::default();
     let mut thread_ids = HashSet::default();
-    let entries = Sidebar::sectioned_entries(
-        Vec::new(),
-        threads,
-        &HashSet::default(),
-        &HashMap::default(),
-        &mut session_ids,
-        &mut thread_ids,
-    );
+    let entries = cx.update(|cx| {
+        Sidebar::sectioned_entries(
+            Vec::new(),
+            threads,
+            &HashSet::default(),
+            &HashMap::default(),
+            &mut session_ids,
+            &mut thread_ids,
+            &[],
+            cx,
+        )
+    });
 
     assert_eq!(
         entry_shape_strings(&entries),
@@ -2314,7 +2347,7 @@ fn test_a_live_thread_does_not_pull_its_worktree_siblings_into_active(_cx: &mut 
 }
 
 #[gpui::test]
-fn test_archived_threads_go_to_their_own_bottom_section(_cx: &mut TestAppContext) {
+fn test_archived_threads_go_to_their_own_bottom_section(cx: &mut TestAppContext) {
     let make_entry = |title: &str, is_archived: bool, updated_at: DateTime<Utc>| {
         let entry = test_thread_entry(title, "/repo/wt", updated_at);
         Arc::new(if is_archived { archived(entry) } else { entry })
@@ -2329,14 +2362,18 @@ fn test_archived_threads_go_to_their_own_bottom_section(_cx: &mut TestAppContext
 
     let mut session_ids = HashSet::default();
     let mut thread_ids = HashSet::default();
-    let entries = Sidebar::sectioned_entries(
-        Vec::new(),
-        threads,
-        &HashSet::default(),
-        &HashMap::default(),
-        &mut session_ids,
-        &mut thread_ids,
-    );
+    let entries = cx.update(|cx| {
+        Sidebar::sectioned_entries(
+            Vec::new(),
+            threads,
+            &HashSet::default(),
+            &HashMap::default(),
+            &mut session_ids,
+            &mut thread_ids,
+            &[],
+            cx,
+        )
+    });
 
     assert_eq!(
         entry_shape_strings(&entries),
@@ -2353,7 +2390,7 @@ fn test_archived_threads_go_to_their_own_bottom_section(_cx: &mut TestAppContext
 }
 
 #[gpui::test]
-fn test_active_rows_follow_the_tab_order(_cx: &mut TestAppContext) {
+fn test_active_rows_follow_the_tab_order(cx: &mut TestAppContext) {
     let make_entry = |title: &str, folder: &str, minutes_old: i64| {
         Arc::new(test_thread_entry(
             title,
@@ -2390,14 +2427,18 @@ fn test_active_rows_follow_the_tab_order(_cx: &mut TestAppContext) {
 
     let mut session_ids = HashSet::default();
     let mut thread_ids = HashSet::default();
-    let entries = Sidebar::sectioned_entries(
-        Vec::new(),
-        threads,
-        &open_thread_ids,
-        &tab_positions,
-        &mut session_ids,
-        &mut thread_ids,
-    );
+    let entries = cx.update(|cx| {
+        Sidebar::sectioned_entries(
+            Vec::new(),
+            threads,
+            &open_thread_ids,
+            &tab_positions,
+            &mut session_ids,
+            &mut thread_ids,
+            &[],
+            cx,
+        )
+    });
 
     let active: Vec<String> = entry_shape_strings(&entries)
         .into_iter()
@@ -2425,7 +2466,7 @@ fn test_active_rows_follow_the_tab_order(_cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn test_a_thread_is_in_active_or_in_all_threads_but_not_both(_cx: &mut TestAppContext) {
+fn test_a_thread_is_in_active_or_in_all_threads_but_not_both(cx: &mut TestAppContext) {
     let make_entry = |title: &str, minutes_old: i64| {
         Arc::new(test_thread_entry(
             title,
@@ -2451,14 +2492,18 @@ fn test_a_thread_is_in_active_or_in_all_threads_but_not_both(_cx: &mut TestAppCo
             .collect();
         let mut session_ids = HashSet::default();
         let mut thread_ids = HashSet::default();
-        entry_shape_strings(&Sidebar::sectioned_entries(
-            Vec::new(),
-            threads.clone(),
-            &open_thread_ids,
-            &tab_positions,
-            &mut session_ids,
-            &mut thread_ids,
-        ))
+        entry_shape_strings(&cx.update(|cx| {
+            Sidebar::sectioned_entries(
+                Vec::new(),
+                threads.clone(),
+                &open_thread_ids,
+                &tab_positions,
+                &mut session_ids,
+                &mut thread_ids,
+                &[],
+                cx,
+            )
+        }))
     };
 
     assert_eq!(
@@ -2752,7 +2797,9 @@ fn test_collapsing_a_worktree_leaves_the_rows_after_it_alone(cx: &mut TestAppCon
         .map(|entry| match entry {
             ListEntry::WorkspaceHeader(header) => header.label.to_string(),
             ListEntry::Thread(thread) => thread.metadata.display_title().to_string(),
-            ListEntry::Terminal(_) | ListEntry::SectionHeader(_) => "?".to_string(),
+            ListEntry::Terminal(_) | ListEntry::SectionHeader(_) | ListEntry::MachineHeader(_) => {
+                "?".to_string()
+            }
         })
         .collect();
     assert_eq!(
@@ -2943,12 +2990,242 @@ async fn a_remote_repository_is_named_for_the_pr_chips(
     cx.update(|_, cx| {
         let store = gh_status::GhStatusStore::try_global(cx).expect("the store should be set up");
         assert_eq!(
-            store
-                .read(cx)
-                .repo_name_for(Path::new("/on-the-box/repo")),
+            store.read(cx).repo_name_for(Path::new("/on-the-box/repo")),
             Some("ArthurBrussee/zed".to_string()),
             "the box's checkout should be named from its origin remote, since gh cannot be \
              run in a directory this machine does not have"
         );
     });
+}
+
+/// Arthur works on the laptop and on a dev box, and needs to see where each
+/// thread runs.
+#[gpui::test]
+fn test_threads_group_under_the_machine_they_run_on(cx: &mut TestAppContext) {
+    let now = Utc::now();
+    let devbox = mock_host(99);
+    let threads: Vec<Arc<ThreadEntry>> = vec![
+        Arc::new(test_thread_entry_on(
+            "on the box",
+            "/box/repo",
+            "/box/repo",
+            Some(devbox.clone()),
+            now,
+        )),
+        Arc::new(test_thread_entry_on(
+            "on the laptop",
+            "/here/repo",
+            "/here/repo",
+            None,
+            now - chrono::Duration::minutes(1),
+        )),
+    ];
+    let open_thread_ids: HashSet<ThreadId> = threads.iter().map(|t| t.metadata.thread_id).collect();
+
+    let mut session_ids = HashSet::default();
+    let mut thread_ids = HashSet::default();
+    // Deliberately remote-first, to show the ordering is the machine list's
+    // and not the rows'.
+    let machines = vec![machine("mock-99", Some(devbox)), machine("This Mac", None)];
+    let entries = cx.update(|cx| {
+        Sidebar::sectioned_entries(
+            Vec::new(),
+            threads,
+            &open_thread_ids,
+            &HashMap::default(),
+            &mut session_ids,
+            &mut thread_ids,
+            &machines,
+            cx,
+        )
+    });
+
+    assert_eq!(
+        entry_shape_strings(&entries),
+        vec![
+            "section: Active",
+            "machine: mock-99",
+            "thread: on the box",
+            "machine: This Mac",
+            "thread: on the laptop",
+        ],
+        "each thread belongs to the machine its project is on, in the \
+         machine list's order"
+    );
+}
+
+/// One machine is the ordinary case, and says nothing it did not say before.
+#[gpui::test]
+fn test_one_machine_draws_no_machine_header(cx: &mut TestAppContext) {
+    let now = Utc::now();
+    let threads: Vec<Arc<ThreadEntry>> = vec![
+        Arc::new(test_thread_entry_on("first", "/repo", "/repo", None, now)),
+        Arc::new(test_thread_entry_on(
+            "second",
+            "/repo",
+            "/repo",
+            None,
+            now - chrono::Duration::minutes(1),
+        )),
+    ];
+    let open_thread_ids: HashSet<ThreadId> = threads.iter().map(|t| t.metadata.thread_id).collect();
+
+    let mut session_ids = HashSet::default();
+    let mut thread_ids = HashSet::default();
+    let machines = vec![machine("This Mac", None)];
+    let entries = cx.update(|cx| {
+        Sidebar::sectioned_entries(
+            Vec::new(),
+            threads,
+            &open_thread_ids,
+            &HashMap::default(),
+            &mut session_ids,
+            &mut thread_ids,
+            &machines,
+            cx,
+        )
+    });
+
+    assert_eq!(
+        entry_shape_strings(&entries),
+        vec![
+            "section: Active",
+            "workspace: Workspace",
+            "thread: first",
+            "thread: second",
+        ],
+        "with one machine the rows group by worktree exactly as before"
+    );
+}
+
+/// A thread whose machine is closed is still reachable.
+#[gpui::test]
+fn test_a_thread_on_a_closed_machine_is_still_listed(cx: &mut TestAppContext) {
+    let now = Utc::now();
+    let threads: Vec<Arc<ThreadEntry>> = vec![
+        Arc::new(test_thread_entry_on("here", "/here", "/here", None, now)),
+        Arc::new(test_thread_entry_on(
+            "on a box that is gone",
+            "/gone",
+            "/gone",
+            Some(mock_host(7)),
+            now - chrono::Duration::minutes(1),
+        )),
+    ];
+    let open_thread_ids: HashSet<ThreadId> = threads.iter().map(|t| t.metadata.thread_id).collect();
+
+    let mut session_ids = HashSet::default();
+    let mut thread_ids = HashSet::default();
+    let machines = vec![
+        machine("This Mac", None),
+        machine("mock-99", Some(mock_host(99))),
+    ];
+    let entries = cx.update(|cx| {
+        Sidebar::sectioned_entries(
+            Vec::new(),
+            threads,
+            &open_thread_ids,
+            &HashMap::default(),
+            &mut session_ids,
+            &mut thread_ids,
+            &machines,
+            cx,
+        )
+    });
+
+    let shapes = entry_shape_strings(&entries);
+    assert!(
+        shapes.contains(&"thread: on a box that is gone".to_string()),
+        "a thread whose machine has no group must not disappear, got {shapes:?}"
+    );
+}
+
+/// With a project open here and one on a dev box, the machine groups come in
+/// that order and each machine's `+` offers only that machine's repositories —
+/// which is the choice the `+` makes before handing off to the same
+/// worktree-thread flow the top `+` uses.
+#[gpui::test]
+async fn test_each_machine_offers_only_its_own_repositories(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    cx.update(|cx| {
+        release_channel::init(semver::Version::new(0, 0, 0), cx);
+    });
+    server_cx.update(|cx| {
+        release_channel::init(semver::Version::new(0, 0, 0), cx);
+    });
+
+    let app_state = cx.update(|cx| {
+        let app_state = workspace::AppState::test(cx);
+        workspace::init(app_state.clone(), cx);
+        app_state
+    });
+
+    let server_fs = FakeFs::new(server_cx.executor());
+    server_fs
+        .insert_tree("/box-repo", serde_json::json!({ ".git": {}, "src": {} }))
+        .await;
+    let (remote_project, _headless, opts) = start_remote_project(
+        &server_fs,
+        Path::new("/box-repo"),
+        &app_state,
+        None,
+        cx,
+        server_cx,
+    )
+    .await;
+
+    cx.update(|cx| <dyn fs::Fs>::set_global(app_state.fs.clone(), cx));
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree("/here-repo", serde_json::json!({ ".git": {}, "src": {} }))
+        .await;
+    let local_project =
+        project::Project::test(app_state.fs.clone(), ["/here-repo".as_ref()], cx).await;
+
+    let (multi_workspace, cx) = cx
+        .add_window_view(|window, cx| MultiWorkspace::test_new(local_project, window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(remote_project, window, cx)
+    });
+    cx.run_until_parked();
+
+    let labels = |repositories: Vec<(SharedString, Entity<Workspace>)>| {
+        repositories
+            .into_iter()
+            .map(|(label, _)| label.to_string())
+            .collect::<Vec<_>>()
+    };
+    let (machines, here, box_) = sidebar.read_with(cx, |sidebar, cx| {
+        let mw = multi_workspace.read(cx);
+        let workspaces: Vec<_> = mw.workspaces().cloned().collect();
+        (
+            Sidebar::open_machines(mw, &workspaces, cx),
+            sidebar.machine_repositories(None, cx),
+            sidebar.machine_repositories(Some(&opts), cx),
+        )
+    });
+
+    assert_eq!(
+        machines
+            .iter()
+            .map(|machine| machine.label.to_string())
+            .collect::<Vec<_>>(),
+        vec!["This Mac".to_string(), opts.display_name()],
+        "this machine comes first, then the hosts"
+    );
+    assert_eq!(
+        labels(here),
+        vec!["here-repo".to_string()],
+        "this machine's + offers only what is open here"
+    );
+    assert_eq!(
+        labels(box_),
+        vec!["box-repo".to_string()],
+        "the dev box's + offers only what is open there"
+    );
 }

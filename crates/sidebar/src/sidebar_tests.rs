@@ -86,6 +86,7 @@ fn entry_shape_strings(entries: &[ListEntry]) -> Vec<String> {
         .iter()
         .map(|entry| match entry {
             ListEntry::SectionHeader(section) => format!("section: {}", section.label()),
+            ListEntry::MachineHeader(header) => format!("machine: {}", header.label),
             ListEntry::WorkspaceHeader(header) => format!("workspace: {}", header.label),
             ListEntry::Thread(thread) => format!("thread: {}", thread.metadata.display_title()),
             ListEntry::Terminal(terminal) => {
@@ -231,7 +232,9 @@ fn assert_remote_project_integration_sidebar_state(
     let mut saw_remote_thread = false;
     for entry in &sidebar.contents.entries {
         match entry {
-            ListEntry::SectionHeader(_) | ListEntry::WorkspaceHeader(_) => {}
+            ListEntry::SectionHeader(_)
+            | ListEntry::MachineHeader(_)
+            | ListEntry::WorkspaceHeader(_) => {}
             ListEntry::Thread(thread)
                 if thread.metadata.session_id.as_ref() == Some(main_thread_id) =>
             {
@@ -662,7 +665,9 @@ fn visible_entries_as_strings(
                     ""
                 };
                 match entry {
-                    ListEntry::SectionHeader(_) | ListEntry::WorkspaceHeader(_) => String::new(),
+                    ListEntry::SectionHeader(_)
+                    | ListEntry::MachineHeader(_)
+                    | ListEntry::WorkspaceHeader(_) => String::new(),
                     ListEntry::Thread(thread) => {
                         let title = thread.metadata.display_title();
                         let worktree = format_linked_worktree_chips(&thread.worktrees);
@@ -5127,6 +5132,7 @@ async fn test_rename_thread_from_sidebar_updates_title_override(cx: &mut TestApp
                     thread.metadata.display_title(),
                 )),
                 ListEntry::SectionHeader(_)
+                | ListEntry::MachineHeader(_)
                 | ListEntry::WorkspaceHeader(_)
                 | ListEntry::Terminal(_) => None,
             })
@@ -5204,6 +5210,7 @@ async fn test_rename_thread_from_sidebar_updates_title_override(cx: &mut TestApp
             .find_map(|entry| match entry {
                 ListEntry::Thread(thread) => Some(thread),
                 ListEntry::SectionHeader(_)
+                | ListEntry::MachineHeader(_)
                 | ListEntry::WorkspaceHeader(_)
                 | ListEntry::Terminal(_) => None,
             })
@@ -5245,6 +5252,7 @@ async fn test_rename_selected_thread_action_renames_selected_thread(cx: &mut Tes
             .find_map(|(ix, entry)| match entry {
                 ListEntry::Thread(thread) => Some((ix, thread.metadata.thread_id)),
                 ListEntry::SectionHeader(_)
+                | ListEntry::MachineHeader(_)
                 | ListEntry::WorkspaceHeader(_)
                 | ListEntry::Terminal(_) => None,
             })
@@ -7143,7 +7151,9 @@ async fn test_clicking_worktree_thread_does_not_briefly_render_as_separate_proje
         let mut saw_expected_thread = false;
         for entry in &sidebar.contents.entries {
             match entry {
-                ListEntry::SectionHeader(_) | ListEntry::WorkspaceHeader(_) => {}
+                ListEntry::SectionHeader(_)
+                | ListEntry::MachineHeader(_)
+                | ListEntry::WorkspaceHeader(_) => {}
                 ListEntry::Thread(thread)
                     if thread.metadata.title.as_ref().map(|t| t.as_ref()) == Some("WT Thread")
                         && thread
@@ -12685,8 +12695,9 @@ mod property_test {
         let mut last_rank: Option<usize> = None;
         for (ix, entry) in entries.iter().enumerate() {
             match entry {
-                // Workspace headers are presentation rows inside a section.
-                ListEntry::WorkspaceHeader(_) => {}
+                // Workspace and machine headers are presentation rows inside
+                // a section.
+                ListEntry::WorkspaceHeader(_) | ListEntry::MachineHeader(_) => {}
                 ListEntry::SectionHeader(section) => {
                     let rank = section_rank(*section);
                     if let Some(last) = last_rank {
