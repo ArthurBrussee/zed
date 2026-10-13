@@ -1071,6 +1071,7 @@ impl ThreadView {
         window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
+        let _group_timer = GroupTimer::new(&self.frame_perf);
         let entries = self.thread.read(cx).entries();
 
         let mut segments: Vec<AnyElement> = Vec::new();

@@ -13453,6 +13453,175 @@ mod tests {
         });
     }
 
+    /// What the per-frame memo is worth on a long thread. Ignored because it is
+    /// a measurement rather than an assertion: run it with
+    /// `--ignored --nocapture` to print the numbers.
+    #[gpui::test]
+    #[ignore]
+    async fn measure_the_per_frame_memo_on_a_long_thread(cx: &mut TestAppContext) {
+        const ENTRIES: usize = 400;
+        /// Roughly the number of times one frame asks for the layout answer.
+        const CALLS_PER_FRAME: usize = 10;
+        const FRAMES: usize = 50;
+
+        let (panel, mut cx) = setup_panel(cx).await;
+        let connection = StubAgentConnection::new();
+        let (session_id, _thread_id) =
+            open_generating_thread_with_loadable_connection(&panel, &connection, &mut cx);
+
+        for ix in 0..ENTRIES {
+            let id = acp::ToolCallId::new(format!("call-{ix}"));
+            cx.update(|_, cx| {
+                connection.send_update(
+                    session_id.clone(),
+                    acp::SessionUpdate::ToolCall(
+                        acp::ToolCall::new(id.clone(), format!("git log -n {ix}"))
+                            .kind(acp::ToolKind::Execute)
+                            .status(acp::ToolCallStatus::Completed),
+                    ),
+                    cx,
+                );
+            });
+        }
+        cx.run_until_parked();
+
+        let view = panel.read_with(&cx, |panel, cx| {
+            panel
+                .active_tab_thread
+                .as_ref()
+                .expect("the opened thread should be the active tab")
+                .read(cx)
+                .active_thread()
+                .expect("the active tab should hold a thread view")
+                .clone()
+        });
+
+        view.read_with(&cx, |view, cx| {
+            let entries = view.entry_count_for_perf(cx);
+
+            // Before: every call site walked the entries itself.
+            let started = std::time::Instant::now();
+            for _ in 0..FRAMES {
+                for _ in 0..CALLS_PER_FRAME {
+                    view.begin_test_frame();
+                    std::hint::black_box(view.lays_out_as_conversation(cx));
+                    std::hint::black_box(view.running_work_for_perf(cx));
+                }
+            }
+            let unmemoized = started.elapsed();
+
+            // After: one walk a frame, however many ask.
+            let started = std::time::Instant::now();
+            for _ in 0..FRAMES {
+                view.begin_test_frame();
+                for _ in 0..CALLS_PER_FRAME {
+                    std::hint::black_box(view.lays_out_as_conversation(cx));
+                    std::hint::black_box(view.running_work_for_perf(cx));
+                }
+            }
+            let memoized = started.elapsed();
+
+            let per_frame = |d: std::time::Duration| d.as_secs_f64() * 1000. / FRAMES as f64;
+            println!(
+                "quiet-ui perf measurement: {entries} entries, {CALLS_PER_FRAME} asks a frame \
+                 over {FRAMES} frames\n  without the memo: {:.3}ms a frame\n  \
+                 with the memo:    {:.3}ms a frame",
+                per_frame(unmemoized),
+                per_frame(memoized),
+            );
+            assert!(
+                memoized < unmemoized,
+                "the memo should cost less than walking per call site"
+            );
+        });
+    }
+
+    /// The layout answer is read from a long thread many times a frame, so it
+    /// is walked once a frame — and never kept past a change to the entries it
+    /// was read from.
+    #[gpui::test]
+    async fn test_the_layout_answer_is_walked_once_a_frame(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let connection = StubAgentConnection::new();
+        open_thread_with_custom_connection(&panel, connection, &mut cx);
+        cx.run_until_parked();
+
+        let thread_view = |cx: &mut VisualTestContext| {
+            panel.read_with(cx, |panel, cx| {
+                panel
+                    .active_tab_thread
+                    .as_ref()
+                    .expect("the opened thread should be the active tab")
+                    .read(cx)
+                    .active_thread()
+                    .expect("the active tab should hold a thread view")
+                    .clone()
+            })
+        };
+
+        let view = thread_view(&mut cx);
+        view.read_with(&cx, |view, cx| {
+            view.begin_test_frame();
+            let before = view.frame_memo_walks();
+            for _ in 0..8 {
+                assert!(
+                    !view.lays_out_as_conversation(cx),
+                    "a thread nothing has been said in yet is a draft"
+                );
+            }
+            assert_eq!(
+                view.frame_memo_walks() - before,
+                1,
+                "eight call sites in one frame should walk the entries once"
+            );
+            view.end_test_frame();
+
+            view.begin_test_frame();
+            let before = view.frame_memo_walks();
+            view.lays_out_as_conversation(cx);
+            assert_eq!(
+                view.frame_memo_walks() - before,
+                1,
+                "the next frame should walk again rather than reuse the answer"
+            );
+            view.end_test_frame();
+
+            // Outside a frame nothing is cached: a reader here may be running
+            // between a change to the entries and the frame that draws them.
+            let before = view.frame_memo_walks();
+            for _ in 0..3 {
+                view.lays_out_as_conversation(cx);
+            }
+            assert_eq!(
+                view.frame_memo_walks() - before,
+                3,
+                "outside a render pass every ask walks, so none can be stale"
+            );
+        });
+
+        // `sync_editor_mode` reads this from `ConversationView`'s own thread
+        // subscription, which can run before `ThreadView`'s, so the answer has
+        // to be right the moment a message lands rather than after the next
+        // frame. The editor's mode is the visible consequence.
+        send_message(&panel, &mut cx);
+        cx.run_until_parked();
+        view.read_with(&cx, |view, cx| {
+            assert!(
+                view.lays_out_as_conversation(cx),
+                "a thread a message has been sent in is a conversation, and a \
+                 memo from before the message must not say otherwise"
+            );
+            assert!(
+                matches!(
+                    view.message_editor_mode_for_perf(cx),
+                    editor::EditorMode::AutoHeight { .. }
+                ),
+                "the editor leaves its empty-state full height once a message \
+                 lands"
+            );
+        });
+    }
+
     /// Losing focus is not going off screen: the thread the user is looking at
     /// keeps its views, and only a window the platform has stopped presenting
     /// gives them up.

@@ -690,6 +690,8 @@ pub struct ThreadView {
     /// Image chips start expanded, so this records the ones collapsed.
     collapsed_image_chips: HashSet<ActionChipId>,
     chip_cache: ChipCache,
+    frame_perf: Rc<RefCell<FramePerf>>,
+    frame_memo: Rc<FrameMemo>,
     /// Only used when the project is not this machine's; see [`RemoteChipImage`].
     remote_chip_images: HashMap<ProjectPath, RemoteChipImage>,
     /// Keyed by entry as well as path: two commands that touched one file each
@@ -849,6 +851,210 @@ struct ChipCache {
     frame_style: RefCell<Option<MarkdownStyle>>,
     frame_chip_entries: RefCell<Vec<Option<bool>>>,
     frame_runs: RefCell<Vec<RunMemo>>,
+}
+
+/// How often a frame report is logged when no single frame is slow enough to
+/// force one.
+const PERF_FRAME_REPORT_EVERY: u32 = 120;
+/// A frame dearer than this is reported on its own.
+const PERF_SLOW_FRAME: std::time::Duration = std::time::Duration::from_millis(8);
+/// An entry-change handler dearer than this is reported on its own.
+const PERF_SLOW_EVENT: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// Where the frame went, reported as one `quiet-ui perf: thread view frame`
+/// line so a thread that has gone slow can be read off the log rather than
+/// guessed at.
+#[derive(Default)]
+struct FramePerf {
+    frames: u32,
+    render: std::time::Duration,
+    worst_render: std::time::Duration,
+    entries: std::time::Duration,
+    entries_drawn: u32,
+    groups: std::time::Duration,
+    groups_drawn: u32,
+    /// The dearest single entry since the last report, and which one it was.
+    worst_entry: Option<(usize, std::time::Duration)>,
+}
+
+impl FramePerf {
+    fn record_entry(&mut self, entry_ix: usize, elapsed: std::time::Duration) {
+        self.entries += elapsed;
+        self.entries_drawn += 1;
+        if self.worst_entry.is_none_or(|(_, worst)| elapsed > worst) {
+            self.worst_entry = Some((entry_ix, elapsed));
+        }
+    }
+
+    fn record_group(&mut self, elapsed: std::time::Duration) {
+        self.groups += elapsed;
+        self.groups_drawn += 1;
+    }
+
+    /// Logs and resets every [`PERF_FRAME_REPORT_EVERY`] frames, or at once for
+    /// a frame over [`PERF_SLOW_FRAME`].
+    fn finish_frame(&mut self, elapsed: std::time::Duration) {
+        self.frames += 1;
+        self.render += elapsed;
+        self.worst_render = self.worst_render.max(elapsed);
+        if self.frames < PERF_FRAME_REPORT_EVERY && elapsed < PERF_SLOW_FRAME {
+            return;
+        }
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.;
+        let per_frame = |d: std::time::Duration| ms(d) / f64::from(self.frames);
+        let worst_entry = match self.worst_entry {
+            Some((ix, worst)) => format!(", worst #{ix} {:.2}ms", ms(worst)),
+            None => String::new(),
+        };
+        log::info!(
+            "quiet-ui perf: thread view frame {:.2}ms avg over {} frames \
+             (worst {:.2}ms); entries {:.2}ms/frame over {} draws{}; \
+             action groups {:.2}ms/frame over {} draws",
+            per_frame(self.render),
+            self.frames,
+            ms(self.worst_render),
+            per_frame(self.entries),
+            self.entries_drawn,
+            worst_entry,
+            per_frame(self.groups),
+            self.groups_drawn,
+        );
+        *self = Self::default();
+    }
+}
+
+/// Brackets one render: records what the frame cost and closes the frame's
+/// memo when it falls out of scope, so the whole builder chain `render`
+/// returns is covered without being restructured.
+struct FrameTimer {
+    perf: Rc<RefCell<FramePerf>>,
+    memo: Rc<FrameMemo>,
+    started: std::time::Instant,
+}
+
+impl FrameTimer {
+    fn new(perf: &Rc<RefCell<FramePerf>>, memo: &Rc<FrameMemo>) -> Self {
+        memo.begin_frame();
+        Self {
+            perf: perf.clone(),
+            memo: memo.clone(),
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for FrameTimer {
+    fn drop(&mut self) {
+        self.memo.end_frame();
+        self.perf.borrow_mut().finish_frame(self.started.elapsed());
+    }
+}
+
+/// What an entry's draw cost, recorded however the draw returns.
+struct EntryTimer {
+    perf: Rc<RefCell<FramePerf>>,
+    entry_ix: usize,
+    started: std::time::Instant,
+}
+
+impl EntryTimer {
+    fn new(perf: &Rc<RefCell<FramePerf>>, entry_ix: usize) -> Self {
+        Self {
+            perf: perf.clone(),
+            entry_ix,
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for EntryTimer {
+    fn drop(&mut self) {
+        self.perf
+            .borrow_mut()
+            .record_entry(self.entry_ix, self.started.elapsed());
+    }
+}
+
+/// What a chip run's draw cost.
+struct GroupTimer {
+    perf: Rc<RefCell<FramePerf>>,
+    started: std::time::Instant,
+}
+
+impl GroupTimer {
+    fn new(perf: &Rc<RefCell<FramePerf>>) -> Self {
+        Self {
+            perf: perf.clone(),
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for GroupTimer {
+    fn drop(&mut self) {
+        self.perf.borrow_mut().record_group(self.started.elapsed());
+    }
+}
+
+/// Names the events the perf line reports, so a slow handler says which event
+/// it was handling.
+fn acp_thread_event_name(event: &AcpThreadEvent) -> &'static str {
+    match event {
+        AcpThreadEvent::NewEntry => "NewEntry",
+        AcpThreadEvent::EntryUpdated(_) => "EntryUpdated",
+        AcpThreadEvent::EntriesRemoved(_) => "EntriesRemoved",
+        AcpThreadEvent::StatusChanged => "StatusChanged",
+        AcpThreadEvent::Stopped { .. } => "Stopped",
+        _ => "thread",
+    }
+}
+
+/// Answers that hold for one frame but are asked for many times in it. Both
+/// walk every entry, so without this a long thread pays for the walk once per
+/// call site per frame.
+///
+/// Valid **only inside one `Render::render` call**, which is what makes it
+/// safe: no thread mutation can interleave with a render, so nothing cached
+/// here can go stale while it is readable. Everything else reaching these
+/// answers — an event handler, an action — walks, because it may be running
+/// between a change to the entries and the frame that redraws them.
+/// `sync_editor_mode` is the one that taught this the hard way: it is called
+/// from `ConversationView`'s own thread subscription, which can run before
+/// `ThreadView`'s, so a memo that a handler was trusted to clear left the
+/// message editor in its empty-state full height after a message landed.
+#[derive(Default)]
+struct FrameMemo {
+    in_frame: std::cell::Cell<bool>,
+    has_conversation: std::cell::Cell<Option<bool>>,
+    running_work: std::cell::Cell<Option<acp_thread::RunningWork>>,
+    /// Counted so a test can show the walk happens once a frame, not once a
+    /// call.
+    walks: std::cell::Cell<u32>,
+}
+
+impl FrameMemo {
+    fn begin_frame(&self) {
+        self.in_frame.set(true);
+        self.has_conversation.set(None);
+        self.running_work.set(None);
+    }
+
+    fn end_frame(&self) {
+        self.in_frame.set(false);
+        self.has_conversation.set(None);
+        self.running_work.set(None);
+    }
+
+    /// `None` when nothing may be cached, so the caller walks.
+    fn cached<T: Copy>(&self, slot: &std::cell::Cell<Option<T>>) -> Option<T> {
+        self.in_frame.get().then(|| slot.get()).flatten()
+    }
+
+    fn store<T: Copy>(&self, slot: &std::cell::Cell<Option<T>>, value: T) {
+        if self.in_frame.get() {
+            slot.set(Some(value));
+        }
+    }
 }
 
 /// The maximal run of chip entries containing `entry_ix`, inclusive. Memoizes
@@ -1493,6 +1699,7 @@ impl ThreadView {
         subscriptions.push(cx.subscribe(
             &thread,
             |this: &mut Self, thread, event: &AcpThreadEvent, cx| {
+                let handler_started = std::time::Instant::now();
                 if matches!(
                     event,
                     AcpThreadEvent::NewEntry
@@ -1503,6 +1710,9 @@ impl ThreadView {
                 ) {
                     this.sync_branch_diff_work_dirs(cx);
                     this.mine_pr_mentions(cx);
+                    // An image can only appear when an entry does, so this is
+                    // the walk's occasion rather than every frame's.
+                    this.load_remote_chip_images(cx);
                     cx.notify();
                 }
                 // A finished command may have been a git operation git's own
@@ -1517,6 +1727,14 @@ impl ThreadView {
                     this.branch_diff_stats
                         .update(cx, |stats, cx| stats.refresh(cx));
                     this.remeasure_chip(&ActionChipId::ToolCall(finished), cx);
+                }
+                let elapsed = handler_started.elapsed();
+                if elapsed >= PERF_SLOW_EVENT {
+                    log::info!(
+                        "quiet-ui perf: thread view {} handler took {:.2}ms",
+                        acp_thread_event_name(event),
+                        elapsed.as_secs_f64() * 1000.
+                    );
                 }
             },
         ));
@@ -1657,6 +1875,8 @@ impl ThreadView {
             command_script_markdown: RefCell::default(),
             collapsed_image_chips: HashSet::default(),
             chip_cache: ChipCache::default(),
+            frame_perf: Rc::default(),
+            frame_memo: Rc::default(),
             remote_chip_images: HashMap::default(),
             command_file_diffs: RefCell::default(),
             displayed_thought: None,
@@ -1897,16 +2117,68 @@ impl ThreadView {
     // Upstream also counts its in-list generating indicator here; this fork draws
     // activity as a pill instead and removed that flag, so only entries count.
     fn has_visible_conversation(&self, cx: &App) -> bool {
-        self.thread.read(cx).entries().iter().any(|entry| {
+        if let Some(known) = self.frame_memo.cached(&self.frame_memo.has_conversation) {
+            return known;
+        }
+        self.frame_memo.walks.set(self.frame_memo.walks.get() + 1);
+        let known = self.thread.read(cx).entries().iter().any(|entry| {
             !matches!(entry, AgentThreadEntry::UserMessage(message)
                 if message.content.source_blocks().is_empty())
-        })
+        });
+        self.frame_memo
+            .store(&self.frame_memo.has_conversation, known);
+        known
+    }
+
+    /// [`AcpThread::running_work`] walks every entry and every tool call's
+    /// terminals; the activity pill and the bottom bar both ask for it.
+    fn running_work(&self, cx: &App) -> acp_thread::RunningWork {
+        if let Some(known) = self.frame_memo.cached(&self.frame_memo.running_work) {
+            return known;
+        }
+        self.frame_memo.walks.set(self.frame_memo.walks.get() + 1);
+        let work = self.thread.read(cx).running_work(cx);
+        self.frame_memo.store(&self.frame_memo.running_work, work);
+        work
     }
 
     /// Whether the thread lays out as a conversation rather than as a draft.
     #[cfg(test)]
     pub(crate) fn lays_out_as_conversation(&self, cx: &App) -> bool {
         self.has_visible_conversation(cx)
+    }
+
+    /// How many times the memoized per-frame answers have actually been walked.
+    #[cfg(test)]
+    pub(crate) fn frame_memo_walks(&self) -> u32 {
+        self.frame_memo.walks.get()
+    }
+
+    /// Opens and closes a frame the way [`Render::render`] does, for tests that
+    /// are not drawing one.
+    #[cfg(test)]
+    pub(crate) fn begin_test_frame(&self) {
+        self.frame_memo.begin_frame();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn end_test_frame(&self) {
+        self.frame_memo.end_frame();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn message_editor_mode_for_perf(&self, cx: &App) -> editor::EditorMode {
+        self.message_editor.read(cx).editor().read(cx).mode().clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn running_work_for_perf(&self, cx: &App) -> acp_thread::RunningWork {
+        self.running_work(cx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entry_count_for_perf(&self, cx: &App) -> usize {
+        self.thread.read(cx).entries().len()
     }
 
     pub(super) fn can_edit_user_message(&self, index: usize, cx: &App) -> bool {
@@ -7304,8 +7576,8 @@ impl ThreadView {
 
     /// The same pill the sidebar's rows draw.
     fn render_input_activity_pill(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let running_work = self.running_work(cx);
         let thread = self.thread.read(cx);
-        let running_work = thread.running_work(cx);
         let work = ui::RunningWorkCounts {
             terminals: running_work.terminals,
             subagents: running_work.subagents,
@@ -7945,6 +8217,7 @@ impl ThreadView {
         window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
+        let _entry_timer = EntryTimer::new(&self.frame_perf, entry_ix);
         // Thinking is shown beside the progress indicator, not in the transcript.
         if self
             .thread
@@ -15181,8 +15454,8 @@ impl Render for ThreadView {
         // renders (settings, connection state, feature flags).
         self.sync_local_commands(cx);
 
+        let _frame_timer = FrameTimer::new(&self.frame_perf, &self.frame_memo);
         self.chip_cache.begin_frame();
-        self.load_remote_chip_images(cx);
 
         let has_messages = self.has_visible_conversation(cx);
         let list_state = self.list_state.clone();
@@ -16074,7 +16347,6 @@ mod tests {
             .expect("a blank image encodes as a png");
         bytes.into_inner()
     }
-
 
     /// The chip for an image a command wrote on a dev box. The path the agent reports only
     /// exists on the box, so nothing on this machine's disk answers it: the bytes have to come
