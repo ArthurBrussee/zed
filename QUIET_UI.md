@@ -207,6 +207,17 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**Show where a thread runs: a host marker on remote rows.**
+
+With threads on the laptop and on a dev box, the sidebar gives no way to tell them apart. The
+sidebar already works it out per row (`ThreadEntryWorkspace::is_remote`) and passes it to
+`ThreadItem::is_remote` (`crates/ui/src/components/ai/thread_item.rs`), but nothing in
+`ThreadItem::render` reads the field. Draw it: a remote row gets a small muted host label on its
+metadata line (the SSH connection's nickname, or the host name if it has none), before the PR
+chip. A worktree group header on a remote host gets the same label. Local rows show nothing.
+Terminal rows (`render_terminal`, which also sets `is_remote`) follow the same rule. Test: a
+remote row renders the host label and a local one doesn't.
+
 **The memory baselines: what it would take, and the one measurement that would justify it.**
 
 Decided on 2026-10-07 by reading the code; the 10-05 findings and the 10-07 rebase log entry hold
