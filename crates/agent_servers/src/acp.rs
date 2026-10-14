@@ -6008,7 +6008,7 @@ mod tests {
 
         // An `api_retry` notice is a warning about a retry in progress, not a
         // reason the thread stopped.
-        let mut warning = update.clone();
+        let mut warning = update;
         warning["_meta"]["jetbrains"]["air"]["sessionFailure"]["severity"] =
             serde_json::json!("warning");
         assert!(air_session_failure(&warning).is_none());

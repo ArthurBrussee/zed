@@ -3289,7 +3289,6 @@ impl Sidebar {
                 "Hide This Machine's Threads"
             }))
             .on_click(cx.listener({
-                let key = key.clone();
                 move |this, _, _window, cx| {
                     if !this.collapsed_machines.remove(&key) {
                         this.collapsed_machines.insert(key.clone());

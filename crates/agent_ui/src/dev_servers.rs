@@ -566,7 +566,7 @@ mod tests {
         assert_eq!(store.read(cx).state(&here), Some(&DevServerState::Starting));
         assert_eq!(
             store.read(cx).row_label(&a),
-            Some(label.clone()),
+            Some(label),
             "before a port is known the row says which task it is"
         );
 
