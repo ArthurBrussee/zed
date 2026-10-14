@@ -219,34 +219,6 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
-**Say why a thread stopped: error states in the sidebar row and the thread.**
-
-Arthur's transcripts (97 Zed threads, Sep 2 to Oct 14) have 65 "go on" messages restarting
-threads that had stopped and looked done. 19 followed API failures (27 can't-reach-API, 16
-out-of-credits, 7 laptop sleep, 3 OAuth expiries), and 9 followed a turn that ended with
-"waiting on the background run". There were also 15 "how's it going" pings, each after a turn
-that ended with work still running in the background. A row that just looks idle makes him open
-each thread to find out. Give a stopped thread a reason **on its sidebar row**, where the error dot is (Arthur, 2026-10-14:
-the sidebar is where it belongs; the thread keeps upstream's own error callout and retry, nothing
-new there):
-- **Failed**, with a kind: rate-limited or quota exhausted (with the reset time if known),
-  overloaded, offline / connection lost, auth expired, context exhausted, internal error. The
-  Claude adapter already classifies these. With the AIR `sessionFailure` capability advertised
-  (same `_meta.jetbrains.air` mechanism as `asyncTasks`; see
-  `@agentclientprotocol/claude-agent-acp` `dist/session-failure-extension.js`), it reports
-  `context_exhausted`, `internal_error`, `overloaded`, `provider_error`, `quota_exhausted`,
-  `rate_limited`, `transport_lost` and `worker_shutdown` as structured metadata. Advertise it,
-  read it, and map it onto the row. For other agents, fall back to what `LoadError` / the error
-  text says.
-- **Waiting on background work**: the turn ended but background commands or subagents are still
-  live (`running_work` outside a turn). This is distinct from both "working" and "done".
-
-The row shows a short label ("rate-limited until 14:00", "offline", "waiting on 2 commands")
-in place of the age token, with the full reason in its tooltip. No automatic retries for now; the
-point is that the reason is visible without opening the thread. Test: each failure kind from a
-fake connection renders its label on the row, and a thread with a backgrounded command after its
-turn reads "waiting on 1 command", not done.
-
 **A sidebar footer: plan usage, CPU load, and what is running.**
 
 Arthur wants a small footer at the bottom of the sidebar with three things.

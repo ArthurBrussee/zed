@@ -354,6 +354,7 @@ impl Conversation {
                     | AcpThreadEvent::Retry(_)
                     | AcpThreadEvent::SubagentSpawned(_)
                     | AcpThreadEvent::RunningWorkChanged
+                    | AcpThreadEvent::StopReasonChanged
                     | AcpThreadEvent::Stopped { .. }
                     | AcpThreadEvent::Error
                     | AcpThreadEvent::LoadError(_)
@@ -794,6 +795,7 @@ fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
         | AcpThreadEvent::ConfigOptionsUpdated(_)
         | AcpThreadEvent::SubagentSpawned(_)
         | AcpThreadEvent::RunningWorkChanged
+        | AcpThreadEvent::StopReasonChanged
         | AcpThreadEvent::NoticesUpdated
         | AcpThreadEvent::PromptUpdated => false,
     }
@@ -2468,7 +2470,7 @@ impl ConversationView {
             }
             // The thread's own views redraw on its notify; the sidebar row
             // only hears the panel, which hears this view.
-            AcpThreadEvent::RunningWorkChanged => cx.notify(),
+            AcpThreadEvent::RunningWorkChanged | AcpThreadEvent::StopReasonChanged => cx.notify(),
             AcpThreadEvent::ToolAuthorizationRequested(_) => {
                 self.notify_with_sound("Waiting for tool confirmation", IconName::Info, window, cx);
             }

@@ -579,6 +579,10 @@ pub struct ThreadItem {
     running_subagents: usize,
     /// A dev server running for this thread's worktree, read-only here.
     dev_server: Option<SharedString>,
+    /// Why the thread stopped: a short label and the full reason for its
+    /// tooltip. Drawn in place of the age, which a stopped thread's reader
+    /// cares about less.
+    stop_reason: Option<(SharedString, SharedString)>,
     project_paths: Option<Arc<[PathBuf]>>,
     project_name: Option<SharedString>,
     worktrees: Vec<ThreadItemWorktreeInfo>,
@@ -620,6 +624,7 @@ impl ThreadItem {
             running_async_tasks: 0,
             running_subagents: 0,
             dev_server: None,
+            stop_reason: None,
             project_paths: None,
             project_name: None,
             worktrees: Vec::new(),
@@ -640,6 +645,11 @@ impl ThreadItem {
 
     pub fn dev_server(mut self, dev_server: Option<SharedString>) -> Self {
         self.dev_server = dev_server;
+        self
+    }
+
+    pub fn stop_reason(mut self, stop_reason: Option<(SharedString, SharedString)>) -> Self {
+        self.stop_reason = stop_reason;
         self
     }
 
@@ -1005,7 +1015,9 @@ impl RenderOnce for ThreadItem {
 
         let has_project_name = self.project_name.is_some();
         let has_project_paths = project_paths.is_some();
-        let has_timestamp = !self.timestamp.is_empty();
+        // A reason the thread stopped is worth more than how long ago it did.
+        let stop_reason = self.stop_reason.clone();
+        let has_timestamp = !self.timestamp.is_empty() || stop_reason.is_some();
         let timestamp = self.timestamp;
         let dev_server = self.dev_server.clone();
         let has_dev_server = dev_server.is_some();
@@ -1225,12 +1237,22 @@ impl RenderOnce for ThreadItem {
                     .when(has_size && has_timestamp, |this| {
                         this.child(dot_separator())
                     })
-                    .when(has_timestamp, |this| {
-                        this.child(
+                    .when(has_timestamp, |this| match stop_reason.clone() {
+                        Some((label, reason)) => this.child(
+                            div()
+                                .id("thread-stop-reason")
+                                .child(
+                                    Label::new(label)
+                                        .size(LabelSize::Small)
+                                        .color(Color::Warning),
+                                )
+                                .tooltip(Tooltip::text(reason)),
+                        ),
+                        None => this.child(
                             Label::new(timestamp.clone())
                                 .size(LabelSize::Small)
                                 .color(Color::Muted),
-                        )
+                        ),
                     }),
             )
             .when(show_tooltip, |this| {

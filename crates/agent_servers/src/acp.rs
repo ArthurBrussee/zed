@@ -811,6 +811,7 @@ fn client_capabilities_for_agent(agent_id: &AgentId) -> acp::ClientCapabilities 
                     "capabilities": [
                         AIR_ASYNC_TASKS_CAPABILITY,
                         AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
+                        AIR_SESSION_FAILURE_CAPABILITY,
                     ],
                 }
             }),
@@ -5912,7 +5913,8 @@ mod tests {
             air.get("capabilities"),
             Some(&serde_json::json!([
                 AIR_ASYNC_TASKS_CAPABILITY,
-                AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY
+                AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
+                AIR_SESSION_FAILURE_CAPABILITY
             ])),
         );
     }
@@ -5969,6 +5971,60 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "claudeCode": { "toolName": "Bash" } }))
                 .unwrap();
         assert!(air_async_tasks_meta(Some(&meta)).is_none());
+    }
+
+    /// The shape the adapter's `sessionFailureMeta` builds, which carries the
+    /// category behind the failure rather than its own finer kind.
+    #[test]
+    fn the_session_failure_is_read_off_the_air_namespace() {
+        let update = serde_json::json!({
+            "sessionUpdate": "session_info_update",
+            "_meta": {
+                "jetbrains": {
+                    "air": {
+                        "version": 1,
+                        "sessionFailure": {
+                            "id": "session-1:session-error:epoch:1",
+                            "revision": 2,
+                            "category": "limit",
+                            "severity": "error",
+                            "title": "Claude is temporarily rate limited.",
+                            "details": "Try again in a few minutes.",
+                            "actions": ["retry"],
+                        }
+                    }
+                }
+            },
+        });
+        let failure = air_session_failure(&update).expect("a published failure");
+        assert_eq!(failure.id.as_ref(), "session-1:session-error:epoch:1");
+        assert_eq!(failure.revision, 2);
+        assert_eq!(
+            failure.category,
+            acp_thread::SessionFailureCategory::Limit
+        );
+        assert_eq!(failure.title.as_ref(), "Claude is temporarily rate limited.");
+        assert_eq!(failure.details.as_deref(), Some("Try again in a few minutes."));
+
+        // An `api_retry` notice is a warning about a retry in progress, not a
+        // reason the thread stopped.
+        let mut warning = update.clone();
+        warning["_meta"]["jetbrains"]["air"]["sessionFailure"]["severity"] =
+            serde_json::json!("warning");
+        assert!(air_session_failure(&warning).is_none());
+
+        // An ordinary session info update carries no such thing.
+        assert!(
+            air_session_failure(&serde_json::json!({
+                "sessionUpdate": "session_info_update",
+                "_meta": { "claudeCode": { "whatever": true } },
+            }))
+            .is_none()
+        );
+        assert!(
+            air_session_failure(&serde_json::json!({ "sessionUpdate": "session_info_update" }))
+                .is_none()
+        );
     }
 
     #[test]
@@ -10174,7 +10230,10 @@ const AIR_EXTENSION_KEY: &str = "air";
 const AIR_EXTENSION_VERSION: u64 = 1;
 const AIR_ASYNC_TASKS_CAPABILITY: &str = "asyncTasks";
 const AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY: &str = "nativeSubagentSessions";
+/// Without this the adapter never says why a session stopped.
+const AIR_SESSION_FAILURE_CAPABILITY: &str = "sessionFailure";
 const ASYNC_TASK_STOP_METHOD: &str = "_session/async_task/stop";
+const SESSION_INFO_UPDATE: &str = "session_info_update";
 
 fn air_async_tasks_meta(
     meta: Option<&acp::Meta>,
@@ -10184,6 +10243,36 @@ fn air_async_tasks_meta(
         .get(AIR_EXTENSION_KEY)?
         .get(AIR_ASYNC_TASKS_CAPABILITY)?
         .as_object()
+}
+
+/// A session failure the agent published on a `session_info_update`. The
+/// payload carries no `kind`, only the category behind it, so that is what a
+/// row can say; `severity: "warning"` is a retry notice rather than a stop and
+/// is not one of these.
+fn air_session_failure(update: &serde_json::Value) -> Option<acp_thread::SessionFailure> {
+    let failure = update
+        .get("_meta")?
+        .get(AIR_META_KEY)?
+        .get(AIR_EXTENSION_KEY)?
+        .get(AIR_SESSION_FAILURE_CAPABILITY)?;
+    if failure.get("severity").and_then(|value| value.as_str()) != Some("error") {
+        return None;
+    }
+    let title = update_string_field(failure, "title")?;
+    Some(acp_thread::SessionFailure {
+        id: update_string_field(failure, "id")?,
+        revision: failure
+            .get("revision")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        category: failure
+            .get("category")
+            .and_then(|value| value.as_str())
+            .map(acp_thread::SessionFailureCategory::from_wire)
+            .unwrap_or(acp_thread::SessionFailureCategory::Unknown),
+        title,
+        details: update_string_field(failure, "details"),
+    })
 }
 
 /// A non-empty string field of an extension update.
@@ -10328,6 +10417,20 @@ fn handle_session_notification(
             apply_subagent_update(&raw.update, &thread, cx);
         }
         return;
+    }
+    if session_update_kind == SESSION_INFO_UPDATE
+        && let Some(failure) = air_session_failure(&raw.update)
+    {
+        let thread = {
+            let sessions = ctx.sessions.borrow();
+            let key = acp_v2::SessionId::new(raw.session_id.0.clone());
+            sessions.get(&key).map(|session| session.thread.clone())
+        };
+        if let Some(thread) = thread {
+            thread
+                .update(cx, |thread, cx| thread.report_session_failure(failure, cx))
+                .log_err();
+        }
     }
     let update = match serde_json::from_value::<acp::SessionUpdate>(raw.update) {
         Ok(update) => update,

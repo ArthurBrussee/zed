@@ -34,6 +34,7 @@ fn test_thread_entry(title: &str, folder: &str, updated_at: DateTime<Utc>) -> Th
         worktrees: Vec::new(),
         diff_stats: DiffStats::default(),
         running_work: RunningWork::default(),
+        stop_reason: None,
         solo_worktree: None,
         under_worktree_header: false,
     }
@@ -3297,5 +3298,81 @@ async fn test_a_row_follows_work_the_turn_left_running(cx: &mut TestAppContext) 
     assert!(
         row_work(cx).is_empty(),
         "and the row goes idle when it finishes, with no other event behind it"
+    );
+}
+
+/// A row that just looks idle makes you open the thread to find out why it
+/// stopped. The reason belongs on the row, in place of the age.
+#[gpui::test]
+async fn test_a_row_says_why_a_thread_stopped(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let thread_id = open_sent_thread(&panel, cx);
+    let thread = panel.read_with(cx, |panel, cx| {
+        panel.active_agent_thread(cx).expect("a live thread")
+    });
+    let row_reason = |cx: &mut gpui::VisualTestContext| -> Option<(String, String)> {
+        let ix = row_of(&sidebar, thread_id, cx);
+        sidebar.read_with(cx, |sidebar, _cx| match &sidebar.contents.entries[ix] {
+            ListEntry::Thread(thread) => thread
+                .stop_reason
+                .as_ref()
+                .map(|stop| (stop.label.to_string(), stop.reason.to_string())),
+            _ => panic!("the row should be a thread"),
+        })
+    };
+
+    assert_eq!(
+        row_reason(cx),
+        None,
+        "a thread that finished its turn cleanly has no reason to give"
+    );
+
+    thread.update(cx, |thread, cx| {
+        thread.report_session_failure(
+            acp_thread::SessionFailure {
+                id: "session-1:session-error:epoch:1".into(),
+                revision: 1,
+                category: acp_thread::SessionFailureCategory::Limit,
+                title: "Claude is temporarily rate limited.".into(),
+                details: Some("Try again in a few minutes.".into()),
+            },
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        row_reason(cx),
+        Some((
+            "limit reached".to_string(),
+            "Claude is temporarily rate limited.\nTry again in a few minutes.".to_string(),
+        )),
+        "the row says what kind of failure it was, with the whole of it in its tooltip"
+    );
+
+    // Work the turn left behind outranks it: that is neither failed nor done.
+    thread.update(cx, |thread, cx| {
+        thread.async_task_spawned(
+            acp_thread::AsyncTask {
+                id: "task-1".into(),
+                name: "cargo test".into(),
+                description: None,
+                state: acp_thread::AsyncTaskState::Running,
+                summary: None,
+                tool_call_id: None,
+                output_file_path: None,
+                can_stop: true,
+            },
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        row_reason(cx).map(|(label, _)| label),
+        Some("waiting on 1 command".to_string()),
+        "a turn that ended with work still running says so"
     );
 }

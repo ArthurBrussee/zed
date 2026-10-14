@@ -3552,6 +3552,9 @@ pub struct AcpThread {
     pending_terminal_output: HashMap<acp_v2::TerminalId, Vec<Vec<u8>>>,
     pending_terminal_exit: HashMap<acp_v2::TerminalId, acp_v1::TerminalExitStatus>,
     had_error: bool,
+    /// Why the agent said the session stopped. Nothing on the wire takes it
+    /// back, so it is this side that drops it when a turn starts.
+    session_failure: Option<SessionFailure>,
     local_execution_error: Option<Arc<anyhow::Error>>,
     /// The user's unsent prompt text, persisted so it can be restored when reloading the thread.
     draft_prompt: Option<Vec<acp_v2::ContentBlock>>,
@@ -3689,6 +3692,8 @@ pub enum AcpThreadEvent {
     /// thread's own views; nothing watching the thread from outside it, such as
     /// the sidebar row, learns of a command that detached or finished.
     RunningWorkChanged,
+    /// Why the thread stopped changed, for the same reason and the same readers.
+    StopReasonChanged,
     Stopped {
         activity_generation: u64,
         activity_duration: Option<Duration>,
@@ -3761,6 +3766,56 @@ pub struct RunningWork {
 impl RunningWork {
     pub fn is_empty(&self) -> bool {
         self.terminals == 0 && self.subagents == 0 && self.async_tasks == 0
+    }
+}
+
+/// Why a session stopped, as the agent reported it. The Claude adapter
+/// publishes this under the AIR `sessionFailure` capability; the payload
+/// carries a category rather than its own finer `kind`, so this is what a row
+/// can actually say.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionFailure {
+    pub id: SharedString,
+    /// Rises with each report of the same failure; a stale one is dropped.
+    pub revision: u64,
+    pub category: SessionFailureCategory,
+    /// A sentence, for a tooltip rather than a row.
+    pub title: SharedString,
+    pub details: Option<SharedString>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionFailureCategory {
+    Connection,
+    Access,
+    Limit,
+    Request,
+    Service,
+    Unknown,
+}
+
+impl SessionFailureCategory {
+    pub fn from_wire(category: &str) -> Self {
+        match category {
+            "connection" => Self::Connection,
+            "access" => Self::Access,
+            "limit" => Self::Limit,
+            "request" => Self::Request,
+            "service" => Self::Service,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Short enough for a sidebar row; the title says the rest.
+    pub fn short_label(&self) -> &'static str {
+        match self {
+            Self::Connection => "offline",
+            Self::Access => "sign-in needed",
+            Self::Limit => "limit reached",
+            Self::Request => "rejected",
+            Self::Service => "service error",
+            Self::Unknown => "failed",
+        }
     }
 }
 
@@ -3903,6 +3958,7 @@ impl AcpThread {
                 | AcpThreadEvent::Retry(_)
                 | AcpThreadEvent::SubagentSpawned(_)
                 | AcpThreadEvent::RunningWorkChanged
+                | AcpThreadEvent::StopReasonChanged
                 | AcpThreadEvent::Stopped { .. }
                 | AcpThreadEvent::Error
                 | AcpThreadEvent::LoadError(_)
@@ -3971,6 +4027,7 @@ impl AcpThread {
             pending_terminal_output: HashMap::default(),
             pending_terminal_exit: HashMap::default(),
             had_error: false,
+            session_failure: None,
             local_execution_error: None,
             draft_prompt: None,
             draft_prompt_revision: 0,
@@ -4195,6 +4252,31 @@ impl AcpThread {
 
     pub fn had_error(&self) -> bool {
         self.had_error
+    }
+
+    pub fn session_failure(&self) -> Option<&SessionFailure> {
+        self.session_failure.as_ref()
+    }
+
+    /// The agent reporting why it stopped. A report of the same failure with a
+    /// revision no higher than the one in hand is a replay and is dropped.
+    pub fn report_session_failure(&mut self, failure: SessionFailure, cx: &mut Context<Self>) {
+        if let Some(current) = &self.session_failure
+            && current.id == failure.id
+            && current.revision >= failure.revision
+        {
+            return;
+        }
+        self.session_failure = Some(failure);
+        cx.emit(AcpThreadEvent::StopReasonChanged);
+        cx.notify();
+    }
+
+    fn clear_session_failure(&mut self, cx: &mut Context<Self>) {
+        if self.session_failure.take().is_some() {
+            cx.emit(AcpThreadEvent::StopReasonChanged);
+            cx.notify();
+        }
     }
 
     pub fn local_execution_error(&self) -> Option<&Arc<anyhow::Error>> {
@@ -4635,6 +4717,7 @@ impl AcpThread {
         if previous == ForegroundActivity::Idle && current != ForegroundActivity::Idle {
             self.had_error = false;
             self.local_execution_error = None;
+            self.clear_session_failure(cx);
         }
         // Whether a turn is running decides which in-flight calls count.
         if (previous == ForegroundActivity::Idle) != (current == ForegroundActivity::Idle) {
@@ -7072,6 +7155,7 @@ impl AcpThread {
         self.clear_completed_plan_entries(cx);
         self.had_error = false;
         self.local_execution_error = None;
+        self.clear_session_failure(cx);
 
         let (tx, rx) = oneshot::channel();
         let cancel_task = self.cancel_inner(RequestPermissionOutcome::InterruptedByFollowUp, cx);
@@ -12209,7 +12293,102 @@ mod tests {
         );
     }
 
-    /// The chip's spinner and the row's working state read the same calls
+    /// Nothing on the wire takes a failure back, so a row would show the last
+    /// one forever if this side did not drop it when a turn starts.
+    #[gpui::test]
+    async fn test_a_reported_failure_lasts_until_the_next_turn(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let thread = new_test_thread(cx).await;
+        let reports = Rc::new(RefCell::new(0usize));
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&thread, {
+                let reports = reports.clone();
+                move |_, event, _| {
+                    if matches!(event, AcpThreadEvent::StopReasonChanged) {
+                        *reports.borrow_mut() += 1;
+                    }
+                }
+            })
+        });
+
+        let failure = |revision: u64, title: &str| SessionFailure {
+            id: "session-1:session-error:epoch:1".into(),
+            revision,
+            category: SessionFailureCategory::Limit,
+            title: title.to_string().into(),
+            details: None,
+        };
+
+        thread.update(cx, |thread, cx| {
+            thread.report_session_failure(failure(1, "Claude is temporarily rate limited."), cx);
+        });
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(
+                thread.session_failure().map(|failure| failure.title.clone()),
+                Some("Claude is temporarily rate limited.".into())
+            );
+        });
+        assert_eq!(*reports.borrow(), 1);
+
+        // The adapter republishes the same failure as it is restored from the
+        // transcript, with the revision it had.
+        thread.update(cx, |thread, cx| {
+            thread.report_session_failure(failure(1, "a replay of the same report"), cx);
+        });
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(
+                thread.session_failure().map(|failure| failure.title.clone()),
+                Some("Claude is temporarily rate limited.".into()),
+                "a report that is not newer leaves the one in hand alone"
+            );
+        });
+        assert_eq!(*reports.borrow(), 1);
+
+        thread.update(cx, |thread, cx| {
+            thread.report_session_failure(failure(2, "and now it is worse"), cx);
+        });
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(
+                thread.session_failure().map(|failure| failure.title.clone()),
+                Some("and now it is worse".into())
+            );
+        });
+        assert_eq!(*reports.borrow(), 2);
+
+        // A turn starting is what clears it; nothing on the wire does.
+        let (complete, request) = start_test_turn(&thread, cx);
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, _| {
+            assert!(thread.session_failure().is_none());
+        });
+        assert_eq!(*reports.borrow(), 3);
+        complete
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .expect("turn should still be running");
+        request.await.expect("turn should complete");
+    }
+
+    #[test]
+    fn test_every_failure_category_has_something_short_to_say() {
+        for (wire, label) in [
+            ("connection", "offline"),
+            ("access", "sign-in needed"),
+            ("limit", "limit reached"),
+            ("request", "rejected"),
+            ("service", "service error"),
+            ("unknown", "failed"),
+            // A category this side has never heard of still says something.
+            ("something-new", "failed"),
+        ] {
+            assert_eq!(
+                SessionFailureCategory::from_wire(wire).short_label(),
+                label,
+                "category {wire}"
+            );
+        }
+    }
+
+    /// The chip's spinner and the row's working state read the same calls    /// The chip's spinner and the row's working state read the same calls
     /// through the same predicate, so one cannot say running while the other
     /// says idle.
     #[gpui::test]

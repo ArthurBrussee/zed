@@ -201,6 +201,16 @@ struct ActiveThreadInfo {
     is_title_generating: bool,
     diff_stats: DiffStats,
     running_work: RunningWork,
+    stop_reason: Option<ThreadStopReason>,
+}
+
+/// Why a thread stopped, said on its row: a short label in place of the age,
+/// with the whole reason in its tooltip. The thread keeps upstream's own error
+/// callout and retry; this is so the reason is visible without opening it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ThreadStopReason {
+    label: SharedString,
+    reason: SharedString,
 }
 
 #[derive(Clone, PartialEq)]
@@ -380,6 +390,7 @@ struct ThreadEntry {
     worktrees: Vec<ThreadItemWorktreeInfo>,
     diff_stats: DiffStats,
     running_work: RunningWork,
+    stop_reason: Option<ThreadStopReason>,
     /// Set when this thread is the only one in its worktree, so the row stands
     /// in for the worktree header.
     solo_worktree: Option<SoloWorktree>,
@@ -468,6 +479,7 @@ impl ThreadEntry {
         self.is_title_generating = info.is_title_generating;
         self.diff_stats = info.diff_stats;
         self.running_work = info.running_work;
+        self.stop_reason = info.stop_reason.clone();
     }
 }
 
@@ -1578,6 +1590,7 @@ impl Sidebar {
                     worktrees,
                     diff_stats: DiffStats::default(),
                     running_work: RunningWork::default(),
+                    stop_reason: None,
                     solo_worktree: None,
                     under_worktree_header: false,
                 })
@@ -6594,6 +6607,12 @@ impl Sidebar {
             .running_async_tasks(thread.running_work.async_tasks)
             .running_subagents(thread.running_work.subagents)
             .dev_server(self.dev_server_label(&thread.metadata, cx))
+            .stop_reason(
+                thread
+                    .stop_reason
+                    .as_ref()
+                    .map(|stop| (stop.label.clone(), stop.reason.clone())),
+            )
             .when(thread.diff_stats.lines_added > 0, |this| {
                 this.added(thread.diff_stats.lines_added as usize)
             })
@@ -8036,6 +8055,7 @@ fn all_thread_infos_for_workspace(
 
             let diff_stats = thread.action_log().read(cx).diff_stats(cx);
             let running_work = thread.running_work(cx);
+            let stop_reason = thread_stop_reason(thread, status, running_work);
 
             Some(ActiveThreadInfo {
                 session_id,
@@ -8046,10 +8066,63 @@ fn all_thread_infos_for_workspace(
                 is_title_generating,
                 diff_stats,
                 running_work,
+                stop_reason,
             })
         });
 
     Some(threads).into_iter().flatten()
+}
+
+/// Why this thread is not generating, in as few words as a row allows. A turn
+/// in flight has no reason to give.
+fn thread_stop_reason(
+    thread: &acp_thread::AcpThread,
+    status: AgentThreadStatus,
+    running_work: RunningWork,
+) -> Option<ThreadStopReason> {
+    if status == AgentThreadStatus::Running {
+        return None;
+    }
+    // Distinct from both working and done: the turn ended and left work behind.
+    if !running_work.is_empty() {
+        let mut parts = Vec::new();
+        for (count, noun) in [
+            (running_work.terminals + running_work.async_tasks, "command"),
+            (running_work.subagents, "subagent"),
+        ] {
+            if count > 0 {
+                parts.push(format!(
+                    "{count} {noun}{}",
+                    if count == 1 { "" } else { "s" }
+                ));
+            }
+        }
+        let what = parts.join(" and ");
+        return Some(ThreadStopReason {
+            label: format!("waiting on {what}").into(),
+            reason: format!("The turn ended with {what} still running").into(),
+        });
+    }
+    if let Some(failure) = thread.session_failure() {
+        return Some(ThreadStopReason {
+            label: failure.category.short_label().into(),
+            reason: match &failure.details {
+                Some(details) => format!("{}\n{details}", failure.title).into(),
+                None => failure.title.clone(),
+            },
+        });
+    }
+    // Every other agent: all there is to go on is that it errored.
+    if thread.had_error() {
+        return Some(ThreadStopReason {
+            label: "failed".into(),
+            reason: match thread.local_execution_error() {
+                Some(error) => format!("{error}").into(),
+                None => "The agent reported an error".into(),
+            },
+        });
+    }
+    None
 }
 
 pub fn dump_workspace_info(
