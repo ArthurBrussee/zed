@@ -219,6 +219,29 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**Clicking "1 command running" shows what is running, with a stop for each.**
+
+The activity pill in the thread's bottom bar (`render_input_activity_pill` in `thread_view.rs`)
+says how many commands and subagents are running but not which. Clicking it opens a small
+popover listing each one:
+- each running command, by its chip label and how long it has run, with its last output line;
+- each backgrounded task and each live subagent, by name.
+
+Each item has a Stop button. A command run in a Zed terminal stops through
+`AcpThread::kill_terminal`. A backgrounded task stops through the existing `stop_async_task`
+(`_session/async_task/stop`). A subagent stops through whatever its agent offers, and where
+it offers nothing, the item has no Stop rather than a fake one. Clicking an item's label
+scrolls the thread to that command's chip. Test: two running commands list both, and stopping
+one leaves the other running and the count drops to 1.
+
+**Remove the copy button from command chips; it covers the stop button.**
+
+On a running command chip the copy button (`IconButton::new(("copy-command", entry_ix),
+IconName::Copy)` in `chips.rs`) sits on top of the stop button, so a running command can't be
+stopped from its chip. Remove the copy button. The command can still be copied from the
+expanded body or the hover. Check nothing else in the chip's action slot overlaps once it's
+gone.
+
 **Say why a thread stopped: error states in the sidebar row and the thread.**
 
 Arthur's transcripts (97 Zed threads, Sep 2 to Oct 14) have 65 "go on" messages restarting
@@ -226,8 +249,9 @@ threads that had stopped and looked done. 19 followed API failures (27 can't-rea
 out-of-credits, 7 laptop sleep, 3 OAuth expiries), and 9 followed a turn that ended with
 "waiting on the background run". There were also 15 "how's it going" pings, each after a turn
 that ended with work still running in the background. A row that just looks idle makes him open
-each thread to find out. Give a stopped thread a reason, on its sidebar row (where the error dot
-is) and as a callout in the thread:
+each thread to find out. Give a stopped thread a reason **on its sidebar row**, where the error dot is (Arthur, 2026-10-14:
+the sidebar is where it belongs; the thread keeps upstream's own error callout and retry, nothing
+new there):
 - **Failed**, with a kind: rate-limited or quota exhausted (with the reset time if known),
   overloaded, offline / connection lost, auth expired, context exhausted, internal error. The
   Claude adapter already classifies these. With the AIR `sessionFailure` capability advertised
@@ -240,26 +264,36 @@ is) and as a callout in the thread:
 - **Waiting on background work**: the turn ended but background commands or subagents are still
   live (`running_work` outside a turn). This is distinct from both "working" and "done".
 
-The row shows a short label ("rate-limited until 14:00", "offline", "waiting on 2 commands").
-The thread's callout keeps upstream's retry affordance. No automatic retries for now; the
+The row shows a short label ("rate-limited until 14:00", "offline", "waiting on 2 commands")
+in place of the age token, with the full reason in its tooltip. No automatic retries for now; the
 point is that the reason is visible without opening the thread. Test: each failure kind from a
 fake connection renders its label on the row, and a thread with a backgrounded command after its
 turn reads "waiting on 1 command", not done.
 
-**Plan usage % at the bottom of the sidebar.**
+**A sidebar footer: plan usage, CPU load, and what is running.**
 
-Arthur wants to see how much of his Claude plan he has used, at a glance, at the bottom of the
-sidebar. His transcripts have 16 out-of-credits and 15 session-limit stops. The Claude adapter
-forwards Claude Code's rate-limit events as `usage_update` session updates carrying
-`_meta["_claude/rateLimit"]` (the SDK's `rate_limit_info`: status, utilization, reset time,
-which window). See `case "rate_limit_event"` in `dist/acp-agent.js`. Its `/usage` command also
-returns a structured `rate_limits` object (`five_hour` and `seven_day` utilization and
-`resets_at`; `dist/usage-markdown.js`). Keep the latest values per account across all Claude
-threads, and show a small footer in the sidebar: the 5-hour and weekly percentages as two thin
-bars or `5h 42% · wk 18%`, with a tooltip giving the reset times. Turn it amber past 80% and red
-at the limit. When nothing has been reported yet this session, show nothing rather than a
-guess. Test: a fake `usage_update` with rate-limit meta updates the footer; a thread on a
-different agent leaves it alone.
+Arthur wants a small footer at the bottom of the sidebar with three things.
+
+1. **Plan usage %.** His transcripts have 16 out-of-credits and 15 session-limit stops. The Claude
+   adapter forwards Claude Code's rate-limit events as `usage_update` session updates carrying
+   `_meta["_claude/rateLimit"]` (the SDK's `rate_limit_info`: status, utilization, reset time,
+   which window; `case "rate_limit_event"` in `dist/acp-agent.js`). Its `/usage` returns a
+   structured `rate_limits` object (`five_hour` and `seven_day` utilization and `resets_at`;
+   `dist/usage-markdown.js`). Keep the latest values per account across Claude threads and show
+   `5h 42% · wk 18%`, with the reset times in a tooltip. Amber past 80%, red at the limit, and
+   nothing at all until something has been reported.
+2. **CPU load per machine.** The laptop's, and each connected dev box's, since the box is where
+   the heavy work goes now. A load average or CPU %, refreshed every few seconds, cheap to read
+   (sysinfo locally; for a box, over the existing remote connection, e.g. a light periodic RPC
+   or reading `/proc/loadavg` through the project, not a new SSH session per tick). One short
+   item per machine, labelled like the machine groups.
+3. **Totals of what is running**: threads working, commands running, subagents running, summed
+   across all threads from the same `running_work` the activity pills use, e.g. `3 agents ·
+   5 commands · 2 subagents`.
+
+Keep it one line, muted, out of the way. Test: fake rate-limit meta updates the usage item, the
+totals follow `running_work` across two threads, and a machine with no load reading shows
+nothing for it.
 
 **The git diff: fix the collapse overlap, and group it into code, tests and generated, each
 with its own stats.**
