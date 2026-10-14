@@ -219,6 +219,48 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**Say why a thread stopped: error states in the sidebar row and the thread.**
+
+Arthur's transcripts (97 Zed threads, Sep 2 to Oct 14) have 65 "go on" messages restarting
+threads that had stopped and looked done. 19 followed API failures (27 can't-reach-API, 16
+out-of-credits, 7 laptop sleep, 3 OAuth expiries), and 9 followed a turn that ended with
+"waiting on the background run". There were also 15 "how's it going" pings, each after a turn
+that ended with work still running in the background. A row that just looks idle makes him open
+each thread to find out. Give a stopped thread a reason, on its sidebar row (where the error dot
+is) and as a callout in the thread:
+- **Failed**, with a kind: rate-limited or quota exhausted (with the reset time if known),
+  overloaded, offline / connection lost, auth expired, context exhausted, internal error. The
+  Claude adapter already classifies these. With the AIR `sessionFailure` capability advertised
+  (same `_meta.jetbrains.air` mechanism as `asyncTasks`; see
+  `@agentclientprotocol/claude-agent-acp` `dist/session-failure-extension.js`), it reports
+  `context_exhausted`, `internal_error`, `overloaded`, `provider_error`, `quota_exhausted`,
+  `rate_limited`, `transport_lost` and `worker_shutdown` as structured metadata. Advertise it,
+  read it, and map it onto the row. For other agents, fall back to what `LoadError` / the error
+  text says.
+- **Waiting on background work**: the turn ended but background commands or subagents are still
+  live (`running_work` outside a turn). This is distinct from both "working" and "done".
+
+The row shows a short label ("rate-limited until 14:00", "offline", "waiting on 2 commands").
+The thread's callout keeps upstream's retry affordance. No automatic retries for now; the
+point is that the reason is visible without opening the thread. Test: each failure kind from a
+fake connection renders its label on the row, and a thread with a backgrounded command after its
+turn reads "waiting on 1 command", not done.
+
+**Plan usage % at the bottom of the sidebar.**
+
+Arthur wants to see how much of his Claude plan he has used, at a glance, at the bottom of the
+sidebar. His transcripts have 16 out-of-credits and 15 session-limit stops. The Claude adapter
+forwards Claude Code's rate-limit events as `usage_update` session updates carrying
+`_meta["_claude/rateLimit"]` (the SDK's `rate_limit_info`: status, utilization, reset time,
+which window). See `case "rate_limit_event"` in `dist/acp-agent.js`. Its `/usage` command also
+returns a structured `rate_limits` object (`five_hour` and `seven_day` utilization and
+`resets_at`; `dist/usage-markdown.js`). Keep the latest values per account across all Claude
+threads, and show a small footer in the sidebar: the 5-hour and weekly percentages as two thin
+bars or `5h 42% · wk 18%`, with a tooltip giving the reset times. Turn it amber past 80% and red
+at the limit. When nothing has been reported yet this session, show nothing rather than a
+guess. Test: a fake `usage_update` with rate-limit meta updates the footer; a thread on a
+different agent leaves it alone.
+
 **The git diff: fix the collapse overlap, and group it into code, tests and generated, each
 with its own stats.**
 
@@ -255,25 +297,6 @@ Arthur, 2026-10-14. Two things.
    (the worktree "since base" view), since they share the multibuffer. Test: a diff with one
    file of each kind gives three groups in that order, the right stats on each, and the last
    two collapsed. Expanding and collapsing them doesn't overlap anything (see 1).
-
-**`cmd-d` toggles between the thread and its diff.**
-
-Arthur, 2026-10-14: a hotkey to flip between the thread view and the diff, so he can watch what
-the agent is changing and go straight back. `cmd-d` in the thread opens (or focuses) the diff
-for that thread's worktree. That is the same view the bottom bar's diff stats open ("this
-worktree's diff since {base}"), so reuse that action rather than a new path. `cmd-d` in that
-diff goes back to the thread it came from, focused. If the diff was opened some other way,
-it goes to the most recent thread on that worktree.
-
-`cmd-d` is upstream's `editor::SelectNext` (add the next match to the selection), and both
-places are editors underneath: the message box, and the diff's multibuffer. A binding in the
-`ProjectDiff` or `AgentPanel` context loses to `Editor`'s, because the deeper context wins. Bind
-it in contexts specific enough to win there (e.g. `AgentPanel > Editor`, `ProjectDiff > Editor`,
-plus the thread view itself), in the fork's own keymap additions, and leave `cmd-d` as
-`SelectNext` in every other editor. Losing add-next-match inside the message box and the diff
-view is the accepted trade. Put the action and its handler in the fork's own files. Test: from a
-thread `cmd-d` lands in the worktree's diff with focus, and `cmd-d` again lands back in that
-thread; `cmd-d` in an ordinary editor still selects the next match.
 
 **Machine headers collapse, like worktree headers do.**
 
