@@ -219,6 +219,62 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**The git diff: fix the collapse overlap, and group it into code, tests and generated, each
+with its own stats.**
+
+Arthur, 2026-10-14. Two things.
+
+1. **Collapsing something can make diffs overlap each other.** The fork's own diff UI changes
+   were reverted to upstream on 10-08 ("generated" markers included), and `crates/git_ui` and
+   `crates/editor` now carry no fork diff beyond `editor/src/code_lens.rs` (+4/-2). So
+   either upstream's diff view has this bug, or something lower that the fork touches is
+   involved: the fork carries +33 lines in `crates/gpui/src/elements/list.rs`, plus the
+   remeasure routing in the agent UI. Reproduce it in a test (a multi-file diff, collapse a
+   file's excerpts, collapse a section, assert that excerpt and block bounds don't overlap
+   after relayout). Find which side it is on. Fix it in the smallest form; if it's upstream's,
+   record it in the rebase log so it can go upstream.
+
+2. **Clearer groups.** Split the diff into three groups, each under a header with its own diff
+   stats (`+N -M`, file count): **Code**, **Tests**, **Generated**. Tests and Generated start
+   collapsed. Categorise by simple file-name rules only, no content sniffing:
+   - Tests: Rust `*_tests.rs`, `*_test.rs`, anything under a `tests/` directory; TypeScript and
+     JavaScript `*.test.ts(x)`, `*.spec.ts(x)`, `*.test.js`, anything under `__tests__/`.
+     Check Arthur's repos for the exact conventions; the Zed repo uses `*_tests.rs`, and mech has
+     TS tests too.
+   - Generated: lockfiles (`Cargo.lock`, `pnpm-lock.yaml`, `package-lock.json`, `yarn.lock`),
+     `*.snap`, `*.generated.*`, `*_pb2.py`, `*.pb.go`, and anything under `generated/` or
+     `gen/`.
+   - Everything else is Code.
+
+   Upstream already orders the diff's files by section (`CONFLICT_SORT_PREFIX`,
+   `TRACKED_SORT_PREFIX` and `NEW_SORT_PREFIX` in `git_ui/src/diff_multibuffer.rs`, via
+   `PathKey::with_sort_prefix`). Fold the category into that ordering rather than building a
+   parallel one. Put the rules in one small fork-owned function, and keep the changes to
+   upstream's files to the hook. Arthur asked on 10-08 not to maintain a diff UI of the fork's
+   own, so keep this as small as it can be. It applies to the project diff and the branch diff
+   (the worktree "since base" view), since they share the multibuffer. Test: a diff with one
+   file of each kind gives three groups in that order, the right stats on each, and the last
+   two collapsed. Expanding and collapsing them doesn't overlap anything (see 1).
+
+**`cmd-d` toggles between the thread and its diff.**
+
+Arthur, 2026-10-14: a hotkey to flip between the thread view and the diff, so he can watch what
+the agent is changing and go straight back. `cmd-d` in the thread opens (or focuses) the diff
+for that thread's worktree. That is the same view the bottom bar's diff stats open ("this
+worktree's diff since {base}"), so reuse that action rather than a new path. `cmd-d` in that
+diff goes back to the thread it came from, focused. If the diff was opened some other way,
+it goes to the most recent thread on that worktree.
+
+`cmd-d` is upstream's `editor::SelectNext` (add the next match to the selection), and both
+places are editors underneath: the message box, and the diff's multibuffer. A binding in the
+`ProjectDiff` or `AgentPanel` context loses to `Editor`'s, because the deeper context wins. Bind
+it in contexts specific enough to win there (e.g. `AgentPanel > Editor`, `ProjectDiff > Editor`,
+plus the thread view itself), in the fork's own keymap additions, and leave `cmd-d` as
+`SelectNext` in every other editor. Losing add-next-match inside the message box and the diff
+view is the accepted trade. Put the action and its handler in the fork's own files. Test: from a
+thread `cmd-d` lands in the worktree's diff with focus, and `cmd-d` again lands back in that
+thread; `cmd-d` in an ordinary editor still selects the next match.
+
 **Machine headers collapse, like worktree headers do.**
 
 Arthur, 2026-10-14: machine group headers in the sidebar should be collapsible. Worktree headers
