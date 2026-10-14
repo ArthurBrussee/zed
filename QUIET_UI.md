@@ -219,6 +219,48 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**Dev servers from the message bar, driven by tagged Zed tasks.**
+
+Arthur, 2026-10-14: starting a dev server (`cd portico && pnpm dev` in mech) is very common. He
+wants it one click away in the thread's bottom bar, with its state and port visible. Don't
+hardcode mech: use upstream's own tasks, with tags as the only extra metadata. No new schema,
+and any repo can opt in from its `.zed/tasks.json` (or the user's global tasks):
+
+```json
+{ "label": "portico", "command": "pnpm dev", "cwd": "$ZED_WORKTREE_ROOT/portico",
+  "reveal": "never", "tags": ["bar", "icon:server", "open:/"] }
+```
+
+- **`bar`**: the task gets a button in the bottom bar of every thread whose worktree has it,
+  resolved against *that* thread's worktree (`$ZED_WORKTREE_ROOT`), so each worktree runs its
+  own server. Several `bar` tasks give several buttons.
+- **`icon:<IconName>`** (optional): the button's glyph. Default is a generic play/server glyph.
+- **`open:<path or url>`** (optional): what "Open" goes to once it's running. A path is appended
+  to the detected URL, and a full URL is used as is. Without it, Open goes to the detected URL.
+
+Behaviour:
+- **Not running:** the button shows the label. Clicking it spawns the task through upstream's
+  task machinery (a Zed terminal, hidden per `reveal`) in that worktree.
+- **Running:** the button shows a running state and the port. The port is detected from the
+  task's terminal output: the first `http://localhost:PORT` / `http://127.0.0.1:PORT` /
+  `0.0.0.0:PORT` it prints, which handles vite moving to 5174 when 5173 is taken by another
+  worktree. Clicking it opens a menu: **Open** (the `open:` target, in the browser), **Show
+  output** (reveal the task's terminal), **Stop**.
+- **Exited:** back to the start state, with an error tint and "exited (code N)" in the tooltip
+  if it failed.
+- **Sidebar:** the row shows the state, read-only: a small `:5173` (or the label) while the
+  task is running for that thread's worktree. Interaction stays in the bar.
+- **On a dev box:** the task runs on the box (upstream runs remote tasks there), so the port is
+  the box's. Open must forward it through the existing SSH connection (the transport already
+  supports a port forward on its commands; use it or `ssh -O forward` on the control socket),
+  then open `localhost:<forwarded>`. A port that can't be forwarded says so instead of opening
+  a dead URL.
+
+Keep it in the fork's own files, reading upstream's `TaskTemplate` (`tags` already exists) and
+spawning through upstream's task path. Test: a tagged task shows a button; starting it with a
+fake terminal printing `Local: http://localhost:5174/` shows `:5174`; Stop ends it; two
+worktrees get independent buttons; an untagged task shows nothing.
+
 **Clicking an expanded image opens it in Zed's image viewer, laptop and dev box alike.**
 
 Arthur, 2026-10-14: expanding an image chip works; clicking the expanded image should then
