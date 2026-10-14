@@ -219,6 +219,27 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**A connected machine shows in the sidebar right away, and with several machines the top `+`
+goes.**
+
+Arthur, 2026-10-14:
+- **An added SSH box should appear in the sidebar immediately, with its `+`, before it has any
+  threads.** Today `group_rows_by_machine` (`sidebar.rs`) skips a machine whose list of thread
+  rows is empty ("A machine with nothing open gets no group"). With only one machine left,
+  `machines.len() < 2` drops the headers altogether, so a freshly connected box is invisible
+  until something already has a thread there. A machine counts as present when it has an open
+  workspace with paths (`can_create_thread` already computes exactly that). Give it its header
+  and `+` even with no threads; the header alone, with no rows under it, is fine.
+- **When more than one machine is present, hide the top `+`** (`render_new_thread_button`). With
+  one machine it stays as it is. With several, the only way to start a worktree thread is a
+  machine header's `+`, so it is always clear which machine it lands on. The `NewThread`
+  keybinding that the top `+` shares keeps working on the active workspace's machine. Only the
+  ambiguous button goes.
+
+Test: a local project with threads plus a remote workspace with none shows both machine
+headers, each with its `+`, and no top `+`. Closing the remote workspace brings the top `+`
+back. The remote header's `+` creates the worktree thread on the remote (fake transport).
+
 **Make `+` fast: find the waste in new-worktree creation. No caches, no pre-warming.**
 
 Arthur, 2026-10-14: profile where new-worktree time goes and make it faster by removing waste.
