@@ -219,17 +219,6 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
-**A machine's renamed nickname shows only after reconnecting.**
-
-Arthur, 2026-10-14: renaming the dev box (an SSH connection's `nickname`) doesn't change its
-machine group in the sidebar. The label is `RemoteConnectionOptions::display_name()` on the
-*live* connection's options, which captured the nickname when the connection was made, so it
-only changes after closing and reopening the box's window. Resolve the label from the current
-`ssh_connections` settings instead: match by host, username and port, and take that entry's
-`nickname`, falling back to `display_name()`. Rebuild the sidebar when `ssh_connections`
-changes; the sidebar already observes `SettingsStore` for its width. Test: change the nickname
-in settings, and the machine header's label updates without a reconnect.
-
 **A freshly connected machine gets no group, and so no `+`.**
 
 Arthur, 2026-10-14: connected to his dev box and opened the mech folder there, and the sidebar
