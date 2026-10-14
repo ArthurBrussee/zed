@@ -510,19 +510,6 @@ What to fix:
 
 Report before and after from tests where possible, and leave the lines in so his log confirms.
 
-**A freshly connected machine gets no group, and so no `+`.**
-
-Arthur, 2026-10-14: connected to his dev box and opened the mech folder there, and the sidebar
-still shows only "This Mac", with no box group and no `+` for it. `group_rows_by_machine`
-(`sidebar.rs`) skips a machine whose list of thread rows is empty ("A machine with nothing open
-gets no group"), so a machine with an open workspace and no threads yet never shows. With only
-one machine left, `machines.len() < 2` drops the headers altogether. A machine counts as open
-when it has an open workspace with paths (`can_create_thread` already computes exactly that), so
-give it its group and `+` even with no threads. The group shows only its header until the first
-thread. The "no group" rule is for machines with nothing open at all. Test: a local project with
-threads plus a remote workspace with none shows both machine headers, and the remote one's `+`
-creates the worktree thread on the remote.
-
 **Add a machine from the sidebar, and keep its group once it has been used.**
 
 Arthur, 2026-10-14, after the machine groups landed: "how do I add it now?" The sidebar has
@@ -564,6 +551,104 @@ take. Without the numbers, neither should be built.
 (Also settled on 10-05 and not worth rediscovering: `environment.rs:303` is not running twice for
 one directory, and the off-screen view sweep structurally cannot release the `Markdown`, because
 none of it is owned by `EntryViewState`.)
+
+**Agents that keep running on the dev box when the laptop is gone: a relay in `remote_server`.**
+
+Arthur, 2026-10-14. On a remote project, agents run on the box but die whenever the laptop
+sleeps or the SSH link drops, and any turn in progress is lost. He wants them to keep working
+on the box and to reattach afterwards, catching up on everything that happened. Build all of
+it in one go; a partial design is not useful. Shape it so the move to ACP v2 is easy: v2 is
+progressing quickly and this should map onto it, not fight it.
+
+**Why it happens today.** `remote_server` resolves and installs the agent, but the laptop spawns
+it as `ssh host <agent>` (`agent_servers/src/acp/transport.rs`, via
+`RemoteClient::build_stdio_command`). The ACP client is the laptop, connected over that SSH
+pipe, and `claude-agent-acp` exits when its stdin closes (adapter PR #530). `remote_server`
+itself exits after 10 idle minutes (`IDLE_TIMEOUT`, `remote_server/src/server.rs` ~521).
+
+**State of the art, researched 2026-10-14.**
+- Upstream Zed has only an unanswered community request (discussion #60515) and related bugs:
+  #57252 (queued messages lost on disconnect), #59394 (remote sessions drop hourly) and #62488.
+  Nobody is building it upstream.
+- ACP v1 can resume a saved session (`session/load` replays, `session/resume` doesn't) but has
+  no way to reattach to a running turn or recover missed notifications (discussions #396 and
+  #1783).
+- ACP v2, alpha, RFDs active: `session/prompt` returns on insertion, a `state_update`
+  notification gives running / idle(stopReason) / requires_action, and `session/resume` takes a
+  `replayFrom` cursor. Issue #2286 asks for a `state_update` right after resume. Nothing in v2
+  says who keeps the agent process alive; that is this relay's job.
+- Claude Desktop's SSH sessions already work this way: a server on the host owns the agent,
+  keeps recent output in a 16 MiB buffer while the client is away, and on reconnect catches up
+  from the buffer, then from the transcript on the host.
+
+**Design.**
+
+1. **The box owns the agent.** For a remote project, `remote_server` spawns and owns the agent
+   process (the command it already resolves via `GetAgentServerCommand`), instead of the
+   laptop running `ssh host agent`. ACP traffic is tunneled over the existing `remote_server`
+   proto channel, which already reconnects, via new proto messages: open a relay session,
+   client-to-agent frames, agent-to-client frames, attach, detach. On a box that is always on,
+   Arthur wants the relay **always on** too: `remote_server` doesn't exit while any relayed agent
+   is alive (gate `IDLE_TIMEOUT` on that), and agents live until their thread is closed or
+   archived. No idle reaping. Note in the rebase log that systemd-logind `KillUserProcesses`
+   would kill it, and how to disable that.
+2. **Put the relay in a fork-only crate** (e.g. `crates/acp_relay`), with only thin hooks in
+   upstream files: the spawn decision in the transport, the proto additions, the idle gate, and
+   the attach path in the thread. Keep it **message-agnostic**: store and forward raw JSON-RPC
+   frames, parsing only `id`, `method` and `params.sessionId`. Then v1 to v2 is a change of
+   method-name tables plus the cursor and state mapping, not a rewrite.
+3. **What the relay keeps per agent and per session:**
+   - It owns the agent-side JSON-RPC id space: it rewrites client ids to its own and back, so a
+     response that arrives while no client is attached (e.g. a `session/prompt` result at the
+     end of a turn) is not lost.
+   - It caches the agent's `initialize` result and answers a reattaching client from the
+     cache. The agent is initialized once, with a fixed set of client capabilities (the ones
+     Zed advertises today, `asyncTasks` / `sessionFailure` / native subagents included).
+   - A numbered, append-only log of every agent-to-client frame per session (session/update,
+     commands, config / mode, session info, the AIR async-task and subagent updates), **on disk
+     on the box** (e.g. under `~/.local/share/zed/acp-relay/<session>.log`) with a bounded
+     in-memory tail. Since the relay is permanent, it can't grow without bound in memory.
+   - Agent-to-client requests still waiting for an answer: permission prompts, elicitations,
+     any v1 fs / terminal requests. While no client is attached they stay pending, so the agent
+     blocks on a permission question exactly as it would with Zed open. Fs and terminal requests
+     the box can serve itself are answered by the relay acting as the client, the same way the
+     project would.
+   - Turn state: running or idle with its last stopReason / error, derived from prompt
+     request/response pairs and, under v2, from `state_update`.
+4. **Reattach.** On reconnect, Zed sends attach(sessionId, last seen sequence number). The relay
+   replays every frame after that number, re-sends the pending requests, and sends a synthetic
+   state frame (v2's `state_update` shape, under a fork `_meta` / extension method on v1).
+   When the cursor is older than the log, it falls back to the log on disk. Never call
+   `session/load` on a live session to catch up (claude-agent-acp issue #1011: duplicate
+   `claude --resume` children). Name the cursor and state messages the way v2 will need them
+   (`replayFrom`, `state_update`), so swapping in v2 is mostly deleting the extension.
+5. **Laptop side.**
+   - `AcpThread` / `ConversationView` get a third way in besides new and load: **attach to a
+     live session**. It applies the replayed frames as normal updates, shows pending
+     permission prompts, and sets the turn state.
+   - A dropped connection must **not** send `session/cancel` or mark the turn failed. The thread
+     shows "reconnecting…" and reattaches when the remote connection comes back.
+   - The sidebar lists the box's live relayed sessions as running threads under that machine,
+     including ones started while the laptop was away, and reopening one attaches.
+   - Stopping a turn still works as `session/cancel` through the relay.
+   - Local projects keep the plain stdio path unchanged.
+6. **Tests: the gate for this entry.** An end-to-end test with the fake remote transport and a
+   fake ACP agent covers the whole loop:
+   - start a turn;
+   - drop the connection mid-turn;
+   - while detached, the agent streams updates, asks a permission question, and finishes;
+   - reattach;
+   - assert every update arrived in order and exactly once, the permission prompt showed and
+     its answer reached the agent, and the final state is idle with the right stopReason.
+
+   Add a reattach after a log longer than the in-memory tail (disk fallback), a reattach while
+   still running, and two sequential attaches with no duplicate frames. This test is what keeps
+   the feature from silently breaking on rebases, since the spawn path is being reworked for v2
+   upstream right now (#64598, #65582 and the "Route v2" PRs). It must stay green every night.
+
+Record in the rebase log the exact upstream files touched and the hooks, so each night's
+conflicts there are easy to place, and note what to change when upstream switches Zed to ACP
+v2.
 
 ## Verification queue
 
