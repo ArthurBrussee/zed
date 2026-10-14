@@ -3685,6 +3685,10 @@ pub enum AcpThreadEvent {
     ElicitationResponded(ElicitationEntryId),
     Retry(RetryStatus),
     SubagentSpawned(acp_v2::SessionId),
+    /// An input to [`AcpThread::running_work`] moved. `cx.notify()` reaches the
+    /// thread's own views; nothing watching the thread from outside it, such as
+    /// the sidebar row, learns of a command that detached or finished.
+    RunningWorkChanged,
     Stopped {
         activity_generation: u64,
         activity_duration: Option<Duration>,
@@ -3898,6 +3902,7 @@ impl AcpThread {
                 | AcpThreadEvent::EntryUpdated(_)
                 | AcpThreadEvent::Retry(_)
                 | AcpThreadEvent::SubagentSpawned(_)
+                | AcpThreadEvent::RunningWorkChanged
                 | AcpThreadEvent::Stopped { .. }
                 | AcpThreadEvent::Error
                 | AcpThreadEvent::LoadError(_)
@@ -4222,25 +4227,73 @@ impl AcpThread {
         )
     }
 
+    /// Whether this call is still running, for the chip's spinner and the
+    /// sidebar row alike: both ask this, so a chip that spins always has a row
+    /// that says working.
+    ///
+    /// Replayed history and a call a dead agent or a cancel left `InProgress`
+    /// both read in flight forever, so outside a turn the evidence has to be
+    /// the agent saying it detached the call, a reported lifecycle, or a
+    /// process of ours still running under it.
+    pub fn tool_call_is_running(&self, call: &ToolCall, cx: &App) -> bool {
+        if let Some(state) = self.subagent_state_for_tool_call(call) {
+            return !state.is_terminal();
+        }
+        if self.tool_call_is_backgrounded(&call.id) {
+            return true;
+        }
+        if !matches!(
+            call.status(),
+            ToolCallStatus::Pending | ToolCallStatus::InProgress
+        ) {
+            return false;
+        }
+        !matches!(self.foreground_activity(), ForegroundActivity::Idle)
+            || call.terminals().any(|terminal| {
+                let terminal = terminal.read(cx);
+                terminal.is_process_backed() && terminal.output().is_none()
+            })
+    }
+
+    /// The row and the chips read the same calls through
+    /// [`Self::tool_call_is_running`], so a spinning chip above an idle row is
+    /// a bug in what the counts below gather, and names itself in the log
+    /// rather than going unnoticed.
+    fn log_running_work_disagreement(&self, cx: &App) {
+        let chips_running = self
+            .entries
+            .iter()
+            .filter(|entry| match entry {
+                AgentThreadEntry::ToolCall(call) => self.tool_call_is_running(call, cx),
+                _ => false,
+            })
+            .count();
+        if chips_running > 0 && self.running_work(cx).is_empty() {
+            log::info!(
+                "quiet-ui: row idle but {chips_running} chips running in {}",
+                self.session_id()
+            );
+        }
+    }
+
+    /// `cx.notify()` reaches this thread's own views and nothing else. The
+    /// sidebar row watches the panel's events, so every input to
+    /// [`Self::running_work`] has to say so as an event too.
+    fn running_work_changed(&mut self, cx: &mut Context<Self>) {
+        self.log_running_work_disagreement(cx);
+        cx.emit(AcpThreadEvent::RunningWorkChanged);
+        cx.notify();
+    }
+
     /// What this thread is running right now. Only work with evidence it is
     /// alive counts; replayed history counts for nothing.
     pub fn running_work(&self, cx: &App) -> RunningWork {
         let mut work = RunningWork::default();
-        // Replayed and cancelled terminals never get output, and calls can be
-        // left `InProgress` by a dead agent or a cancel. Outside a turn nobody
-        // is left to finish them, so only detached work counts then.
-        let turn_is_running = !matches!(self.foreground_activity(), ForegroundActivity::Idle);
         for entry in &self.entries {
             let AgentThreadEntry::ToolCall(call) = entry else {
                 continue;
             };
-            let in_flight = matches!(
-                call.status(),
-                ToolCallStatus::Pending
-                    | ToolCallStatus::InProgress
-                    | ToolCallStatus::WaitingForConfirmation
-            );
-            if !(in_flight && turn_is_running) && !self.tool_call_is_backgrounded(&call.id) {
+            if !self.tool_call_is_running(call, cx) {
                 continue;
             }
             work.terminals += call
@@ -4313,7 +4366,7 @@ impl AcpThread {
         cx: &mut Context<Self>,
     ) {
         if self.backgrounded_tool_calls.insert(tool_call_id) {
-            cx.notify();
+            self.running_work_changed(cx);
         }
     }
 
@@ -4336,7 +4389,7 @@ impl AcpThread {
             None => self.async_tasks.push(task),
         }
         self.settle_backgrounded_tool_calls();
-        cx.notify();
+        self.running_work_changed(cx);
     }
 
     pub fn async_task_progress(
@@ -4364,7 +4417,7 @@ impl AcpThread {
             task.output_file_path = output_file_path;
         }
         self.settle_backgrounded_tool_calls();
-        cx.notify();
+        self.running_work_changed(cx);
     }
 
     pub fn async_task_state_updated(
@@ -4386,7 +4439,7 @@ impl AcpThread {
             task.tool_call_id = tool_call_id;
         }
         self.settle_backgrounded_tool_calls();
-        cx.notify();
+        self.running_work_changed(cx);
     }
 
     fn clear_async_tasks(&mut self, cx: &mut Context<Self>) {
@@ -4395,7 +4448,7 @@ impl AcpThread {
         }
         self.async_tasks.clear();
         self.backgrounded_tool_calls.clear();
-        cx.notify();
+        self.running_work_changed(cx);
     }
 
     /// The marker never updates, so a task's terminal state releases it.
@@ -4583,7 +4636,12 @@ impl AcpThread {
             self.had_error = false;
             self.local_execution_error = None;
         }
-        cx.notify();
+        // Whether a turn is running decides which in-flight calls count.
+        if (previous == ForegroundActivity::Idle) != (current == ForegroundActivity::Idle) {
+            self.running_work_changed(cx);
+        } else {
+            cx.notify();
+        }
     }
 
     pub fn sync_local_action_state(&mut self, cx: &mut Context<Self>) {
@@ -5711,7 +5769,7 @@ impl AcpThread {
             None => self.subagents.push(subagent),
         }
         cx.emit(AcpThreadEvent::SubagentSpawned(session_id));
-        cx.notify();
+        self.running_work_changed(cx);
     }
 
     pub fn subagent_state_updated(
@@ -5731,7 +5789,7 @@ impl AcpThread {
             return;
         }
         subagent.state = state;
-        cx.notify();
+        self.running_work_changed(cx);
     }
 
     fn clear_subagents(&mut self, cx: &mut Context<Self>) {
@@ -5739,7 +5797,7 @@ impl AcpThread {
             return;
         }
         self.subagents.clear();
-        cx.notify();
+        self.running_work_changed(cx);
     }
 
     pub fn update_token_usage(&mut self, usage: Option<TokenUsage>, cx: &mut Context<Self>) {
@@ -7930,6 +7988,7 @@ impl AcpThread {
                 terminal.update(cx, |terminal, cx| {
                     terminal.watch_repository(this.project.clone(), cx)
                 });
+                this.watch_terminal_lifecycle(&terminal, cx);
                 this.terminals.insert(terminal_id, terminal.clone());
                 terminal
             })
@@ -8023,8 +8082,18 @@ impl AcpThread {
         entity.update(cx, |terminal, cx| {
             terminal.watch_repository(self.project.clone(), cx)
         });
+        self.watch_terminal_lifecycle(&entity, cx);
         self.terminals.insert(terminal_id.clone(), entity.clone());
         entity
+    }
+
+    /// A terminal we own caches its output on itself when its process exits,
+    /// which is a notify on the terminal and nothing on the thread.
+    fn watch_terminal_lifecycle(&self, terminal: &Entity<Terminal>, cx: &mut Context<Self>) {
+        cx.observe(terminal, |this, _terminal, cx| {
+            this.running_work_changed(cx);
+        })
+        .detach();
     }
 
     pub fn mark_as_subagent_output(&mut self, cx: &mut Context<Self>) {
@@ -8108,7 +8177,7 @@ impl AcpThread {
                     cx.emit(AcpThreadEvent::EntryUpdated(index));
                 }
             }
-            cx.notify();
+            this.running_work_changed(cx);
         })
         .detach();
         self.terminals.insert(terminal_id.clone(), entity.clone());
@@ -11975,6 +12044,231 @@ mod tests {
         cx.run_until_parked();
         thread.read_with(cx, |thread, cx| {
             assert!(thread.running_work(cx).is_empty());
+        });
+    }
+
+    /// The row rebuilds on the thread's events, and before this the whole
+    /// running set could move with nothing but a `cx.notify()` behind it, which
+    /// reaches the thread's own views and nothing watching from outside.
+    #[gpui::test]
+    async fn test_running_work_says_so_with_an_event(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let thread = new_test_thread(cx).await;
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&thread, {
+                let events = events.clone();
+                move |_, event, _| match event {
+                    AcpThreadEvent::RunningWorkChanged => events.borrow_mut().push("running work"),
+                    AcpThreadEvent::NewEntry => events.borrow_mut().push("new entry"),
+                    AcpThreadEvent::EntryUpdated(_) => events.borrow_mut().push("entry updated"),
+                    _ => {}
+                }
+            })
+        });
+
+        let tool_call_id = acp_v2::ToolCallId::new("bash-call");
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::ToolCall(
+                        acp_v1::ToolCall::new(
+                            acp_v1::ToolCallId::new(tool_call_id.0.clone()),
+                            "cargo test",
+                        )
+                        .kind(acp_v1::ToolKind::Execute)
+                        .status(acp_v1::ToolCallStatus::Completed),
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+        cx.run_until_parked();
+        events.borrow_mut().clear();
+
+        // The turn has ended and the agent reports the command detached, which
+        // changes no entry at all.
+        thread.update(cx, |thread, cx| {
+            thread.mark_tool_call_backgrounded(tool_call_id.clone(), cx);
+            thread.async_task_spawned(
+                AsyncTask {
+                    id: "task-1".into(),
+                    name: "cargo test".into(),
+                    description: None,
+                    state: AsyncTaskState::Running,
+                    summary: None,
+                    tool_call_id: Some(tool_call_id.clone()),
+                    output_file_path: None,
+                    can_stop: true,
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(thread.running_work(cx).async_tasks, 1);
+        });
+        assert_eq!(
+            *events.borrow(),
+            vec!["running work", "running work"],
+            "a detached command has to say so, or the row keeps what it last drew"
+        );
+
+        events.borrow_mut().clear();
+        thread.update(cx, |thread, cx| {
+            thread.async_task_state_updated("task-1", AsyncTaskState::Completed, None, None, cx);
+        });
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            assert!(thread.running_work(cx).is_empty());
+        });
+        assert_eq!(
+            *events.borrow(),
+            vec!["running work"],
+            "the row goes idle on this event alone; no other event arrives"
+        );
+    }
+
+    /// A command the turn left running has a process of ours behind it, which
+    /// is the evidence that counts outside a turn. Its exit is a notify on the
+    /// terminal and nothing on the thread, so the thread watches for it.
+    #[gpui::test]
+    async fn test_a_command_exiting_after_the_turn_says_so(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let thread = new_test_thread(cx).await;
+        cx.executor().allow_parking();
+        cx.update(|cx| cx.set_global(::terminal::HeadlessTerminal(true)));
+
+        let terminal = thread
+            .update(cx, |thread, cx| {
+                thread.create_terminal(
+                    "sleep 60".into(),
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                    None,
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("a real client process");
+        let terminal_id = terminal.read_with(cx, |terminal, _| terminal.id().clone());
+
+        let events = Rc::new(RefCell::new(0usize));
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&thread, {
+                let events = events.clone();
+                move |_, event, _| {
+                    if matches!(event, AcpThreadEvent::RunningWorkChanged) {
+                        *events.borrow_mut() += 1;
+                    }
+                }
+            })
+        });
+
+        // The call the turn left behind, with no turn running over it.
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    execute_call_with_terminal(
+                        "terminal-call",
+                        acp_v1::ToolCallStatus::InProgress,
+                        &acp_v1::TerminalId::new(terminal_id.0.clone()),
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(
+                thread.running_work(cx).terminals,
+                1,
+                "a process of ours is still running under the call"
+            );
+        });
+
+        *events.borrow_mut() = 0;
+        thread
+            .update(cx, |thread, cx| {
+                thread.kill_terminal(terminal_id.clone(), cx)
+            })
+            .expect("the terminal is ours to kill");
+        terminal
+            .read_with(cx, |terminal, _| terminal.wait_for_exit())
+            .expect("client process exit")
+            .await;
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            assert!(thread.running_work(cx).is_empty());
+        });
+        assert!(
+            *events.borrow() > 0,
+            "the exit has to reach the row, which hears only the thread's events"
+        );
+    }
+
+    /// The chip's spinner and the row's working state read the same calls
+    /// through the same predicate, so one cannot say running while the other
+    /// says idle.
+    #[gpui::test]
+    async fn test_a_spinning_chip_always_has_a_working_row(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let thread = new_test_thread(cx).await;
+
+        let running_calls = |thread: &AcpThread, cx: &App| {
+            thread
+                .entries()
+                .iter()
+                .filter(|entry| match entry {
+                    AgentThreadEntry::ToolCall(call) => thread.tool_call_is_running(call, cx),
+                    _ => false,
+                })
+                .count()
+        };
+
+        let terminal_id = acp_v1::TerminalId::new("long-command");
+        let (complete, request) = start_test_turn(&thread, cx);
+        cx.run_until_parked();
+        thread.update(cx, |thread, cx| {
+            create_display_terminal(thread, &terminal_id, cx);
+            thread
+                .handle_session_update(
+                    execute_call_with_terminal(
+                        "terminal-call",
+                        acp_v1::ToolCallStatus::InProgress,
+                        &terminal_id,
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(running_calls(thread, cx), 1);
+            assert!(!thread.running_work(cx).is_empty());
+        });
+
+        // The turn ends with the call still `InProgress`. Nobody is left to
+        // finish it, so neither the chip nor the row claims it is running.
+        complete
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .expect("turn should still be running");
+        request.await.expect("turn should complete");
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(running_calls(thread, cx), 0);
+            assert!(thread.running_work(cx).is_empty());
+        });
+
+        // Until the agent says it detached it, when both say so again.
+        thread.update(cx, |thread, cx| {
+            thread.mark_tool_call_backgrounded(acp_v2::ToolCallId::new("terminal-call"), cx);
+        });
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(running_calls(thread, cx), 1);
+            assert!(!thread.running_work(cx).is_empty());
         });
     }
 

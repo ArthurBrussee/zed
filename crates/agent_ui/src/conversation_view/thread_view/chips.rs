@@ -1696,21 +1696,10 @@ impl ThreadView {
             .and_then(|terminal| terminal.read(cx).output());
         // A detached command's call reads `completed` while it runs on, and a
         // subagent's likewise; their own reported lifecycles say otherwise.
-        let backgrounded = self
-            .thread
-            .read(cx)
-            .tool_call_is_backgrounded(&tool_call.id);
+        // The sidebar row counts the same calls with the same predicate, so a
+        // spinner here is always a working row there.
         let subagent_state = self.thread.read(cx).subagent_state_for_tool_call(tool_call);
-        let running = match subagent_state {
-            Some(state) => !state.is_terminal(),
-            None => {
-                backgrounded
-                    || matches!(
-                        tool_call.status(),
-                        ToolCallStatus::InProgress | ToolCallStatus::Pending
-                    )
-            }
-        };
+        let running = self.thread.read(cx).tool_call_is_running(tool_call, cx);
         // A user-stopped command exits non-zero but did not fail.
         let user_stopped = tool_call
             .terminals()

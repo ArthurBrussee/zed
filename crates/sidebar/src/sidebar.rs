@@ -1593,9 +1593,11 @@ impl Sidebar {
         threads.retain(|thread| thread.draft.is_none() || thread.metadata.title.is_some());
 
         // Build a lookup from live thread infos across all open workspaces.
+        // Every window's, not just this one's: a thread open in a second Zed
+        // window is as live as one in this one, and its row is drawn here too.
         let mut live_info_by_session: HashMap<acp::SessionId, ActiveThreadInfo> = HashMap::new();
-        for workspace in &workspaces {
-            for info in all_thread_infos_for_workspace(workspace, cx) {
+        for workspace in workspaces_across_windows(cx) {
+            for info in all_thread_infos_for_workspace(&workspace, cx) {
                 live_info_by_session.insert(info.session_id.clone(), info);
             }
         }
@@ -7960,6 +7962,18 @@ impl Render for Sidebar {
     }
 }
 
+/// Every open workspace in the app, this window's and every other window's.
+fn workspaces_across_windows(cx: &App) -> Vec<Entity<Workspace>> {
+    cx.windows()
+        .into_iter()
+        .filter_map(|window| window.downcast::<MultiWorkspace>())
+        .flat_map(|window| match window.read(cx) {
+            Ok(multi_workspace) => multi_workspace.workspaces().cloned().collect::<Vec<_>>(),
+            Err(_) => Vec::new(),
+        })
+        .collect()
+}
+
 fn all_thread_infos_for_workspace(
     workspace: &Entity<Workspace>,
     cx: &App,
@@ -7989,13 +8003,15 @@ fn all_thread_infos_for_workspace(
                 .is_some_and(|native_thread| native_thread.read(cx).is_generating_title());
             let session_id = thread.session_id().clone();
 
+            // A turn outranks an error from an earlier one: `had_error` is
+            // cleared when a turn starts, but a refusal reported against a
+            // finished turn sets it while the next one is already running.
             let status = if has_pending_tool_call {
                 AgentThreadStatus::WaitingForConfirmation
-            } else if thread.had_error() {
-                AgentThreadStatus::Error
             } else {
                 match thread.status() {
                     ThreadStatus::Generating => AgentThreadStatus::Running,
+                    ThreadStatus::Idle if thread.had_error() => AgentThreadStatus::Error,
                     ThreadStatus::Idle => AgentThreadStatus::Completed,
                 }
             };

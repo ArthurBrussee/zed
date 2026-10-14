@@ -3229,3 +3229,73 @@ async fn test_each_machine_offers_only_its_own_repositories(
         "the dev box's + offers only what is open there"
     );
 }
+
+/// The row used to keep whatever it last computed until an unrelated event came
+/// along, so a turn that ended with a command still running read as idle.
+#[gpui::test]
+async fn test_a_row_follows_work_the_turn_left_running(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let thread_id = open_sent_thread(&panel, cx);
+    let thread = panel.read_with(cx, |panel, cx| {
+        panel.active_agent_thread(cx).expect("a live thread")
+    });
+    let row_work = |cx: &mut gpui::VisualTestContext| {
+        let ix = row_of(&sidebar, thread_id, cx);
+        sidebar.read_with(cx, |sidebar, _cx| match &sidebar.contents.entries[ix] {
+            ListEntry::Thread(thread) => thread.running_work,
+            _ => panic!("the row should be a thread"),
+        })
+    };
+
+    assert!(
+        row_work(cx).is_empty(),
+        "the turn has ended with nothing running"
+    );
+
+    // The agent reports a detached command. Nothing else about the thread
+    // moves, so this is the only thing that can rebuild the row.
+    thread.update(cx, |thread, cx| {
+        thread.async_task_spawned(
+            acp_thread::AsyncTask {
+                id: "task-1".into(),
+                name: "cargo test".into(),
+                description: None,
+                state: acp_thread::AsyncTaskState::Running,
+                summary: None,
+                tool_call_id: None,
+                output_file_path: None,
+                can_stop: true,
+            },
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        row_work(cx),
+        RunningWork {
+            terminals: 0,
+            subagents: 0,
+            async_tasks: 1,
+        },
+        "a command the turn left running shows on the row"
+    );
+
+    thread.update(cx, |thread, cx| {
+        thread.async_task_state_updated(
+            "task-1",
+            acp_thread::AsyncTaskState::Completed,
+            None,
+            None,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    assert!(
+        row_work(cx).is_empty(),
+        "and the row goes idle when it finishes, with no other event behind it"
+    );
+}

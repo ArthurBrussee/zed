@@ -1473,6 +1473,7 @@ impl AgentDiff {
             | AcpThreadEvent::TokenUsageUpdated
             | AcpThreadEvent::NoticesUpdated
             | AcpThreadEvent::SubagentSpawned(_)
+            | AcpThreadEvent::RunningWorkChanged
             | AcpThreadEvent::EntriesRemoved(_)
             | AcpThreadEvent::ToolAuthorizationRequested(_)
             | AcpThreadEvent::ToolAuthorizationReceived(_)
