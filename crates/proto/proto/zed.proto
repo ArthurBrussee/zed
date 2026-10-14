@@ -536,7 +536,8 @@ message Envelope {
     AcpRelayClose acp_relay_close = 504;
     AcpRelayFrame acp_relay_frame = 505;
     AcpRelayListSessions acp_relay_list_sessions = 506;
-    AcpRelaySessions acp_relay_sessions = 507; // current max
+    AcpRelaySessions acp_relay_sessions = 507;
+    GetExternalAgents get_external_agents = 508; // current max
   }
 
   reserved 87 to 88;

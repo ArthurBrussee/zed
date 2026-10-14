@@ -272,6 +272,9 @@ impl AgentServer for CustomAgentServer {
                     extra_env.insert("GEMINI_API_KEY".into(), api_key);
                 }
             }
+            if let Some(store) = store.upgrade() {
+                crate::remote_agents::wait_until_registered(&store, &project, &agent_id, cx).await;
+            }
             let command = store
                 .update(cx, |store, cx| {
                     let agent = store.get_external_agent(&agent_id).with_context(|| {

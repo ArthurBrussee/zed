@@ -35,6 +35,12 @@ message ExternalAgentsUpdated {
   repeated string names = 2;
 }
 
+// quiet-ui: asked by the client once it is ready to hear the answer, since
+// the list the server pushes on connect can arrive before then.
+message GetExternalAgents {
+  uint64 project_id = 1;
+}
+
 message ExternalExtensionAgentTarget {
   string archive = 1;
   string cmd = 2;

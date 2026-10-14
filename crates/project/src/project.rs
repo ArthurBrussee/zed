@@ -1731,6 +1731,8 @@ impl Project {
             BreakpointStore::init(&remote_proto);
             GitStore::init(&remote_proto);
             AgentServerStore::init_remote(&remote_proto);
+            this.agent_server_store
+                .update(cx, |store, cx| store.refresh_remote_agents(cx));
             acp_relay_client::AcpRelayClient::init(&remote_proto);
 
             this
@@ -3947,7 +3949,10 @@ impl Project {
                 });
                 cx.emit(Event::DisconnectedFromRemote { server_not_running });
             }
-            &remote::RemoteClientEvent::Reconnected => {}
+            &remote::RemoteClientEvent::Reconnected => {
+                self.agent_server_store
+                    .update(cx, |store, cx| store.refresh_remote_agents(cx));
+            }
         }
     }
 
