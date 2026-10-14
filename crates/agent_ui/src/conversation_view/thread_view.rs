@@ -7548,11 +7548,8 @@ impl ThreadView {
                             });
                         }
                     })
-                    .entry("Stop", None, {
-                        let (store, key) = (store.clone(), key.clone());
-                        move |_, cx| {
-                            store.update(cx, |store, cx| store.stop(&key, cx));
-                        }
+                    .entry("Stop", None, move |_, cx| {
+                        store.update(cx, |store, cx| store.stop(&key, cx));
                     })
                 }))
             })

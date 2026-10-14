@@ -1842,7 +1842,7 @@ impl ThreadView {
                 let tool_call_id = tool_call.id.clone();
                 move || format!("COMMAND_CHIP-{tool_call_id}")
             })
-            .group(chip_group.clone())
+            .group(chip_group)
             .when(command_pieces.is_some(), |this| this.max_w_full())
             .when(is_expanded && has_terminals, |this| {
                 this.w_full()
@@ -2549,11 +2549,8 @@ impl ThreadView {
             )
             .cursor_pointer()
             .tooltip(Tooltip::text("Open Image"))
-            .on_click(cx.listener({
-                let image = openable.clone();
-                move |this, _, window, cx| {
-                    this.open_chip_image(image.clone(), window, cx);
-                }
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.open_chip_image(openable.clone(), window, cx);
             }))
             .into_any_element();
 
