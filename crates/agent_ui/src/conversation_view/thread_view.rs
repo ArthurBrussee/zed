@@ -1,12 +1,13 @@
 use crate::{
     DEFAULT_THREAD_TITLE, SelectPermissionGranularity,
     conversation_view::thread_search_bar::{ThreadSearchBar, ThreadSearchBarEvent},
+    dev_servers::{self, DevServerKey, DevServerState, DevServerStore, DevServerTask},
     entry_view_state::TERMINAL_CONTENT_TOP_PADDING,
     is_html_path, open_abs_path_at_point, project_path_for_file_link,
     thread_metadata_store::{ThreadId, ThreadMetadataStore, WatchedPr},
 };
 use agent_client_protocol::schema::v2 as acp_v2;
-use std::{borrow::Cow, cell::RefCell, ops::Range, path::Path};
+use std::{borrow::Cow, cell::RefCell, ops::Range, path::Path, path::PathBuf};
 
 use acp_thread::{
     AcpThreadEvent, Elicitation, ElicitationEntryId, ElicitationStatus, ForegroundActivity,
@@ -43,7 +44,7 @@ use language_model::{
     LanguageModelProviderId, LanguageModelRegistry, Speed,
 };
 use notifications::status_toast::StatusToast;
-use project::ResolvedPath;
+use project::{ResolvedPath, WorktreeId};
 use settings::{update_settings_file, update_settings_file_with_completion};
 use ui::{
     ButtonLike, CalloutBorderPosition, Checkbox, SpinnerLabel, SpinnerVariant, Tab, ToggleState,
@@ -1574,6 +1575,10 @@ impl ThreadView {
         let parent_session_id = thread.read(cx).parent_session_id().cloned();
 
         subscriptions.push(cx.observe(&thread, |_, _, cx| cx.notify()));
+        // The dev-server buttons' state lives outside the thread.
+        if let Some(dev_servers) = DevServerStore::try_global(cx) {
+            subscriptions.push(cx.observe(&dev_servers, |_, _, cx| cx.notify()));
+        }
         subscriptions.push(cx.observe(&conversation, |_, _, cx| cx.notify()));
 
         let has_slash_completions = session_capabilities.read().has_slash_completions();
@@ -7255,6 +7260,9 @@ impl ThreadView {
                                     )),
                             )
                             .children(self.render_thread_pr_controls(cx))
+                            // A dev server belongs to a worktree, and a draft's
+                            // worktree may not be the one it ends up in.
+                            .children(self.render_dev_server_buttons(cx))
                     })
                     .children(self.render_discard_protected_draft_button(cx))
                     .children(self.render_input_activity_pill(cx))
@@ -7289,6 +7297,169 @@ impl ThreadView {
                 )
                 .into_any_element(),
         )
+    }
+
+    /// The thread's own worktree. A thread's workspace holds one in this fork,
+    /// and that is what a `bar` task's `$ZED_WORKTREE_ROOT` resolves to, so
+    /// two worktrees of a repository each run their own server.
+    fn dev_server_worktree(&self, cx: &App) -> Option<(WorktreeId, PathBuf)> {
+        let project = self.thread.read(cx).project().read(cx);
+        let worktree = project.visible_worktrees(cx).next()?;
+        let worktree = worktree.read(cx);
+        Some((worktree.id(), worktree.abs_path().to_path_buf()))
+    }
+
+    /// One button per `bar` task this worktree offers; none at all is the
+    /// ordinary case, and draws nothing.
+    fn render_dev_server_buttons(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let Some(store) = DevServerStore::try_global(cx) else {
+            return Vec::new();
+        };
+        let Some((worktree_id, worktree_root)) = self.dev_server_worktree(cx) else {
+            return Vec::new();
+        };
+        let project = self.thread.read(cx).project().clone();
+        dev_servers::bar_tasks(&project, worktree_id, cx)
+            .into_iter()
+            .enumerate()
+            .map(|(index, task)| {
+                let key = DevServerKey::new(&worktree_root, &task.label);
+                let state = store.read(cx).state(&key).cloned();
+                self.render_dev_server_button(index, task, key, state, &worktree_root, cx)
+            })
+            .collect()
+    }
+
+    fn render_dev_server_button(
+        &self,
+        index: usize,
+        task: DevServerTask,
+        key: DevServerKey,
+        state: Option<DevServerState>,
+        worktree_root: &Path,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let running = matches!(
+            state,
+            Some(DevServerState::Starting | DevServerState::Running { .. })
+        );
+        let port = match &state {
+            Some(DevServerState::Running { port }) => *port,
+            _ => None,
+        };
+        let exit_code = match &state {
+            Some(DevServerState::Exited { code }) => *code,
+            _ => None,
+        };
+        let failed = exit_code.is_some_and(|code| code != 0);
+
+        let label = match port {
+            Some(port) => SharedString::from(format!("{} :{port}", task.label)),
+            None => task.label.clone(),
+        };
+        let tooltip = match &state {
+            Some(DevServerState::Starting) => format!("{} is starting", task.label),
+            Some(DevServerState::Running { port: Some(port) }) => {
+                format!("{} is running on port {port}", task.label)
+            }
+            Some(DevServerState::Running { port: None }) => {
+                format!("{} is running; it has not printed a URL yet", task.label)
+            }
+            Some(DevServerState::Exited { code: Some(code) }) => {
+                format!("{} exited (code {code})", task.label)
+            }
+            Some(DevServerState::Exited { code: None }) => format!("{} exited", task.label),
+            None => format!("Start {}", task.label),
+        };
+
+        let content = h_flex()
+            .px_1()
+            .py_0p5()
+            .gap_1()
+            .rounded_md()
+            .border_1()
+            .border_color(if failed {
+                cx.theme().status().error_border
+            } else {
+                cx.theme().colors().border
+            })
+            .child(
+                Icon::new(task.icon)
+                    .size(IconSize::XSmall)
+                    .color(if running {
+                        Color::Accent
+                    } else if failed {
+                        Color::Error
+                    } else {
+                        Color::Muted
+                    }),
+            )
+            .child(
+                Label::new(label)
+                    .size(LabelSize::Small)
+                    .color(if running { Color::Default } else { Color::Muted })
+                    .buffer_font(cx),
+            );
+        let chip = ButtonLike::new(("dev-server-chip", index))
+            .style(ButtonStyle::Transparent)
+            .child(content);
+
+        if !running {
+            let worktree_root = worktree_root.to_path_buf();
+            let workspace = self.workspace.clone();
+            return chip
+                .tooltip(Tooltip::text(tooltip))
+                .on_click(move |_, window, cx| {
+                    let Some(workspace) = workspace.upgrade() else {
+                        return;
+                    };
+                    let Some(store) = DevServerStore::try_global(cx) else {
+                        return;
+                    };
+                    store.update(cx, |store, cx| {
+                        store.start(&task, &worktree_root, &workspace, window, cx);
+                    });
+                })
+                .into_any_element();
+        }
+
+        let workspace = self.workspace.clone();
+        PopoverMenu::new(("dev-server-menu", index))
+            .trigger_with_tooltip(chip, move |_window, cx| Tooltip::simple(&tooltip, cx))
+            .anchor(gpui::Anchor::BottomLeft)
+            .menu(move |window, cx| {
+                let workspace = workspace.upgrade()?;
+                let store = DevServerStore::try_global(cx)?;
+                let key = key.clone();
+                let task = task.clone();
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    menu.entry("Open", None, {
+                        let (store, workspace, key, task) =
+                            (store.clone(), workspace.clone(), key.clone(), task.clone());
+                        move |_, cx| {
+                            store.update(cx, |store, cx| {
+                                store.open(&key, &task, &workspace, cx);
+                            });
+                        }
+                    })
+                    .entry("Show Output", None, {
+                        let (store, workspace, key) =
+                            (store.clone(), workspace.clone(), key.clone());
+                        move |window, cx| {
+                            store.update(cx, |store, cx| {
+                                store.show_output(&key, &workspace, window, cx);
+                            });
+                        }
+                    })
+                    .entry("Stop", None, {
+                        let (store, key) = (store.clone(), key.clone());
+                        move |_, cx| {
+                            store.update(cx, |store, cx| store.stop(&key, cx));
+                        }
+                    })
+                }))
+            })
+            .into_any_element()
     }
 
     fn render_thread_pr_controls(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {

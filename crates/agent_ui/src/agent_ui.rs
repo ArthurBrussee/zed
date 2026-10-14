@@ -10,6 +10,7 @@ mod config_options;
 mod context;
 mod context_server_configuration;
 pub(crate) mod conversation_view;
+pub mod dev_servers;
 mod diagnostics;
 pub mod draft_prompt_store;
 mod entry_view_state;
@@ -811,6 +812,8 @@ pub fn init(
     context_server_configuration::init(language_registry, fs.clone(), cx);
     thread_metadata_store::init(cx);
     terminal_thread_metadata_store::init(cx);
+    // The bottom bar and the sidebar both read it, so it exists before either.
+    dev_servers::DevServerStore::global(cx);
 
     inline_assistant::init(fs.clone(), prompt_builder.clone(), cx);
     terminal_inline_assistant::init(fs.clone(), prompt_builder, cx);

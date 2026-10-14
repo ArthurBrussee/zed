@@ -924,6 +924,12 @@ impl Sidebar {
         })
         .detach();
 
+        // A dev server's port is read when a row draws, so a redraw is enough.
+        if let Some(dev_servers) = agent_ui::dev_servers::DevServerStore::try_global(cx) {
+            cx.observe(&dev_servers, |_this, _store, cx| cx.notify())
+                .detach();
+        }
+
         if let Some(gh_store) = GhStatusStore::try_global(cx) {
             cx.observe(&gh_store, |this, _store, cx| {
                 this.persist_pr_snapshots(cx);
@@ -6587,6 +6593,7 @@ impl Sidebar {
             .running_terminals(thread.running_work.terminals)
             .running_async_tasks(thread.running_work.async_tasks)
             .running_subagents(thread.running_work.subagents)
+            .dev_server(self.dev_server_label(&thread.metadata, cx))
             .when(thread.diff_stats.lines_added > 0, |this| {
                 this.added(thread.diff_stats.lines_added as usize)
             })
@@ -7963,6 +7970,17 @@ impl Render for Sidebar {
 }
 
 /// Every open workspace in the app, this window's and every other window's.
+/// What a dev server running for this thread's worktree says on the row: the
+/// port once it is known. Read-only here; it is started and stopped from the
+/// thread's own bottom bar.
+impl Sidebar {
+    fn dev_server_label(&self, metadata: &ThreadMetadata, cx: &App) -> Option<SharedString> {
+        let store = agent_ui::dev_servers::DevServerStore::try_global(cx)?;
+        let roots = metadata.folder_paths().paths().to_vec();
+        store.read(cx).row_label(&roots)
+    }
+}
+
 fn workspaces_across_windows(cx: &App) -> Vec<Entity<Workspace>> {
     cx.windows()
         .into_iter()

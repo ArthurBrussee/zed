@@ -577,6 +577,8 @@ pub struct ThreadItem {
     running_terminals: usize,
     running_async_tasks: usize,
     running_subagents: usize,
+    /// A dev server running for this thread's worktree, read-only here.
+    dev_server: Option<SharedString>,
     project_paths: Option<Arc<[PathBuf]>>,
     project_name: Option<SharedString>,
     worktrees: Vec<ThreadItemWorktreeInfo>,
@@ -617,6 +619,7 @@ impl ThreadItem {
             running_terminals: 0,
             running_async_tasks: 0,
             running_subagents: 0,
+            dev_server: None,
             project_paths: None,
             project_name: None,
             worktrees: Vec::new(),
@@ -632,6 +635,11 @@ impl ThreadItem {
 
     pub fn size(mut self, size: impl Into<SharedString>) -> Self {
         self.size = size.into();
+        self
+    }
+
+    pub fn dev_server(mut self, dev_server: Option<SharedString>) -> Self {
+        self.dev_server = dev_server;
         self
     }
 
@@ -999,6 +1007,8 @@ impl RenderOnce for ThreadItem {
         let has_project_paths = project_paths.is_some();
         let has_timestamp = !self.timestamp.is_empty();
         let timestamp = self.timestamp;
+        let dev_server = self.dev_server.clone();
+        let has_dev_server = dev_server.is_some();
         let has_size = !self.size.is_empty();
         let size = self.size;
 
@@ -1179,8 +1189,23 @@ impl RenderOnce for ThreadItem {
                             PrChip::new(("pr-chip", chip_ix), chip).surface(base_bg)
                         }))
                     })
+                    .when_some(dev_server, |this, dev_server| {
+                        this.when(
+                            has_project_name || has_project_paths || has_worktree || has_pr_chips,
+                            |this| this.child(dot_separator()),
+                        )
+                        .child(
+                            Label::new(dev_server)
+                                .size(LabelSize::Small)
+                                .color(Color::Accent),
+                        )
+                    })
                     .when(
-                        (has_project_name || has_project_paths || has_worktree || has_pr_chips)
+                        (has_project_name
+                            || has_project_paths
+                            || has_worktree
+                            || has_pr_chips
+                            || has_dev_server)
                             && (has_diff_stats || has_size || has_timestamp),
                         |this| this.child(dot_separator()),
                     )

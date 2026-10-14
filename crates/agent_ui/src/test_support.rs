@@ -115,6 +115,7 @@ pub fn init_test(cx: &mut TestAppContext) {
         release_channel::init("0.0.0".parse().unwrap(), cx);
         agent_panel::init(cx);
         crate::terminal_thread_metadata_store::TerminalThreadMetadataStore::init_global(cx);
+        crate::dev_servers::DevServerStore::global(cx);
     });
 }
 
