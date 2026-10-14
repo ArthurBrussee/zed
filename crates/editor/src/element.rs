@@ -3496,13 +3496,34 @@ impl EditorElement {
             }
         };
 
+        // A custom block that lays out taller than its rows reports the new
+        // height below and has its rows re-reserved. Every other block's rows
+        // are the block map's own and nothing carries a remeasure back to it,
+        // so an element taller than them paints over whatever follows — and a
+        // collapsed file leaves nothing beneath its header to absorb it, since
+        // its block replaces the rows the file had. Hold it to its rows.
+        let rows_reserved = (!matches!(block_id, BlockId::Custom(_)) || !block.has_height())
+            .then(|| block.height())
+            .filter(|height| *height > 0)
+            .map(|height| line_height * height as f32);
+
         // Discover the element's content height, then round up to the nearest multiple of line height.
         let preliminary_size = element.layout_as_root(
             size(available_width, AvailableSpace::MinContent),
             window,
             cx,
         );
-        let quantized_height = (preliminary_size.height / line_height).ceil() * line_height;
+        let mut quantized_height = (preliminary_size.height / line_height).ceil() * line_height;
+        if let Some(rows_reserved) = rows_reserved
+            && quantized_height > rows_reserved
+        {
+            log::info!(
+                "quiet-ui layout: block {block_id:?} wanted {:.0}px of the {:.0}px its rows give it",
+                f32::from(quantized_height),
+                f32::from(rows_reserved),
+            );
+            quantized_height = rows_reserved;
+        }
         let final_size = if preliminary_size.height == quantized_height {
             preliminary_size
         } else {
