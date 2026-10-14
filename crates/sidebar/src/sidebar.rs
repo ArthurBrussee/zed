@@ -1,3 +1,4 @@
+mod machine_load;
 mod thread_switcher;
 
 use acp_thread::{RunningWork, ThreadStatus};
@@ -793,6 +794,9 @@ pub struct Sidebar {
     draft_typing_task: Option<Task<()>>,
     restoring_tasks: HashMap<agent_ui::ThreadId, Task<()>>,
     recent_projects_popover_handle: PopoverMenuHandle<SidebarRecentProjects>,
+    /// The footer's per-machine load, refreshed by the poll below.
+    machine_loads: HashMap<machine_load::MachineKey, machine_load::MachineLoad>,
+    _machine_load_poll: Option<Task<()>>,
     /// (repo path, branch) pairs watched in the [`GhStatusStore`].
     gh_watched_branches: HashSet<(PathBuf, String)>,
     /// PRs watched by number: (working directory, repository, number).
@@ -942,6 +946,12 @@ impl Sidebar {
                 .detach();
         }
 
+        // And so is the footer's plan usage.
+        if let Some(plan_usage) = acp_thread::plan_usage::PlanUsageStore::try_global(cx) {
+            cx.observe(&plan_usage, |_this, _store, cx| cx.notify())
+                .detach();
+        }
+
         if let Some(gh_store) = GhStatusStore::try_global(cx) {
             cx.observe(&gh_store, |this, _store, cx| {
                 this.persist_pr_snapshots(cx);
@@ -1008,6 +1018,8 @@ impl Sidebar {
             draft_typing_task: None,
             restoring_tasks: HashMap::new(),
             recent_projects_popover_handle: PopoverMenuHandle::default(),
+            machine_loads: HashMap::new(),
+            _machine_load_poll: None,
             gh_watched_branches: HashSet::new(),
             gh_watched_prs: HashSet::new(),
             collapsed_worktrees: HashSet::new(),
@@ -7855,6 +7867,240 @@ impl Focusable for Sidebar {
     }
 }
 
+impl Sidebar {
+    /// One muted line at the bottom: what is left of the plan, what each
+    /// machine is doing, and what is running across every thread. Each part is
+    /// absent until something has reported it, so an idle laptop-only sidebar
+    /// draws no footer at all.
+    fn render_footer(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        self.start_machine_load_poll(cx);
+        let mut items: Vec<AnyElement> = Vec::new();
+        items.extend(self.render_plan_usage(cx));
+        items.extend(self.render_machine_loads(cx));
+        items.extend(self.render_running_totals(cx));
+        if items.is_empty() {
+            return None;
+        }
+        let last = items.len() - 1;
+        Some(
+            h_flex()
+                .w_full()
+                .flex_none()
+                .px_2()
+                .py_0p5()
+                .gap_1()
+                .border_t_1()
+                .border_color(cx.theme().colors().border)
+                .children(items.into_iter().enumerate().flat_map(|(index, item)| {
+                    let mut pair = vec![item];
+                    if index != last {
+                        pair.push(
+                            Label::new("·")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .into_any_element(),
+                        );
+                    }
+                    pair
+                }))
+                .into_any_element(),
+        )
+    }
+
+    fn start_machine_load_poll(&mut self, cx: &mut Context<Self>) {
+        if self._machine_load_poll.is_some() {
+            return;
+        }
+        self._machine_load_poll = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let Ok(reading) = this.update(cx, |_this, cx| {
+                    machine_load::read_machine_loads(&workspaces_across_windows(cx), cx)
+                }) else {
+                    return;
+                };
+                let loads = reading.await;
+                let applied = this.update(cx, |this, cx| {
+                    if this.machine_loads != loads {
+                        this.machine_loads = loads;
+                        cx.notify();
+                    }
+                });
+                if applied.is_err() {
+                    return;
+                }
+                cx.background_executor()
+                    .timer(machine_load::POLL_INTERVAL)
+                    .await;
+            }
+        }));
+    }
+
+    /// `5h 42% · wk 18%`, amber past 80% and red at the limit. Nothing at all
+    /// until Claude has reported something.
+    fn render_plan_usage(&self, cx: &App) -> Option<AnyElement> {
+        use acp_thread::plan_usage::{PlanUsageStore, UsageWindow};
+
+        let store = PlanUsageStore::try_global(cx)?;
+        let store = store.read(cx);
+        let windows: Vec<_> = store
+            .windows()
+            .into_iter()
+            .filter(|(window, _)| {
+                matches!(window, UsageWindow::FiveHour | UsageWindow::SevenDay)
+            })
+            .collect();
+        if windows.is_empty() {
+            return None;
+        }
+        let mut tooltip = String::new();
+        for (window, usage) in &store.windows() {
+            let percent = match usage.utilization {
+                Some(utilization) => format!("{utilization:.0}%"),
+                None => "unknown".to_string(),
+            };
+            tooltip.push_str(&format!("{}: {percent}", window.full_label()));
+            if let Some(reset) = usage
+                .resets_at
+                .and_then(acp_thread::plan_usage::reset_label)
+            {
+                tooltip.push_str(&format!(", resets at {reset}"));
+            }
+            tooltip.push('\n');
+        }
+        Some(
+            h_flex()
+                .id("sidebar-plan-usage")
+                .gap_1()
+                .children(windows.into_iter().map(|(window, usage)| {
+                    let (text, color) = plan_usage_label(window, &usage);
+                    Label::new(text).size(LabelSize::Small).color(color)
+                }))
+                .tooltip(Tooltip::text(tooltip.trim_end().to_string()))
+                .into_any_element(),
+        )
+    }
+
+    /// One item per machine, labelled as its group header is.
+    fn render_machine_loads(&self, cx: &App) -> Vec<AnyElement> {
+        if self.machine_loads.is_empty() {
+            return Vec::new();
+        }
+        let machines = self
+            .multi_workspace
+            .upgrade()
+            .map(|multi_workspace| {
+                let mw = multi_workspace.read(cx);
+                let workspaces: Vec<_> = mw.workspaces().cloned().collect();
+                Self::open_machines(mw, &workspaces, cx)
+            })
+            .unwrap_or_default();
+        self.machine_load_labels(&machines)
+            .into_iter()
+            .map(|(label, reading, tooltip)| {
+                h_flex()
+                    .id(SharedString::from(format!("load-{label}")))
+                    .gap_1()
+                    .child(
+                        Label::new(label)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(reading)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .tooltip(Tooltip::text(tooltip))
+                    .into_any_element()
+            })
+            .collect()
+    }
+
+    /// A machine with no reading yet shows nothing for itself, rather than a
+    /// zero that would read as idle.
+    fn machine_load_labels(
+        &self,
+        machines: &[MachineGroup],
+    ) -> Vec<(SharedString, SharedString, String)> {
+        machines
+            .iter()
+            .filter_map(|machine| {
+                let load = self.machine_loads.get(&machine.host)?;
+                Some((
+                    machine.label.clone(),
+                    load.label(),
+                    format!(
+                        "{}: load average {:.2} over the last minute",
+                        machine.label, load.one_minute
+                    ),
+                ))
+            })
+            .collect()
+    }
+
+    fn render_running_totals(&self, _cx: &App) -> Option<AnyElement> {
+        Some(
+            Label::new(self.running_totals()?)
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .into_any_element(),
+        )
+    }
+
+    /// What is running, summed over every thread the rows know about.
+    fn running_totals(&self) -> Option<SharedString> {
+        let mut agents = 0usize;
+        let mut work = RunningWork::default();
+        for entry in &self.contents.entries {
+            let ListEntry::Thread(thread) = entry else {
+                continue;
+            };
+            if thread.status == AgentThreadStatus::Running {
+                agents += 1;
+            }
+            work.terminals += thread.running_work.terminals;
+            work.subagents += thread.running_work.subagents;
+            work.async_tasks += thread.running_work.async_tasks;
+        }
+        let parts: Vec<String> = [
+            (agents, "agent"),
+            (work.terminals + work.async_tasks, "command"),
+            (work.subagents, "subagent"),
+        ]
+        .into_iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, noun)| {
+            format!("{count} {noun}{}", if count == 1 { "" } else { "s" })
+        })
+        .collect();
+        if parts.is_empty() {
+            return None;
+        }
+        Some(parts.join(" · ").into())
+    }
+}
+
+/// What a usage window says on the footer: amber past 80%, red at the limit.
+fn plan_usage_label(
+    window: acp_thread::plan_usage::UsageWindow,
+    usage: &acp_thread::plan_usage::WindowUsage,
+) -> (String, Color) {
+    use acp_thread::plan_usage::UsageStatus;
+
+    let color = match (usage.status, usage.utilization) {
+        (UsageStatus::Rejected, _) => Color::Error,
+        (_, Some(utilization)) if utilization >= 100.0 => Color::Error,
+        (UsageStatus::Warning, _) => Color::Warning,
+        (_, Some(utilization)) if utilization >= 80.0 => Color::Warning,
+        _ => Color::Muted,
+    };
+    let text = match usage.utilization {
+        Some(utilization) => format!("{} {utilization:.0}%", window.short_label()),
+        None => format!("{} at limit", window.short_label()),
+    };
+    (text, color)
+}
+
 impl Render for Sidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let _titlebar_height = ui::utils::platform_title_bar_height(window);
@@ -7985,14 +8231,16 @@ impl Render for Sidebar {
                     this.child(self.render_cross_channel_import_onboarding(verbose, cx))
                 })
             })
+            .when(!no_open_projects, |this| {
+                this.children(self.render_footer(cx))
+            })
     }
 }
 
-/// Every open workspace in the app, this window's and every other window's.
-/// What a dev server running for this thread's worktree says on the row: the
-/// port once it is known. Read-only here; it is started and stopped from the
-/// thread's own bottom bar.
 impl Sidebar {
+    /// What a dev server running for this thread's worktree says on the row:
+    /// the port once it is known. Read-only here; it is started and stopped
+    /// from the thread's own bottom bar.
     fn dev_server_label(&self, metadata: &ThreadMetadata, cx: &App) -> Option<SharedString> {
         let store = agent_ui::dev_servers::DevServerStore::try_global(cx)?;
         let roots = metadata.folder_paths().paths().to_vec();
@@ -8000,6 +8248,7 @@ impl Sidebar {
     }
 }
 
+/// Every open workspace in the app, this window's and every other window's.
 fn workspaces_across_windows(cx: &App) -> Vec<Entity<Workspace>> {
     cx.windows()
         .into_iter()

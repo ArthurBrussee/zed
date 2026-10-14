@@ -814,6 +814,8 @@ pub fn init(
     terminal_thread_metadata_store::init(cx);
     // The bottom bar and the sidebar both read it, so it exists before either.
     dev_servers::DevServerStore::global(cx);
+    // The footer observes it, so it is there to be observed from the start.
+    acp_thread::plan_usage::init(cx);
 
     inline_assistant::init(fs.clone(), prompt_builder.clone(), cx);
     terminal_inline_assistant::init(fs.clone(), prompt_builder, cx);

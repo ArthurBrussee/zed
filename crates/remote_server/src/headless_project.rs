@@ -312,6 +312,7 @@ impl HeadlessProject {
         session.add_request_handler(cx.weak_entity(), Self::handle_shutdown_remote_server);
         session.add_request_handler(cx.weak_entity(), Self::handle_ping);
         session.add_request_handler(cx.weak_entity(), Self::handle_get_processes);
+        session.add_request_handler(cx.weak_entity(), Self::handle_get_system_load);
         session.add_request_handler(cx.weak_entity(), Self::handle_get_remote_profiling_data);
 
         session.add_entity_request_handler(Self::handle_add_worktree);
@@ -1374,6 +1375,18 @@ impl HeadlessProject {
     ) -> Result<proto::Ack> {
         log::debug!("Received ping from client");
         Ok(proto::Ack {})
+    }
+
+    /// What this machine is doing, for the sidebar's per-machine load.
+    async fn handle_get_system_load(
+        _this: Entity<Self>,
+        _envelope: TypedEnvelope<proto::GetSystemLoad>,
+        _cx: AsyncApp,
+    ) -> Result<proto::SystemLoadResponse> {
+        Ok(proto::SystemLoadResponse {
+            load_average_one: System::load_average().one,
+            cpu_count: System::physical_core_count().unwrap_or(0) as u32,
+        })
     }
 
     async fn handle_get_processes(

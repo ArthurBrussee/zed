@@ -11,6 +11,7 @@ pub mod elicitation;
 mod mention;
 pub mod notices;
 mod pr_mentions;
+pub mod plan_usage;
 pub mod prompt_capabilities;
 mod submission;
 mod terminal;
@@ -5895,6 +5896,8 @@ impl AcpThread {
         let usage = self.token_usage.get_or_insert_with(Default::default);
         usage.max_tokens = update.size;
         usage.used_tokens = update.used;
+        // A rate-limit report rides along on the same update.
+        plan_usage::note_usage_update(update.meta.as_ref(), cx);
         // The schema uses Option for cost, so omission and null both mean no new report.
         if let Some(cost) = update.cost {
             self.cost = Some(SessionCost {

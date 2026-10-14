@@ -219,31 +219,6 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
-**A sidebar footer: plan usage, CPU load, and what is running.**
-
-Arthur wants a small footer at the bottom of the sidebar with three things.
-
-1. **Plan usage %.** His transcripts have 16 out-of-credits and 15 session-limit stops. The Claude
-   adapter forwards Claude Code's rate-limit events as `usage_update` session updates carrying
-   `_meta["_claude/rateLimit"]` (the SDK's `rate_limit_info`: status, utilization, reset time,
-   which window; `case "rate_limit_event"` in `dist/acp-agent.js`). Its `/usage` returns a
-   structured `rate_limits` object (`five_hour` and `seven_day` utilization and `resets_at`;
-   `dist/usage-markdown.js`). Keep the latest values per account across Claude threads and show
-   `5h 42% · wk 18%`, with the reset times in a tooltip. Amber past 80%, red at the limit, and
-   nothing at all until something has been reported.
-2. **CPU load per machine.** The laptop's, and each connected dev box's, since the box is where
-   the heavy work goes now. A load average or CPU %, refreshed every few seconds, cheap to read
-   (sysinfo locally; for a box, over the existing remote connection, e.g. a light periodic RPC
-   or reading `/proc/loadavg` through the project, not a new SSH session per tick). One short
-   item per machine, labelled like the machine groups.
-3. **Totals of what is running**: threads working, commands running, subagents running, summed
-   across all threads from the same `running_work` the activity pills use, e.g. `3 agents ·
-   5 commands · 2 subagents`.
-
-Keep it one line, muted, out of the way. Test: fake rate-limit meta updates the usage item, the
-totals follow `running_work` across two threads, and a machine with no load reading shows
-nothing for it.
-
 **The git diff: fix the collapse overlap, and group it into code, tests and generated, each
 with its own stats.**
 

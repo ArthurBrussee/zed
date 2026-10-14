@@ -3376,3 +3376,141 @@ async fn test_a_row_says_why_a_thread_stopped(cx: &mut TestAppContext) {
         "a turn that ended with work still running says so"
     );
 }
+
+#[gpui::test]
+fn test_the_footer_says_what_is_left_of_the_plan(_cx: &mut TestAppContext) {
+    use acp_thread::plan_usage::{UsageStatus, UsageWindow, WindowUsage};
+
+    let usage = |status, utilization| WindowUsage {
+        status,
+        utilization,
+        resets_at: None,
+    };
+    assert_eq!(
+        plan_usage_label(UsageWindow::FiveHour, &usage(UsageStatus::Allowed, Some(42.0))),
+        ("5h 42%".to_string(), Color::Muted)
+    );
+    assert_eq!(
+        plan_usage_label(UsageWindow::SevenDay, &usage(UsageStatus::Allowed, Some(83.0))),
+        ("wk 83%".to_string(), Color::Warning),
+        "amber past 80%"
+    );
+    assert_eq!(
+        plan_usage_label(UsageWindow::SevenDay, &usage(UsageStatus::Allowed, Some(100.0))),
+        ("wk 100%".to_string(), Color::Error)
+    );
+    assert_eq!(
+        plan_usage_label(UsageWindow::FiveHour, &usage(UsageStatus::Rejected, None)),
+        ("5h at limit".to_string(), Color::Error),
+        "a rejection need not carry a percentage to be the limit"
+    );
+    assert_eq!(
+        plan_usage_label(UsageWindow::FiveHour, &usage(UsageStatus::Warning, Some(12.0))),
+        ("5h 12%".to_string(), Color::Warning),
+        "the report's own warning counts whatever the percentage says"
+    );
+}
+
+#[gpui::test]
+async fn test_the_footer_totals_what_is_running(cx: &mut TestAppContext) {
+    let now = Utc::now();
+    let busy = |title: &str, agents: bool, work: RunningWork| {
+        let mut entry = test_thread_entry(title, "/project", now);
+        entry.status = if agents {
+            ui::AgentThreadStatus::Running
+        } else {
+            ui::AgentThreadStatus::Completed
+        };
+        entry.running_work = work;
+        ListEntry::Thread(Arc::new(entry))
+    };
+
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    let project = project::Project::test(fs, [], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    sidebar.update(cx, |sidebar, _cx| {
+        assert_eq!(sidebar.running_totals(), None, "nothing is running");
+        sidebar.contents.entries = vec![
+            busy(
+                "one",
+                true,
+                RunningWork {
+                    terminals: 2,
+                    subagents: 1,
+                    async_tasks: 0,
+                },
+            ),
+            busy(
+                "two",
+                true,
+                RunningWork {
+                    terminals: 0,
+                    subagents: 1,
+                    async_tasks: 1,
+                },
+            ),
+            busy("three", false, RunningWork::default()),
+        ];
+        assert_eq!(
+            sidebar.running_totals().map(|total| total.to_string()),
+            Some("2 agents · 3 commands · 2 subagents".to_string()),
+            "summed across threads, with a detached command counted as a command"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_a_machine_with_no_reading_says_nothing_for_itself(cx: &mut TestAppContext) {
+    let devbox = mock_host(7);
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    let project = project::Project::test(fs, [], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    let machines = vec![machine("This Mac", None), machine("mock-7", Some(devbox.clone()))];
+
+    sidebar.update(cx, |sidebar, _cx| {
+        sidebar.machine_loads.insert(
+            None,
+            crate::machine_load::MachineLoad {
+                one_minute: 4.0,
+                cpu_count: Some(8),
+            },
+        );
+        let labels: Vec<_> = sidebar
+            .machine_load_labels(&machines)
+            .into_iter()
+            .map(|(label, reading, _)| (label.to_string(), reading.to_string()))
+            .collect();
+        assert_eq!(
+            labels,
+            vec![("This Mac".to_string(), "50%".to_string())],
+            "the box has not answered yet, so it gets no item rather than a zero"
+        );
+
+        sidebar.machine_loads.insert(
+            Some(devbox),
+            crate::machine_load::MachineLoad {
+                one_minute: 12.0,
+                cpu_count: Some(16),
+            },
+        );
+        let labels: Vec<_> = sidebar
+            .machine_load_labels(&machines)
+            .into_iter()
+            .map(|(label, reading, _)| (label.to_string(), reading.to_string()))
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                ("This Mac".to_string(), "50%".to_string()),
+                ("mock-7".to_string(), "75%".to_string()),
+            ],
+        );
+    });
+}
