@@ -219,6 +219,25 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**Add a machine from the sidebar, and keep its group once it has been used.**
+
+Arthur, 2026-10-14, after the machine groups landed: "how do I add it now?" The sidebar has
+no way in. A machine group only appears once a project on that machine is open, and the way to
+open one is upstream's `projects::OpenRemote` (ctrl-cmd-o), which nothing in the sidebar points
+to. Two changes:
+- An "Add Machine…" entry in the sidebar (the top `+`'s menu or the machine area's header)
+  that dispatches `projects::OpenRemote { from_existing_connection: false }`, so adding an SSH
+  host and picking its folder is upstream's own flow.
+- A machine that has been used keeps its group after its windows close: every host in the
+  user's `ssh_connections` settings that has projects listed there. Its `+` opens that host's
+  most recent project from `ssh_connections` (connecting if needed, through upstream's
+  `open_remote_project`), then makes the worktree thread there the way the group's `+` does
+  now. Its threads stay listed under it, as closed-workspace rows already are. A host the user
+  removes from `ssh_connections` loses its group.
+
+Test: with an `ssh_connections` entry and no window open on it, the group renders, and its `+`
+connects (fake remote transport) and creates the worktree thread on that host.
+
 **The memory baselines: what it would take, and the one measurement that would justify it.**
 
 Decided on 2026-10-07 by reading the code; the 10-05 findings and the 10-07 rebase log entry hold
