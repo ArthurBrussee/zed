@@ -2080,28 +2080,40 @@ impl Sidebar {
         machines: &[MachineGroup],
         cx: &App,
     ) -> Vec<ListEntry> {
-        if machines.len() < 2 {
-            return Self::group_rows_by_workspace(rows);
-        }
         let host_of = |entry: &ListEntry| match entry {
             ListEntry::Thread(thread) => Some(thread.workspace.host(cx)),
             ListEntry::Terminal(terminal) => Some(terminal.workspace.host(cx)),
             _ => None,
         };
-        let mut out: Vec<ListEntry> = Vec::with_capacity(rows.len() + machines.len());
+        let rows_of = |machine: &MachineGroup| -> Vec<usize> {
+            rows.iter()
+                .enumerate()
+                .filter(|(_, row)| {
+                    host_of(row).is_some_and(|host| {
+                        same_remote_connection_identity(host.as_ref(), machine.host.as_ref())
+                    })
+                })
+                .map(|(index, _)| index)
+                .collect()
+        };
+        // A machine is present when something of its own is listed, or when a
+        // thread could be made on it: a box connected a moment ago is where the
+        // next thread is going, and it needs its own `+` before it has any.
+        let present: Vec<(&MachineGroup, Vec<usize>)> = machines
+            .iter()
+            .map(|machine| (machine, rows_of(machine)))
+            .filter(|(machine, mine)| !mine.is_empty() || machine.can_create_thread)
+            .collect();
+        if present.len() < 2 {
+            return Self::group_rows_by_workspace(rows);
+        }
+        let mut out: Vec<ListEntry> = Vec::with_capacity(rows.len() + present.len());
         let mut grouped = vec![false; rows.len()];
-        for machine in machines {
-            let mut mine: Vec<ListEntry> = Vec::new();
-            for (row, taken) in rows.iter().zip(&mut grouped) {
-                let Some(host) = host_of(row) else { continue };
-                if same_remote_connection_identity(host.as_ref(), machine.host.as_ref()) {
-                    *taken = true;
-                    mine.push(row.clone());
-                }
-            }
-            // A machine with nothing open gets no group.
-            if mine.is_empty() {
-                continue;
+        for (machine, indices) in &present {
+            let mut mine: Vec<ListEntry> = Vec::with_capacity(indices.len());
+            for index in indices {
+                grouped[*index] = true;
+                mine.push(rows[*index].clone());
             }
             let mut running_work = RunningWork::default();
             for row in &mine {
@@ -2121,10 +2133,10 @@ impl Sidebar {
         }
         // A row whose machine is no longer open still has to be reachable.
         let orphans: Vec<ListEntry> = rows
-            .into_iter()
+            .iter()
             .zip(&grouped)
             .filter(|(_, taken)| !**taken)
-            .map(|(row, _)| row)
+            .map(|(row, _)| row.clone())
             .collect();
         if !orphans.is_empty() {
             out.extend(Self::group_rows_by_workspace(orphans));
@@ -3436,7 +3448,13 @@ impl Sidebar {
             )
             .when(matches!(section, SidebarSection::OpenInZed), |this| {
                 this.child(div().flex_1())
-                    .child(self.render_new_thread_button(cx))
+                    // With several machines this button is ambiguous: a machine
+                    // header's own `+` says where the thread lands. The
+                    // `NewThread` binding it shares keeps working on the active
+                    // workspace's machine.
+                    .when(self.machines_shown() < 2, |this| {
+                        this.child(self.render_new_thread_button(cx))
+                    })
             })
             .on_click(cx.listener(move |this, _, _window, cx| {
                 this.toggle_section(section, cx);
@@ -3455,6 +3473,18 @@ impl Sidebar {
         self.update_entries(cx);
         self.serialize(cx);
         cx.notify();
+    }
+
+    /// How many machines the rows are headed by, counted by identity so a
+    /// machine heading more than one section counts once.
+    fn machines_shown(&self) -> usize {
+        let mut machines: HashSet<String> = HashSet::new();
+        for entry in &self.contents.all_entries {
+            if let ListEntry::MachineHeader(header) = entry {
+                machines.insert(machine_collapse_key(header.host.as_ref()));
+            }
+        }
+        machines.len()
     }
 
     fn render_new_thread_button(&self, cx: &mut Context<Self>) -> AnyElement {

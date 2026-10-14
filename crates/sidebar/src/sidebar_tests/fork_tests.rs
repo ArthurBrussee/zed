@@ -3647,3 +3647,103 @@ async fn test_a_collapsed_machine_survives_a_restart(cx: &mut TestAppContext) {
         );
     });
 }
+
+/// A box connected a moment ago is where the next thread is going, so it needs
+/// its header and its `+` before it has any threads of its own.
+#[gpui::test]
+fn test_a_machine_with_nothing_open_yet_still_gets_its_header(cx: &mut TestAppContext) {
+    let now = Utc::now();
+    let devbox = mock_host(9);
+    let threads: Vec<Arc<ThreadEntry>> = vec![Arc::new(test_thread_entry_on(
+        "here",
+        "/here",
+        "/here",
+        None,
+        now,
+    ))];
+    let open_thread_ids: HashSet<ThreadId> = threads.iter().map(|t| t.metadata.thread_id).collect();
+
+    let shapes = |machines: Vec<MachineGroup>, threads: Vec<Arc<ThreadEntry>>| {
+        let mut session_ids = HashSet::default();
+        let mut thread_ids = HashSet::default();
+        let entries = cx.update(|cx| {
+            Sidebar::sectioned_entries(
+                Vec::new(),
+                threads,
+                &open_thread_ids,
+                &HashMap::default(),
+                &mut session_ids,
+                &mut thread_ids,
+                &machines,
+                cx,
+            )
+        });
+        entry_shape_strings(&entries)
+    };
+
+    let connected = shapes(
+        vec![
+            machine("This Mac", None),
+            machine("mock-9", Some(devbox.clone())),
+        ],
+        threads.clone(),
+    );
+    assert!(
+        connected.contains(&"machine: This Mac".to_string())
+            && connected.contains(&"machine: mock-9".to_string()),
+        "both machines are headed even though only one has a thread, got {connected:?}"
+    );
+
+    // A machine with no project a thread could go in is not present, and one
+    // machine is still no grouping.
+    let gone = shapes(
+        vec![
+            machine("This Mac", None),
+            MachineGroup {
+                can_create_thread: false,
+                ..machine("mock-9", Some(devbox))
+            },
+        ],
+        threads,
+    );
+    assert!(
+        !gone.iter().any(|shape| shape.starts_with("machine:")),
+        "one machine draws no header, got {gone:?}"
+    );
+}
+
+#[gpui::test]
+async fn test_the_top_plus_goes_once_two_machines_are_headed(cx: &mut TestAppContext) {
+    init_test(cx);
+    let devbox = mock_host(9);
+    let fs = FakeFs::new(cx.executor());
+    let project = project::Project::test(fs, [], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    let header = |host: Option<remote::RemoteConnectionOptions>| {
+        ListEntry::MachineHeader(Arc::new(MachineHeaderEntry {
+            label: "machine".into(),
+            host,
+            can_create_thread: true,
+            running_work: RunningWork::default(),
+        }))
+    };
+
+    sidebar.update(cx, |sidebar, _cx| {
+        assert_eq!(
+            sidebar.machines_shown(),
+            0,
+            "a laptop-only sidebar keeps its top +"
+        );
+        sidebar.contents.all_entries = vec![header(None), header(Some(devbox))];
+        assert_eq!(sidebar.machines_shown(), 2);
+        sidebar.contents.all_entries = vec![header(None), header(None)];
+        assert_eq!(
+            sidebar.machines_shown(),
+            1,
+            "a machine heading two sections is still one machine"
+        );
+    });
+}
