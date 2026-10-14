@@ -3427,3 +3427,116 @@ evidence of nothing at all.
 **Diff size**: 98 files, +38,057 / -11,282 against the merge base, from 97 files,
 +36,905 / -11,277 after 10-12. Up 1,152 added lines and one file for three queue entries that
 each asked for lines; a little under half of the 1,152 are their tests.
+
+**2026-10-14**: onto main c403bc6af (8 upstream commits). A working night four times over: the
+Work queue held twelve buildable entries, the branch carried twenty-one commits over the merge
+base, upstream had moved, and the queue's first entry was a bug that had been there for as long
+as the activity state has existed. Squash-then-rebase folded all twenty-one into one, reusing the
+squash's own message; tree-identical to the old tip (`5f1caf630`, tree `128e2da29`) before
+rebasing. Backup at `quiet-ui-pre-rebase50-2026-10-14`, pushed before anything else.
+
+**Two files conflicted, four hunks, and for the first time in this log none of them were the
+thread-view seam** — both were in `crates/sidebar`.
+- `sidebar.rs`: upstream's `sidebar: Fix archive loop when a thread's worktree folder was
+  deleted (#65578)` split `archive_thread` into `thread_to_archive` and
+  `archive_thread_in_loaded_workspace`, moving the closed-workspace check above any mutation so
+  the open-then-archive path stops recursing. The fork had already rewritten the same function
+  for its own reason: archive is keyed on the **thread id**, because a thread exists from the
+  click that made it and an unsent one has no session (2026-10-02), and it archives the thread
+  immediately and defers the worktree to `archive_worktree_after_workspace_loads` rather than
+  returning early to open a workspace. That shape cannot loop — it never re-enters
+  `archive_thread` — so the fork's side was kept, and what was taken from upstream is its new
+  test, with its one call site adapted to `archive_thread_by_session`. **Worth the note**: when
+  upstream fixes a bug the fork's own restructure already made impossible, the test is the part
+  to adopt; taking the rewrite would have cost the thread-id keying for nothing.
+- `sidebar_tests.rs`: upstream inserted that test immediately above one the fork had renamed, so
+  the conflict was two function signatures with one body. Both tests kept.
+
+**Markerless drift: none from the replay — but the check that would have proved it was spent on
+something else.** `cargo check --workspace --all-targets` was started right after the replay and
+left running while the night's first edit went in; cargo had not reached `acp_thread` yet, so the
+one error it reported was that edit's own non-exhaustive match rather than anything upstream had
+changed. The lesson is small and costs seventeen minutes to relearn: **the post-replay workspace
+check is only a check of the replay if nothing is edited while it runs.** Let it finish, or
+accept that it has become a check of the working tree. The per-crate checks that followed every
+edit came back clean throughout.
+
+**Nothing the fork carries became deletable this round.** The one candidate was the archive
+restructure above, and it is the other way round: upstream's fix addresses a loop the fork's
+shape does not have.
+
+**What was built: the first ten Work queue entries, in order.**
+
+- *Threads that showed as idle while visibly running commands.* The entry's diagnosis was right
+  to the line. The whole running set moved with nothing but a `cx.notify()` behind it — a notify
+  reaches the thread's own views and nothing watching from outside, and the sidebar row watches
+  the panel, which watches the conversation view, which notifies on the **action log** and
+  nothing else. So a detached command, a finished background task, a terminal exiting or a
+  subagent's lifecycle moved the pill in the thread and left the row with whatever it last drew.
+  `AcpThreadEvent::RunningWorkChanged` is emitted at every input to `running_work`, the turn's
+  own start and end included, and the conversation view forwards it as a notify so
+  `live_panel_state_changed` decides the rebuild. The chip and the row now share one predicate,
+  `AcpThread::tool_call_is_running`: outside a turn the evidence is the agent saying it detached
+  the call, a reported lifecycle, or a process of ours still alive under it, so a call a dead
+  agent left `InProgress` neither spins nor works. **Where the entry and the code disagreed**:
+  it asked for `had_error` to stop outranking a running turn, and `had_error` is in fact cleared
+  when a turn starts — the case that is real is a refusal reported against a finished turn while
+  the next one runs, so the reorder stays, as a narrow one.
+- *Dev servers in the bottom bar from tagged Zed tasks*, as the entry specified: `bar`,
+  `icon:` and `open:` tags, upstream's own task path, the port read out of what the task printed,
+  and the box's port forwarded on Open. `Inventory::templates_with_tag` is the one addition to
+  upstream, beside `templates_with_hooks` and in its shape.
+- *Every expanded image opens in Zed's viewer.* **Where the entry and the code disagreed**: it
+  worried that a remote `/tmp/x.png` would be read off this machine's disk, and `open_abs_path`
+  already resolves through the project (`OpenVisible::None` never touches the local fs), so that
+  case needed a test rather than a fix. What did need building is the inline image with no file
+  behind it, which is written out before it opens; on a remote project it has nowhere to go, since
+  paths resolve on the box and nothing implements `Fs` over RPC, so it says so.
+- *The activity pill lists what it is counting*, with a Stop where something can stop it and
+  nothing where nothing can.
+- *The chip's copy button is gone*, which is what was covering the stop control.
+- *Why a thread stopped, on its row.* **The entry's description of the wire was wrong and the
+  adapter settled it**: `@agentclientprotocol/claude-agent-acp@0.90.0`'s
+  `session-failure-extension.js` publishes a session failure on a `session_info_update` under
+  `_meta.jetbrains.air.sessionFailure`, and `sessionFailureMeta` sends `id`, `revision`,
+  `category`, `severity`, `title`, `details`, `reason` and `actions` — **no `kind`**, and no
+  reset time anywhere. So the row says the category (offline, sign-in needed, limit reached,
+  rejected, service error) and the title goes in the tooltip; "rate-limited until 14:00" is not
+  available from this payload. Two more things the source said that the entry did not: a
+  `severity: "warning"` record is an `api_retry` notice rather than a stop, and `clear()` emits
+  **nothing** — so the client has to drop a failure itself, which it does where it drops
+  `had_error`, when the next turn starts.
+- *A sidebar footer.* The live usage source is the rate-limit report the adapter forwards on
+  `usage_update`; `SDKRateLimitInfo` carries one window per report (`rateLimitType`,
+  `utilization`, `resetsAt`, `status`), so the latest for each is kept across every Claude
+  thread. `/usage`, which the entry also named, is a command rather than a stream and is not
+  read. Machine load needed the one proto message of the night, `GetSystemLoad`, handled in
+  `remote_server` beside its `GetProcesses`: four seconds apart over the connection the project
+  already has, which is what the entry asked for instead of a shell per tick.
+- *The git diff.* The overlap is upstream's, and the fork is not involved: `git_ui` carries no
+  fork change, `editor` carries four lines, and the fork's gpui `list.rs` change is a log call
+  for a list the diff does not use. A new block-map test folds files in a three-file multibuffer
+  and the blocks stay disjoint in row terms, so the row arithmetic is sound; what is left is an
+  element laying out taller than its rows, and only a **custom** block reports a new height and
+  gets its rows re-reserved. A buffer header, an excerpt boundary and a folded buffer carry no
+  remeasure back, and a collapsed file leaves nothing beneath its header to absorb the overflow
+  because its block replaces the file's rows. Those blocks are now held to the height their rows
+  give them and say so in the log when the clamp bites. **That is the patch to send upstream**,
+  in `editor/src/element.rs::render_block`. The groups themselves fold into the sort prefix
+  upstream already orders by; the headers went into a strip above the diff rather than inline,
+  for the reason the commit gives.
+- *Machine headers collapse*, keyed by connection identity and persisted beside the collapsed
+  sections.
+- *A connected machine is headed before it has threads*, and the top `+` goes once more than one
+  machine is headed.
+
+**Not built, and why.** The tail of the queue, untouched for want of clock rather than for any
+other reason: making `+` fast, adding a machine from the sidebar, and the ACP relay. The memory
+baselines are unchanged from 10-07 and are still one line of Arthur's measurement rather than
+code.
+
+**One thing worth knowing before the next adapter entry.** The adapter and the SDK are on npm and
+the proxy serves them: `curl` the tarball from `registry.npmjs.org` and read
+`package/dist/*.d.ts`. Two of tonight's entries described the wire from documentation and both
+were wrong about it in ways that would have shipped a row saying nothing. Twenty minutes of
+reading the published package is cheaper than a night's worth of guessing.

@@ -3634,7 +3634,12 @@ async fn test_a_collapsed_machine_survives_a_restart(cx: &mut TestAppContext) {
         "the machine's identity is what is stored, got {state}"
     );
 
-    let restored = setup_sidebar(&multi_workspace, cx);
+    // A second sidebar, as a restart makes one, rather than a second
+    // registered one: `setup_sidebar` would toggle this one shut.
+    let restored = cx.update(|window, cx| {
+        let multi_workspace = multi_workspace.clone();
+        cx.new(|cx| Sidebar::new(multi_workspace, window, cx))
+    });
     restored.update_in(cx, |sidebar, window, cx| {
         assert!(sidebar.collapsed_machines.is_empty());
         sidebar.restore_serialized_state(&state, window, cx);
