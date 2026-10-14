@@ -65,6 +65,7 @@ fn machine(label: &str, host: Option<remote::RemoteConnectionOptions>) -> Machin
         label: label.to_string().into(),
         host,
         can_create_thread: true,
+        saved_project: None,
     }
 }
 
@@ -3536,6 +3537,7 @@ fn test_collapsing_a_machine_hides_everything_under_it(cx: &mut TestAppContext) 
                 subagents: 0,
                 async_tasks: 0,
             },
+            saved_project: None,
         }))
     };
     let worktree_header = |label: &str| {
@@ -3733,6 +3735,7 @@ async fn test_the_top_plus_goes_once_two_machines_are_headed(cx: &mut TestAppCon
             host,
             can_create_thread: true,
             running_work: RunningWork::default(),
+            saved_project: None,
         }))
     };
 
@@ -3813,4 +3816,172 @@ async fn test_a_session_running_on_a_box_is_listed_as_running(cx: &mut TestAppCo
     });
     cx.run_until_parked();
     assert_ne!(rows(&sidebar, cx)[0].status, AgentThreadStatus::Running);
+}
+
+/// A host in `ssh_connections` with projects keeps its machine group with no
+/// window open on it, its `+` opens the project its latest thread was in, and
+/// a host removed from the settings loses the group.
+#[gpui::test]
+async fn test_a_saved_host_keeps_its_group(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    let project = project::Project::test(fs, [], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let _sidebar = setup_sidebar(&multi_workspace, cx);
+
+    let set_connections = |connections: serde_json::Value, cx: &mut gpui::VisualTestContext| {
+        cx.update(|_, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store
+                    .set_user_settings(
+                        &serde_json::json!({ "ssh_connections": connections }).to_string(),
+                        cx,
+                    )
+                    .unwrap();
+            });
+        });
+    };
+    set_connections(
+        serde_json::json!([
+            { "host": "devbox", "projects": [{ "paths": ["/box/alpha"] }, { "paths": ["/box/beta"] }] },
+            { "host": "unused-box", "projects": [] },
+        ]),
+        cx,
+    );
+    let devbox = remote::RemoteConnectionOptions::Ssh(remote::SshConnectionOptions {
+        host: "devbox".into(),
+        ..Default::default()
+    });
+
+    // The latest thread on the box was in beta.
+    let now = Utc::now();
+    cx.update(|_, cx| {
+        let store = ThreadMetadataStore::global(cx);
+        store.update(cx, |store, cx| {
+            for (paths, updated_at) in [
+                ("/box/alpha", now - chrono::Duration::hours(2)),
+                ("/box/beta", now),
+            ] {
+                store.save(
+                    agent_ui::thread_metadata_store::ThreadMetadata {
+                        thread_id: agent_ui::ThreadId::new(),
+                        session_id: None,
+                        agent_id: project::AgentId("claude-acp".into()),
+                        title: Some("on the box".into()),
+                        title_override: None,
+                        updated_at,
+                        created_at: Some(updated_at),
+                        interacted_at: None,
+                        worktree_paths: project::WorktreePaths::from_folder_paths(&PathList::new(
+                            &[Path::new(paths)],
+                        )),
+                        remote_connection: Some(devbox.clone()),
+                        archived: false,
+                    },
+                    cx,
+                );
+            }
+        });
+    });
+    cx.run_until_parked();
+
+    let machines = |cx: &mut gpui::VisualTestContext| {
+        multi_workspace.read_with(cx, |mw, cx| {
+            let workspaces: Vec<_> = mw.workspaces().cloned().collect();
+            Sidebar::open_machines(mw, &workspaces, cx)
+        })
+    };
+    let saved = machines(cx);
+    let devbox_group = saved
+        .iter()
+        .find(|machine| machine.label.as_ref() == "devbox")
+        .expect("the used host keeps a group with nothing open on it");
+    assert!(devbox_group.can_create_thread);
+    assert_eq!(
+        devbox_group.saved_project,
+        Some(PathList::new(&[Path::new("/box/beta")])),
+        "its + opens the project the latest thread was in"
+    );
+    assert!(
+        !saved.iter().any(|machine| machine.label.as_ref() == "unused-box"),
+        "a host with no projects was never used"
+    );
+
+    set_connections(serde_json::json!([]), cx);
+    assert!(
+        !machines(cx)
+            .iter()
+            .any(|machine| machine.label.as_ref() == "devbox"),
+        "a host removed from ssh_connections loses its group"
+    );
+}
+
+/// A saved machine's `+` opens its project on that host, connecting through
+/// upstream's remote flow, when nothing is open there.
+#[gpui::test]
+async fn test_a_saved_machine_plus_opens_its_project(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+    server_cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+    let app_state = cx.update(|cx| {
+        let app_state = workspace::AppState::test(cx);
+        workspace::init(app_state.clone(), cx);
+        app_state
+    });
+    let server_fs = FakeFs::new(server_cx.executor());
+    server_fs
+        .insert_tree("/box-repo", serde_json::json!({ ".git": {}, "src": {} }))
+        .await;
+    // A box that will answer when connected to; nothing of it is open here.
+    let (opts, server_session, connect_guard) = remote::RemoteClient::fake_server(cx, server_cx);
+    server_cx.update(remote_server::HeadlessProject::init);
+    let _headless = server_cx.new(|cx| {
+        remote_server::HeadlessProject::new(
+            remote_server::HeadlessAppState {
+                session: server_session,
+                fs: server_fs.clone(),
+                http_client: Arc::new(http_client::BlockedHttpClient),
+                node_runtime: node_runtime::NodeRuntime::unavailable(),
+                languages: Arc::new(language::LanguageRegistry::new(cx.background_executor().clone())),
+                extension_host_proxy: Arc::new(extension::ExtensionHostProxy::new()),
+                startup_time: std::time::Instant::now(),
+            },
+            false,
+            cx,
+        )
+    });
+    drop(connect_guard);
+    cx.update(|cx| <dyn fs::Fs>::set_global(app_state.fs.clone(), cx));
+    let local_project = project::Project::test(app_state.fs.clone(), [], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(local_project, window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    let on_the_box = |cx: &mut gpui::VisualTestContext| {
+        multi_workspace.read_with(cx, |mw, cx| {
+            mw.workspaces().any(|workspace| {
+                let project = workspace.read(cx).project().read(cx);
+                project.is_remote()
+                    && project
+                        .visible_worktrees(cx)
+                        .any(|worktree| worktree.read(cx).abs_path().as_ref() == Path::new("/box-repo"))
+            })
+        })
+    };
+    assert!(!on_the_box(cx));
+
+    let opened = sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.new_worktree_thread_on_saved_machine(
+            opts.clone(),
+            PathList::new(&[Path::new("/box-repo")]),
+            window,
+            cx,
+        )
+    });
+    opened.await.expect("the box's project opens");
+    cx.run_until_parked();
+    assert!(on_the_box(cx), "the box's project is open in this window");
 }

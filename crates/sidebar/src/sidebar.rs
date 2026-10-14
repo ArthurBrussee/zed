@@ -545,6 +545,9 @@ struct MachineGroup {
     host: Option<RemoteConnectionOptions>,
     /// Whether a new worktree thread could be made here.
     can_create_thread: bool,
+    /// For a host kept from `ssh_connections` with nothing open: the project
+    /// its `+` opens first.
+    saved_project: Option<PathList>,
 }
 
 /// A machine's group header: the threads under it run there. Drawn only when
@@ -559,6 +562,7 @@ struct MachineHeaderEntry {
     /// What its threads are running, so a collapsed machine still says it is
     /// working.
     running_work: RunningWork,
+    saved_project: Option<PathList>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -2080,10 +2084,27 @@ impl Sidebar {
                 },
                 host,
                 can_create_thread,
+                saved_project: None,
             });
         }
         // This machine first; the rest keep the order they were connected in.
         machines.sort_by_key(|machine| machine.host.is_some());
+        // A machine that has been used keeps its group after its windows
+        // close: every host in `ssh_connections` with projects listed there.
+        for (host, project) in saved_machines(cx) {
+            if machines
+                .iter()
+                .any(|seen| same_remote_connection_identity(seen.host.as_ref(), Some(&host)))
+            {
+                continue;
+            }
+            machines.push(MachineGroup {
+                label: host.display_name().into(),
+                host: Some(host),
+                can_create_thread: true,
+                saved_project: Some(project),
+            });
+        }
         machines
     }
 
@@ -2146,6 +2167,7 @@ impl Sidebar {
                 host: machine.host.clone(),
                 can_create_thread: machine.can_create_thread,
                 running_work,
+                saved_project: machine.saved_project.clone(),
             })));
             out.extend(Self::group_rows_by_workspace(mine));
         }
@@ -3271,6 +3293,52 @@ impl Sidebar {
         }
     }
 
+    /// Opens `project` on `host`, connecting if needed through upstream's
+    /// remote flow, then makes a worktree thread in it.
+    fn new_worktree_thread_on_saved_machine(
+        &mut self,
+        host: RemoteConnectionOptions,
+        project: PathList,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
+        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+            return Task::ready(Ok(()));
+        };
+        let active_workspace = multi_workspace.read(cx).workspace().clone();
+        let modal_workspace = active_workspace.clone();
+        log::info!("quiet-ui: opening {} for a new thread", host.display_name());
+        let task = multi_workspace.update(cx, |this, cx| {
+            this.find_or_create_workspace(
+                project,
+                Some(host),
+                None,
+                |options, window, cx| connect_remote(active_workspace, options, window, cx),
+                None,
+                OpenMode::Activate,
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            remote_connection::dismiss_connection_modal(&modal_workspace, cx);
+            let workspace = result?;
+            // The `+` branches from the repository, which has to be known first.
+            let scanned = workspace.update(cx, |workspace, cx| {
+                workspace
+                    .project()
+                    .update(cx, |project, cx| project.git_scans_complete(cx))
+            });
+            scanned.await;
+            this.update_in(cx, |this, window, cx| {
+                this.new_worktree_thread_in(&workspace, window, cx)
+            })?;
+            anyhow::Ok(())
+        })
+    }
+
     fn render_machine_header(
         &self,
         ix: usize,
@@ -3361,6 +3429,32 @@ impl Sidebar {
             return None;
         }
         let repositories = self.machine_repositories(header.host.as_ref(), cx);
+        // Nothing open there yet: connect, open its most recent project, then
+        // make the thread the way the group's `+` does when it is open.
+        if repositories.is_empty()
+            && let (Some(host), Some(project)) = (&header.host, &header.saved_project)
+        {
+            let host = host.clone();
+            let project = project.clone();
+            return Some(
+                IconButton::new(("new-thread-on-saved-machine", ix), IconName::Plus)
+                    .icon_size(IconSize::XSmall)
+                    .icon_color(Color::Muted)
+                    .visible_on_hover(group.clone())
+                    .tooltip(Tooltip::text("Connect and Start a Thread in a New Worktree"))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.new_worktree_thread_on_saved_machine(
+                            host.clone(),
+                            project.clone(),
+                            window,
+                            cx,
+                        )
+                        .detach_and_log_err(cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
         let tooltip = match header.host {
             Some(_) => "New Thread in New Worktree on This Machine",
             None => "New Thread in New Worktree",
@@ -3472,6 +3566,25 @@ impl Sidebar {
                     // header's own `+` says where the thread lands. The
                     // `NewThread` binding it shares keeps working on the active
                     // workspace's machine.
+                    .child(
+                        IconButton::new("sidebar-add-machine", IconName::Server)
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text("Add Machine…"))
+                            .on_click(|_, window, cx| {
+                                cx.stop_propagation();
+                                // Upstream's own flow: pick or add an SSH host, then
+                                // a folder on it.
+                                window.dispatch_action(
+                                    zed_actions::OpenRemote {
+                                        from_existing_connection: false,
+                                        create_new_window: Some(false),
+                                    }
+                                    .boxed_clone(),
+                                    cx,
+                                );
+                            }),
+                    )
                     .when(self.machines_shown() < 2, |this| {
                         this.child(self.render_new_thread_button(cx))
                     })
@@ -8795,4 +8908,58 @@ fn dump_single_workspace(workspace: &Workspace, output: &mut String, cx: &gpui::
     }
 
     writeln!(output).ok();
+}
+
+/// Hosts in `ssh_connections` with projects listed, each with the project its
+/// `+` opens: the one its latest thread was in, else the first listed.
+fn saved_machines(cx: &App) -> Vec<(RemoteConnectionOptions, PathList)> {
+    let Some(settings) = cx
+        .try_global::<SettingsStore>()
+        .and_then(|store| store.try_get::<recent_projects::RemoteSettings>(None))
+    else {
+        return Vec::new();
+    };
+    let threads = ThreadMetadataStore::try_global(cx);
+    settings
+        .ssh_connections()
+        .filter(|connection| !connection.projects.is_empty())
+        .filter_map(|connection| {
+            let projects: Vec<PathList> = connection
+                .projects
+                .iter()
+                .map(|project| {
+                    PathList::new(&project.paths.iter().map(PathBuf::from).collect::<Vec<_>>())
+                })
+                .collect();
+            let host = RemoteConnectionOptions::Ssh(connection.into());
+            let mut threads_there = threads
+                .as_ref()
+                .map(|store| {
+                    store
+                        .read(cx)
+                        .entries()
+                        .filter(|thread| {
+                            same_remote_connection_identity(
+                                thread.remote_connection.as_ref(),
+                                Some(&host),
+                            )
+                        })
+                        .map(|thread| {
+                            (
+                                thread.updated_at,
+                                thread.worktree_paths.main_worktree_path_list().clone(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            threads_there.sort_by(|a, b| b.0.cmp(&a.0));
+            let project = threads_there
+                .into_iter()
+                .map(|(_, paths)| paths)
+                .find(|paths| projects.contains(paths))
+                .or_else(|| projects.first().cloned())?;
+            Some((host, project))
+        })
+        .collect()
 }
