@@ -219,6 +219,51 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**Make `+` fast: find the waste in new-worktree creation. No caches, no pre-warming.**
+
+Arthur, 2026-10-14: profile where new-worktree time goes and make it faster by removing waste.
+He explicitly does **not** want new caches, more pre-warming or anything complicated. The
+existing spare pool stays as it is, but nothing new of that kind. From his log, same day:
+
+Local (spare claimed):
+`base already present in 303ms` → `claimed from the spare` → `window shown in 93–179ms` →
+`shell environment … took 490–699ms` → `workspace opened in 1402–3163ms`; the replacement spare
+then checks out in the background (3.9–6.0s).
+
+On the dev box over SSH:
+`the spare worktree is gone from disk; checking one out instead` → `base already present in
+208–246ms` → `worktree checked out in 3341–3567ms` → `window shown in 880–908ms` → `workspace
+opened in 4042–6748ms`.
+
+What to fix:
+1. **On a remote machine the spare is never used.** The spare's presence check is
+   `fs.is_dir(path)` in `worktree_service.rs` (around "is gone from disk"), run against the
+   *laptop's* filesystem for a path that exists on the box. So every remote `+` throws the
+   ready spare away and pays a 3.5s checkout before the window. Check through the repository
+   (`Entity<Repository>` worktree list over RPC, as the rest of the flow already does).
+2. **A remote spare checkout failed** (11:01): `git worktree add failed: Preparing worktree
+   (detached HEAD 78cbbb1281) Updating files: 40% … 51%` and the message ends there. The error
+   text is git's progress output, so the real failure (an RPC timeout, a killed process, stderr
+   mistaken for failure) is not in it. Find it and fix it. The follow-up `git worktree remove` of
+   a worktree that was never created then errors (`is not a working tree`), which shouldn't
+   happen either.
+3. **The thread waits for the whole workspace to open.** `create_new_worktree_thread` awaits
+   `create_worktree_workspace_foreground`, which returns only once the project has scanned and
+   its repositories have reported. That is 1.4–3.2s after the window is up locally, and 4–6.7s
+   remotely. A thread needs the panel and the worktree's path, not a finished scan of 20k
+   files. Create and focus the thread as soon as the new workspace's panel exists, and let the
+   scan finish behind it. Check the agent and thread pieces that read the project don't break on
+   a still-scanning worktree (upstream opens threads in fresh workspaces all the time).
+4. **300ms to learn the base is "already present".** Find what that phase runs (a git
+   subprocess, a fetch check, a ref walk) and cut it to what is needed.
+5. **Remote window shown in ~900ms vs ~100–180ms locally.** Find what runs serially before the
+   window on the remote path and move it after, the way the local path already does.
+6. Whatever else the timings show once 1–5 are done. Add one summary line per `+`: `quiet-ui
+   perf: + to thread ready in Xms (base Y, claim Z, window W, thread V)`, so Arthur's log shows
+   the whole click-to-typing time, laptop and box alike.
+
+Report before and after from tests where possible, and leave the lines in so his log confirms.
+
 **A freshly connected machine gets no group, and so no `+`.**
 
 Arthur, 2026-10-14: connected to his dev box and opened the mech folder there, and the sidebar
