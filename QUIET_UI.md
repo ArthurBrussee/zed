@@ -219,6 +219,19 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**A freshly connected machine gets no group, and so no `+`.**
+
+Arthur, 2026-10-14: connected to his dev box and opened the mech folder there, and the sidebar
+still shows only "This Mac", with no box group and no `+` for it. `group_rows_by_machine`
+(`sidebar.rs`) skips a machine whose list of thread rows is empty ("A machine with nothing open
+gets no group"), so a machine with an open workspace and no threads yet never shows. With only
+one machine left, `machines.len() < 2` drops the headers altogether. A machine counts as open
+when it has an open workspace with paths (`can_create_thread` already computes exactly that), so
+give it its group and `+` even with no threads. The group shows only its header until the first
+thread. The "no group" rule is for machines with nothing open at all. Test: a local project with
+threads plus a remote workspace with none shows both machine headers, and the remote one's `+`
+creates the worktree thread on the remote.
+
 **Add a machine from the sidebar, and keep its group once it has been used.**
 
 Arthur, 2026-10-14, after the machine groups landed: "how do I add it now?" The sidebar has
