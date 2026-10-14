@@ -2299,8 +2299,10 @@ impl GitRepository for RealGitRepository {
                 if output.status.success() {
                     Ok(())
                 } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    anyhow::bail!("git worktree add failed: {stderr}");
+                    anyhow::bail!(worktree_add_failure(
+                        &output.status.to_string(),
+                        &String::from_utf8_lossy(&output.stderr)
+                    ));
                 }
             })
             .boxed()
@@ -4307,8 +4309,39 @@ fn checkpoint_author_envs() -> HashMap<String, String> {
     ])
 }
 
+
+/// quiet-ui: git reports checkout progress on stderr too, and a checkout
+/// killed partway leaves nothing else there, so the message leads with the
+/// exit status, which is what says why it stopped.
+fn worktree_add_failure(status: &str, stderr: &str) -> String {
+    let stderr = stderr
+        .split(['\r', '\n'])
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("Updating files:"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("git worktree add failed ({status}): {stderr}")
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_killed_checkout_says_how_it_ended_instead_of_how_far_it_got() {
+        let stderr = "Preparing worktree (detached HEAD 78cbbb1281)\nUpdating files:  40% (8123/20307)\rUpdating files:  51% (10357/20307)\r";
+        assert_eq!(
+            worktree_add_failure("signal: 9 (SIGKILL)", stderr),
+            "git worktree add failed (signal: 9 (SIGKILL)): Preparing worktree (detached HEAD 78cbbb1281)"
+        );
+        assert_eq!(
+            worktree_add_failure(
+                "exit status: 128",
+                "fatal: '/w/x' already exists\n"
+            ),
+            "git worktree add failed (exit status: 128): fatal: '/w/x' already exists"
+        );
+    }
+
     use std::{
         ffi::{OsStr, OsString},
         fs,

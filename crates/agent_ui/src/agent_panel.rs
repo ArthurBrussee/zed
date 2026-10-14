@@ -3834,6 +3834,7 @@ impl AgentPanel {
         );
 
         let workspace = workspace.downgrade();
+        let clicked = std::time::Instant::now();
         cx.spawn_in(window, async move |_this, cx| {
             let branch_target = branch_target.await;
             let action = zed_actions::CreateWorktree {
@@ -3855,6 +3856,7 @@ impl AgentPanel {
             {
                 // The new workspace opens with no thread, and its panels are
                 // already registered by the time this resolves.
+                let thread_started = std::time::Instant::now();
                 created
                     .workspace
                     .update_in(cx, |workspace, window, cx| {
@@ -3872,6 +3874,15 @@ impl AgentPanel {
                         workspace.focus_panel::<AgentPanel>(window, cx);
                     })
                     .log_err();
+                let timings = created.timings;
+                log::info!(
+                    "quiet-ui perf: + to thread ready in {:.0}ms (base {:.0}, claim {:.0}, window {:.0}, thread {:.0})",
+                    clicked.elapsed().as_secs_f64() * 1000.,
+                    timings.base_ms,
+                    timings.claim_ms,
+                    timings.window_ms,
+                    thread_started.elapsed().as_secs_f64() * 1000.,
+                );
             }
         })
         .detach();

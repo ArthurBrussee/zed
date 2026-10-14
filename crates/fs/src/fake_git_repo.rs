@@ -409,8 +409,19 @@ impl GitRepository for FakeGitRepository {
 
     fn show(&self, commit: String) -> BoxFuture<'_, Result<CommitDetails>> {
         self.with_state_async(false, move |state| {
-            let sha = match state.refs.get(&commit) {
-                Some(sha) => sha.clone(),
+            // A branch the test inserted by name resolves under its full ref
+            // name, as `branches()` reports it.
+            let branch_sha = state
+                .branches
+                .iter()
+                .any(|branch| {
+                    branch == &commit
+                        || format!("refs/remotes/{branch}") == commit
+                        || format!("refs/heads/{branch}") == commit
+                })
+                .then(|| format!("{:040x}", commit.len()));
+            let sha = match state.refs.get(&commit).cloned().or(branch_sha) {
+                Some(sha) => sha,
                 // Real git fails to show an unresolvable revision (e.g. HEAD on an
                 // unborn branch), so only fall back to treating the input as a sha.
                 None => {

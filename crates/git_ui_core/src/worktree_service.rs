@@ -23,7 +23,7 @@ use workspace::{
 };
 use zed_actions::NewWorktreeBranchTarget;
 
-use git::repository::{BranchesScanResult, FetchOptions, Remote};
+use git::repository::{FetchOptions, Remote};
 
 use util::ResultExt as _;
 
@@ -455,29 +455,27 @@ fn repo_work_directories(git_repos: &[Entity<Repository>], cx: &App) -> Vec<Path
         .collect()
 }
 
-type BranchScan = futures::channel::oneshot::Receiver<anyhow::Result<BranchesScanResult>>;
+/// quiet-ui: one `git show` per repository for the one ref asked about. It used
+/// to list every ref in the repository with its latest commit, through the
+/// repository's job queue, to answer whether a single ref exists (~300ms).
+type BranchScan = Task<anyhow::Result<git::repository::CommitDetails>>;
 
-fn start_base_ref_scan(git_repos: &[Entity<Repository>], cx: &mut App) -> Vec<BranchScan> {
+fn start_base_ref_scan(
+    git_repos: &[Entity<Repository>],
+    base_ref: &str,
+    cx: &mut App,
+) -> Vec<BranchScan> {
     git_repos
         .iter()
-        .map(|repo| repo.update(cx, |repo, _cx| repo.branches()))
+        .map(|repo| repo.read(cx).show_commit(base_ref.to_string(), cx))
         .collect()
 }
 
 /// `None` when any repository lacks `base_ref`, which means it must be fetched before creating.
-async fn base_ref_commits(
-    scans: Vec<BranchScan>,
-    base_ref: &str,
-) -> Option<Vec<Option<SharedString>>> {
+async fn base_ref_commits(scans: Vec<BranchScan>) -> Option<Vec<Option<SharedString>>> {
     let mut commits = Vec::with_capacity(scans.len());
     for scan in futures::future::join_all(scans).await {
-        let branch = scan
-            .ok()?
-            .ok()?
-            .branches
-            .into_iter()
-            .find(|branch| branch.ref_name == base_ref)?;
-        commits.push(branch.most_recent_commit.map(|commit| commit.sha));
+        commits.push(Some(scan.ok()?.sha));
     }
     Some(commits)
 }
@@ -517,8 +515,8 @@ fn fetch_base_behind_creation(
             return anyhow::Ok(());
         }
 
-        let scans = cx.update(|_, cx| start_base_ref_scan(&git_repos, cx))?;
-        let moved = match base_ref_commits(scans, &base_ref).await {
+        let scans = cx.update(|_, cx| start_base_ref_scan(&git_repos, &base_ref, cx))?;
+        let moved = match base_ref_commits(scans).await {
             Some(base_after) => base_after != base_before,
             None => false,
         };
@@ -866,8 +864,8 @@ async fn build_spare_worktree(
         if repos_owed_a_fetch(&work_directories) {
             return Ok(None);
         }
-        let scans = cx.update(|_, cx| start_base_ref_scan(git_repos, cx))?;
-        if base_ref_commits(scans, base_ref).await.is_none() {
+        let scans = cx.update(|_, cx| start_base_ref_scan(git_repos, base_ref, cx))?;
+        if base_ref_commits(scans).await.is_none() {
             return Ok(None);
         }
     }
@@ -886,6 +884,7 @@ async fn build_spare_worktree(
     })?;
     let (existing_worktree_names, existing_worktree_paths) =
         existing_worktrees(worktree_receivers).await;
+
 
     let (paths, path_remapping) = create_worktree_directories(
         git_repos,
@@ -968,6 +967,13 @@ pub async fn await_and_rollback_on_failure(
         if let Some(receiver) = receiver_opt {
             match receiver.await {
                 Ok(Ok(())) => {}
+                // quiet-ui: a creation that failed before git registered the
+                // worktree leaves nothing for git to remove; only its directory
+                // (if any) is cleaned up below.
+                Ok(Err(rollback_err)) if format!("{rollback_err:#}").contains("is not a working tree") => {
+                    log::info!("{} was never registered; removing its directory", path.display());
+                    git_remove_failed = true;
+                }
                 Ok(Err(rollback_err)) => {
                     log::error!(
                         "git worktree remove failed for {}: {rollback_err}",
@@ -1116,6 +1122,16 @@ pub struct CreatedWorktreeWorkspace {
     /// that care — like the `create_thread` agent tool — can use this to warn
     /// that the result may not reflect every source worktree's state.
     pub consolidated_worktrees: bool,
+    /// quiet-ui: where a creation's time went, for the `+` summary line.
+    pub timings: CreationTimings,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CreationTimings {
+    pub base_ms: f64,
+    /// Validating a claimed spare, or checking a worktree out without one.
+    pub claim_ms: f64,
+    pub window_ms: f64,
 }
 
 /// Same as [`handle_create_worktree`], but returns a `Task` that resolves to
@@ -1393,23 +1409,7 @@ async fn do_create_worktree(
                 )
             })
         })?;
-        // The user may have deleted the spare's directory since it was made.
-        match claimed {
-            Some(spare) => {
-                let fs = cx.update(|_, cx| <dyn Fs>::global(cx))?;
-                let mut all_present = true;
-                for path in &spare.paths {
-                    all_present &= fs.is_dir(path).await;
-                }
-                if all_present {
-                    Some(spare)
-                } else {
-                    log::info!("the spare worktree is gone from disk; checking one out instead");
-                    None
-                }
-            }
-            None => None,
-        }
+        claimed
     } else {
         None
     };
@@ -1437,7 +1437,9 @@ async fn do_create_worktree(
         let work_directories = cx.update(|_, cx| repo_work_directories(&git_repos, cx))?;
         let scans = match repos_owed_a_fetch(&work_directories) {
             true => None,
-            false => Some(cx.update(|_, cx| start_base_ref_scan(&git_repos, cx))?),
+            false => Some(cx.update(|_, cx| {
+                start_base_ref_scan(&git_repos, base_ref.as_deref().unwrap_or_default(), cx)
+            })?),
         };
         (work_directories, scans)
     } else {
@@ -1446,6 +1448,35 @@ async fn do_create_worktree(
 
     let (existing_worktree_names, existing_worktree_paths) =
         existing_worktrees(worktree_receivers).await;
+
+    // The user may have deleted the spare since it was made. On a remote
+    // project its paths are on the box, so the repository's own worktree list
+    // (already fetched above) is the authority, not this machine's disk.
+    let claim_started = std::time::Instant::now();
+    let claimed = match claimed {
+        Some(spare) => {
+            let all_present = if remote_connection_options.is_some() {
+                spare
+                    .paths
+                    .iter()
+                    .all(|path| existing_worktree_paths.contains(path))
+            } else {
+                let fs = cx.update(|_, cx| <dyn Fs>::global(cx))?;
+                let mut all_present = true;
+                for path in &spare.paths {
+                    all_present &= fs.is_dir(path).await;
+                }
+                all_present
+            };
+            if all_present {
+                Some(spare)
+            } else {
+                log::info!("the spare worktree is gone; checking one out instead");
+                None
+            }
+        }
+        None => None,
+    };
 
     // The fetch only has to block creation when the base isn't in the clone yet; otherwise it
     // runs behind the new window.
@@ -1457,7 +1488,7 @@ async fn do_create_worktree(
         let remote_name = remote_name.to_string();
         let branch_name = branch_name.to_string();
         let base_before = match (base_ref.as_deref(), base_ref_scans) {
-            (Some(base_ref), Some(scans)) => base_ref_commits(scans, base_ref).await,
+            (Some(_), Some(scans)) => base_ref_commits(scans).await,
             _ => None,
         };
         match base_before {
@@ -1490,14 +1521,14 @@ async fn do_create_worktree(
         }
     }
 
+    let base_ms = fetch_started.elapsed().as_secs_f64() * 1000.;
     log::info!(
-        "quiet-ui perf: worktree base {} in {:.0}ms",
+        "quiet-ui perf: worktree base {} in {base_ms:.0}ms",
         if fetch_behind_creation.is_some() {
             "already present"
         } else {
             "fetched"
         },
-        fetch_started.elapsed().as_secs_f64() * 1000.
     );
 
     let (created_paths, path_remapping, consolidated_worktrees) = match claimed {
@@ -1538,6 +1569,7 @@ async fn do_create_worktree(
         }
     };
 
+    let claim_ms = claim_started.elapsed().as_secs_f64() * 1000.;
     let spare_remote_connection_options = remote_connection_options.clone();
 
     let mut all_paths = created_paths;
@@ -1559,10 +1591,8 @@ async fn do_create_worktree(
         cx,
     )
     .await?;
-    log::info!(
-        "quiet-ui perf: worktree workspace opened in {:.0}ms",
-        open_started.elapsed().as_secs_f64() * 1000.
-    );
+    let window_ms = open_started.elapsed().as_secs_f64() * 1000.;
+    log::info!("quiet-ui perf: worktree workspace opened in {window_ms:.0}ms");
 
     drop(creating);
     start_spare_worktree(
@@ -1581,6 +1611,11 @@ async fn do_create_worktree(
     Ok(CreatedWorktreeWorkspace {
         workspace,
         consolidated_worktrees,
+        timings: CreationTimings {
+            base_ms,
+            claim_ms,
+            window_ms,
+        },
     })
 }
 
@@ -1707,12 +1742,20 @@ async fn open_worktree_workspace(
     let result = workspace_task.await;
     remote_connection::dismiss_connection_modal(&modal_workspace, cx);
     let new_workspace = result?;
+    let workspace_built = open_started.elapsed();
 
     let panels_task = new_workspace.update(cx, |workspace, _cx| workspace.take_panels_task());
 
     if let Some(task) = panels_task {
         task.await.log_err();
     }
+    // Which of these is the long pole on a remote project is a question for
+    // a real box's log, not a guess.
+    log::info!(
+        "quiet-ui perf: worktree window parts: workspace {:.0}ms, panels {:.0}ms",
+        workspace_built.as_secs_f64() * 1000.,
+        (open_started.elapsed() - workspace_built).as_secs_f64() * 1000.
+    );
 
     maybe_propagate_worktree_trust(&workspace, &new_workspace, &all_paths, cx);
 
@@ -1778,7 +1821,37 @@ async fn open_worktree_workspace(
         open_started.elapsed().as_secs_f64() * 1000.
     );
 
+    // quiet-ui: a thread opened from `+` needs the panel and the worktree's
+    // path, both there by now, not a finished scan of the worktree (1.4-3.2s
+    // here, 4-6.7s on a box). The rest finishes behind the window.
+    if activate {
+        let finishing = new_workspace.clone();
+        cx.spawn(async move |cx| {
+            finish_opening(finishing, window_handle, is_creating_new_worktree, cx)
+                .await
+                .log_err();
+        })
+        .detach();
+        return Ok(new_workspace);
+    }
+
     // Callers like `create_thread` still need a scanned project when this returns.
+    finish_opening(
+        new_workspace.clone(),
+        window_handle,
+        is_creating_new_worktree,
+        cx,
+    )
+    .await?;
+    Ok(new_workspace)
+}
+
+async fn finish_opening(
+    new_workspace: Entity<Workspace>,
+    window_handle: gpui::WindowHandle<MultiWorkspace>,
+    is_creating_new_worktree: bool,
+    cx: &mut AsyncWindowContext,
+) -> anyhow::Result<()> {
     new_workspace
         .update(cx, |workspace, cx| {
             workspace.project().read(cx).wait_for_initial_scan(cx)
@@ -1812,7 +1885,7 @@ async fn open_worktree_workspace(
         })?;
     }
 
-    Ok(new_workspace)
+    Ok(())
 }
 
 #[cfg(test)]
