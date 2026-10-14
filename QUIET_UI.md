@@ -12,17 +12,18 @@ names are the stable anchors; line numbers drift with every rebase and are not u
 
 ## Never bail on time (from 2026-10-06)
 
-Arthur's rule: **the clock is never a reason to leave work undone.** The 00:45 build is not a
-deadline. A branch pushed after it starts is simply bundled by the next build, which costs a day
-of latency and nothing else. Build every item in the queue, gate it, and push when the gate is
-green, however late that is.
+Arthur's rule: **the clock is never a reason to leave work undone.** Since 2026-10-14 there is no
+build hour to aim for at all: the routine's push to `quiet-ui` starts the build
+(`.github/workflows/quiet_ui_kick.yml` on this branch dispatches `quiet_ui_nightly.yml` on `main`
+for any push that changes more than this file). One run, one push, one build, whenever the run
+finishes. Build every item in the queue, gate it, and push when the gate is green, however late
+that is.
 
-The one deadline is the gate: a branch that has not passed `cargo test` and `./script/clippy`
+The one hard rule is the gate: a branch that has not passed `cargo test` and `./script/clippy`
 never gets pushed, because there is no way to compile a fix from the laptop. So the rule is
-"finish, then gate, then push", and if that runs past the build, say so in the report and push
-anyway. On 2026-10-05 the routine stopped at three of five items "to leave time to gate before
-the build"; Arthur had it finish the other two the same night, and both landed in the 00:45 build
-regardless.
+"finish, then gate, then push". On 2026-10-05 the routine stopped at three of five items "to leave
+time to gate before the build", and on 2026-10-14 it stopped before the `+` speed item citing the
+clock; both were wrong.
 
 ## Upstream first (from 2026-10-01)
 
@@ -219,6 +220,38 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**Reconnecting to the dev box: a dead server leaves the window stuck, and a fresh one comes up without Claude.**
+
+Arthur, 2026-10-14, laptop log (`~/Library/Logs/Zed/Zed.log`) and the box's
+`~/.local/share/zed/logs/server-dev-workspace-497.log`:
+
+1. The laptop went away (sleep). The box's server saw stdin EOF, waited out `IDLE_TIMEOUT`
+   ("timed out waiting for new connections after 600s. exiting.", `remote_server/src/server.rs`
+   ~555), and exited. At 18:05 local the laptop woke: `proxy process terminated unexpectedly:
+   255`, a reconnect attempt, `(remote proxy) attempted to reconnect, but no server running`,
+   then `setting state to 'server not running'`. The window stayed in that state until Arthur
+   reconnected by hand.
+   - The relay entry already makes the server permanent on the box. Check it covers this exact
+     path: no idle exit at all, whether or not an agent is alive. Arthur's box is always on and he
+     wants the server to stay up.
+   - In the client: when a reconnect finds "no server running", start a fresh server and
+     reattach the window's projects automatically (upstream's "Reconnect" already knows how). The
+     window must not sit in 'server not running' needing a manual step.
+
+2. The fresh connection at 18:07 came up without Claude: `client:unhandled remote message
+   name:ExternalAgentsUpdated`, then `quiet-ui launch: claude-acp failed after 391µs: Custom agent
+   server claude-acp is not registered` (twice). The box sent its agent list before the laptop's
+   `AgentServerStore` for that project had registered its `ExternalAgentsUpdated` handler
+   (`project/src/agent_server_store.rs`, `init_remote` / `handle_external_agents_updated`), so the
+   list was dropped. Threads then fail to start with "not registered". Fix the race at its source:
+   register the handler before the connection can deliver it, or have the client ask for the
+   list once it is ready and on every reconnect. Also make a thread whose agent isn't registered
+   *yet* on a remote project wait for the list, rather than fail at once.
+
+Test: with the fake remote transport, a reconnect after the server has exited starts a new one
+and reattaches without user action; an `ExternalAgentsUpdated` sent immediately on connect
+registers `claude-acp`, and a thread created at that moment launches.
+
 **Make `+` fast: find the waste in new-worktree creation. No caches, no pre-warming.**
 
 Arthur, 2026-10-14: profile where new-worktree time goes and make it faster by removing waste.
@@ -399,6 +432,17 @@ itself exits after 10 idle minutes (`IDLE_TIMEOUT`, `remote_server/src/server.rs
    still running, and two sequential attaches with no duplicate frames. This test is what keeps
    the feature from silently breaking on rebases, since the spawn path is being reworked for v2
    upstream right now (#64598, #65582 and the "Route v2" PRs). It must stay green every night.
+
+**Updates must not orphan the box's agents.** The server binary is named per build commit, so
+after Arthur updates, the client starts a *new* `remote_server` while the old, permanent one still
+owns the running agents. Handle the handover: when a newer server comes up for the same
+identifier, the old one takes no new sessions and lets in-flight turns finish (pending permission
+prompts stay answerable through it). Then it hands its sessions over by ending each agent cleanly,
+the new server resumes them with `session/resume`, and the old one exits. Keep the relay's on-disk
+log format stable across versions so the new server can read the old logs for catch-up. Threads
+started before the relay existed (spawned the old way, over `ssh host agent`) keep working: the
+agent on the box saved their conversations, and reopening one starts it under the relay and
+resumes it. Test the handover with two server versions in the fake transport.
 
 Record in the rebase log the exact upstream files touched and the hooks, so each night's
 conflicts there are easy to place, and note what to change when upstream switches Zed to ACP
