@@ -219,6 +219,34 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**Threads that are visibly running commands show as idle in the sidebar.**
+
+Arthur, 2026-10-14: some threads are actively running things, terminals included, while their
+sidebar row looks inactive. Three causes, in the order to check them:
+
+1. **Live state is read only from the sidebar's own window.** `rebuild_contents` (`sidebar.rs`)
+   builds `live_info_by_session` from `mw.workspaces()`, the workspaces of *this window's*
+   `MultiWorkspace`, and `all_thread_infos_for_workspace` reads status and `running_work` from
+   those panels only. A thread hosted in another Zed window gets its row from stored metadata
+   with no live overlay, so it shows idle whatever it is doing. Arthur now has a second window
+   (the dev box opened through Open Remote), and the machine groups list that window's threads
+   in this one's sidebar, so this is now common. Gather live info from every window's
+   `MultiWorkspace` (`cx.windows()`, which the sidebar already walks elsewhere, around line
+   3757). Rebuild when a thread in any window changes state, not only this window's.
+2. **`had_error` outranks running.** `all_thread_infos_for_workspace` checks `thread.had_error()`
+   before `thread.status()`, so a thread that errored earlier and is now generating again reads
+   Error, or idle once errors are styled quietly. Check when `had_error` is cleared (it is reset
+   at `acp_thread.rs` ~4583 and ~7015) and make a running turn win over a stale error.
+3. **The row and the chip disagree about what is running.** Since 10-02, `running_work` counts a
+   terminal outside a turn only when the agent said it detached. Use one predicate for both:
+   whatever makes a command chip draw its running spinner also counts the row as working. Log
+   `quiet-ui: row idle but N chips running in <thread>` when they disagree, so the next report
+   names itself.
+
+Test: a thread running a command in a second window shows working in the first window's sidebar;
+a thread that errored and was resent shows running; a chip with a running spinner always has a
+working row.
+
 **Dev servers from the message bar, driven by tagged Zed tasks.**
 
 Arthur, 2026-10-14: starting a dev server (`cd portico && pnpm dev` in mech) is very common. He
