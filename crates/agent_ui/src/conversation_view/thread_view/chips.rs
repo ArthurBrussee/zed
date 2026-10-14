@@ -1817,8 +1817,6 @@ impl ThreadView {
         let environment = has_terminals
             .then(|| self.command_environment_for(tool_call, cx))
             .flatten();
-        let full_command =
-            has_terminals.then(|| self.chip_cache.command(tool_call, cx).command.clone());
         // A display terminal has no process of ours to kill.
         let stoppable_terminal = running
             .then(|| tool_call.terminals().next())
@@ -1969,31 +1967,6 @@ impl ThreadView {
                             cx.stop_propagation();
                             this.stop_async_task(async_task_id.clone(), cx);
                         })),
-                )
-            })
-            // Overlaid, not placed: in the flow a hover-only button reserves its
-            // width on every chip, which was the blank tail after every label.
-            .when_some(full_command, |this, command| {
-                this.child(
-                    h_flex()
-                        .absolute()
-                        .right_1()
-                        .top_0()
-                        .bottom_0()
-                        .items_center()
-                        .child(
-                            IconButton::new(("copy-command", entry_ix), IconName::Copy)
-                                .icon_size(IconSize::XSmall)
-                                .icon_color(Color::Muted)
-                                .visible_on_hover(chip_group.clone())
-                                .tooltip(Tooltip::text("Copy Command"))
-                                .on_click(move |_, _, cx| {
-                                    cx.stop_propagation();
-                                    cx.write_to_clipboard(ClipboardItem::new_string(
-                                        command.clone(),
-                                    ));
-                                }),
-                        ),
                 )
             })
             .when_some(edit_stats, |this, stats| {

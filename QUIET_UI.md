@@ -219,14 +219,6 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
-**Remove the copy button from command chips; it covers the stop button.**
-
-On a running command chip the copy button (`IconButton::new(("copy-command", entry_ix),
-IconName::Copy)` in `chips.rs`) sits on top of the stop button, so a running command can't be
-stopped from its chip. Remove the copy button. The command can still be copied from the
-expanded body or the hover. Check nothing else in the chip's action slot overlaps once it's
-gone.
-
 **Say why a thread stopped: error states in the sidebar row and the thread.**
 
 Arthur's transcripts (97 Zed threads, Sep 2 to Oct 14) have 65 "go on" messages restarting

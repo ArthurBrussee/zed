@@ -15721,6 +15721,13 @@ pub(crate) mod tests {
         let stop = cx
             .debug_bounds("ICON-Stop")
             .expect("a running command's chip should offer to stop it");
+        if let Some(copy) = cx.debug_bounds("ICON-Copy") {
+            assert!(
+                !copy.intersects(&stop),
+                "the chip's copy button sat on top of the stop control, so a \
+                 running command could not be stopped from its chip"
+            );
+        }
 
         cx.simulate_click(stop.center(), gpui::Modifiers::none());
 
