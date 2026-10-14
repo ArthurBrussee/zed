@@ -80,6 +80,10 @@ pub(super) fn spawn_stdio(
         arguments
     );
     log::trace!("Spawned (pid: {})", child.id());
+    log::info!(
+        "quiet-ui launch: spawned {path} (pid {}) {arguments:?}",
+        child.id()
+    );
 
     let debug_log = AcpDebugLog::default();
     let incoming = BufReader::new(stdout)

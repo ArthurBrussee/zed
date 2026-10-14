@@ -857,6 +857,26 @@ impl MultiWorkspace {
             .collect()
     }
 
+    /// Every project group, most recently active first. Groups never activated
+    /// keep their order, after the rest.
+    pub fn project_group_keys_by_recency(&self, cx: &App) -> Vec<ProjectGroupKey> {
+        let mut keyed: Vec<(Option<u64>, ProjectGroupKey)> = self
+            .project_groups
+            .iter()
+            .map(|group| {
+                let activated_at = self
+                    .held
+                    .iter()
+                    .filter(|held| held.workspace.read(cx).project_group_key(cx) == group.key)
+                    .filter_map(|held| held.activated_at)
+                    .max();
+                (activated_at, group.key.clone())
+            })
+            .collect();
+        keyed.sort_by_key(|left| std::cmp::Reverse(left.0));
+        keyed.into_iter().map(|(_, key)| key).collect()
+    }
+
     pub fn last_active_workspace_for_group(
         &self,
         key: &ProjectGroupKey,

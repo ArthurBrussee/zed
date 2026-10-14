@@ -128,6 +128,11 @@ impl LanguageModelRegistry {
         cx.global::<GlobalLanguageModelRegistry>().0.read(cx)
     }
 
+    pub fn try_read_global(cx: &App) -> Option<&Self> {
+        cx.try_global::<GlobalLanguageModelRegistry>()
+            .map(|registry| registry.0.read(cx))
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     /// Installs a registry whose only provider is a fake, with its model as
     /// the default, and returns the fake.

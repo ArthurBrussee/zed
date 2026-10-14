@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::anyhow;
 use askpass::AskPassDelegate;
@@ -23,13 +23,15 @@ use workspace::{
 };
 use zed_actions::NewWorktreeBranchTarget;
 
-use git::repository::{FetchOptions, Remote};
+use git::repository::{BranchesScanResult, FetchOptions, Remote};
 
 use util::ResultExt as _;
 
 use crate::askpass_modal::AskPassModal;
 use crate::notifications::{open_output, show_error_toast};
 use crate::worktree_names;
+use crate::worktree_spares::{ReadySpare, SpareKey, SpareWorktrees};
+use notifications::status_toast::StatusToast;
 
 /// A remote-tracking branch reference parsed into its remote and branch parts,
 /// e.g. `origin/main` -> remote `origin`, branch `main`.
@@ -410,6 +412,134 @@ fn create_worktree_askpass_delegate(
     )
 }
 
+struct DeferredBaseFetch {
+    remote_name: String,
+    base_display: String,
+    work_directories: Vec<PathBuf>,
+    base_before: Vec<Option<SharedString>>,
+}
+
+/// A background fetch can't prompt for credentials, so after one fails the next
+/// creation fetches in front of itself (prompt and all) rather than never refreshing.
+static REPOS_OWED_A_FETCH: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Default::default);
+
+fn repos_owed_a_fetch(work_directories: &[PathBuf]) -> bool {
+    let owed = REPOS_OWED_A_FETCH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    work_directories.iter().any(|path| owed.contains(path))
+}
+
+fn set_repos_owed_a_fetch(work_directories: &[PathBuf], owed: bool) {
+    let mut repos = REPOS_OWED_A_FETCH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for path in work_directories {
+        if owed {
+            repos.insert(path.clone());
+        } else {
+            repos.remove(path);
+        }
+    }
+}
+
+fn repo_work_directories(git_repos: &[Entity<Repository>], cx: &App) -> Vec<PathBuf> {
+    git_repos
+        .iter()
+        .map(|repo| {
+            repo.read(cx)
+                .snapshot()
+                .work_directory_abs_path
+                .to_path_buf()
+        })
+        .collect()
+}
+
+type BranchScan = futures::channel::oneshot::Receiver<anyhow::Result<BranchesScanResult>>;
+
+fn start_base_ref_scan(git_repos: &[Entity<Repository>], cx: &mut App) -> Vec<BranchScan> {
+    git_repos
+        .iter()
+        .map(|repo| repo.update(cx, |repo, _cx| repo.branches()))
+        .collect()
+}
+
+/// `None` when any repository lacks `base_ref`, which means it must be fetched before creating.
+async fn base_ref_commits(
+    scans: Vec<BranchScan>,
+    base_ref: &str,
+) -> Option<Vec<Option<SharedString>>> {
+    let mut commits = Vec::with_capacity(scans.len());
+    for scan in futures::future::join_all(scans).await {
+        let branch = scan
+            .ok()?
+            .ok()?
+            .branches
+            .into_iter()
+            .find(|branch| branch.ref_name == base_ref)?;
+        commits.push(branch.most_recent_commit.map(|commit| commit.sha));
+    }
+    Some(commits)
+}
+
+/// Never prompts for credentials: a password prompt for a fetch the user didn't ask for is worse
+/// than a stale base.
+fn fetch_base_behind_creation(
+    git_repos: Vec<Entity<Repository>>,
+    base_ref: String,
+    deferred: DeferredBaseFetch,
+    workspace: &Entity<Workspace>,
+    cx: &mut AsyncWindowContext,
+) {
+    let DeferredBaseFetch {
+        remote_name,
+        base_display,
+        work_directories,
+        base_before,
+    } = deferred;
+    let workspace = workspace.downgrade();
+    cx.spawn(async move |cx| {
+        let askpass_delegates = cx.update(|_, cx| {
+            let mut cx = cx.to_async();
+            git_repos
+                .iter()
+                // Dropping the sender fails the fetch instead of prompting.
+                .map(|_| AskPassDelegate::new(&mut cx, |_prompt, _password, _cx| {}))
+                .collect::<Vec<_>>()
+        })?;
+
+        let fetched =
+            fetch_remote_for_worktree_base(&git_repos, remote_name.clone(), askpass_delegates, cx)
+                .await;
+        set_repos_owed_a_fetch(&work_directories, fetched.is_err());
+        if let Err(error) = fetched {
+            log::info!("fetching {remote_name} behind a worktree creation failed: {error:#}");
+            return anyhow::Ok(());
+        }
+
+        let scans = cx.update(|_, cx| start_base_ref_scan(&git_repos, cx))?;
+        let moved = match base_ref_commits(scans, &base_ref).await {
+            Some(base_after) => base_after != base_before,
+            None => false,
+        };
+        if !moved {
+            return anyhow::Ok(());
+        }
+
+        log::info!("{base_display} moved while the worktree was being created from it");
+        workspace.update(cx, |workspace, cx| {
+            let toast = StatusToast::new(
+                format!("{base_display} moved; this worktree is behind it"),
+                cx,
+                |this, _cx| this.icon(Icon::new(IconName::ArrowDown).size(IconSize::Small)),
+            );
+            workspace.toggle_status_toast(toast, cx);
+        })?;
+        anyhow::Ok(())
+    })
+    .detach();
+}
+
 async fn fetch_remote_for_worktree_base(
     git_repos: &[Entity<Repository>],
     remote_name: String,
@@ -516,6 +646,266 @@ fn start_worktree_creations(
     }
 
     Ok((creation_infos, path_remapping))
+}
+
+/// `+` and the spare pool both use this, so a spare is made at the base `+` will ask for.
+pub fn default_worktree_branch_target(
+    project: &Entity<Project>,
+    cx: &mut gpui::App,
+) -> Task<NewWorktreeBranchTarget> {
+    let default_branch = project
+        .read(cx)
+        .active_repository(cx)
+        .map(|repo| repo.update(cx, |repo, _| repo.default_branch(true)));
+    cx.background_spawn(async move {
+        match default_branch {
+            Some(rx) => match rx.await {
+                Ok(Ok(Some(name))) => RemoteBranchName::parse(&name)
+                    .map(|remote| WorktreeCreateTarget::DefaultBranch(remote).branch_target())
+                    .unwrap_or(NewWorktreeBranchTarget::CurrentBranch),
+                _ => NewWorktreeBranchTarget::CurrentBranch,
+            },
+            None => NewWorktreeBranchTarget::CurrentBranch,
+        }
+    })
+}
+
+pub fn ensure_spare_worktree(
+    workspace: &Entity<Workspace>,
+    window: &mut gpui::Window,
+    cx: &mut gpui::App,
+) {
+    let project = workspace.read(cx).project().clone();
+    if project.read(cx).is_via_collab() {
+        return;
+    }
+    let (git_repos, _non_git_paths) = classify_worktrees(project.read(cx), cx);
+    let Some(key) = spare_key_for_repos(&git_repos, cx) else {
+        return;
+    };
+    // Checked before resolving the default branch, which is a git call.
+    if !SpareWorktrees::needs_one(&key, cx) {
+        return;
+    }
+    let remote_connection_options = project.read(cx).remote_connection_options(cx);
+    let branch_target = default_worktree_branch_target(&project, cx);
+    window
+        .spawn(cx, async move |cx| {
+            let branch_target = branch_target.await;
+            start_spare_worktree(git_repos, branch_target, remote_connection_options, cx);
+        })
+        .detach();
+}
+
+/// Keyed by where a probe-named worktree would go, which resolves through each repository's
+/// main checkout, so projects on linked worktrees of the same repositories share a spare.
+fn spare_key_for_repos(git_repos: &[Entity<Repository>], cx: &App) -> Option<SpareKey> {
+    let worktree_directory_setting = &ProjectSettings::get_global(cx).git.worktree_directory;
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for repo in git_repos {
+        let Some(path) = repo
+            .read(cx)
+            .path_for_new_linked_worktree("zed-spare-probe", worktree_directory_setting)
+            .log_err()
+        else {
+            continue;
+        };
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    (!paths.is_empty()).then_some(paths)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_worktree_directories(
+    git_repos: &[Entity<Repository>],
+    worktree_name: Option<String>,
+    existing_worktree_names: &[String],
+    existing_worktree_paths: &HashSet<PathBuf>,
+    base_ref: Option<String>,
+    worktree_directory_setting: &str,
+    remote_connection_options: Option<&RemoteConnectionOptions>,
+    spare: bool,
+    cx: &mut AsyncWindowContext,
+) -> anyhow::Result<(Vec<PathBuf>, Vec<(PathBuf, PathBuf)>)> {
+    let mut rng = rand::rng();
+
+    let (creation_infos, path_remapping) = cx.update(|_, cx| {
+        start_worktree_creations(
+            git_repos,
+            worktree_name,
+            existing_worktree_names,
+            existing_worktree_paths,
+            base_ref,
+            worktree_directory_setting,
+            &mut rng,
+            cx,
+        )
+    })??;
+
+    let fs = cx.update(|_, cx| <dyn Fs>::global(cx))?;
+
+    let creation_pairs: Vec<(Entity<Repository>, PathBuf)> = creation_infos
+        .iter()
+        .map(|(repo, path, _)| (repo.clone(), path.clone()))
+        .collect();
+
+    let checkout_started = std::time::Instant::now();
+    let created_paths = await_and_rollback_on_failure(creation_infos, fs, cx).await?;
+    log::info!(
+        "quiet-ui perf: worktree checked out in {:.0}ms",
+        checkout_started.elapsed().as_secs_f64() * 1000.
+    );
+
+    // Record each created worktree so thread archival can later verify that
+    // Zed created it before deleting it from disk. Failures are non-fatal:
+    // the worktree just won't be eligible for automatic archival.
+    for (repo, path) in creation_pairs {
+        crate::created_worktrees::record_created_worktree_for_repo(
+            &repo,
+            &path,
+            remote_connection_options,
+            spare,
+            cx,
+        )
+        .await;
+    }
+
+    Ok((created_paths, path_remapping))
+}
+
+async fn existing_worktrees(
+    receivers: Vec<
+        futures::channel::oneshot::Receiver<anyhow::Result<Vec<git::repository::Worktree>>>,
+    >,
+) -> (Vec<String>, HashSet<PathBuf>) {
+    let mut existing_worktree_names = Vec::new();
+    let mut existing_worktree_paths = HashSet::default();
+    for result in futures::future::join_all(receivers).await {
+        match result {
+            Ok(Ok(worktrees)) => {
+                for worktree in worktrees {
+                    if let Some(name) = worktree
+                        .path
+                        .parent()
+                        .and_then(|p| p.file_name())
+                        .and_then(|n| n.to_str())
+                    {
+                        existing_worktree_names.push(name.to_string());
+                    }
+                    existing_worktree_paths.insert(worktree.path.clone());
+                }
+            }
+            Ok(Err(err)) => {
+                Err::<(), _>(err).log_err();
+            }
+            Err(_) => {}
+        }
+    }
+    (existing_worktree_names, existing_worktree_paths)
+}
+
+fn start_spare_worktree(
+    git_repos: Vec<Entity<Repository>>,
+    branch_target: NewWorktreeBranchTarget,
+    remote_connection_options: Option<RemoteConnectionOptions>,
+    cx: &mut AsyncWindowContext,
+) {
+    let Ok(Some(key)) = cx.update(|_, cx| spare_key_for_repos(&git_repos, cx)) else {
+        return;
+    };
+    let Ok(true) = cx.update(|_, cx| SpareWorktrees::start_building(key.clone(), cx)) else {
+        return;
+    };
+
+    cx.spawn(async move |cx| {
+        let built = build_spare_worktree(
+            &git_repos,
+            branch_target,
+            remote_connection_options.as_ref(),
+            cx,
+        )
+        .await;
+        match built {
+            Ok(Some(spare)) => {
+                log::info!(
+                    "quiet-ui perf: a spare worktree is ready at {:?}",
+                    spare.paths
+                );
+                cx.update(|_, cx| SpareWorktrees::finish_building(key, spare, cx))?;
+            }
+            Ok(None) => {
+                log::info!("no spare worktree: its base would have to be fetched first");
+                cx.update(|_, cx| SpareWorktrees::abandon_building(&key, cx))?;
+            }
+            Err(error) => {
+                log::info!("no spare worktree was made: {error:#}");
+                cx.update(|_, cx| SpareWorktrees::abandon_building(&key, cx))?;
+            }
+        }
+        anyhow::Ok(())
+    })
+    .detach();
+}
+
+/// `Ok(None)` when the base would have to be fetched: a spare never fetches, since nothing could
+/// report a fetch nobody asked for.
+async fn build_spare_worktree(
+    git_repos: &[Entity<Repository>],
+    branch_target: NewWorktreeBranchTarget,
+    remote_connection_options: Option<&RemoteConnectionOptions>,
+    cx: &mut AsyncWindowContext,
+) -> anyhow::Result<Option<ReadySpare>> {
+    let base_ref = resolve_worktree_branch_target(&branch_target);
+    if remote_branch_to_fetch(&branch_target).is_some() {
+        let Some(base_ref) = base_ref.as_deref() else {
+            return Ok(None);
+        };
+        let work_directories = cx.update(|_, cx| repo_work_directories(git_repos, cx))?;
+        if repos_owed_a_fetch(&work_directories) {
+            return Ok(None);
+        }
+        let scans = cx.update(|_, cx| start_base_ref_scan(git_repos, cx))?;
+        if base_ref_commits(scans, base_ref).await.is_none() {
+            return Ok(None);
+        }
+    }
+
+    let worktree_receivers = cx.update(|_, cx| {
+        git_repos
+            .iter()
+            .map(|repo| repo.update(cx, |repo, _cx| repo.worktrees()))
+            .collect::<Vec<_>>()
+    })?;
+    let worktree_directory_setting = cx.update(|_, cx| {
+        ProjectSettings::get_global(cx)
+            .git
+            .worktree_directory
+            .clone()
+    })?;
+    let (existing_worktree_names, existing_worktree_paths) =
+        existing_worktrees(worktree_receivers).await;
+
+    let (paths, path_remapping) = create_worktree_directories(
+        git_repos,
+        None,
+        &existing_worktree_names,
+        &existing_worktree_paths,
+        base_ref.clone(),
+        &worktree_directory_setting,
+        remote_connection_options,
+        true,
+        cx,
+    )
+    .await?;
+
+    let consolidated_worktrees = path_remapping.len() > paths.len();
+    Ok(Some(ReadySpare {
+        paths,
+        base_ref,
+        consolidated_worktrees,
+    }))
 }
 
 /// Waits for every in-flight worktree creation to complete. If any
@@ -692,7 +1082,19 @@ pub fn handle_create_worktree(
     fallback_focused_dock: Option<DockPosition>,
     cx: &mut gpui::Context<Workspace>,
 ) {
-    let task = create_worktree_workspace_inner(
+    let task =
+        create_worktree_workspace_foreground(workspace, action, window, fallback_focused_dock, cx);
+    task.detach_and_log_err(cx);
+}
+
+pub fn create_worktree_workspace_foreground(
+    workspace: &mut Workspace,
+    action: &zed_actions::CreateWorktree,
+    window: &mut gpui::Window,
+    fallback_focused_dock: Option<DockPosition>,
+    cx: &mut gpui::Context<Workspace>,
+) -> Task<anyhow::Result<CreatedWorktreeWorkspace>> {
+    create_worktree_workspace_inner(
         workspace,
         action,
         window,
@@ -701,8 +1103,7 @@ pub fn handle_create_worktree(
         // The user explicitly asked to create a worktree, so foreground it.
         true,
         cx,
-    );
-    task.detach_and_log_err(cx);
+    )
 }
 
 /// Outcome of [`create_worktree_workspace`].
@@ -978,6 +1379,41 @@ async fn do_create_worktree(
     activate: bool,
     cx: &mut AsyncWindowContext,
 ) -> anyhow::Result<CreatedWorktreeWorkspace> {
+    // Holds off spare checkouts until this creation's window is open.
+    let creating = crate::worktree_spares::CreationInFlight::begin();
+
+    // Only a generated-name creation can take a spare.
+    let claimed = if worktree_name.is_none() {
+        let claimed = cx.update(|_, cx| {
+            spare_key_for_repos(&git_repos, cx).and_then(|key| {
+                SpareWorktrees::claim(
+                    &key,
+                    resolve_worktree_branch_target(&branch_target).as_deref(),
+                    cx,
+                )
+            })
+        })?;
+        // The user may have deleted the spare's directory since it was made.
+        match claimed {
+            Some(spare) => {
+                let fs = cx.update(|_, cx| <dyn Fs>::global(cx))?;
+                let mut all_present = true;
+                for path in &spare.paths {
+                    all_present &= fs.is_dir(path).await;
+                }
+                if all_present {
+                    Some(spare)
+                } else {
+                    log::info!("the spare worktree is gone from disk; checking one out instead");
+                    None
+                }
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
     // List existing worktrees from all repos to detect name collisions
     let worktree_receivers: Vec<_> = cx.update(|_, cx| {
         git_repos
@@ -992,101 +1428,123 @@ async fn do_create_worktree(
             .clone()
     })?;
 
-    let mut existing_worktree_names = Vec::new();
-    let mut existing_worktree_paths = HashSet::default();
-    for result in futures::future::join_all(worktree_receivers).await {
-        match result {
-            Ok(Ok(worktrees)) => {
-                for worktree in worktrees {
-                    if let Some(name) = worktree
-                        .path
-                        .parent()
-                        .and_then(|p| p.file_name())
-                        .and_then(|n| n.to_str())
-                    {
-                        existing_worktree_names.push(name.to_string());
-                    }
-                    existing_worktree_paths.insert(worktree.path.clone());
-                }
-            }
-            Ok(Err(err)) => {
-                Err::<(), _>(err).log_err();
-            }
-            Err(_) => {}
-        }
-    }
+    // Started alongside the worktree listing so the two git calls overlap.
+    let base_ref = resolve_worktree_branch_target(&branch_target);
+    let (work_directories, base_ref_scans) = if remote_branch_fetch_mode.should_fetch()
+        && remote_branch_to_fetch(&branch_target).is_some()
+        && base_ref.is_some()
+    {
+        let work_directories = cx.update(|_, cx| repo_work_directories(&git_repos, cx))?;
+        let scans = match repos_owed_a_fetch(&work_directories) {
+            true => None,
+            false => Some(cx.update(|_, cx| start_base_ref_scan(&git_repos, cx))?),
+        };
+        (work_directories, scans)
+    } else {
+        (Vec::new(), None)
+    };
 
+    let (existing_worktree_names, existing_worktree_paths) =
+        existing_worktrees(worktree_receivers).await;
+
+    // The fetch only has to block creation when the base isn't in the clone yet; otherwise it
+    // runs behind the new window.
+    let fetch_started = std::time::Instant::now();
+    let mut fetch_behind_creation = None;
     if remote_branch_fetch_mode.should_fetch()
         && let Some((remote_name, branch_name)) = remote_branch_to_fetch(&branch_target)
     {
         let remote_name = remote_name.to_string();
         let branch_name = branch_name.to_string();
-        if let Err(error) = fetch_remote_for_worktree_base(
-            &git_repos,
-            remote_name.clone(),
-            fetch_askpass_delegates,
-            cx,
-        )
-        .await
-        {
-            return Err(WorktreeFetchError {
-                remote_name,
-                branch_name,
-                source: error,
+        let base_before = match (base_ref.as_deref(), base_ref_scans) {
+            (Some(base_ref), Some(scans)) => base_ref_commits(scans, base_ref).await,
+            _ => None,
+        };
+        match base_before {
+            Some(base_before) => {
+                fetch_behind_creation = Some(DeferredBaseFetch {
+                    base_display: format!("{remote_name}/{branch_name}"),
+                    remote_name,
+                    work_directories,
+                    base_before,
+                });
             }
-            .into());
+            None => {
+                if let Err(error) = fetch_remote_for_worktree_base(
+                    &git_repos,
+                    remote_name.clone(),
+                    fetch_askpass_delegates,
+                    cx,
+                )
+                .await
+                {
+                    return Err(WorktreeFetchError {
+                        remote_name,
+                        branch_name,
+                        source: error,
+                    }
+                    .into());
+                }
+                set_repos_owed_a_fetch(&work_directories, false);
+            }
         }
     }
 
-    let mut rng = rand::rng();
+    log::info!(
+        "quiet-ui perf: worktree base {} in {:.0}ms",
+        if fetch_behind_creation.is_some() {
+            "already present"
+        } else {
+            "fetched"
+        },
+        fetch_started.elapsed().as_secs_f64() * 1000.
+    );
 
-    let base_ref = resolve_worktree_branch_target(&branch_target);
+    let (created_paths, path_remapping, consolidated_worktrees) = match claimed {
+        Some(spare) => {
+            log::info!("quiet-ui perf: worktree claimed from the spare, not checked out");
+            for path in &spare.paths {
+                let cleared = cx.update(|_, cx| {
+                    crate::created_worktrees::clear_spare_mark(
+                        path,
+                        remote_connection_options.as_ref(),
+                        cx,
+                    )
+                })?;
+                cleared.await.log_err();
+            }
+            (spare.paths, Vec::new(), spare.consolidated_worktrees)
+        }
+        None => {
+            let (created_paths, path_remapping) = create_worktree_directories(
+                &git_repos,
+                worktree_name,
+                &existing_worktree_names,
+                &existing_worktree_paths,
+                base_ref.clone(),
+                &worktree_directory_setting,
+                remote_connection_options.as_ref(),
+                false,
+                cx,
+            )
+            .await?;
+            // `path_remapping` has one entry per source git repo, while
+            // `created_paths` has one per *unique* target worktree. When the
+            // former is larger, two or more source repos were linked worktrees
+            // of the same underlying repository and `start_worktree_creations`
+            // consolidated them.
+            let consolidated_worktrees = path_remapping.len() > created_paths.len();
+            (created_paths, path_remapping, consolidated_worktrees)
+        }
+    };
 
-    let (creation_infos, path_remapping) = cx.update(|_, cx| {
-        start_worktree_creations(
-            &git_repos,
-            worktree_name,
-            &existing_worktree_names,
-            &existing_worktree_paths,
-            base_ref,
-            &worktree_directory_setting,
-            &mut rng,
-            cx,
-        )
-    })??;
-
-    let fs = cx.update(|_, cx| <dyn Fs>::global(cx))?;
-
-    let creation_pairs: Vec<(Entity<Repository>, PathBuf)> = creation_infos
-        .iter()
-        .map(|(repo, path, _)| (repo.clone(), path.clone()))
-        .collect();
-
-    let created_paths = await_and_rollback_on_failure(creation_infos, fs, cx).await?;
-
-    // Record each created worktree so thread archival can later verify that
-    // Zed created it before deleting it from disk. Failures are non-fatal:
-    // the worktree just won't be eligible for automatic archival.
-    for (repo, path) in creation_pairs {
-        crate::created_worktrees::record_created_worktree_for_repo(
-            &repo,
-            &path,
-            remote_connection_options.as_ref(),
-            cx,
-        )
-        .await;
-    }
-
-    // `path_remapping` has one entry per source git repo, while `created_paths`
-    // has one per *unique* target worktree. When the former is larger, two or
-    // more source repos were linked worktrees of the same underlying
-    // repository and `start_worktree_creations` consolidated them.
-    let consolidated_worktrees = path_remapping.len() > created_paths.len();
+    let spare_remote_connection_options = remote_connection_options.clone();
 
     let mut all_paths = created_paths;
     let has_non_git = !non_git_paths.is_empty();
     all_paths.extend(non_git_paths.iter().cloned());
 
+    let open_started = std::time::Instant::now();
     let workspace = open_worktree_workspace(
         all_paths,
         path_remapping,
@@ -1101,6 +1559,24 @@ async fn do_create_worktree(
         cx,
     )
     .await?;
+    log::info!(
+        "quiet-ui perf: worktree workspace opened in {:.0}ms",
+        open_started.elapsed().as_secs_f64() * 1000.
+    );
+
+    drop(creating);
+    start_spare_worktree(
+        git_repos.clone(),
+        branch_target,
+        spare_remote_connection_options,
+        cx,
+    );
+
+    if let Some(deferred) = fetch_behind_creation
+        && let Some(base_ref) = base_ref
+    {
+        fetch_base_behind_creation(git_repos, base_ref, deferred, &workspace, cx);
+    }
 
     Ok(CreatedWorktreeWorkspace {
         workspace,
@@ -1149,8 +1625,9 @@ async fn do_switch_worktree(
 /// work (e.g., the `create_thread` agent tool spawns a thread inside it).
 async fn open_worktree_workspace(
     all_paths: Vec<PathBuf>,
-    path_remapping: Vec<(PathBuf, PathBuf)>,
-    non_git_paths: Vec<PathBuf>,
+    // Unused since open files aren't carried over; kept so call sites stay upstream's.
+    _path_remapping: Vec<(PathBuf, PathBuf)>,
+    _non_git_paths: Vec<PathBuf>,
     has_non_git: bool,
     previous_state: PreviousWorkspaceState,
     workspace: WeakEntity<Workspace>,
@@ -1162,6 +1639,8 @@ async fn open_worktree_workspace(
 ) -> anyhow::Result<Entity<Workspace>> {
     let window_handle = window_handle
         .ok_or_else(|| anyhow!("No window handle available for workspace creation"))?;
+
+    let open_started = std::time::Instant::now();
 
     let focused_dock = previous_state.focused_dock;
 
@@ -1235,6 +1714,71 @@ async fn open_worktree_workspace(
         task.await.log_err();
     }
 
+    maybe_propagate_worktree_trust(&workspace, &new_workspace, &all_paths, cx);
+
+    if transfer_state {
+        window_handle.update(cx, |_multi_workspace, window, cx| {
+            new_workspace.update(cx, |workspace, cx| {
+                if has_non_git {
+                    struct WorktreeCreationToast;
+                    let toast_id =
+                        workspace::notifications::NotificationId::unique::<WorktreeCreationToast>();
+                    workspace.show_toast(
+                        workspace::Toast::new(
+                            toast_id,
+                            "Some project folders are not git repositories. \
+                             They were included as-is without creating a worktree.",
+                        ),
+                        cx,
+                    );
+                }
+
+                // A new worktree is a new thread's workspace, so the source's open files aren't
+                // reopened in it.
+                if focused_dock.is_none() {
+                    workspace.focus_center_pane(window, cx);
+                }
+            });
+        })?;
+    }
+
+    // Clear the creation status on the SOURCE workspace so its title bar
+    // stops showing the loading indicator immediately.
+    workspace
+        .update(cx, |ws, cx| {
+            ws.set_active_worktree_creation(None, false, cx);
+        })
+        .ok();
+
+    // Shown before the initial scan below, which is most of the wait on a large repository.
+    window_handle.update(cx, |multi_workspace, window, cx| {
+        if activate {
+            multi_workspace.activate(new_workspace.clone(), source_for_transfer, window, cx);
+        } else {
+            // Background open: register the new workspace as a retained tab
+            // but leave the user where they are.
+            multi_workspace.add(new_workspace.clone(), window, cx);
+        }
+
+        if activate
+            && is_creating_new_worktree
+            && let Some(dock_position) = focused_dock
+        {
+            new_workspace.update(cx, |workspace, cx| {
+                let dock = workspace.dock_at_position(dock_position);
+                if let Some(panel) = dock.read(cx).active_panel() {
+                    panel.activation_focus_handle(cx).focus(window, cx);
+                }
+            });
+        }
+    })?;
+
+    log::info!(
+        "quiet-ui perf: worktree window shown in {:.0}ms",
+        open_started.elapsed().as_secs_f64() * 1000.
+    );
+
+    // Callers like `create_thread` still need a scanned project when this returns.
     new_workspace
         .update(cx, |workspace, cx| {
             workspace.project().read(cx).wait_for_initial_scan(cx)
@@ -1258,130 +1802,15 @@ async fn open_worktree_workspace(
         })
         .await;
 
-    maybe_propagate_worktree_trust(&workspace, &new_workspace, &all_paths, cx);
-
-    if transfer_state {
+    if is_creating_new_worktree {
+        // Run create-worktree setup hooks regardless of foreground vs
+        // background — the worktree was created either way.
         window_handle.update(cx, |_multi_workspace, window, cx| {
             new_workspace.update(cx, |workspace, cx| {
-                if has_non_git {
-                    struct WorktreeCreationToast;
-                    let toast_id =
-                        workspace::notifications::NotificationId::unique::<WorktreeCreationToast>();
-                    workspace.show_toast(
-                        workspace::Toast::new(
-                            toast_id,
-                            "Some project folders are not git repositories. \
-                             They were included as-is without creating a worktree.",
-                        ),
-                        cx,
-                    );
-                }
-
-                // Remap every previously-open file path into the new worktree.
-                let remap_path = |original_path: PathBuf| -> Option<PathBuf> {
-                    let best_match = path_remapping
-                        .iter()
-                        .filter_map(|(old_root, new_root)| {
-                            original_path.strip_prefix(old_root).ok().map(|relative| {
-                                (old_root.components().count(), new_root.join(relative))
-                            })
-                        })
-                        .max_by_key(|(depth, _)| *depth);
-
-                    if let Some((_, remapped_path)) = best_match {
-                        return Some(remapped_path);
-                    }
-
-                    for non_git in &non_git_paths {
-                        if original_path.starts_with(non_git) {
-                            return Some(original_path);
-                        }
-                    }
-                    None
-                };
-
-                let remapped_active_path =
-                    previous_state.active_file_path.and_then(|p| remap_path(p));
-
-                let mut paths_to_open: Vec<PathBuf> = Vec::new();
-                let mut seen = HashSet::default();
-                for path in previous_state.open_file_paths {
-                    if let Some(remapped) = remap_path(path) {
-                        if remapped_active_path.as_ref() != Some(&remapped)
-                            && seen.insert(remapped.clone())
-                        {
-                            paths_to_open.push(remapped);
-                        }
-                    }
-                }
-
-                if let Some(active) = &remapped_active_path {
-                    if seen.insert(active.clone()) {
-                        paths_to_open.push(active.clone());
-                    }
-                }
-
-                if !paths_to_open.is_empty() {
-                    let should_focus_center = focused_dock.is_none();
-                    let open_task = workspace.open_paths(
-                        paths_to_open,
-                        workspace::OpenOptions {
-                            focus: Some(false),
-                            ..Default::default()
-                        },
-                        None,
-                        window,
-                        cx,
-                    );
-                    cx.spawn_in(window, async move |workspace, cx| {
-                        for item in open_task.await.into_iter().flatten() {
-                            item.log_err();
-                        }
-                        if should_focus_center {
-                            workspace.update_in(cx, |workspace, window, cx| {
-                                workspace.focus_center_pane(window, cx);
-                            })?;
-                        }
-                        anyhow::Ok(())
-                    })
-                    .detach_and_log_err(cx);
-                }
+                workspace.run_create_worktree_tasks(window, cx);
             });
         })?;
     }
-
-    // Clear the creation status on the SOURCE workspace so its title bar
-    // stops showing the loading indicator immediately.
-    workspace
-        .update(cx, |ws, cx| {
-            ws.set_active_worktree_creation(None, false, cx);
-        })
-        .ok();
-
-    window_handle.update(cx, |multi_workspace, window, cx| {
-        if activate {
-            multi_workspace.activate(new_workspace.clone(), source_for_transfer, window, cx);
-        } else {
-            // Background open: register the new workspace as a retained tab
-            // but leave the user where they are.
-            multi_workspace.add(new_workspace.clone(), window, cx);
-        }
-
-        if is_creating_new_worktree {
-            new_workspace.update(cx, |workspace, cx| {
-                // Run create-worktree setup hooks regardless of foreground vs
-                // background — the worktree was created either way.
-                workspace.run_create_worktree_tasks(window, cx);
-
-                if activate && let Some(dock_position) = focused_dock {
-                    let dock = workspace.dock_at_position(dock_position);
-                    if let Some(panel) = dock.read(cx).active_panel() {
-                        panel.activation_focus_handle(cx).focus(window, cx);
-                    }
-                }
-            });
-        }
-    })?;
 
     Ok(new_workspace)
 }
@@ -1706,6 +2135,324 @@ mod tests {
         assert!(
             !has_modal,
             "security modal should not show for a linked worktree created from a trusted main worktree"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_a_base_already_in_the_clone_is_not_fetched_before_creating(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+        fs.insert_tree(
+            path!("/offline"),
+            json!({
+                "project": {
+                    ".git": {},
+                    "src": { "main.rs": "fn main() {}" },
+                },
+            }),
+        )
+        .await;
+        let dot_git = PathBuf::from(path!("/offline/project/.git"));
+        fs.insert_branches(&dot_git, &["main", "origin/main"]);
+        fs.set_fetch_error(&dot_git, Some("could not resolve host"));
+
+        let project = Project::test(fs.clone(), [Path::new(path!("/offline/project"))], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        multi_workspace.update(cx, |multi_workspace, cx| {
+            multi_workspace.retain_active_workspace(cx);
+        });
+        let main_workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        let created = main_workspace
+            .update_in(cx, |workspace, window, cx| {
+                create_worktree_workspace(
+                    workspace,
+                    &zed_actions::CreateWorktree {
+                        worktree_name: Some("feature".to_string()),
+                        branch_target: NewWorktreeBranchTarget::RemoteBranch {
+                            remote_name: "origin".to_string(),
+                            branch_name: "main".to_string(),
+                        },
+                    },
+                    window,
+                    None,
+                    cx,
+                )
+            })
+            .await;
+        assert!(
+            created.is_ok(),
+            "a base already in the clone should not make creation wait on a fetch: {:?}",
+            created.err()
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            fs.fetched_remotes(&dot_git),
+            vec!["origin".to_string()],
+            "the fetch should still have happened, behind the creation"
+        );
+
+        let second = main_workspace
+            .update_in(cx, |workspace, window, cx| {
+                create_worktree_workspace(
+                    workspace,
+                    &zed_actions::CreateWorktree {
+                        worktree_name: Some("feature-2".to_string()),
+                        branch_target: NewWorktreeBranchTarget::RemoteBranch {
+                            remote_name: "origin".to_string(),
+                            branch_name: "main".to_string(),
+                        },
+                    },
+                    window,
+                    None,
+                    cx,
+                )
+            })
+            .await;
+        assert!(
+            second.is_err(),
+            "a repository whose background fetch failed should fetch in front of the next creation"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_a_base_missing_from_the_clone_is_fetched_first(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+        fs.insert_tree(
+            path!("/never-fetched"),
+            json!({
+                "project": {
+                    ".git": {},
+                    "src": { "main.rs": "fn main() {}" },
+                },
+            }),
+        )
+        .await;
+        let dot_git = PathBuf::from(path!("/never-fetched/project/.git"));
+        fs.insert_branches(&dot_git, &["main"]);
+        fs.set_fetch_error(&dot_git, Some("could not resolve host"));
+
+        let project =
+            Project::test(fs.clone(), [Path::new(path!("/never-fetched/project"))], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        multi_workspace.update(cx, |multi_workspace, cx| {
+            multi_workspace.retain_active_workspace(cx);
+        });
+        let main_workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        let created = main_workspace
+            .update_in(cx, |workspace, window, cx| {
+                create_worktree_workspace(
+                    workspace,
+                    &zed_actions::CreateWorktree {
+                        worktree_name: Some("feature".to_string()),
+                        branch_target: NewWorktreeBranchTarget::RemoteBranch {
+                            remote_name: "origin".to_string(),
+                            branch_name: "main".to_string(),
+                        },
+                    },
+                    window,
+                    None,
+                    cx,
+                )
+            })
+            .await;
+        assert!(
+            created.is_err(),
+            "a base that is not in the clone has to be fetched before anything can be made from it"
+        );
+    }
+
+    fn worktree_directories(fs: &Arc<FakeFs>, managed_root: &str) -> Vec<PathBuf> {
+        let managed_root = PathBuf::from(managed_root);
+        let mut dirs: Vec<PathBuf> = fs
+            .directories(false)
+            .into_iter()
+            .filter(|dir| dir.parent() == Some(managed_root.as_path()))
+            .collect();
+        dirs.sort();
+        dirs
+    }
+
+    #[gpui::test]
+    async fn test_a_spare_worktree_is_handed_over_and_replaced(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+        fs.insert_tree(
+            path!("/spares"),
+            json!({
+                "project": {
+                    ".git": {},
+                    "src": { "main.rs": "fn main() {}" },
+                },
+            }),
+        )
+        .await;
+        let dot_git = PathBuf::from(path!("/spares/project/.git"));
+        fs.insert_branches(&dot_git, &["main", "origin/main"]);
+
+        let project = Project::test(fs.clone(), [Path::new(path!("/spares/project"))], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        multi_workspace.update(cx, |multi_workspace, cx| {
+            multi_workspace.retain_active_workspace(cx);
+        });
+        let main_workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let managed_root = path!("/spares/worktrees/project");
+
+        multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+            let workspace = multi_workspace.workspace().clone();
+            ensure_spare_worktree(&workspace, window, cx);
+        });
+        cx.run_until_parked();
+        let spares = worktree_directories(&fs, managed_root);
+        assert_eq!(
+            spares.len(),
+            1,
+            "one spare is made before anyone presses +, at {managed_root}: {spares:?}"
+        );
+        let spare = spares[0].clone();
+
+        let branch_target = main_workspace
+            .update(cx, |workspace, cx| {
+                default_worktree_branch_target(&workspace.project().clone(), cx)
+            })
+            .await;
+        let created = main_workspace
+            .update_in(cx, |workspace, window, cx| {
+                create_worktree_workspace(
+                    workspace,
+                    &zed_actions::CreateWorktree {
+                        worktree_name: None,
+                        branch_target,
+                    },
+                    window,
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("a creation with a spare standing by should open a workspace");
+
+        let roots = created
+            .workspace
+            .read_with(cx, |workspace, cx| workspace.root_paths(cx));
+        assert_eq!(
+            roots
+                .iter()
+                .map(|path| path.to_path_buf())
+                .collect::<Vec<_>>(),
+            vec![spare.join("project")],
+            "the workspace should open over the spare rather than a fresh checkout"
+        );
+
+        cx.run_until_parked();
+        let after = worktree_directories(&fs, managed_root);
+        assert_eq!(
+            after.len(),
+            2,
+            "claiming a spare should start the next one: {after:?}"
+        );
+        assert!(
+            after.contains(&spare),
+            "the claimed worktree is still the thread's"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_a_spare_at_another_base_is_not_claimed(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+        fs.insert_tree(
+            path!("/other-base"),
+            json!({
+                "project": {
+                    ".git": {},
+                    "src": { "main.rs": "fn main() {}" },
+                },
+            }),
+        )
+        .await;
+        let dot_git = PathBuf::from(path!("/other-base/project/.git"));
+        fs.insert_branches(&dot_git, &["main", "origin/main"]);
+
+        let project =
+            Project::test(fs.clone(), [Path::new(path!("/other-base/project"))], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        multi_workspace.update(cx, |multi_workspace, cx| {
+            multi_workspace.retain_active_workspace(cx);
+        });
+        let main_workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let managed_root = path!("/other-base/worktrees/project");
+
+        multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+            let workspace = multi_workspace.workspace().clone();
+            ensure_spare_worktree(&workspace, window, cx);
+        });
+        cx.run_until_parked();
+        let spares = worktree_directories(&fs, managed_root);
+        assert_eq!(spares.len(), 1, "a spare is standing by: {spares:?}");
+        let spare = spares[0].clone();
+
+        let created = main_workspace
+            .update_in(cx, |workspace, window, cx| {
+                create_worktree_workspace(
+                    workspace,
+                    &zed_actions::CreateWorktree {
+                        worktree_name: None,
+                        branch_target: NewWorktreeBranchTarget::ExistingBranch {
+                            name: "some-other-branch".to_string(),
+                        },
+                    },
+                    window,
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("a creation at another base should make its own worktree");
+
+        let roots = created
+            .workspace
+            .read_with(cx, |workspace, cx| workspace.root_paths(cx));
+        assert_ne!(
+            roots
+                .iter()
+                .map(|path| path.to_path_buf())
+                .collect::<Vec<_>>(),
+            vec![spare.join("project")],
+            "a spare made from another base is not this creation's"
+        );
+        cx.run_until_parked();
+        assert!(
+            worktree_directories(&fs, managed_root).contains(&spare),
+            "the spare is left standing for a creation that does want its base"
         );
     }
 
