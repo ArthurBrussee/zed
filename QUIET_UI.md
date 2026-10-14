@@ -219,21 +219,6 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
-**Clicking "1 command running" shows what is running, with a stop for each.**
-
-The activity pill in the thread's bottom bar (`render_input_activity_pill` in `thread_view.rs`)
-says how many commands and subagents are running but not which. Clicking it opens a small
-popover listing each one:
-- each running command, by its chip label and how long it has run, with its last output line;
-- each backgrounded task and each live subagent, by name.
-
-Each item has a Stop button. A command run in a Zed terminal stops through
-`AcpThread::kill_terminal`. A backgrounded task stops through the existing `stop_async_task`
-(`_session/async_task/stop`). A subagent stops through whatever its agent offers, and where
-it offers nothing, the item has no Stop rather than a fake one. Clicking an item's label
-scrolls the thread to that command's chip. Test: two running commands list both, and stopping
-one leaves the other running and the count drops to 1.
-
 **Remove the copy button from command chips; it covers the stop button.**
 
 On a running command chip the copy button (`IconButton::new(("copy-command", entry_ix),

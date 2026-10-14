@@ -15774,6 +15774,86 @@ pub(crate) mod tests {
         );
     }
 
+    /// "2 commands running" has to be able to say which two, and stopping one
+    /// from that list leaves the other alone.
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_the_activity_pill_lists_what_is_running(cx: &mut TestAppContext) {
+        init_test(cx);
+        // Real subprocesses run on real threads.
+        cx.executor().allow_parking();
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(StubAgentConnection::new()), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+
+        let first_lower = headless_terminal("sleep 60", cx).await;
+        let first = register_running_command(&thread, "first", "sleep 60", first_lower, cx);
+        let second_lower = headless_terminal("sleep 61", cx).await;
+        let second = register_running_command(&thread, "second", "sleep 61", second_lower, cx);
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(thread.running_work(cx).terminals, 2);
+        });
+        assert_eq!(
+            thread_view.read_with(cx, |view, cx| view
+                .running_items(cx)
+                .into_iter()
+                .map(|item| item.label.to_string())
+                .collect::<Vec<_>>()),
+            vec!["sleep 60".to_string(), "sleep 61".to_string()],
+            "the pill's popover names both, by the labels their chips carry"
+        );
+
+        let stop = thread_view
+            .read_with(cx, |view, cx| {
+                view.running_items(cx).into_iter().next()?.stop
+            })
+            .expect("a command of ours can be stopped");
+        thread_view.update(cx, |view, cx| view.stop_running_item(&stop, cx));
+
+        wait_until(
+            cx,
+            std::time::Duration::from_secs(10),
+            "stopping one from the list kills that one command",
+            |cx| first.read_with(cx, |terminal, _| terminal.was_stopped_by_user()),
+        )
+        .await;
+        wait_until(
+            cx,
+            std::time::Duration::from_secs(60),
+            "and it really exits",
+            |cx| first.read_with(cx, |terminal, _| terminal.output().is_some()),
+        )
+        .await;
+
+        second.read_with(cx, |terminal, _| {
+            assert!(
+                terminal.output().is_none(),
+                "the other command keeps running"
+            );
+        });
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(
+                thread.running_work(cx).terminals,
+                1,
+                "and the count drops to one"
+            );
+        });
+        assert_eq!(
+            thread_view.read_with(cx, |view, cx| view
+                .running_items(cx)
+                .into_iter()
+                .map(|item| item.label.to_string())
+                .collect::<Vec<_>>()),
+            vec!["sleep 61".to_string()],
+            "so the popover lists only what is left"
+        );
+    }
+
     #[gpui::test]
     async fn test_terminal_snapshots_reuse_the_read_only_tool_view(cx: &mut TestAppContext) {
         init_test(cx);

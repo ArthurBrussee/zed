@@ -1424,6 +1424,82 @@ fn stale_by_use<K>(used: impl Iterator<Item = (u64, K)>, keep: usize) -> Vec<K> 
     used.into_iter().map(|(_, _, key)| key).collect()
 }
 
+/// One thing the activity pill is counting, for the popover behind it.
+#[derive(Clone)]
+pub(super) struct RunningItem {
+    pub(super) label: SharedString,
+    detail: Option<SharedString>,
+    /// The chip to scroll to, where this is a command in the thread.
+    entry_ix: Option<usize>,
+    /// `None` where nothing can stop it, rather than a button that does
+    /// nothing.
+    pub(super) stop: Option<RunningStop>,
+}
+
+#[derive(Clone)]
+pub(super) enum RunningStop {
+    /// A terminal of ours; killing it leaves the turn alone.
+    Terminal(Entity<acp_thread::Terminal>),
+    /// A command the agent detached: a request to it, not a signal.
+    AsyncTask(SharedString),
+    /// A subagent's own session.
+    Subagent(acp_v2::SessionId),
+}
+
+fn elapsed_label(elapsed: std::time::Duration) -> String {
+    let seconds = elapsed.as_secs();
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h {}m", seconds / 3600, (seconds % 3600) / 60)
+    }
+}
+
+fn render_running_item(
+    index: usize,
+    item: &RunningItem,
+    thread_view: &WeakEntity<ThreadView>,
+    cx: &mut App,
+) -> AnyElement {
+    h_flex()
+        .w_full()
+        .gap_2()
+        .justify_between()
+        .child(
+            v_flex()
+                .min_w_0()
+                .child(
+                    Label::new(item.label.clone())
+                        .size(LabelSize::Small)
+                        .buffer_font(cx)
+                        .truncate(),
+                )
+                .children(item.detail.clone().map(|detail| {
+                    Label::new(detail)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .buffer_font(cx)
+                        .truncate()
+                })),
+        )
+        .children(item.stop.clone().map(|stop| {
+            let thread_view = thread_view.clone();
+            IconButton::new(("stop-running-item", index), IconName::Stop)
+                .icon_size(IconSize::XSmall)
+                .icon_color(Color::Error)
+                .tooltip(Tooltip::text("Stop This"))
+                .on_click(move |_, _window, cx| {
+                    cx.stop_propagation();
+                    thread_view
+                        .update(cx, |this, cx| this.stop_running_item(&stop, cx))
+                        .ok();
+                })
+        }))
+        .into_any_element()
+}
+
 #[derive(Clone)]
 enum ChipImage {
     /// May live outside the project.
@@ -7766,7 +7842,125 @@ impl ThreadView {
         cx.spawn(async move |_, _| task.await.log_err()).detach();
     }
 
-    /// The same pill the sidebar's rows draw.
+    /// Everything the activity pill is counting, so "1 command running" can
+    /// say which one.
+    pub(super) fn running_items(&self, cx: &App) -> Vec<RunningItem> {
+        let thread = self.thread.read(cx);
+        let mut items = Vec::new();
+        let mut listed_calls: HashSet<acp_v2::ToolCallId> = HashSet::default();
+
+        for (entry_ix, entry) in thread.entries().iter().enumerate() {
+            let AgentThreadEntry::ToolCall(call) = entry else {
+                continue;
+            };
+            if !thread.tool_call_is_running(call, cx) {
+                continue;
+            }
+            // A subagent with a reported lifecycle is listed from that below.
+            if thread.subagent_state_for_tool_call(call).is_some() {
+                continue;
+            }
+            listed_calls.insert(call.id.clone());
+            let terminal = call.terminals().next();
+            let (detail, stop) = match terminal {
+                Some(terminal) => {
+                    let read = terminal.read(cx);
+                    let mut detail = elapsed_label(read.started_at().elapsed());
+                    if let Some(line) = read
+                        .inner()
+                        .read(cx)
+                        .last_n_non_empty_lines(1)
+                        .pop()
+                        .filter(|line| !line.trim().is_empty())
+                    {
+                        detail = format!("{detail} · {}", line.trim());
+                    }
+                    let stop = read
+                        .is_process_backed()
+                        .then(|| RunningStop::Terminal(terminal.clone()));
+                    (Some(SharedString::from(detail)), stop)
+                }
+                None => (None, None),
+            };
+            // No process of ours is behind a command the agent detached, so
+            // stopping it is a request to the agent.
+            let stop = stop.or_else(|| {
+                thread
+                    .async_task_for_tool_call(&call.id)
+                    .filter(|task| task.can_stop)
+                    .map(|task| RunningStop::AsyncTask(task.id.clone()))
+            });
+            items.push(RunningItem {
+                label: self.low_value_item_label(call, cx),
+                detail,
+                entry_ix: Some(entry_ix),
+                stop,
+            });
+        }
+
+        for task in thread.async_tasks() {
+            if task.state.is_terminal() {
+                continue;
+            }
+            // Already listed beside the command that started it.
+            if task
+                .tool_call_id
+                .as_ref()
+                .is_some_and(|id| listed_calls.contains(id))
+            {
+                continue;
+            }
+            items.push(RunningItem {
+                label: task.name.clone(),
+                detail: task.summary.clone().or_else(|| task.description.clone()),
+                entry_ix: None,
+                stop: task
+                    .can_stop
+                    .then(|| RunningStop::AsyncTask(task.id.clone())),
+            });
+        }
+
+        for subagent in thread.subagents() {
+            if subagent.state.is_terminal() {
+                continue;
+            }
+            let entry_ix = thread.entries().iter().position(|entry| match entry {
+                AgentThreadEntry::ToolCall(call) => call
+                    .subagent_session_info
+                    .as_ref()
+                    .is_some_and(|info| info.session_id == subagent.session_id),
+                _ => false,
+            });
+            items.push(RunningItem {
+                label: subagent
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| SharedString::from("Subagent")),
+                detail: subagent.task.clone(),
+                entry_ix,
+                // Its own session, which the agent reported and can cancel.
+                stop: Some(RunningStop::Subagent(subagent.session_id.clone())),
+            });
+        }
+
+        items
+    }
+
+    pub(super) fn stop_running_item(&mut self, stop: &RunningStop, cx: &mut Context<Self>) {
+        match stop {
+            RunningStop::Terminal(terminal) => {
+                terminal.update(cx, |terminal, cx| terminal.stop_by_user(cx));
+            }
+            RunningStop::AsyncTask(id) => self.stop_async_task(id.clone(), cx),
+            RunningStop::Subagent(session_id) => {
+                let connection = self.thread.read(cx).connection().clone();
+                connection.cancel(session_id, cx);
+            }
+        }
+    }
+
+    /// The same pill the sidebar's rows draw, with what it is counting behind
+    /// it: the row says how many, the popover says which.
     fn render_input_activity_pill(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let running_work = self.running_work(cx);
         let thread = self.thread.read(cx);
@@ -7778,12 +7972,53 @@ impl ThreadView {
         if thread.status() == ThreadStatus::Idle && work.is_empty() {
             return None;
         }
-        Some(ui::agent_activity_pill(
-            "input-activity",
-            work,
-            self.agent_icon,
-            cx,
-        ))
+        let pill = ui::agent_activity_pill("input-activity", work, self.agent_icon, cx);
+        if work.is_empty() {
+            return Some(pill);
+        }
+        let weak_self = cx.weak_entity();
+        Some(
+            PopoverMenu::new("input-activity-menu")
+                .trigger_with_tooltip(
+                    ButtonLike::new("input-activity-trigger")
+                        .style(ButtonStyle::Transparent)
+                        .child(pill),
+                    move |_window, cx| Tooltip::simple("What Is Running", cx),
+                )
+                .anchor(gpui::Anchor::BottomRight)
+                .menu(move |window, cx| {
+                    let items = weak_self
+                        .read_with(cx, |this, cx| this.running_items(cx))
+                        .ok()?;
+                    if items.is_empty() {
+                        return None;
+                    }
+                    let weak_self = weak_self.clone();
+                    Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                        for (index, item) in items.into_iter().enumerate() {
+                            let weak_self = weak_self.clone();
+                            let entry_ix = item.entry_ix;
+                            let scroll_to = weak_self.clone();
+                            menu = menu.custom_entry(
+                                move |_window, cx| {
+                                    render_running_item(index, &item, &weak_self, cx)
+                                },
+                                move |_window, cx| {
+                                    if let Some(entry_ix) = entry_ix {
+                                        scroll_to
+                                            .update(cx, |this, cx| {
+                                                this.scroll_to_entry(entry_ix, cx)
+                                            })
+                                            .ok();
+                                    }
+                                },
+                            );
+                        }
+                        menu
+                    }))
+                })
+                .into_any_element(),
+        )
     }
 
     fn render_input_run_indicator(&self, _cx: &mut Context<Self>) -> AnyElement {
