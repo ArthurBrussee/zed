@@ -219,6 +219,27 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**Clicking an expanded image opens it in Zed's image viewer, laptop and dev box alike.**
+
+Arthur, 2026-10-14: expanding an image chip works; clicking the expanded image should then
+open the picture in Zed, in its image viewer tab (`image_viewer::ImageView`), not outside it.
+Today, in `render_inline_image` (`chips.rs`), only a chip with a `file` gets a click handler,
+which calls `open_image_file`. That function goes through `find_project_path`, else
+`workspace.open_abs_path`, and failures are swallowed by `log_err`. Make every expanded image
+open, and report the cases that can't:
+- **A file inside the project** opens through `open_path`.
+- **A file outside the project** (scripts write to `/tmp` constantly) opens through
+  `open_abs_path`, which on a remote project must resolve on the box: upstream opens an
+  out-of-worktree absolute path through an invisible worktree, over RPC for a remote project.
+  Make sure a remote `/tmp/x.png` opens the box's file, not a missing local one.
+- **An inline image the agent sent with no file behind it** (`ChipImage::Data` without a path)
+  has no path to open. Give it one: write the bytes to a temp file on the laptop and open that.
+  Then every image is clickable.
+- If opening fails, show a toast saying why instead of nothing.
+
+Test: a project file, a `/tmp` file, a remote `/tmp` file (fake remote transport) and an inline
+data image each open an `ImageView` item in the workspace when the expanded image is clicked.
+
 **Clicking "1 command running" shows what is running, with a stop for each.**
 
 The activity pill in the thread's bottom bar (`render_input_activity_pill` in `thread_view.rs`)
