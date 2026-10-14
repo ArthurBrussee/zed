@@ -1,25 +1,16 @@
-# Builds the quiet-ui branch on a schedule.
+# Builds the quiet-ui branch: the macOS dmg and the Linux remote servers,
+# published to the quiet-ui-latest release that the app's updater reads.
 #
-# This file lives on the default branch because GitHub runs scheduled workflows
-# only from there, which is why the equivalent `schedule:` cannot go in the copy
-# of quiet_ui_build.yml that lives on quiet-ui. It checks out quiet-ui and
-# builds that; nothing here builds main.
+# It runs only when dispatched. The nightly routine's push to quiet-ui is what
+# dispatches it, through quiet_ui_kick.yml on that branch, so each routine run
+# that pushes code gets exactly one build, whenever it finishes. A push that
+# only edits QUIET_UI.md dispatches nothing. Anyone can also dispatch it by hand.
 #
-# It exists because the nightly rebase routine cannot reliably ask for a build
-# itself: `gh` is not authenticated in its sandbox, so its dispatch step fails
-# silently and the branch gets rebased with no dmg to show for it. A schedule
-# needs nothing from the routine.
-#
-# The hour is set by what happens either side of it. The rebase routine starts
-# at 19:00 UTC and writes the queue's code before it rebases, the bundle takes two and a
-# bit, and GitHub's scheduler is not punctual: a run asked for at 02:30 once
-# started at 05:33, which is how a dmg meant for breakfast arrived at 09:43
-# local. Starting at 00:45 absorbs that delay and still lands before morning.
+# It lives on the default branch so there is one copy of it; it checks out
+# quiet-ui and builds that, never main.
 name: quiet-ui nightly build
 
 on:
-  schedule:
-    - cron: "45 0 * * 1-5"
   workflow_dispatch:
 
 concurrency:
