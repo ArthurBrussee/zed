@@ -1192,6 +1192,7 @@ mod tests {
             notify_when_agent_waiting: NotifyWhenAgentWaiting::default(),
             play_sound_when_agent_done: PlaySoundWhenAgentDone::Never,
             prevent_idle_sleep: true,
+            remote_relay: true,
             single_file_review: false,
             model_parameters: vec![],
             auto_compact: agent_settings::AutoCompactSettings {

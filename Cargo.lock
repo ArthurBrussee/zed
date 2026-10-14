@@ -83,6 +83,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "acp_relay"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "futures 0.3.34",
+ "log",
+ "serde",
+ "serde_json",
+ "smol",
+ "tempfile",
+]
+
+[[package]]
 name = "acp_thread"
 version = "0.1.0"
 dependencies = [
@@ -376,6 +390,7 @@ dependencies = [
  "acp_thread",
  "action_log",
  "agent-client-protocol",
+ "agent_settings",
  "anyhow",
  "async-channel 2.5.0",
  "base64 0.22.1",
@@ -15044,11 +15059,13 @@ dependencies = [
 name = "remote_server"
 version = "0.1.0"
 dependencies = [
+ "acp_relay",
  "acp_thread",
  "action_log",
  "agent",
  "agent-client-protocol",
  "agent_servers",
+ "agent_settings",
  "anyhow",
  "askpass",
  "async-channel 2.5.0",

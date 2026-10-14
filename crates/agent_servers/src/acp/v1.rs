@@ -440,6 +440,10 @@ fn client_builder(
             on_notification!(handle_complete_elicitation),
             agent_client_protocol::on_receive_notification!(),
         )
+        .on_receive_notification(
+            on_notification!(handle_relay_state_update),
+            agent_client_protocol::on_receive_notification!(),
+        )
 }
 
 fn client_capabilities_for_agent(agent_id: &AgentId) -> acp::ClientCapabilities {
@@ -525,8 +529,9 @@ impl AcpConnection {
             outgoing,
             stderr,
             debug_log,
-        } = transport::spawn_stdio(&project, command, cx)?;
+        } = transport::spawn(&project, &agent_id, command, cx).await?;
         let mut child = transport::OwnedChild(child);
+        let relay_reconnecting = child.0.relay_reconnecting();
         let sessions = Rc::new(RefCell::new(HashMap::default()));
 
         let (release_channel, version): (Option<&str>, String) = cx.update(|cx| {
@@ -628,6 +633,15 @@ impl AcpConnection {
             },
             cx,
         );
+        let wait_task = match relay_reconnecting {
+            Some(reconnecting) => {
+                let sessions = sessions.clone();
+                cx.spawn(async move |cx| {
+                    futures::join!(wait_task, watch_relay(reconnecting, sessions, cx));
+                })
+            }
+            None => wait_task,
+        };
 
         let agent_info = response.agent_info;
         let telemetry_id = agent_info
@@ -9637,6 +9651,105 @@ fn apply_subagent_update(
                 .log_err();
         }
         _ => {}
+    }
+}
+
+/// quiet-ui: while the connection to the box is down the agent keeps running
+/// there, so its threads say they are reconnecting rather than failing.
+async fn watch_relay(
+    reconnecting: async_channel::Receiver<bool>,
+    sessions: Rc<RefCell<HashMap<acp_v2::SessionId, AcpSession>>>,
+    cx: &mut AsyncApp,
+) {
+    while let Ok(reconnecting) = reconnecting.recv().await {
+        let threads = sessions
+            .borrow()
+            .values()
+            .map(|session| session.thread.clone())
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread
+                .update(cx, |thread, cx| thread.set_relay_reconnecting(reconnecting, cx))
+                .ok();
+        }
+    }
+}
+
+/// quiet-ui: the turn state the relay reports after a reattach, for a turn
+/// this connection did not start. Named after ACP v2's `state_update`, which
+/// replaces it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RelayStateUpdate {
+    #[serde(rename = "sessionId")]
+    session_id: acp::SessionId,
+    state: String,
+    #[serde(default, rename = "stopReason")]
+    stop_reason: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+const RELAY_STATE_UPDATE: &str = "_zed/relay/state_update";
+
+impl JsonRpcMessage for RelayStateUpdate {
+    fn matches_method(method: &str) -> bool {
+        method == RELAY_STATE_UPDATE
+    }
+
+    fn method(&self) -> &str {
+        RELAY_STATE_UPDATE
+    }
+
+    fn to_untyped_message(&self) -> Result<UntypedMessage, agent_client_protocol::Error> {
+        UntypedMessage::new(RELAY_STATE_UPDATE, self)
+    }
+
+    fn parse_message(
+        method: &str,
+        params: &impl Serialize,
+    ) -> Result<Self, agent_client_protocol::Error> {
+        if method != RELAY_STATE_UPDATE {
+            return Err(agent_client_protocol::Error::method_not_found());
+        }
+        serde_json::from_value(serde_json::to_value(params)?)
+            .map_err(agent_client_protocol::Error::into_internal_error)
+    }
+}
+
+impl JsonRpcNotification for RelayStateUpdate {}
+
+impl RelayStateUpdate {
+    fn to_state(&self) -> acp_v2::StateUpdate {
+        if self.state == "running" {
+            return acp_v2::StateUpdate::Running(acp_v2::RunningStateUpdate::new());
+        }
+        let stop_reason = match (self.stop_reason.as_deref(), &self.error) {
+            (_, Some(error)) => {
+                log::warn!("quiet-ui relay: the turn ended in error: {error}");
+                Some(acp_v2::StopReason::Error(acp_v2::ErrorStopReason::new()))
+            }
+            (Some("end_turn"), _) => Some(acp_v2::StopReason::EndTurn),
+            (Some("max_tokens"), _) => Some(acp_v2::StopReason::MaxTokens),
+            (Some("max_turn_requests"), _) => Some(acp_v2::StopReason::MaxTurnRequests),
+            (Some("refusal"), _) => Some(acp_v2::StopReason::Refusal),
+            (Some("cancelled"), _) => Some(acp_v2::StopReason::Cancelled),
+            _ => None,
+        };
+        acp_v2::StateUpdate::Idle(acp_v2::IdleStateUpdate::new().stop_reason(stop_reason))
+    }
+}
+
+fn handle_relay_state_update(update: RelayStateUpdate, cx: &mut AsyncApp, ctx: &ClientContext) {
+    let session_id = acp_v2::SessionId::new(update.session_id.0.clone());
+    let thread = ctx
+        .sessions
+        .borrow()
+        .get(&session_id)
+        .map(|session| session.thread.clone());
+    if let Some(thread) = thread {
+        thread
+            .update(cx, |thread, cx| thread.apply_relay_state(update.to_state(), cx))
+            .log_err();
     }
 }
 

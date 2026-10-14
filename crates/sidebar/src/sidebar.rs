@@ -801,6 +801,8 @@ pub struct Sidebar {
     recent_projects_popover_handle: PopoverMenuHandle<SidebarRecentProjects>,
     /// The footer's per-machine load, refreshed by the poll below.
     machine_loads: HashMap<machine_load::MachineKey, machine_load::MachineLoad>,
+    /// What the relays on the boxes are running, for threads not open here.
+    relay_sessions: Vec<machine_load::RelaySession>,
     _machine_load_poll: Option<Task<()>>,
     /// (repo path, branch) pairs watched in the [`GhStatusStore`].
     gh_watched_branches: HashSet<(PathBuf, String)>,
@@ -1027,6 +1029,7 @@ impl Sidebar {
             restoring_tasks: HashMap::new(),
             recent_projects_popover_handle: PopoverMenuHandle::default(),
             machine_loads: HashMap::new(),
+            relay_sessions: Vec::new(),
             _machine_load_poll: None,
             gh_watched_branches: HashSet::new(),
             gh_watched_prs: HashSet::new(),
@@ -1672,10 +1675,19 @@ impl Sidebar {
                 })
                 .unwrap_or_default();
 
+        let relay_running: HashSet<acp::SessionId> = self
+            .relay_sessions
+            .iter()
+            .filter(|session| session.running)
+            .map(|session| acp::SessionId::new(session.session_id.as_str()))
+            .collect();
         for thread in &mut threads {
             if let Some(session_id) = thread.metadata.session_id.clone() {
                 if let Some(info) = live_info_by_session.get(&session_id) {
                     Arc::make_mut(thread).apply_active_info(info);
+                } else if relay_running.contains(&session_id) {
+                    // Nothing here is attached, but the box is working on it.
+                    Arc::make_mut(thread).status = AgentThreadStatus::Running;
                 }
             }
 
@@ -8014,6 +8026,46 @@ impl Sidebar {
         )
     }
 
+    /// A session running on a box that this machine has no thread for (one
+    /// started from another Zed, or whose row was lost) gets a row under that
+    /// machine; opening it attaches to it.
+    fn adopt_relay_sessions(&mut self, cx: &mut Context<Self>) {
+        let store = ThreadMetadataStore::global(cx);
+        let known: HashSet<acp::SessionId> = store
+            .read(cx)
+            .entries()
+            .filter_map(|entry| entry.session_id.clone())
+            .collect();
+        let now = Utc::now();
+        let unknown = self
+            .relay_sessions
+            .iter()
+            .filter(|session| !known.contains(&acp::SessionId::new(session.session_id.as_str())))
+            .map(|session| agent_ui::thread_metadata_store::ThreadMetadata {
+                thread_id: agent_ui::ThreadId::new(),
+                session_id: Some(acp::SessionId::new(session.session_id.as_str())),
+                agent_id: project::AgentId(session.agent_name.clone().into()),
+                title: session.title.clone().map(Into::into),
+                title_override: None,
+                updated_at: now,
+                created_at: Some(now),
+                interacted_at: None,
+                worktree_paths: project::WorktreePaths::from_folder_paths(&PathList::new(
+                    &session.cwd.iter().map(PathBuf::from).collect::<Vec<_>>(),
+                )),
+                remote_connection: Some(session.machine.clone()),
+                archived: false,
+            })
+            .collect::<Vec<_>>();
+        if !unknown.is_empty() {
+            log::info!(
+                "quiet-ui relay: listing {} session(s) running on a box",
+                unknown.len()
+            );
+            store.update(cx, |store, cx| store.save_all(unknown, cx));
+        }
+    }
+
     fn start_machine_load_poll(&mut self, cx: &mut Context<Self>) {
         if self._machine_load_poll.is_some() {
             return;
@@ -8026,10 +8078,21 @@ impl Sidebar {
                     return;
                 };
                 let loads = reading.await;
+                let Ok(relayed) = this.update(cx, |_this, cx| {
+                    machine_load::read_relay_sessions(&workspaces_across_windows(cx), cx)
+                }) else {
+                    return;
+                };
+                let relayed = relayed.await;
                 let applied = this.update(cx, |this, cx| {
                     if this.machine_loads != loads {
                         this.machine_loads = loads;
                         cx.notify();
+                    }
+                    if this.relay_sessions != relayed {
+                        this.relay_sessions = relayed;
+                        this.adopt_relay_sessions(cx);
+                        this.schedule_update_entries(false, cx);
                     }
                 });
                 if applied.is_err() {

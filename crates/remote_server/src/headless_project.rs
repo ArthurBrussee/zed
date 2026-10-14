@@ -78,6 +78,7 @@ pub struct HeadlessProject {
     pub kernels: HashMap<String, Child>,
     search_buffer_batches: async_channel::Sender<SearchBufferBatch>,
     _search_buffer_sender: Task<()>,
+    pub(crate) _acp_relay: Entity<crate::acp_relay_host::AcpRelayHost>,
 }
 
 pub struct HeadlessAppState {
@@ -358,6 +359,7 @@ impl HeadlessProject {
         GitStore::init(&session);
         AgentServerStore::init_headless(&session);
         ContextServerStore::init_headless(&session);
+        let acp_relay = crate::acp_relay_host::init(&session, cx);
 
         let (search_buffer_batches, batches) = async_channel::bounded::<SearchBufferBatch>(1);
         let search_buffer_sender = cx.spawn({
@@ -434,6 +436,7 @@ impl HeadlessProject {
             kernels: Default::default(),
             search_buffer_batches,
             _search_buffer_sender: search_buffer_sender,
+            _acp_relay: acp_relay,
         }
     }
 

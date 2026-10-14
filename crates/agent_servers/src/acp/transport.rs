@@ -11,7 +11,7 @@ use std::{io, pin::Pin, process::Stdio};
 use task::{Shell, ShellBuilder};
 use util::{ResultExt as _, process::Child};
 
-pub(super) struct OwnedChild(pub Child);
+pub(super) struct OwnedChild(pub AgentProcess);
 
 impl Drop for OwnedChild {
     fn drop(&mut self) {
@@ -19,8 +19,62 @@ impl Drop for OwnedChild {
     }
 }
 
+/// The agent behind a connection: a process of ours, or (quiet-ui) one the
+/// relay on a remote project's box runs.
+pub(crate) enum AgentProcess {
+    Local(Child),
+    Relay(super::relay_transport::RelayProcess),
+}
+
+impl AgentProcess {
+    pub fn status(
+        &mut self,
+    ) -> futures::future::BoxFuture<'static, io::Result<std::process::ExitStatus>> {
+        match self {
+            Self::Local(child) => child.status().boxed(),
+            Self::Relay(relay) => relay.status().boxed(),
+        }
+    }
+
+    pub fn kill(&mut self) -> Result<()> {
+        match self {
+            Self::Local(child) => child.kill(),
+            Self::Relay(relay) => {
+                relay.kill();
+                Ok(())
+            }
+        }
+    }
+
+    pub fn relay_reconnecting(&mut self) -> Option<async_channel::Receiver<bool>> {
+        match self {
+            Self::Local(_) => None,
+            Self::Relay(relay) => relay.take_reconnecting(),
+        }
+    }
+}
+
+/// quiet-ui: a remote project's agent runs under the relay on its box, and
+/// falls back to the stdio path below when the relay cannot carry it.
+pub(super) async fn spawn(
+    project: &Entity<Project>,
+    agent_id: &project::AgentId,
+    command: AgentServerCommand,
+    cx: &mut AsyncApp,
+) -> Result<StdioProcess> {
+    if super::relay_transport::wants_relay(project, cx) {
+        match super::relay_transport::spawn_relay(project, agent_id, command.clone(), cx).await {
+            Ok(process) => return Ok(process),
+            Err(error) => {
+                log::warn!("quiet-ui relay: falling back to stdio for {agent_id}: {error:#}")
+            }
+        }
+    }
+    spawn_stdio(project, command, cx)
+}
+
 pub(super) struct StdioProcess {
-    pub child: Child,
+    pub child: AgentProcess,
     pub incoming: BoxStream<'static, io::Result<String>>,
     pub outgoing: Pin<Box<dyn Sink<String, Error = io::Error> + Send>>,
     // The connection owns when this starts and when it is cancelled.
@@ -140,7 +194,7 @@ pub(super) fn spawn_stdio(
     };
 
     Ok(StdioProcess {
-        child,
+        child: AgentProcess::Local(child),
         incoming,
         outgoing,
         stderr,

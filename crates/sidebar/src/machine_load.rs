@@ -152,3 +152,47 @@ mod tests {
         assert_eq!(load.percent(), None, "zero cores is no answer either");
     }
 }
+
+/// A session the relay on a box is running, whether or not anything here is
+/// attached to it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RelaySession {
+    pub machine: RemoteConnectionOptions,
+    pub session_id: String,
+    pub agent_name: String,
+    pub cwd: Option<String>,
+    pub title: Option<String>,
+    pub running: bool,
+}
+
+/// Every box's relayed sessions, asked over the connection each box's project
+/// already has, on the same tick as its load.
+pub(crate) fn read_relay_sessions(
+    workspaces: &[Entity<Workspace>],
+    cx: &App,
+) -> Task<Vec<RelaySession>> {
+    let requests = remote_projects(workspaces, cx)
+        .into_iter()
+        .filter_map(|(machine, project)| {
+            let relay = project.read(cx).acp_relay_client()?;
+            Some((machine, relay.read(cx).list_sessions()))
+        })
+        .collect::<Vec<_>>();
+    cx.background_spawn(async move {
+        let mut sessions = Vec::new();
+        for (machine, request) in requests {
+            let Ok(listed) = request.await else {
+                continue;
+            };
+            sessions.extend(listed.into_iter().map(|session| RelaySession {
+                machine: machine.clone(),
+                session_id: session.session_id,
+                agent_name: session.agent_name,
+                cwd: session.cwd,
+                title: session.title,
+                running: session.running,
+            }));
+        }
+        sessions
+    })
+}

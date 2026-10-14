@@ -1,3 +1,6 @@
+mod acp_relay_host;
+#[cfg(test)]
+mod acp_relay_tests;
 mod headless_project;
 
 #[cfg(test)]
@@ -89,6 +92,11 @@ pub enum Commands {
     Version,
     #[cfg(unix)]
     Exec,
+    /// quiet-ui: the relay that keeps agents running while Zed is away.
+    AcpRelay {
+        #[arg(long)]
+        dir: PathBuf,
+    },
 }
 
 pub fn run(command: Commands) -> anyhow::Result<()> {
@@ -115,6 +123,7 @@ pub fn run(command: Commands) -> anyhow::Result<()> {
         } => execute_proxy(identifier, reconnect).context("running proxy on the remote server"),
         #[cfg(unix)]
         Commands::Exec => execute_command(),
+        Commands::AcpRelay { dir } => acp_relay_host::run_daemon(dir),
         Commands::Version => {
             let release_channel = *RELEASE_CHANNEL;
             match release_channel {

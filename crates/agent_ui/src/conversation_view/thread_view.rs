@@ -7961,6 +7961,15 @@ impl ThreadView {
     fn render_input_activity_pill(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let running_work = self.running_work(cx);
         let thread = self.thread.read(cx);
+        // The agent is still running on the box; only the way to it is down.
+        if thread.relay_reconnecting() {
+            return Some(
+                Label::new("Reconnecting…")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
+                    .into_any_element(),
+            );
+        }
         let work = ui::RunningWorkCounts {
             terminals: running_work.terminals,
             subagents: running_work.subagents,

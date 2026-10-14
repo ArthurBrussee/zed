@@ -3752,3 +3752,65 @@ async fn test_the_top_plus_goes_once_two_machines_are_headed(cx: &mut TestAppCon
         );
     });
 }
+
+/// A session the relay on a box is running with nothing here attached is
+/// listed under that machine as running, once however often it is reported,
+/// and stops being shown as running when the box says it is idle.
+#[gpui::test]
+async fn test_a_session_running_on_a_box_is_listed_as_running(cx: &mut TestAppContext) {
+    let devbox = mock_host(7);
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    let project = project::Project::test(fs, [], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    let mut session = crate::machine_load::RelaySession {
+        machine: devbox.clone(),
+        session_id: "on-the-box".into(),
+        agent_name: "claude-acp".into(),
+        cwd: Some("/box/project".into()),
+        title: Some("Started elsewhere".into()),
+        running: true,
+    };
+    let rows = |sidebar: &Entity<Sidebar>, cx: &mut VisualTestContext| {
+        sidebar.read_with(cx, |sidebar, _| {
+            sidebar
+                .contents
+                .all_entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    ListEntry::Thread(thread)
+                        if thread.metadata.session_id
+                            == Some(acp::SessionId::new("on-the-box")) =>
+                    {
+                        Some(thread.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+
+    for _ in 0..2 {
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.relay_sessions = vec![session.clone()];
+            sidebar.adopt_relay_sessions(cx);
+            sidebar.update_entries(cx);
+        });
+        cx.run_until_parked();
+    }
+    let listed = rows(&sidebar, cx);
+    assert_eq!(listed.len(), 1, "listed once");
+    assert_eq!(listed[0].status, AgentThreadStatus::Running);
+    assert_eq!(listed[0].metadata.remote_connection, Some(devbox));
+    assert_eq!(listed[0].metadata.display_title().as_ref(), "Started elsewhere");
+
+    session.running = false;
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.relay_sessions = vec![session.clone()];
+        sidebar.update_entries(cx);
+    });
+    cx.run_until_parked();
+    assert_ne!(rows(&sidebar, cx)[0].status, AgentThreadStatus::Running);
+}

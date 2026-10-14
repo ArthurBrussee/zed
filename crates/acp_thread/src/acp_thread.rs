@@ -3554,6 +3554,7 @@ pub struct AcpThread {
     shared_buffers: HashMap<Entity<Buffer>, BufferSnapshot>,
     turn_id: u32,
     running_turn: Option<RunningTurn>,
+    relay_reconnecting: bool,
     connection: Rc<dyn AgentConnection>,
     submissions: SessionSubmissions,
     activity: SessionActivity,
@@ -4025,6 +4026,7 @@ impl AcpThread {
             provisional_title: None,
             project,
             running_turn: None,
+            relay_reconnecting: false,
             turn_id: 0,
             submissions: SessionSubmissions::new(receipt_submissions),
             activity: SessionActivity::default(),
@@ -4773,6 +4775,31 @@ impl AcpThread {
             self.uses_reported_activity(),
             "Session does not report foreground state"
         );
+        self.apply_reported_state(state, cx);
+        Ok(())
+    }
+
+    /// quiet-ui: the turn state the relay on a remote project's box reports
+    /// after a reattach. A turn this side started settles through its own
+    /// prompt, so the report only speaks for one it did not.
+    pub fn apply_relay_state(&mut self, state: acp_v2::StateUpdate, cx: &mut Context<Self>) {
+        if self.running_turn.is_none() {
+            self.apply_reported_state(state, cx);
+        }
+    }
+
+    pub fn set_relay_reconnecting(&mut self, reconnecting: bool, cx: &mut Context<Self>) {
+        if self.relay_reconnecting != reconnecting {
+            self.relay_reconnecting = reconnecting;
+            cx.notify();
+        }
+    }
+
+    pub fn relay_reconnecting(&self) -> bool {
+        self.relay_reconnecting
+    }
+
+    fn apply_reported_state(&mut self, state: acp_v2::StateUpdate, cx: &mut Context<Self>) {
         let previous = self.foreground_activity();
         let was_active = previous != ForegroundActivity::Idle;
         self.set_foreground_state(state, cx);
@@ -4810,7 +4837,6 @@ impl AcpThread {
         if previous != self.foreground_activity() {
             cx.emit(AcpThreadEvent::StatusChanged);
         }
-        Ok(())
     }
 
     pub fn cost(&self) -> Option<&SessionCost> {
@@ -7369,6 +7395,11 @@ impl AcpThread {
             let request_ids = self.permission_requests.keys().copied().collect::<Vec<_>>();
             for id in request_ids {
                 self.cancel_permission_request_with_outcome(id, permission_outcome.clone(), cx);
+            }
+            // quiet-ui: a turn the relay reported running was started from
+            // another connection; stopping it still goes through the agent.
+            if self.foreground_activity() != ForegroundActivity::Idle {
+                self.connection.cancel(self.session_id(), cx);
             }
             return Task::ready(());
         };

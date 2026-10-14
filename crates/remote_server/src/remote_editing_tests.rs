@@ -6348,7 +6348,7 @@ fn read_stdio_launch(output_path: &Path) -> (RemoteCommand, serde_json::Value) {
     (command, serde_json::from_str(first_line).unwrap())
 }
 
-fn build_project(ssh: Entity<RemoteClient>, cx: &mut TestAppContext) -> Entity<Project> {
+pub(crate) fn build_project(ssh: Entity<RemoteClient>, cx: &mut TestAppContext) -> Entity<Project> {
     cx.update(|cx| {
         if !cx.has_global::<SettingsStore>() {
             let settings_store = SettingsStore::test(cx);

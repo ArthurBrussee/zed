@@ -69,3 +69,81 @@ message NewExternalAgentVersionAvailable {
   string name = 2;
   string version = 3;
 }
+
+// quiet-ui: a remote project's agents run under a relay on the box, which
+// keeps them alive while Zed is away. Each link is one agent connection; the
+// relay numbers what it sends (`lseq`) and what it is sent (`cseq`), so a
+// link survives the server in between being replaced.
+message AcpRelayOpen {
+  uint64 project_id = 1;
+  string agent_name = 2;
+  string path = 3;
+  repeated string args = 4;
+  map<string, string> env = 5;
+  optional string root_dir = 6;
+}
+
+message AcpRelayOpened {
+  uint64 link_id = 1;
+}
+
+message AcpRelayAttach {
+  uint64 project_id = 1;
+  uint64 link_id = 2;
+  uint64 last_lseq = 3;
+}
+
+message AcpRelayAttached {
+  // Zero when this server already carries the link and nothing was lost.
+  uint64 next_cseq = 1;
+}
+
+message AcpRelaySend {
+  uint64 project_id = 1;
+  uint64 link_id = 2;
+  uint64 cseq = 3;
+  string line = 4;
+}
+
+message AcpRelayAck {
+  uint64 project_id = 1;
+  uint64 link_id = 2;
+  uint64 lseq = 3;
+}
+
+message AcpRelayClose {
+  uint64 project_id = 1;
+  uint64 link_id = 2;
+}
+
+message AcpRelayFrame {
+  uint64 project_id = 1;
+  uint64 link_id = 2;
+  uint64 lseq = 3;
+  oneof kind {
+    string line = 4;
+    string stderr = 5;
+    AcpRelayExit exited = 6;
+  }
+}
+
+message AcpRelayExit {
+  optional int32 code = 1;
+}
+
+message AcpRelayListSessions {
+  uint64 project_id = 1;
+}
+
+message AcpRelaySessions {
+  repeated AcpRelaySession sessions = 1;
+}
+
+message AcpRelaySession {
+  string session_id = 1;
+  string agent_name = 2;
+  optional string cwd = 3;
+  optional string title = 4;
+  bool running = 5;
+  bool attached = 6;
+}
