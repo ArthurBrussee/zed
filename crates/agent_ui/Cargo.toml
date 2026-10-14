@@ -132,6 +132,8 @@ editor = { workspace = true, features = ["test-support"] }
 eval_utils.workspace = true
 gpui = { workspace = true, "features" = ["test-support"] }
 http_client = { workspace = true, features = ["test-support"] }
+# For the image-chip tests: the viewer an expanded image opens in.
+image_viewer.workspace = true
 indoc.workspace = true
 language = { workspace = true, "features" = ["test-support"] }
 languages = { workspace = true, features = ["test-support"] }

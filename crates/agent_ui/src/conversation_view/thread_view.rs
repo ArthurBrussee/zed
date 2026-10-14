@@ -2046,6 +2046,27 @@ impl ThreadView {
         }
     }
 
+    /// An image that will not open says why, rather than a click doing nothing.
+    pub(super) fn show_image_open_error(
+        &self,
+        message: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        workspace.update(cx, |workspace, cx| {
+            let toast = StatusToast::new(message, cx, |this, _cx| {
+                this.icon(
+                    Icon::new(IconName::Warning)
+                        .size(IconSize::Small)
+                        .color(Color::Warning),
+                )
+            });
+            workspace.toggle_status_toast(toast, cx);
+        });
+    }
+
     fn show_local_command_toast(&self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
         // Shown after positive feedback, replacing the inline button state.
         let Some(workspace) = self.workspace.upgrade() else {
@@ -16519,6 +16540,104 @@ mod tests {
         bytes.into_inner()
     }
 
+    /// The names of the images the workspace has open in Zed's own viewer.
+    fn opened_images(
+        workspace: &Entity<Workspace>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Vec<String> {
+        use workspace::item::Item as _;
+        workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .items(cx)
+                .filter_map(|item| item.downcast::<image_viewer::ImageView>())
+                .map(|view| view.read(cx).tab_content_text(0, cx).to_string())
+                .collect()
+        })
+    }
+
+    /// Clicking an expanded image opens it in Zed's image viewer. Only a chip
+    /// that already had a file used to open at all, and a failure was
+    /// swallowed, so a click on anything else did nothing.
+    #[gpui::test]
+    async fn test_every_expanded_image_opens_in_the_viewer(cx: &mut gpui::TestAppContext) {
+        crate::conversation_view::tests::init_test(cx);
+        cx.update(image_viewer::init);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({ "src": {} })).await;
+        fs.insert_file(path!("/project/in-project.png"), png_bytes(8, 8))
+            .await;
+        // Scripts write to /tmp constantly, which is outside every worktree.
+        fs.insert_file(path!("/tmp/outside.png"), png_bytes(8, 8))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+
+        let (conversation_view, cx) = crate::conversation_view::tests::setup_conversation_view_on(
+            crate::test_support::StubAgentServer::new(acp_thread::StubAgentConnection::new()),
+            project.clone(),
+            cx,
+        )
+        .await;
+        let thread_view = crate::conversation_view::tests::active_thread(&conversation_view, cx);
+        let workspace = thread_view
+            .read_with(cx, |view, _| view.workspace.clone())
+            .upgrade()
+            .expect("the thread view's workspace");
+
+        thread_view.update_in(cx, |view, window, cx| {
+            view.open_chip_image(
+                ChipImage::File(path!("/project/in-project.png").into()),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            opened_images(&workspace, cx),
+            vec!["in-project.png".to_string()],
+            "a file in the project opens through its project path"
+        );
+
+        thread_view.update_in(cx, |view, window, cx| {
+            view.open_chip_image(ChipImage::File(path!("/tmp/outside.png").into()), window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            opened_images(&workspace, cx),
+            vec!["in-project.png".to_string(), "outside.png".to_string()],
+            "and a file outside it as an absolute path"
+        );
+
+        // An image the agent sent inline is not a file anywhere, so it is
+        // given one before it opens.
+        let inline = Arc::new(gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            png_bytes(8, 8),
+        ));
+        let inline_name = format!("{}.png", inline.id);
+        thread_view.update_in(cx, |view, window, cx| {
+            view.open_chip_image(
+                ChipImage::Data {
+                    image: inline,
+                    dimensions: None,
+                    path: None,
+                },
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            opened_images(&workspace, cx),
+            vec![
+                "in-project.png".to_string(),
+                "outside.png".to_string(),
+                inline_name,
+            ],
+            "an inline image opens through a file written for it"
+        );
+    }
+
     /// The chip for an image a command wrote on a dev box. The path the agent reports only
     /// exists on the box, so nothing on this machine's disk answers it: the bytes have to come
     /// through the project, and the chip has to be a data chip rather than a file one.
@@ -16528,6 +16647,7 @@ mod tests {
         server_cx: &mut gpui::TestAppContext,
     ) {
         crate::conversation_view::tests::init_test(cx);
+        cx.update(image_viewer::init);
 
         // The box's filesystem, which this machine cannot see.
         let server_fs = FakeFs::new(server_cx.executor());
@@ -16536,6 +16656,11 @@ mod tests {
             .await;
         server_fs
             .insert_file(path!("/on-the-box/repo/shot.png"), png_bytes(800, 600))
+            .await;
+        // Outside every worktree, and on the box alone: this machine's disk has
+        // no such file, so opening it can only resolve through the project.
+        server_fs
+            .insert_file(path!("/tmp/shot.png"), png_bytes(800, 600))
             .await;
 
         let (opts, server_session, _) = remote::RemoteClient::fake_server(cx, server_cx);
@@ -16677,6 +16802,26 @@ mod tests {
                 None => panic!("the image should have come through the project"),
             }
         });
+
+        // And clicking the expanded image opens the box's file. Nothing on this
+        // machine answers the path, so a local open would find nothing.
+        let workspace = thread_view
+            .read_with(cx, |view, _| view.workspace.clone())
+            .upgrade()
+            .expect("the thread view's workspace");
+        thread_view.update_in(cx, |view, window, cx| {
+            view.open_chip_image(
+                ChipImage::File(path!("/tmp/shot.png").into()),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            opened_images(&workspace, cx),
+            vec!["shot.png".to_string()],
+            "a path only the dev box has opens the box's file"
+        );
 
         drop(headless);
     }

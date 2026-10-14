@@ -78,6 +78,19 @@ fn image_format_from_extension(extension: &str) -> Option<gpui::ImageFormat> {
     }
 }
 
+fn image_extension_for_format(format: gpui::ImageFormat) -> Option<&'static str> {
+    match format {
+        gpui::ImageFormat::Png => Some("png"),
+        gpui::ImageFormat::Jpeg => Some("jpg"),
+        gpui::ImageFormat::Webp => Some("webp"),
+        gpui::ImageFormat::Gif => Some("gif"),
+        gpui::ImageFormat::Bmp => Some("bmp"),
+        gpui::ImageFormat::Tiff => Some("tiff"),
+        gpui::ImageFormat::Svg => Some("svg"),
+        _ => None,
+    }
+}
+
 fn diff_stats(added: u32, deleted: u32) -> Option<action_log::DiffStats> {
     (added > 0 || deleted > 0).then_some(action_log::DiffStats {
         lines_added: added,
@@ -2537,6 +2550,7 @@ impl ThreadView {
             ChipImage::Data { path, .. } => path.clone(),
         };
         let copyable = image.clone();
+        let openable = image.clone();
         let box_height = match &image {
             ChipImage::File(path) => self.image_file_box_height(path, entry_ix, cx),
             ChipImage::Data { dimensions, .. } => image_box_height(*dimensions, IMAGE_CHIP_WIDTH),
@@ -2560,13 +2574,14 @@ impl ThreadView {
                     .object_fit(ObjectFit::Contain)
                     .rounded_md(),
             )
-            .when_some(file.clone(), |this, path| {
-                this.cursor_pointer()
-                    .tooltip(Tooltip::text("Open Image"))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_image_file(&path, window, cx);
-                    }))
-            })
+            .cursor_pointer()
+            .tooltip(Tooltip::text("Open Image"))
+            .on_click(cx.listener({
+                let image = openable.clone();
+                move |this, _, window, cx| {
+                    this.open_chip_image(image.clone(), window, cx);
+                }
+            }))
             .into_any_element();
 
         div()
@@ -2598,6 +2613,25 @@ impl ThreadView {
     }
 
     /// By project path when possible, so it shares the project panel's tab.
+    /// Every expanded image opens in Zed's own image viewer: a file in the
+    /// project through its project path, a file outside it (scripts write to
+    /// `/tmp` constantly) as an absolute path, and an image the agent sent
+    /// inline through a file written for it.
+    pub(super) fn open_chip_image(
+        &self,
+        image: ChipImage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match image {
+            ChipImage::File(path)
+            | ChipImage::Data {
+                path: Some(path), ..
+            } => self.open_image_file(&path, window, cx),
+            ChipImage::Data { image, .. } => self.open_image_data(image, window, cx),
+        }
+    }
+
     pub(super) fn open_image_file(
         &self,
         path: &std::path::Path,
@@ -2609,12 +2643,14 @@ impl ThreadView {
             .upgrade()
             .and_then(|project| project.read(cx).find_project_path(path, cx));
         let path = path.to_path_buf();
+        // An absolute path is resolved through the project, so a path only the
+        // dev box has opens the box's file rather than a missing local one.
         let open = self
             .workspace
             .update(cx, |workspace, cx| match project_path {
                 Some(project_path) => workspace.open_path(project_path, None, true, window, cx),
                 None => workspace.open_abs_path(
-                    path,
+                    path.clone(),
                     OpenOptions {
                         focus: Some(true),
                         ..Default::default()
@@ -2624,9 +2660,77 @@ impl ThreadView {
                 ),
             })
             .log_err();
-        if let Some(open) = open {
-            open.detach_and_log_err(cx);
+        let Some(open) = open else {
+            return;
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            // A failure used to be swallowed, so a click did nothing at all.
+            if let Err(error) = open.await {
+                this.update(cx, |this, cx| {
+                    this.show_image_open_error(
+                        format!("Could not open {}: {error}", path.display()),
+                        cx,
+                    );
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// An image the agent sent inline is not a file anywhere, so it is given
+    /// one before it can open.
+    fn open_image_data(
+        &self,
+        image: Arc<gpui::Image>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self.project.upgrade() else {
+            return;
+        };
+        let Some(extension) = image_extension_for_format(image.format) else {
+            self.show_image_open_error(
+                format!("Zed has no viewer for a {:?} image", image.format),
+                cx,
+            );
+            return;
+        };
+        // Paths on a remote project resolve on the box, which cannot see this
+        // machine's temp directory, and nothing implements `Fs` over RPC.
+        if !project.read(cx).is_local() {
+            self.show_image_open_error(
+                "This image came inline from the dev box, so there is no file there to open",
+                cx,
+            );
+            return;
         }
+        let fs = project.read(cx).fs().clone();
+        let directory = paths::temp_dir().join("quiet-ui-images");
+        let path = directory.join(format!("{}.{extension}", image.id));
+        let bytes = image.bytes.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let written = fs.create_dir(&directory).await;
+            let written = match written {
+                Ok(()) => fs.write(&path, &bytes).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = written {
+                this.update(cx, |this, cx| {
+                    this.show_image_open_error(
+                        format!("Could not write the image out to open it: {error}"),
+                        cx,
+                    );
+                })
+                .ok();
+                return;
+            }
+            this.update_in(cx, |this, window, cx| {
+                this.open_image_file(&path, window, cx);
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn open_command_file_diff(
