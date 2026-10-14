@@ -2791,7 +2791,14 @@ fn test_collapsing_a_worktree_leaves_the_rows_after_it_alone(cx: &mut TestAppCon
 
     let collapsed: HashSet<String> = ["mapper".to_string()].into_iter().collect();
     let visible =
-        cx.update(|_| Sidebar::visible_entries(&entries, &HashSet::default(), &collapsed));
+        cx.update(|_| {
+            Sidebar::visible_entries(
+                &entries,
+                &HashSet::default(),
+                &collapsed,
+                &HashSet::default(),
+            )
+        });
 
     let titles: Vec<String> = visible
         .iter()
@@ -3511,6 +3518,132 @@ async fn test_a_machine_with_no_reading_says_nothing_for_itself(cx: &mut TestApp
                 ("This Mac".to_string(), "50%".to_string()),
                 ("mock-7".to_string(), "75%".to_string()),
             ],
+        );
+    });
+}
+
+#[gpui::test]
+fn test_collapsing_a_machine_hides_everything_under_it(cx: &mut TestAppContext) {
+    let devbox = mock_host(5);
+    let now = Utc::now();
+    let machine_header = |label: &str, host: Option<remote::RemoteConnectionOptions>| {
+        ListEntry::MachineHeader(Arc::new(MachineHeaderEntry {
+            label: label.to_string().into(),
+            host,
+            can_create_thread: true,
+            running_work: RunningWork {
+                terminals: 1,
+                subagents: 0,
+                async_tasks: 0,
+            },
+        }))
+    };
+    let worktree_header = |label: &str| {
+        ListEntry::WorkspaceHeader(Arc::new(WorkspaceHeaderEntry {
+            label: label.to_string().into(),
+            lead_thread: None,
+            workspace: None,
+            member_sessions: Vec::new(),
+            is_linked_worktree: true,
+            path: None,
+            key: label.to_string(),
+            member_count: 1,
+        }))
+    };
+    let row = |title: &str| {
+        ListEntry::Thread(Arc::new(ThreadEntry {
+            under_worktree_header: true,
+            ..test_thread_entry(title, "/repo/wt", now)
+        }))
+    };
+
+    let entries = vec![
+        ListEntry::SectionHeader(SidebarSection::OpenInZed),
+        machine_header("This Mac", None),
+        worktree_header("here"),
+        row("on the laptop"),
+        machine_header("mock-5", Some(devbox.clone())),
+        worktree_header("there"),
+        row("on the box"),
+    ];
+
+    let labels = |collapsed: HashSet<String>| -> Vec<String> {
+        cx.update(|_| {
+            Sidebar::visible_entries(
+                &entries,
+                &HashSet::default(),
+                &HashSet::default(),
+                &collapsed,
+            )
+        })
+        .iter()
+        .map(|entry| match entry {
+            ListEntry::SectionHeader(section) => section.label().to_string(),
+            ListEntry::MachineHeader(header) => header.label.to_string(),
+            ListEntry::WorkspaceHeader(header) => header.label.to_string(),
+            ListEntry::Thread(thread) => thread.metadata.display_title().to_string(),
+            ListEntry::Terminal(_) => "terminal".to_string(),
+        })
+        .collect()
+    };
+
+    assert_eq!(
+        labels(HashSet::default()),
+        vec![
+            "Active", "This Mac", "here", "on the laptop", "mock-5", "there", "on the box"
+        ]
+    );
+
+    let collapsed: HashSet<String> = [machine_collapse_key(None)].into_iter().collect();
+    assert_eq!(
+        labels(collapsed),
+        vec!["Active", "This Mac", "mock-5", "there", "on the box"],
+        "a collapsed machine takes its worktree groups and rows with it, and \
+         leaves the next machine alone"
+    );
+
+    let collapsed: HashSet<String> = [machine_collapse_key(Some(&devbox))].into_iter().collect();
+    assert_eq!(
+        labels(collapsed),
+        vec!["Active", "This Mac", "here", "on the laptop", "mock-5"],
+        "and the header itself stays, with its +"
+    );
+}
+
+/// The collapsed machines ride in the sidebar's serialized state, as the
+/// collapsed sections do, so a restart does not expand everything.
+#[gpui::test]
+async fn test_a_collapsed_machine_survives_a_restart(cx: &mut TestAppContext) {
+    init_test(cx);
+    let devbox = mock_host(5);
+    let fs = FakeFs::new(cx.executor());
+    let project = project::Project::test(fs, [], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    let key = machine_collapse_key(Some(&devbox));
+    let state = sidebar.update(cx, |sidebar, cx| {
+        sidebar.collapsed_machines.insert(key.clone());
+        sidebar
+            .serialized_state(cx)
+            .expect("the sidebar serializes its state")
+    });
+    assert!(
+        state.contains(&key),
+        "the machine's identity is what is stored, got {state}"
+    );
+
+    let restored = setup_sidebar(&multi_workspace, cx);
+    restored.update_in(cx, |sidebar, window, cx| {
+        assert!(sidebar.collapsed_machines.is_empty());
+        sidebar.restore_serialized_state(&state, window, cx);
+    });
+    cx.run_until_parked();
+    restored.read_with(cx, |sidebar, _cx| {
+        assert!(
+            sidebar.collapsed_machines.contains(&key),
+            "and it comes back collapsed"
         );
     });
 }

@@ -219,18 +219,6 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
-**Machine headers collapse, like worktree headers do.**
-
-Arthur, 2026-10-14: machine group headers in the sidebar should be collapsible. Worktree headers
-already are (`collapsed_worktrees`, the disclosure chevron and tooltip in the worktree header
-render). Give `MachineHeader` the same thing: a chevron that hides or shows everything under
-that machine, its worktree groups and rows included. The collapsed state is kept per machine,
-keyed by connection identity (`same_remote_connection_identity`; local is its own key), and
-persisted the same way `collapsed_worktrees` is. A collapsed header keeps its `+`. While any
-thread under it is running, it shows the activity pill with the totals, so a collapsed machine
-still says it is working. Test: collapse a machine, its rows go; the state survives a rebuild
-and a restart; its `+` still works.
-
 **A connected machine shows in the sidebar right away, and with several machines the top `+`
 goes.**
 

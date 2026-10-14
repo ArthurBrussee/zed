@@ -119,6 +119,8 @@ struct SerializedSidebar {
     width_set_by_user: bool,
     #[serde(default)]
     collapsed_sections: Vec<SidebarSection>,
+    #[serde(default)]
+    collapsed_machines: Vec<String>,
 }
 
 enum ArchiveWorktreeOutcome {
@@ -554,6 +556,9 @@ struct MachineHeaderEntry {
     host: Option<RemoteConnectionOptions>,
     /// Whether this machine has a project a new worktree thread could go in.
     can_create_thread: bool,
+    /// What its threads are running, so a collapsed machine still says it is
+    /// working.
+    running_work: RunningWork,
 }
 
 #[derive(Clone, PartialEq)]
@@ -802,6 +807,9 @@ pub struct Sidebar {
     /// PRs watched by number: (working directory, repository, number).
     gh_watched_prs: HashSet<(PathBuf, Option<String>, u64)>,
     collapsed_worktrees: HashSet<String>,
+    /// Machines whose header is collapsed, keyed by connection identity so a
+    /// nickname change does not lose the state.
+    collapsed_machines: HashSet<String>,
     /// Measured once per worktree per session: walking the tree is the work
     /// the file scanner avoids.
     worktree_sizes: HashMap<PathBuf, u64>,
@@ -1023,6 +1031,7 @@ impl Sidebar {
             gh_watched_branches: HashSet::new(),
             gh_watched_prs: HashSet::new(),
             collapsed_worktrees: HashSet::new(),
+            collapsed_machines: HashSet::new(),
             worktree_sizes: HashMap::new(),
             worktree_size_task: None,
             worktree_sizes_pending: Vec::new(),
@@ -1755,6 +1764,7 @@ impl Sidebar {
             &all_entries,
             &self.collapsed_sections,
             &self.collapsed_worktrees,
+            &self.collapsed_machines,
         );
 
         notified_threads.retain(|id| current_thread_ids.contains(id));
@@ -1779,38 +1789,44 @@ impl Sidebar {
         entries: &[ListEntry],
         collapsed_sections: &HashSet<SidebarSection>,
         collapsed_worktrees: &HashSet<String>,
+        collapsed_machines: &HashSet<String>,
     ) -> Vec<ListEntry> {
         let mut visible = Vec::with_capacity(entries.len());
         let mut hiding_section = false;
         let mut hiding_worktree = false;
+        let mut hiding_machine = false;
         for entry in entries {
             match entry {
                 ListEntry::SectionHeader(section) => {
                     hiding_section = collapsed_sections.contains(section);
                     hiding_worktree = false;
+                    hiding_machine = false;
                     visible.push(entry.clone());
                 }
-                ListEntry::MachineHeader(_) => {
+                ListEntry::MachineHeader(header) => {
                     hiding_worktree = false;
+                    // Everything under it, worktree groups and rows alike.
+                    hiding_machine =
+                        collapsed_machines.contains(&machine_collapse_key(header.host.as_ref()));
                     if !hiding_section {
                         visible.push(entry.clone());
                     }
                 }
                 ListEntry::WorkspaceHeader(header) => {
                     hiding_worktree = collapsed_worktrees.contains(&header.key);
-                    if !hiding_section {
+                    if !hiding_section && !hiding_machine {
                         visible.push(entry.clone());
                     }
                 }
                 // A solo row is its own group: a collapsed group above stops here.
                 ListEntry::Thread(thread) if thread.solo_worktree.is_some() => {
                     hiding_worktree = false;
-                    if !hiding_section {
+                    if !hiding_section && !hiding_machine {
                         visible.push(entry.clone());
                     }
                 }
                 ListEntry::Thread(_) | ListEntry::Terminal(_) => {
-                    if !hiding_section && !hiding_worktree {
+                    if !hiding_section && !hiding_worktree && !hiding_machine {
                         visible.push(entry.clone());
                     }
                 }
@@ -2087,10 +2103,19 @@ impl Sidebar {
             if mine.is_empty() {
                 continue;
             }
+            let mut running_work = RunningWork::default();
+            for row in &mine {
+                if let ListEntry::Thread(thread) = row {
+                    running_work.terminals += thread.running_work.terminals;
+                    running_work.subagents += thread.running_work.subagents;
+                    running_work.async_tasks += thread.running_work.async_tasks;
+                }
+            }
             out.push(ListEntry::MachineHeader(Arc::new(MachineHeaderEntry {
                 label: machine.label.clone(),
                 host: machine.host.clone(),
                 can_create_thread: machine.can_create_thread,
+                running_work,
             })));
             out.extend(Self::group_rows_by_workspace(mine));
         }
@@ -3220,6 +3245,13 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let group = SharedString::from(format!("machine-header-{ix}"));
+        let key = machine_collapse_key(header.host.as_ref());
+        let is_collapsed = self.collapsed_machines.contains(&key);
+        let running_work = ui::RunningWorkCounts {
+            terminals: header.running_work.terminals,
+            subagents: header.running_work.subagents,
+            async_tasks: header.running_work.async_tasks,
+        };
         h_flex()
             .id(("machine-header", ix))
             .group(group.clone())
@@ -3229,6 +3261,32 @@ impl Sidebar {
             .pb_0p5()
             .gap_1()
             .items_center()
+            .cursor_pointer()
+            .tooltip(Tooltip::text(if is_collapsed {
+                "Show This Machine's Threads"
+            } else {
+                "Hide This Machine's Threads"
+            }))
+            .on_click(cx.listener({
+                let key = key.clone();
+                move |this, _, _window, cx| {
+                    if !this.collapsed_machines.remove(&key) {
+                        this.collapsed_machines.insert(key.clone());
+                    }
+                    this.update_entries(cx);
+                    this.serialize(cx);
+                    cx.notify();
+                }
+            }))
+            .child(
+                Icon::new(if is_collapsed {
+                    IconName::ChevronRight
+                } else {
+                    IconName::ChevronDown
+                })
+                .size(IconSize::XSmall)
+                .color(Color::Muted),
+            )
             .child(
                 Icon::new(match header.host {
                     Some(_) => IconName::Server,
@@ -3244,6 +3302,15 @@ impl Sidebar {
                     .color(Color::Muted)
                     .truncate(),
             )
+            // A collapsed machine still says it is working.
+            .when(is_collapsed && !running_work.is_empty(), |this| {
+                this.child(ui::agent_activity_pill(
+                    format!("machine-activity-{ix}"),
+                    running_work,
+                    IconName::ZedAgent,
+                    cx,
+                ))
+            })
             .child(h_flex().flex_1())
             .children(self.render_machine_new_thread_button(ix, header, &group, cx))
             .into_any_element()
@@ -7831,6 +7898,7 @@ impl WorkspaceSidebar for Sidebar {
             width: self.width_set_by_user.then(|| f32::from(self.width)),
             width_set_by_user: self.width_set_by_user,
             collapsed_sections: self.collapsed_sections.iter().copied().sorted().collect(),
+            collapsed_machines: self.collapsed_machines.iter().cloned().sorted().collect(),
         };
         serde_json::to_string(&serialized).ok()
     }
@@ -7851,6 +7919,7 @@ impl WorkspaceSidebar for Sidebar {
                 self.width_set_by_user = true;
             }
             self.collapsed_sections = serialized.collapsed_sections.into_iter().collect();
+            self.collapsed_machines = serialized.collapsed_machines.into_iter().collect();
             // Restore runs while the MultiWorkspace is mid-update, which
             // rebuilding entries would read back into.
             self.schedule_update_entries(false, cx);
@@ -8249,6 +8318,15 @@ impl Sidebar {
 }
 
 /// Every open workspace in the app, this window's and every other window's.
+/// A machine's key for the collapsed set: its connection identity, which a
+/// renamed SSH nickname does not change. This machine is its own key.
+fn machine_collapse_key(host: Option<&RemoteConnectionOptions>) -> String {
+    match host {
+        Some(host) => remote::remote_connection_identity(host).persistence_key(),
+        None => "local".to_string(),
+    }
+}
+
 fn workspaces_across_windows(cx: &App) -> Vec<Entity<Workspace>> {
     cx.windows()
         .into_iter()
