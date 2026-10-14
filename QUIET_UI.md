@@ -3535,6 +3535,40 @@ other reason: making `+` fast, adding a machine from the sidebar, and the ACP re
 baselines are unchanged from 10-07 and are still one line of Arthur's measurement rather than
 code.
 
+**Making `+` fast was read but not written, and the reading is worth keeping** so the next run
+starts from a diagnosis rather than a profile it has to take again. Three of its six points are
+settled by the code alone:
+- *The remote spare* (point 1): the check is `fs.is_dir` on `<dyn Fs>::global(cx)` in
+  `create_worktree_workspace` — this machine's filesystem, for paths that only exist on the box,
+  so it answers false for every one of them. The flow already fetches the authority a few lines
+  later: `existing_worktrees(worktree_receivers)` returns `existing_worktree_paths` from the
+  repository over RPC. The claim has to stay where it is (two clicks must not take one spare),
+  but the *validation* moves down to that set, keeping the local fs check for a local project,
+  which is the case it was written for — a directory the user deleted without telling git.
+- *The 303ms base check* (point 4): `start_base_ref_scan` calls `repo.branches()`, which lists
+  every ref in the repository with its most recent commit, through the repository's serialized
+  job queue, to answer whether one ref exists and what it points at.
+  `Repository::show_commit(rev, cx)` answers exactly that, skips the job queue (it goes through
+  `object_read_limiter` and the repository state directly), and already works over RPC via
+  `proto::GitShow`. `base_ref` is always a full `refs/remotes/...` name on this path, so it
+  resolves. No new proto.
+- *Waiting for the scan* (point 3): `create_worktree_workspace_foreground` logs
+  `worktree window shown in` and then awaits `wait_for_initial_scan`, with a comment saying
+  callers like `create_thread` need a scanned project. A thread does not — it needs the panel,
+  which `take_panels_task` has already awaited by then. The hook is a callback invoked between
+  those two statements, which `create_new_worktree_thread` fills with the thread creation it
+  currently does after the whole thing resolves.
+
+Point 5, the remote window's ~900ms, is the one that cannot be settled here: it is inside
+`MultiWorkspace::find_or_create_workspace` for a remote project, and telling which of the
+connect, the project build, the worktree registration over RPC and the panel restore is the long
+pole needs a real repository over real latency. The one step there that is demonstrably movable
+without measuring is `maybe_propagate_worktree_trust`, which runs before the activate and affects
+language servers and tasks rather than the window. **That is why the entry was left whole rather
+than built five-sixths of the way**: its own point 6 asks for the breakdown line that would
+answer point 5, and writing the other five while guessing at that one would have put the hot path
+every `+` goes through under a rushed gate.
+
 **One thing worth knowing before the next adapter entry.** The adapter and the SDK are on npm and
 the proxy serves them: `curl` the tarball from `registry.npmjs.org` and read
 `package/dist/*.d.ts`. Two of tonight's entries described the wire from documentation and both
