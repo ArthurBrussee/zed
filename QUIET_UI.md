@@ -221,31 +221,40 @@ starts at 21:00.
 
 **Threads that are visibly running commands show as idle in the sidebar.**
 
-Arthur, 2026-10-14: some threads are actively running things, terminals included, while their
-sidebar row looks inactive. Three causes, in the order to check them:
+Arthur, 2026-10-14: on his local machine, and for as long as the activity state has existed,
+threads that are clearly running things (commands in Zed terminals) often show as inactive in
+the sidebar. Nothing to do with SSH. The causes, from the code:
 
-1. **Live state is read only from the sidebar's own window.** `rebuild_contents` (`sidebar.rs`)
-   builds `live_info_by_session` from `mw.workspaces()`, the workspaces of *this window's*
-   `MultiWorkspace`, and `all_thread_infos_for_workspace` reads status and `running_work` from
-   those panels only. A thread hosted in another Zed window gets its row from stored metadata
-   with no live overlay, so it shows idle whatever it is doing. Arthur now has a second window
-   (the dev box opened through Open Remote), and the machine groups list that window's threads
-   in this one's sidebar, so this is now common. Gather live info from every window's
-   `MultiWorkspace` (`cx.windows()`, which the sidebar already walks elsewhere, around line
-   3757). Rebuild when a thread in any window changes state, not only this window's.
-2. **`had_error` outranks running.** `all_thread_infos_for_workspace` checks `thread.had_error()`
-   before `thread.status()`, so a thread that errored earlier and is now generating again reads
-   Error, or idle once errors are styled quietly. Check when `had_error` is cleared (it is reset
-   at `acp_thread.rs` ~4583 and ~7015) and make a running turn win over a stale error.
-3. **The row and the chip disagree about what is running.** Since 10-02, `running_work` counts a
-   terminal outside a turn only when the agent said it detached. Use one predicate for both:
-   whatever makes a command chip draw its running spinner also counts the row as working. Log
-   `quiet-ui: row idle but N chips running in <thread>` when they disagree, so the next report
-   names itself.
+1. **Running work changes without an event, so the sidebar never rebuilds.** The sidebar
+   rebuilds on `AgentPanelEvent::EntryChanged` (`sidebar.rs` ~1197), which comes from the
+   thread's `AcpThreadEvent`s. But `AcpThread::async_task_spawned`,
+   `async_task_progress`, `async_task_state_updated` and `clear_async_tasks` (`acp_thread.rs`
+   ~4320–4400) only `cx.notify()` and emit no event. A terminal's process starting or exiting
+   (`terminal.rs`, `output = Some(..)`) and a subagent's lifecycle update don't necessarily come
+   with an `EntryUpdated` either. Nothing observes the thread's notify on the sidebar's behalf.
+   So when a command detaches, the turn ends with work still going, or work finishes, the row
+   keeps whatever it last computed until an unrelated event comes along. The thread view's own
+   pill re-renders on notify, which is why the thread looks busy while its row doesn't. Fix:
+   emit one event (e.g. `AcpThreadEvent::RunningWorkChanged`) wherever an input to
+   `running_work` changes (async task spawned, finished or cleared; a terminal starting or
+   exiting; a subagent state change; the turn ending), forward it as `EntryChanged`, and let
+   `live_panel_state_changed`'s comparison (which already includes `running_work`) decide
+   whether to rebuild.
+2. **The row and the chip disagree about what is running.** Since 10-02, `running_work` counts
+   a terminal outside a turn only when the agent said it detached, while a chip draws its
+   running spinner on its own rule. Use one predicate for both, so a chip with a running
+   spinner always has a working row. Log `quiet-ui: row idle but N chips running in <thread>`
+   on any disagreement, so the next report names itself in the log.
+3. **`had_error` outranks running.** `all_thread_infos_for_workspace` checks `had_error()` before
+   `status()`, so a thread that errored earlier and is generating again reads as errored.
+   Check when `had_error` is cleared and make a running turn win.
+4. Lesser: live state is gathered only from the sidebar's own window (`mw.workspaces()` in
+   `rebuild_contents`), so a thread in a second Zed window gets no live overlay. Gather from
+   every window while you're there.
 
-Test: a thread running a command in a second window shows working in the first window's sidebar;
-a thread that errored and was resent shows running; a chip with a running spinner always has a
-working row.
+Test: a thread whose turn ends with a backgrounded command shows working; when that command's
+async task finishes, the row goes idle with no other event; a command terminal exiting after
+the turn updates the row; a chip's running spinner and its row's working state always agree.
 
 **Dev servers from the message bar, driven by tagged Zed tasks.**
 
