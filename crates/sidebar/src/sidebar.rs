@@ -2075,9 +2075,13 @@ impl Sidebar {
         machines
     }
 
+    /// `head_empty_machines` only for the active section, where a header's `+`
+    /// means something. In the history and the archive a machine with nothing
+    /// of its own in that section is not worth a header.
     fn group_rows_by_machine(
         rows: Vec<ListEntry>,
         machines: &[MachineGroup],
+        head_empty_machines: bool,
         cx: &App,
     ) -> Vec<ListEntry> {
         let host_of = |entry: &ListEntry| match entry {
@@ -2102,7 +2106,9 @@ impl Sidebar {
         let present: Vec<(&MachineGroup, Vec<usize>)> = machines
             .iter()
             .map(|machine| (machine, rows_of(machine)))
-            .filter(|(machine, mine)| !mine.is_empty() || machine.can_create_thread)
+            .filter(|(machine, mine)| {
+                !mine.is_empty() || (head_empty_machines && machine.can_create_thread)
+            })
             .collect();
         if present.len() < 2 {
             return Self::group_rows_by_workspace(rows);
@@ -2327,6 +2333,7 @@ impl Sidebar {
                 Self::group_rows_by_machine(
                     sort_by_tab(open_threads.into_iter().map(ListEntry::Thread).collect()),
                     machines,
+                    true,
                     cx,
                 ),
             ),
@@ -2341,6 +2348,7 @@ impl Sidebar {
                             .collect(),
                     ),
                     machines,
+                    false,
                     cx,
                 ),
             ),
@@ -2354,6 +2362,7 @@ impl Sidebar {
                             .collect(),
                     ),
                     machines,
+                    false,
                     cx,
                 ),
             ),

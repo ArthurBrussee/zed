@@ -16803,6 +16803,8 @@ mod tests {
         fs.insert_file(path!("/project/in-project.png"), png_bytes(8, 8))
             .await;
         // Scripts write to /tmp constantly, which is outside every worktree.
+        // FakeFs wants the directory before the file.
+        fs.insert_tree(path!("/tmp"), json!({})).await;
         fs.insert_file(path!("/tmp/outside.png"), png_bytes(8, 8))
             .await;
         let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
@@ -16894,6 +16896,7 @@ mod tests {
             .await;
         // Outside every worktree, and on the box alone: this machine's disk has
         // no such file, so opening it can only resolve through the project.
+        server_fs.insert_tree(path!("/tmp"), json!({})).await;
         server_fs
             .insert_file(path!("/tmp/shot.png"), png_bytes(800, 600))
             .await;
