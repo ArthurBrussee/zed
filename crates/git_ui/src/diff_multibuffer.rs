@@ -1,5 +1,6 @@
 use crate::{
     conflict_view,
+    diff_groups::{DiffGroup, DiffGroupSummary},
     git_panel::{GitPanel, GitStatusEntry},
     git_panel_settings::GitPanelSettings,
 };
@@ -29,7 +30,7 @@ use project::{
 use settings::{GitPanelGroupBy, GitPanelSortBy, Settings, SettingsStore};
 use std::{collections::BTreeMap, sync::Arc};
 use theme::ActiveTheme;
-use ui::{CommonAnimationExt as _, KeyBinding, prelude::*};
+use ui::{CommonAnimationExt as _, DiffStat, KeyBinding, Tooltip, prelude::*};
 use util::{ResultExt as _, rel_path::RelPath};
 use workspace::{
     CloseActiveItem, ItemNavHistory, Workspace,
@@ -42,7 +43,7 @@ use ztracing::instrument;
 const MAX_CONCURRENT_BUFFER_LOADS: usize = 16;
 
 struct BufferSubscriptions {
-    _diff: Entity<BufferDiff>,
+    diff: Entity<BufferDiff>,
     display_buffer: Entity<Buffer>,
     _diff_subscription: Subscription,
     _conflict_set: Option<Entity<ConflictSet>>,
@@ -58,6 +59,9 @@ pub struct DiffMultibuffer {
     focus_handle: FocusHandle,
     pending_scroll: Option<PathKey>,
     review_comment_count: usize,
+    /// Groups the strip above the diff has collapsed. Tests and generated
+    /// files start that way.
+    collapsed_groups: HashSet<DiffGroup>,
     empty_label: SharedString,
     _task: Task<Result<()>>,
     _subscription: Subscription,
@@ -170,6 +174,10 @@ impl DiffMultibuffer {
             buffer_subscriptions: Default::default(),
             pending_scroll: None,
             review_comment_count: 0,
+            collapsed_groups: DiffGroup::ALL
+                .into_iter()
+                .filter(|group| group.starts_collapsed())
+                .collect(),
             empty_label: empty_label.into(),
             _task: task,
             _subscription: Subscription::join(
@@ -495,10 +503,11 @@ impl DiffMultibuffer {
                 }
             })
         });
+        let repo_path_for_group = repo_path.clone();
         self.buffer_subscriptions.insert(
             repo_path,
             BufferSubscriptions {
-                _diff: diff.clone(),
+                diff: diff.clone(),
                 display_buffer: display_buffer.clone(),
                 _diff_subscription: diff_subscription,
                 _conflict_set: conflict_set.clone(),
@@ -566,6 +575,7 @@ impl DiffMultibuffer {
                 }
                 if is_excerpt_newly_added
                     && (file_status.is_deleted()
+                        || DiffGroup::of_path(&repo_path_for_group).starts_collapsed()
                         || (file_status.is_untracked()
                             && GitPanelSettings::get_global(cx).collapse_untracked_diff))
                 {
@@ -966,7 +976,130 @@ impl Render for DiffMultibuffer {
                         ),
                 )
             })
-            .when(!is_empty, |el| el.child(self.editor.clone()))
+            .when(!is_empty, |el| {
+                el.children(self.render_group_strip(cx))
+                    .child(self.editor.clone())
+            })
+    }
+}
+
+impl DiffMultibuffer {
+    /// What is in each group, summed from the diffs the view already holds.
+    fn group_summaries(&self, cx: &App) -> Vec<(DiffGroup, DiffGroupSummary)> {
+        let mut summaries: Vec<(DiffGroup, DiffGroupSummary)> = DiffGroup::ALL
+            .into_iter()
+            .map(|group| (group, DiffGroupSummary::default()))
+            .collect();
+        for (repo_path, subscriptions) in &self.buffer_subscriptions {
+            let group = DiffGroup::of_path(repo_path);
+            let (added, removed) = subscriptions.diff.read(cx).changed_row_counts();
+            let Some((_, summary)) = summaries.iter_mut().find(|(known, _)| *known == group) else {
+                continue;
+            };
+            summary.files += 1;
+            summary.lines_added += added;
+            summary.lines_removed += removed;
+        }
+        summaries
+    }
+
+    fn buffers_in_group(&self, group: DiffGroup, cx: &App) -> Vec<BufferId> {
+        self.buffer_subscriptions
+            .iter()
+            .filter(|(repo_path, _)| DiffGroup::of_path(repo_path) == group)
+            .map(|(_, subscriptions)| subscriptions.display_buffer.read(cx).remote_id())
+            .collect()
+    }
+
+    fn toggle_group(&mut self, group: DiffGroup, cx: &mut Context<Self>) {
+        let collapsed = !self.collapsed_groups.remove(&group);
+        if collapsed {
+            self.collapsed_groups.insert(group);
+        }
+        let buffers = self.buffers_in_group(group, cx);
+        if buffers.is_empty() {
+            cx.notify();
+            return;
+        }
+        self.editor.update(cx, |editor, cx| {
+            editor.rhs_editor().update(cx, |editor, cx| {
+                if collapsed {
+                    editor.fold_buffers(buffers, cx);
+                } else {
+                    for buffer_id in buffers {
+                        editor.unfold_buffer(buffer_id, cx);
+                    }
+                }
+            });
+        });
+        cx.notify();
+    }
+
+    /// A chip per group above the diff: what is in it, and a disclosure that
+    /// collapses every file in it. The files themselves are already grouped by
+    /// the ordering, so this says what the groups are rather than drawing a
+    /// diff UI of its own.
+    fn render_group_strip(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let summaries: Vec<_> = self
+            .group_summaries(cx)
+            .into_iter()
+            .filter(|(_, summary)| !summary.is_empty())
+            .collect();
+        // One group is no grouping: say nothing rather than add a row.
+        if summaries.len() < 2 {
+            return None;
+        }
+        Some(
+            h_flex()
+                .w_full()
+                .flex_none()
+                .px_2()
+                .py_1()
+                .gap_2()
+                .flex_wrap()
+                .border_b_1()
+                .border_color(cx.theme().colors().border)
+                .children(summaries.into_iter().map(|(group, summary)| {
+                    let collapsed = self.collapsed_groups.contains(&group);
+                    h_flex()
+                        .id(SharedString::from(format!("diff-group-{}", group.label())))
+                        .gap_1()
+                        .cursor_pointer()
+                        .child(
+                            Icon::new(if collapsed {
+                                IconName::ChevronRight
+                            } else {
+                                IconName::ChevronDown
+                            })
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                        )
+                        .child(Label::new(group.label()).size(LabelSize::Small))
+                        .child(
+                            Label::new(format!(
+                                "{} file{}",
+                                summary.files,
+                                if summary.files == 1 { "" } else { "s" }
+                            ))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                        )
+                        .child(DiffStat::new(
+                            SharedString::from(format!("diff-group-stat-{}", group.label())),
+                            summary.lines_added as usize,
+                            summary.lines_removed as usize,
+                        ))
+                        .tooltip(Tooltip::text(if collapsed {
+                            format!("Expand {}", group.label())
+                        } else {
+                            format!("Collapse {}", group.label())
+                        }))
+                        .on_click(cx.listener(move |this, _, _window, cx| {
+                            this.toggle_group(group, cx);
+                        }))
+                }))
+                .into_any_element(),
+        )
     }
 }
 
@@ -1004,6 +1137,9 @@ pub(crate) fn project_diff_path_key(
         TRACKED_SORT_PREFIX
     };
     let path = project_diff_sort_path(repo_path, settings.tree_view, settings.sort_by);
+    // The group is the outer key: code first, then tests, then generated, with
+    // upstream's status ordering inside each.
+    let sort_prefix = DiffGroup::of_path(repo_path).sort_prefix() * 10 + sort_prefix;
     PathKey::with_sort_prefix(sort_prefix, path)
 }
 

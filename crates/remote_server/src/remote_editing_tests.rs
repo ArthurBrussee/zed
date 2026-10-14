@@ -6228,6 +6228,42 @@ async fn test_log_store_keys_remote_events_by_primary_kind_on_supplementary_id_c
     });
 }
 
+/// quiet-ui: the sidebar footer asks the box what it is doing, over the
+/// connection the project already has rather than a shell of its own.
+#[gpui::test]
+async fn test_the_box_reports_its_own_load(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(path!("/code"), json!({ "project1": { "src": {} } }))
+        .await;
+    let (project, _headless) = init_test(&fs, cx, server_cx).await;
+
+    let response = project
+        .update(cx, |project, cx| {
+            let remote_client = project
+                .remote_client()
+                .expect("the harness gives a remote project");
+            let proto_client = remote_client.read(cx).proto_client();
+            cx.background_spawn(async move {
+                proto_client
+                    .request(proto::GetSystemLoad {
+                        project_id: proto::REMOTE_SERVER_PROJECT_ID,
+                    })
+                    .await
+            })
+        })
+        .await
+        .expect("the box should answer over the existing connection");
+
+    assert!(
+        response.load_average_one >= 0.0 && response.load_average_one.is_finite(),
+        "a load average, even where it is zero: {}",
+        response.load_average_one
+    );
+}
+
 pub async fn init_test(
     server_fs: &Arc<FakeFs>,
     cx: &mut TestAppContext,
