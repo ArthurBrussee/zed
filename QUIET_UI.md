@@ -3540,3 +3540,49 @@ the proxy serves them: `curl` the tarball from `registry.npmjs.org` and read
 `package/dist/*.d.ts`. Two of tonight's entries described the wire from documentation and both
 were wrong about it in ways that would have shipped a row saying nothing. Twenty minutes of
 reading the published package is cheaper than a night's worth of guessing.
+
+**The gate.** The union is the fork's core (`acp_thread`, `agent_ui`, `sidebar`) plus every crate
+tonight touched: `agent_servers`, `editor`, `git_ui`, `project`, `proto`, `remote_server` and
+`ui`. The Verification queue was already empty. **Green: 3,295 tests passed, 0 failed**
+(`editor` 1,204, `agent_ui` 564 with its 36 `#[ignore]`d left alone, `project` 411, `acp_thread`
+343, `sidebar` 207, `git_ui` 177, `agent_servers` 96, and the rest), and `script/clippy` 0
+errors, 0 warnings across the workspace. The three crates whose source the clippy fixes touched
+were re-run on the final tree, as 10-13 established: 96 + 564 + 207, identical.
+
+**It caught three, and all three were tonight's own.** Two were fixtures —
+`FakeFs::insert_file` wants the directory before the file and neither fake filesystem had a
+`/tmp`, so both image tests panicked on the very case they were written for. The third was a real
+regression in the night's tenth entry: counting a machine as present when a thread *could* be made
+on it gave every connected machine a header in **every** section, so All Threads and Archived grew
+headers with nothing under them. A header's `+` only means something in the active section, which
+is now a parameter rather than an assumption.
+
+**Clippy found six, not three — and the difference is one flag.** The first pass stopped at
+`agent_ui` and so never linted `sidebar`, `git_ui`, `editor`, `project`, `remote_server` or
+`proto`: six of the ten touched crates, including both of the night's new fork modules. With
+`--keep-going` three more appeared. All six were `redundant clone` in code written tonight, and
+two of them were *created* by this run's deletions — removing the chip's copy button orphaned the
+chip group's clone, and rewiring the image click orphaned another. **A clippy run without
+`--keep-going` reports a floor, not a count**; the 10-13 entry said to use the flag and this run
+relearned why.
+
+**The disk, again — but the cheaper version of the 10-13 trick.** It fell to 1.6G while
+`agent_ui`'s and `sidebar`'s test binaries were linking, which is how 10-13 lost `ld` to a bus
+error. Two things recovered ~10G without costing a rebuild:
+- **A crate's test binary is spent the moment its suite reports.** Deleting the seven finished
+  ones (`editor`, `remote_server`, `git_ui`, `acp_thread`, `agent_servers`, `project`, `ui`)
+  freed 3.1G and cost nothing at all, because nothing was going to ask for them again.
+- **The stale-rlib purge wants an mtime guard.** Keeping each crate's newest and skipping
+  anything under twelve minutes old removed 1,235 duplicates for 6.7G while the build was
+  running, and the link that was in flight survived it. 10-13 deleted current rlibs too and paid
+  for it in rebuild time; the guard is the whole difference.
+- `~/.cargo/registry/cache` is another 122M, and is only downloaded tarballs.
+- The order still holds: `cargo test` to completion, delete `target/debug`, then `script/clippy`
+  — and now also **delete `target/release` once clippy is green**, if anything has to be re-run
+  on the final tree.
+
+**Diff size**: 113 files, +42,072 / -11,328 against the merge base, from 98 files,
++38,057 / -11,282 after 10-13. Up 4,015 added lines and fifteen files for ten queue entries, each
+of which asked for lines; roughly two fifths of the 4,015 are their tests. The new files are the
+night's own fork modules and their homes: `agent_ui/dev_servers.rs`,
+`acp_thread/plan_usage.rs`, `sidebar/machine_load.rs` and `git_ui/diff_groups.rs`.
