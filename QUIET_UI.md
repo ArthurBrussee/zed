@@ -257,6 +257,26 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**Images can't be attached to a thread's first message.**
+
+Arthur, 2026-10-15: pasting or dropping an image into a new thread's message box does nothing
+until the thread has started. Cause: a new thread doesn't start its agent until the first send
+(`ConnectionStart::OnFirstSend`), and its unstarted message editor is built with
+`SharedSessionCapabilities::default()` (`conversation_view.rs`, `unstarted_state`). Those are
+empty `PromptCapabilities`, so `supports_images()` is false and the editor refuses images
+(`message_editor.rs`, the `supports_images` paths). The agent's prompt capabilities are
+per-connection: they come from its `initialize` response, not from a session. So:
+- when the agent's shared connection already exists (the one the draft's model selector previews
+  through, `agent_connection_store.rs`), seed the draft's capabilities from it;
+- otherwise use the last capabilities seen for that agent id, kept in memory for the app's
+  lifetime and persisted, so the first thread after a restart has them too;
+- when the real session starts, its capabilities replace the seeded ones, as now. If an image
+  was attached and the agent turns out not to accept images, say so on send instead of dropping
+  it silently.
+
+Test: a new Claude thread accepts a pasted image before the first send, and the image arrives
+with the first message.
+
 **Machine headers: the alias, an always-visible `+`, a clearer divider, and collapse per section.**
 
 Arthur, 2026-10-15, four things about the machine group headers in the sidebar:
