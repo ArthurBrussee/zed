@@ -78,17 +78,9 @@ fn image_format_from_extension(extension: &str) -> Option<gpui::ImageFormat> {
     }
 }
 
+/// Ico and Pnm are not worth a chip.
 fn image_extension_for_format(format: gpui::ImageFormat) -> Option<&'static str> {
-    match format {
-        gpui::ImageFormat::Png => Some("png"),
-        gpui::ImageFormat::Jpeg => Some("jpg"),
-        gpui::ImageFormat::Webp => Some("webp"),
-        gpui::ImageFormat::Gif => Some("gif"),
-        gpui::ImageFormat::Bmp => Some("bmp"),
-        gpui::ImageFormat::Tiff => Some("tiff"),
-        gpui::ImageFormat::Svg => Some("svg"),
-        _ => None,
-    }
+    (!matches!(format, gpui::ImageFormat::Ico | gpui::ImageFormat::Pnm)).then(|| format.extension())
 }
 
 fn diff_stats(added: u32, deleted: u32) -> Option<action_log::DiffStats> {

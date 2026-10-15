@@ -210,10 +210,6 @@ impl Relay {
     pub fn add_adoptable(self: &Rc<Self>, socket: PathBuf, sessions: Vec<SessionSummary>) {
         self.update(|state| state.add_adoptable(socket, sessions));
     }
-
-    pub fn is_draining(&self) -> bool {
-        self.state.borrow().is_draining()
-    }
 }
 
 async fn pump(

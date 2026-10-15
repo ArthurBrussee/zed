@@ -435,6 +435,12 @@
     },
   },
   {
+    "context": "ThreadsArchiveView",
+    "bindings": {
+      "backspace": "agent::ArchiveSelectedThread",
+    },
+  },
+  {
     "context": "BufferSearchBar",
     "use_key_equivalents": true,
     "bindings": {

@@ -149,18 +149,7 @@ pub async fn record_zed_created_worktree(
     remote: Option<&remote::RemoteConnectionOptions>,
     cx: &mut TestAppContext,
 ) {
-    let created_at = fake_worktree_created_at(fs, worktree_path).await;
-    cx.update(|cx| {
-        git_ui_core::created_worktrees::record_created_worktree(
-            worktree_path,
-            remote,
-            created_at,
-            false,
-            cx,
-        )
-    })
-    .await
-    .unwrap();
+    record_worktree(fs, worktree_path, remote, false, cx).await
 }
 
 /// Records a worktree the way the spare pool does, the only kind the reclaim
@@ -171,13 +160,23 @@ pub async fn record_zed_created_spare_worktree(
     remote: Option<&remote::RemoteConnectionOptions>,
     cx: &mut TestAppContext,
 ) {
+    record_worktree(fs, worktree_path, remote, true, cx).await
+}
+
+async fn record_worktree(
+    fs: &dyn fs::Fs,
+    worktree_path: &Path,
+    remote: Option<&remote::RemoteConnectionOptions>,
+    spare: bool,
+    cx: &mut TestAppContext,
+) {
     let created_at = fake_worktree_created_at(fs, worktree_path).await;
     cx.update(|cx| {
         git_ui_core::created_worktrees::record_created_worktree(
             worktree_path,
             remote,
             created_at,
-            true,
+            spare,
             cx,
         )
     })

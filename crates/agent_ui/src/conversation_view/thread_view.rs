@@ -3187,30 +3187,21 @@ impl ThreadView {
     }
 
     pub(crate) fn dismiss_pr(&mut self, pr: WatchedPr, cx: &mut Context<Self>) {
-        let Some(store) = ThreadMetadataStore::try_global(cx) else {
-            return;
-        };
-        let thread_id = self.root_thread_id;
-        // A dismissed PR stops being polled, so remember its title for the
-        // `+` menu now.
-        let title = self.resolve_pr_title(&pr, cx);
-        store.update(cx, |store, cx| {
-            store.update_pr_snapshot(
-                thread_id,
-                |snapshot| {
-                    let mut changed = snapshot.dismiss(&pr);
-                    if let Some(title) = title {
-                        changed |= snapshot.remember_title(&pr, title);
-                    }
-                    changed
-                },
-                cx,
-            );
-        });
-        cx.notify();
+        // A dismissed PR stops being polled, so its title is remembered for
+        // the `+` menu now.
+        self.update_watched_pr(pr, |snapshot, pr| snapshot.dismiss(pr), cx);
     }
 
     pub(crate) fn watch_pr(&mut self, pr: WatchedPr, cx: &mut Context<Self>) {
+        self.update_watched_pr(pr, |snapshot, pr| snapshot.add(pr.clone()), cx);
+    }
+
+    fn update_watched_pr(
+        &mut self,
+        pr: WatchedPr,
+        change: impl FnOnce(&mut crate::thread_metadata_store::ThreadPrSnapshot, &WatchedPr) -> bool,
+        cx: &mut Context<Self>,
+    ) {
         let Some(store) = ThreadMetadataStore::try_global(cx) else {
             return;
         };
@@ -3220,7 +3211,7 @@ impl ThreadView {
             store.update_pr_snapshot(
                 thread_id,
                 |snapshot| {
-                    let mut changed = snapshot.add(pr.clone());
+                    let mut changed = change(snapshot, &pr);
                     if let Some(title) = title {
                         changed |= snapshot.remember_title(&pr, title);
                     }
@@ -9539,7 +9530,7 @@ impl ThreadView {
             return;
         }
 
-        // Find the most recent user message and scroll it to the top of the viewport.
+        // Scroll to the provided user message, or fall back to the most recent one.
         // (Fallback: if no user message exists, scroll to the bottom.)
         if let Some(ix) = user_message_index.or_else(|| {
             entries

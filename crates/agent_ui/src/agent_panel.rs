@@ -2633,16 +2633,6 @@ impl AgentPanel {
         self.activate_draft(focus, source, window, cx);
     }
 
-    pub fn activate_additional_new_thread(
-        &mut self,
-        focus: bool,
-        source: AgentThreadSource,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.activate_new_thread(focus, source, window, cx);
-    }
-
     fn draft_has_content(&self, draft: &Entity<ConversationView>, cx: &App) -> bool {
         let cv = draft.read(cx);
         if cv.has_pending_selections() {
@@ -5342,17 +5332,9 @@ impl AgentPanel {
 
     /// Every thread in the strip, proxies included.
     pub fn thread_tab_ids_in_pane_order(&self, cx: &App) -> Vec<ThreadId> {
-        self.thread_pane
-            .read(cx)
-            .items()
-            .filter_map(|item| {
-                if let Some(tab) = item.downcast::<crate::thread_tab::ThreadTab>() {
-                    Some(tab.read(cx).thread_id(cx))
-                } else {
-                    item.downcast::<crate::thread_tab::ForeignThreadTab>()
-                        .map(|proxy| proxy.read(cx).thread_id())
-                }
-            })
+        self.thread_strip(cx)
+            .into_iter()
+            .map(|(_, _, thread_id)| thread_id)
             .collect()
     }
 

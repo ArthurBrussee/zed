@@ -574,9 +574,7 @@ pub struct ThreadItem {
     is_truncated: bool,
     added: Option<usize>,
     removed: Option<usize>,
-    running_terminals: usize,
-    running_async_tasks: usize,
-    running_subagents: usize,
+    running_work: RunningWorkCounts,
     /// A dev server running for this thread's worktree, read-only here.
     /// A pill per dev server running here: the task's glyph and its port.
     dev_servers: Vec<(Icon, SharedString)>,
@@ -621,9 +619,7 @@ impl ThreadItem {
             is_truncated: true,
             added: None,
             removed: None,
-            running_terminals: 0,
-            running_async_tasks: 0,
-            running_subagents: 0,
+            running_work: RunningWorkCounts::default(),
             dev_servers: Vec::new(),
             stop_reason: None,
             project_paths: None,
@@ -736,18 +732,8 @@ impl ThreadItem {
         self
     }
 
-    pub fn running_terminals(mut self, count: usize) -> Self {
-        self.running_terminals = count;
-        self
-    }
-
-    pub fn running_async_tasks(mut self, count: usize) -> Self {
-        self.running_async_tasks = count;
-        self
-    }
-
-    pub fn running_subagents(mut self, count: usize) -> Self {
-        self.running_subagents = count;
+    pub fn running_work(mut self, running_work: RunningWorkCounts) -> Self {
+        self.running_work = running_work;
         self
     }
 
@@ -860,11 +846,7 @@ impl RenderOnce for ThreadItem {
         let opaque_window = cx.theme().window_background_appearance()
             == WindowBackgroundAppearance::Opaque
             && raw_bg.a >= 1.0;
-        let running_work = RunningWorkCounts {
-            terminals: self.running_terminals,
-            subagents: self.running_subagents,
-            async_tasks: self.running_async_tasks,
-        };
+        let running_work = self.running_work;
         // A turn can end with detached commands still running.
         let running = self.status == AgentThreadStatus::Running || !running_work.is_empty();
         let accent = color.text_accent;
@@ -1869,7 +1851,10 @@ mod tests {
                     // An opaque row, so the fade is drawn and the label is left untruncated.
                     .base_bg(hsla(0.6, 0.12, 0.15, 1.0))
                     .status(AgentThreadStatus::Running)
-                    .running_subagents(2),
+                    .running_work(RunningWorkCounts {
+                        subagents: 2,
+                        ..Default::default()
+                    }),
                 ),
             )
         }

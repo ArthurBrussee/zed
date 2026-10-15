@@ -270,7 +270,7 @@ impl Global for GlobalAutoUpdate {}
 fn polls_for_updates(cx: &App) -> bool {
     ReleaseChannel::try_global(cx)
         .map(|channel| {
-            channel.poll_for_updates() || (channel == ReleaseChannel::Dev && !cfg!(debug_assertions))
+            channel.poll_for_updates() || quiet_ui_update::is_quiet_ui_build(channel)
         })
         .unwrap_or(false)
 }
@@ -773,9 +773,7 @@ impl AutoUpdater {
             cx.notify();
         });
 
-        let fetched_release_data = if release_channel == ReleaseChannel::Dev
-            && !cfg!(debug_assertions)
-        {
+        let fetched_release_data = if quiet_ui_update::is_quiet_ui_build(release_channel) {
             quiet_ui_update::fetch_release(client.clone(), &installed_version).await?
         } else {
             Self::get_release_asset(&this, release_channel, None, "zed", OS, ARCH, cx).await?

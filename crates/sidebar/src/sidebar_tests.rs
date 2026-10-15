@@ -6216,28 +6216,6 @@ async fn test_cmd_n_shows_new_thread_entry(cx: &mut TestAppContext) {
         vec!["  New thread", "  Hello * (!)"],
         "Cmd-N should show a fresh draft row above the live thread"
     );
-    panel.read_with(cx, |panel, cx| {
-        assert!(
-            panel.active_thread_is_draft(cx),
-            "panel should show the draft after Cmd-N",
-        );
-    });
-
-    panel.update_in(cx, |panel, window, cx| {
-        panel.activate_additional_new_thread(
-            true,
-            agent_ui::AgentThreadSource::AgentPanel,
-            window,
-            cx,
-        );
-    });
-    cx.run_until_parked();
-
-    assert_eq!(
-        visible_entries_as_strings(&sidebar, cx),
-        vec!["  New thread", "  Hello * (!)"],
-        "The additional-agent path should show a placeholder row for the active empty draft"
-    );
 
     // The panel should be on the draft and active_entry should track it.
     panel.read_with(cx, |panel, cx| {
@@ -6360,26 +6338,6 @@ async fn test_cmd_n_shows_new_thread_entry_in_absorbed_worktree(cx: &mut TestApp
             "  Hello {wt-feature-a} * (!)",
         ],
         "Cmd-N should show a fresh draft row above the live thread"
-    );
-
-    worktree_panel.update_in(cx, |panel, window, cx| {
-        panel.activate_additional_new_thread(
-            true,
-            agent_ui::AgentThreadSource::AgentPanel,
-            window,
-            cx,
-        );
-    });
-    cx.run_until_parked();
-
-    assert_eq!(
-        visible_entries_as_strings(&sidebar, cx),
-        vec![
-            //
-            "  New thread {wt-feature-a}",
-            "  Hello {wt-feature-a} * (!)",
-        ],
-        "The additional-agent path should show a placeholder row for the active empty draft"
     );
 
     // The panel should be on the draft and active_entry should track it.

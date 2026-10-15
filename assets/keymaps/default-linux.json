@@ -393,6 +393,12 @@
       "backspace": "agent::RemoveSelectedThread",
     },
   },
+  {
+    "context": "ThreadsArchiveView",
+    "bindings": {
+      "shift-backspace": "agent::ArchiveSelectedThread",
+    },
+  },
 
   {
     "context": "BufferSearchBar",

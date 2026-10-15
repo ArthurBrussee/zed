@@ -10,7 +10,6 @@ pub const SESSION_LOAD: &str = "session/load";
 pub const SESSION_RESUME: &str = "session/resume";
 pub const SESSION_PROMPT: &str = "session/prompt";
 pub const SESSION_CLOSE: &str = "session/close";
-pub const SESSION_UPDATE: &str = "session/update";
 pub const FS_READ: &str = "fs/read_text_file";
 pub const FS_WRITE: &str = "fs/write_text_file";
 pub const TERMINAL_PREFIX: &str = "terminal/";

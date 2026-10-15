@@ -6871,9 +6871,11 @@ impl Sidebar {
             .highlight_positions(thread.highlight_positions.to_vec())
             .title_generating(title_generating)
             .notified(has_notification)
-            .running_terminals(thread.running_work.terminals)
-            .running_async_tasks(thread.running_work.async_tasks)
-            .running_subagents(thread.running_work.subagents)
+            .running_work(ui::RunningWorkCounts {
+                terminals: thread.running_work.terminals,
+                subagents: thread.running_work.subagents,
+                async_tasks: thread.running_work.async_tasks,
+            })
             .dev_servers(self.dev_server_pills(&thread.metadata, cx))
             .stop_reason(
                 thread

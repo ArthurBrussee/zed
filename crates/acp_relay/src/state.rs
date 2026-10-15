@@ -1266,10 +1266,6 @@ impl RelayState {
         self.check_drain();
     }
 
-    pub fn is_draining(&self) -> bool {
-        self.draining
-    }
-
     fn check_drain(&mut self) {
         if !self.draining {
             return;
