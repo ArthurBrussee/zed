@@ -89,7 +89,7 @@ mod tests {
 
         let accepts_images: acp_v2::PromptCapabilities =
             serde_json::from_value(json!({ "image": {} })).unwrap();
-        let (_sender, receiver) = watch::channel(accepts_images.clone());
+        let (_sender, receiver) = watch::channel(accepts_images);
         let connection = StubAgentConnection::new().with_prompt_capabilities(receiver);
         open_draft_with_connection(&panel, connection, cx);
         assert!(
