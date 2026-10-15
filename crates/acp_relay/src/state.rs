@@ -823,7 +823,7 @@ impl RelayState {
     fn agent_request(&mut self, process: ProcessId, id: Value, method: String, value: Value) {
         let session = frame::session_id(&value).map(|id| self.root(id));
         let request = self.next_id();
-        let line = frame::with_id(value.clone(), Value::from(request));
+        let line = frame::with_id(value, Value::from(request));
         let link = session
             .as_ref()
             .and_then(|s| self.sessions.get(s))
@@ -1043,7 +1043,7 @@ impl RelayState {
         let request = self.next_id();
         let params = serde_json::json!({
             "sessionId": session_id,
-            "cwd": command.cwd.clone().unwrap_or_default(),
+            "cwd": command.cwd.unwrap_or_default(),
             "mcpServers": [],
         });
         if let Some(session) = self.sessions.get_mut(&session_id) {

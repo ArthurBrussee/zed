@@ -8953,7 +8953,7 @@ fn saved_machines(cx: &App) -> Vec<(RemoteConnectionOptions, PathList)> {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            threads_there.sort_by(|a, b| b.0.cmp(&a.0));
+            threads_there.sort_by_key(|(updated_at, _)| std::cmp::Reverse(*updated_at));
             let project = threads_there
                 .into_iter()
                 .map(|(_, paths)| paths)

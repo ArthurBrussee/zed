@@ -619,10 +619,7 @@ mod daemon {
         assert_eq!(answered[0].1["id"], json!(8));
         assert_eq!(relay.sessions().len(), 1, "the session the agent named is live");
 
-        let listed = pool.run_until({
-            let second = second.clone();
-            async move { second.list().await.unwrap() }
-        });
+        let listed = pool.run_until(async move { second.list().await.unwrap() });
         assert_eq!(listed.len(), 1);
         assert!(listed[0].attached);
     }
@@ -758,7 +755,7 @@ mod daemon {
         });
         assert_eq!(listing.len(), 1);
         assert!(listing[0].running);
-        new.add_adoptable(old_socket.clone(), listing);
+        new.add_adoptable(old_socket, listing);
         pool.run_until_stalled();
         assert!(!old_exited.get(), "a running turn is left to finish");
 
@@ -781,12 +778,9 @@ mod daemon {
         // The turn finishes; the older relay ends its agent and exits, and
         // the newer one resumes the session in an agent of its own.
         server.send(link, 3, json!({"jsonrpc":"2.0","method":"_test/release","params":{"sessionId":session}}).to_string());
-        pool.run_until({
-            let old_exited = old_exited.clone();
-            async move {
-                while !old_exited.get() {
-                    smol::future::yield_now().await;
-                }
+        pool.run_until(async move {
+            while !old_exited.get() {
+                smol::future::yield_now().await;
             }
         });
         pool.run_until(async {

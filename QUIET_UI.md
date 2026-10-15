@@ -27,9 +27,12 @@ clock; both were wrong.
 
 ## Upstream first (from 2026-10-01)
 
-The fork stands at +38.1k / -11.3k lines across 98 files against upstream (the exact figures
-after the 2026-10-13 run were +38,057 / -11,282, against +36,905 / -11,277 after 10-12,
-+36,199 / -11,256 after 10-11 and +37,532 / -11,310 after 10-08). The 1,152 added lines 10-13
+The fork stands at +48.2k / -11.4k lines across 138 files against upstream (the exact figures
+after the 2026-10-14 evening run were +48,218 / -11,435, against +42,072 / -11,328 after that
+morning's run, +38,057 / -11,282 after 10-13, +36,905 / -11,277 after 10-12,
++36,199 / -11,256 after 10-11 and +37,532 / -11,310 after 10-08). The 6.2k added lines the
+10-14 evening run put back are its four Work queue entries, 5.3k of them the relay (a fork-only
+crate, `acp_relay`, of which 0.8k is tests, plus 0.6k of end-to-end tests in `remote_server`). The 1,152 added lines 10-13
 put back, and the file that joined (`workspace/src/multi_workspace.rs`, one additive accessor),
 are the three Work queue entries it built; a little under half of them are their tests.
 The 706 added lines 10-12 put back, and the file that joined
@@ -117,7 +120,10 @@ so a laptop-only sidebar is as it was. Each machine header's `+` makes a worktre
 that machine (`machine_repositories`, ordered by the additive
 `MultiWorkspace::project_group_keys_by_recency`, then `new_worktree_thread_in`, which is also
 what the top `+` now calls), with a menu of repositories when that machine has more than one
-open. `agent_ui/thread_metadata_store.rs` and `terminal_thread_metadata_store.rs` persist the rows,
+open. An "Add Machine…" button beside the Active section's `+` dispatches upstream's
+`projects::OpenRemote`, and every host in `ssh_connections` with projects keeps its group with
+nothing open on it (`saved_machines`); its `+` connects, opens the project its latest thread was
+in, and makes the worktree thread there. `agent_ui/thread_metadata_store.rs` and `terminal_thread_metadata_store.rs` persist the rows,
 `thread_read_state.rs` tracks what has been read, and `agent_ui/thread_worktree_archive.rs`
 archives a thread's worktree and restores it without losing work, submodules included. Whether a
 message has ever been sent in a thread makes no difference to any of this (2026-10-02): a thread
@@ -181,22 +187,53 @@ passes it as `--repo owner/name`; a checkout that only exists on the box is neve
 child process as its working directory. Image chips: an image a command wrote on the box comes
 through upstream's image store over RPC rather than off this machine's disk — `RemoteChipImage`
 in `thread_view.rs` holds what `Project::open_image` returned, and the chip is a `ChipImage::Data`
-carrying the box's path so opening the file still resolves through the project. The agents needed
-nothing: `client_capabilities_for_agent` and the Claude `bypassPermissions` default are computed
-from the agent id and settings rather than from the transport, and upstream's `spawn_stdio`
-already wraps the command for the host and surfaces a failed launch as `LoadError::Exited` with
-the box's stderr. What is still laptop-only, by design or for want of a mechanism: `install-quiet-ui`
+carrying the box's path so opening the file still resolves through the project. The agents run
+under the relay on the box (next paragraph); `client_capabilities_for_agent` and the Claude
+`bypassPermissions` default are computed from the agent id and settings rather than from the
+transport. A box whose server is gone gets a fresh one without a click
+(`recent_projects/disconnected_overlay.rs`, the same `open_remote_project` the Reconnect button
+calls), the server no longer exits after ten idle minutes (`remote_server/src/server.rs`), and the
+laptop asks the box for its agent list (`GetExternalAgents`, `AgentServerStore::refresh_remote_agents`)
+rather than relying on the push that arrives before it listens; a thread asking for an agent not
+listed yet waits for the list (`agent_servers/src/remote_agents.rs`). What is still laptop-only, by design or for want of a mechanism: `install-quiet-ui`
 and auto-update; thread-worktree archive and restore, which move git admin directories through
 `app_state.fs` and have no remote equivalent to move them through (nothing implements `Fs` over
 RPC — only `RealFs` and `FakeFs` do); and the per-worktree language-server switch, which is a
 client-side gate on a decision `remote_server` makes in its own process, where the store is
 absent and upstream's behaviour stands.
 
+**Agents that outlive the connection: the relay (2026-10-14).** On a remote project the agent
+runs under a relay daemon on the box (`remote_server acp-relay`, the fork-only crate `acp_relay`),
+not as `ssh host agent`. `remote_server` is one process per window and is killed by every fresh
+connection, so the daemon is its own process: started detached by the first server that needs it,
+on a socket named for its build under `~/.local/share/zed/acp-relay/`, and never idle-reaped. It
+is message-agnostic (`frame.rs` reads id, method and `params.sessionId`, nothing else): it owns the
+JSON-RPC id space both ways, logs each session's agent-to-client frames on disk with a bounded tail
+in memory (`log.rs`), keeps the agent's unanswered requests (permission prompts) until a client is
+back, answers `fs/*` itself while nobody is attached, and reports turn state as
+`_zed/relay/state_update`. All decisions are in `state.rs`, a state machine with no I/O;
+`relay.rs` drives it and `daemon.rs` is the socket, the client and the process spawner. Upstream
+files carry only hooks: `agent_servers/src/acp/transport.rs` (`spawn` tries the relay, then
+stdio; `AgentProcess`), `acp/v1.rs` (the `spawn` call, `watch_relay`, the state-update handler),
+`acp_thread.rs` (`apply_relay_state`, `relay_reconnecting`, cancelling a turn another client
+started), `project.rs` (the `AcpRelayClient` entity for remote projects), `headless_project.rs`
+(the `AcpRelayHost` entity), `server.rs` (the `acp-relay` subcommand) and the proto messages
+(`AcpRelay*` in `ai.proto`). The fork's own files are `project/src/acp_relay_client.rs` (the link,
+which reattaches after a reconnect with the last frame it saw and resends what was not acknowledged),
+`agent_servers/src/acp/relay_transport.rs` (the link as a transport) and
+`remote_server/src/acp_relay_host.rs` (the pass-through to the daemon). A fresh client loading a
+live session is attached to it, not loaded again (claude-agent-acp#1011). A daemon from a newer
+build drains older ones: they take no new sessions, let turns finish, then end their agents, and the
+newer one resumes each session with `session/resume`. `agent.remote_relay: false` puts back the stdio
+path, which is also the fallback when the relay cannot start (`quiet-ui relay: falling back to stdio
+for …` in the log). The sidebar lists sessions the box is running that nothing here is attached to
+(`machine_load::read_relay_sessions`). The end-to-end test is `remote_server/src/acp_relay_tests.rs`.
+
 **Reliability and performance for many worktrees.** Shaped as patches upstream could take: the
 fd-limit spawn error in `util/src/process.rs`, capped environment capture in
 `project/src/environment.rs`, the measurement lines in `zed/src/reliability.rs`, and in gpui
 `App::callback_counts` and `App::entity_counts_by_type` (`gpui/src/app.rs`, `app/entity_map.rs`,
-`subscription.rs`) plus focus-handle sweeping (`gpui/src/window.rs`). A thread tab off screen for
+`subscription.rs`). The fork's focus-handle sweep is gone: upstream's #65177 does the same, better. A thread tab off screen for
 thirty seconds drops its whole per-entry view tree and rebuilds it on return
 (`agent_ui/entry_view_state.rs`), which is what reclaims the view trees of threads left open all
 day. In gpui, `ListState::report_stale_measurements` (`gpui/src/elements/list.rs`) logs
@@ -219,224 +256,6 @@ bail on time**).
 
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
-
-**Agents that keep running on the dev box when the laptop is gone: a relay in `remote_server`.**
-
-Arthur, 2026-10-14. On a remote project, agents run on the box but die whenever the laptop
-sleeps or the SSH link drops, and any turn in progress is lost. He wants them to keep working
-on the box and to reattach afterwards, catching up on everything that happened. Build all of
-it in one go; a partial design is not useful. Shape it so the move to ACP v2 is easy: v2 is
-progressing quickly and this should map onto it, not fight it.
-
-**Why it happens today.** `remote_server` resolves and installs the agent, but the laptop spawns
-it as `ssh host <agent>` (`agent_servers/src/acp/transport.rs`, via
-`RemoteClient::build_stdio_command`). The ACP client is the laptop, connected over that SSH
-pipe, and `claude-agent-acp` exits when its stdin closes (adapter PR #530). `remote_server`
-itself exits after 10 idle minutes (`IDLE_TIMEOUT`, `remote_server/src/server.rs` ~521).
-
-**State of the art, researched 2026-10-14.**
-- Upstream Zed has only an unanswered community request (discussion #60515) and related bugs:
-  #57252 (queued messages lost on disconnect), #59394 (remote sessions drop hourly) and #62488.
-  Nobody is building it upstream.
-- ACP v1 can resume a saved session (`session/load` replays, `session/resume` doesn't) but has
-  no way to reattach to a running turn or recover missed notifications (discussions #396 and
-  #1783).
-- ACP v2, alpha, RFDs active: `session/prompt` returns on insertion, a `state_update`
-  notification gives running / idle(stopReason) / requires_action, and `session/resume` takes a
-  `replayFrom` cursor. Issue #2286 asks for a `state_update` right after resume. Nothing in v2
-  says who keeps the agent process alive; that is this relay's job.
-- Claude Desktop's SSH sessions already work this way: a server on the host owns the agent,
-  keeps recent output in a 16 MiB buffer while the client is away, and on reconnect catches up
-  from the buffer, then from the transcript on the host.
-
-**Design.**
-
-1. **The box owns the agent.** For a remote project, `remote_server` spawns and owns the agent
-   process (the command it already resolves via `GetAgentServerCommand`), instead of the
-   laptop running `ssh host agent`. ACP traffic is tunneled over the existing `remote_server`
-   proto channel, which already reconnects, via new proto messages: open a relay session,
-   client-to-agent frames, agent-to-client frames, attach, detach. On a box that is always on,
-   Arthur wants the relay **always on** too: `remote_server` doesn't exit while any relayed agent
-   is alive (gate `IDLE_TIMEOUT` on that), and agents live until their thread is closed or
-   archived. No idle reaping. Note in the rebase log that systemd-logind `KillUserProcesses`
-   would kill it, and how to disable that.
-2. **Put the relay in a fork-only crate** (e.g. `crates/acp_relay`), with only thin hooks in
-   upstream files: the spawn decision in the transport, the proto additions, the idle gate, and
-   the attach path in the thread. Keep it **message-agnostic**: store and forward raw JSON-RPC
-   frames, parsing only `id`, `method` and `params.sessionId`. Then v1 to v2 is a change of
-   method-name tables plus the cursor and state mapping, not a rewrite.
-3. **What the relay keeps per agent and per session:**
-   - It owns the agent-side JSON-RPC id space: it rewrites client ids to its own and back, so a
-     response that arrives while no client is attached (e.g. a `session/prompt` result at the
-     end of a turn) is not lost.
-   - It caches the agent's `initialize` result and answers a reattaching client from the
-     cache. The agent is initialized once, with a fixed set of client capabilities (the ones
-     Zed advertises today, `asyncTasks` / `sessionFailure` / native subagents included).
-   - A numbered, append-only log of every agent-to-client frame per session (session/update,
-     commands, config / mode, session info, the AIR async-task and subagent updates), **on disk
-     on the box** (e.g. under `~/.local/share/zed/acp-relay/<session>.log`) with a bounded
-     in-memory tail. Since the relay is permanent, it can't grow without bound in memory.
-   - Agent-to-client requests still waiting for an answer: permission prompts, elicitations,
-     any v1 fs / terminal requests. While no client is attached they stay pending, so the agent
-     blocks on a permission question exactly as it would with Zed open. Fs and terminal requests
-     the box can serve itself are answered by the relay acting as the client, the same way the
-     project would.
-   - Turn state: running or idle with its last stopReason / error, derived from prompt
-     request/response pairs and, under v2, from `state_update`.
-4. **Reattach.** On reconnect, Zed sends attach(sessionId, last seen sequence number). The relay
-   replays every frame after that number, re-sends the pending requests, and sends a synthetic
-   state frame (v2's `state_update` shape, under a fork `_meta` / extension method on v1).
-   When the cursor is older than the log, it falls back to the log on disk. Never call
-   `session/load` on a live session to catch up (claude-agent-acp issue #1011: duplicate
-   `claude --resume` children). Name the cursor and state messages the way v2 will need them
-   (`replayFrom`, `state_update`), so swapping in v2 is mostly deleting the extension.
-5. **Laptop side.**
-   - `AcpThread` / `ConversationView` get a third way in besides new and load: **attach to a
-     live session**. It applies the replayed frames as normal updates, shows pending
-     permission prompts, and sets the turn state.
-   - A dropped connection must **not** send `session/cancel` or mark the turn failed. The thread
-     shows "reconnecting…" and reattaches when the remote connection comes back.
-   - The sidebar lists the box's live relayed sessions as running threads under that machine,
-     including ones started while the laptop was away, and reopening one attaches.
-   - Stopping a turn still works as `session/cancel` through the relay.
-   - Local projects keep the plain stdio path unchanged.
-6. **Tests: the gate for this entry.** An end-to-end test with the fake remote transport and a
-   fake ACP agent covers the whole loop:
-   - start a turn;
-   - drop the connection mid-turn;
-   - while detached, the agent streams updates, asks a permission question, and finishes;
-   - reattach;
-   - assert every update arrived in order and exactly once, the permission prompt showed and
-     its answer reached the agent, and the final state is idle with the right stopReason.
-
-   Add a reattach after a log longer than the in-memory tail (disk fallback), a reattach while
-   still running, and two sequential attaches with no duplicate frames. This test is what keeps
-   the feature from silently breaking on rebases, since the spawn path is being reworked for v2
-   upstream right now (#64598, #65582 and the "Route v2" PRs). It must stay green every night.
-
-**Updates must not orphan the box's agents.** The server binary is named per build commit, so
-after Arthur updates, the client starts a *new* `remote_server` while the old, permanent one still
-owns the running agents. Handle the handover: when a newer server comes up for the same
-identifier, the old one takes no new sessions and lets in-flight turns finish (pending permission
-prompts stay answerable through it). Then it hands its sessions over by ending each agent cleanly,
-the new server resumes them with `session/resume`, and the old one exits. Keep the relay's on-disk
-log format stable across versions so the new server can read the old logs for catch-up. Threads
-started before the relay existed (spawned the old way, over `ssh host agent`) keep working: the
-agent on the box saved their conversations, and reopening one starts it under the relay and
-resumes it. Test the handover with two server versions in the fake transport.
-
-Record in the rebase log the exact upstream files touched and the hooks, so each night's
-conflicts there are easy to place, and note what to change when upstream switches Zed to ACP
-v2.
-
-**Keep the old path working, at least for now.** Until the relay has proven itself on Arthur's
-box, the old way of starting a remote agent (the laptop running `ssh host agent` over stdio) stays
-in the code as a fallback, not deleted:
-- threads started the old way keep running that way until they are closed;
-- if the relay can't start or attach for a session, Zed falls back to the old path for that thread
-  and logs why (`quiet-ui relay: falling back to stdio for <thread>: <reason>`), rather than
-  failing to open it;
-- a setting (e.g. `agent.remote_relay: false`) turns the relay off entirely, so a bad night can be
-  undone without a rebuild.
-
-Note in the rebase log that the fallback is temporary, to be removed once the relay has run
-cleanly for a week or so.
-
-**Reconnecting to the dev box: a dead server leaves the window stuck, and a fresh one comes up without Claude.**
-
-Arthur, 2026-10-14, laptop log (`~/Library/Logs/Zed/Zed.log`) and the box's
-`~/.local/share/zed/logs/server-dev-workspace-497.log`:
-
-1. The laptop went away (sleep). The box's server saw stdin EOF, waited out `IDLE_TIMEOUT`
-   ("timed out waiting for new connections after 600s. exiting.", `remote_server/src/server.rs`
-   ~555), and exited. At 18:05 local the laptop woke: `proxy process terminated unexpectedly:
-   255`, a reconnect attempt, `(remote proxy) attempted to reconnect, but no server running`,
-   then `setting state to 'server not running'`. The window stayed in that state until Arthur
-   reconnected by hand.
-   - The relay entry already makes the server permanent on the box. Check it covers this exact
-     path: no idle exit at all, whether or not an agent is alive. Arthur's box is always on and he
-     wants the server to stay up.
-   - In the client: when a reconnect finds "no server running", start a fresh server and
-     reattach the window's projects automatically (upstream's "Reconnect" already knows how). The
-     window must not sit in 'server not running' needing a manual step.
-
-2. The fresh connection at 18:07 came up without Claude: `client:unhandled remote message
-   name:ExternalAgentsUpdated`, then `quiet-ui launch: claude-acp failed after 391µs: Custom agent
-   server claude-acp is not registered` (twice). The box sent its agent list before the laptop's
-   `AgentServerStore` for that project had registered its `ExternalAgentsUpdated` handler
-   (`project/src/agent_server_store.rs`, `init_remote` / `handle_external_agents_updated`), so the
-   list was dropped. Threads then fail to start with "not registered". Fix the race at its source:
-   register the handler before the connection can deliver it, or have the client ask for the
-   list once it is ready and on every reconnect. Also make a thread whose agent isn't registered
-   *yet* on a remote project wait for the list, rather than fail at once.
-
-Test: with the fake remote transport, a reconnect after the server has exited starts a new one
-and reattaches without user action; an `ExternalAgentsUpdated` sent immediately on connect
-registers `claude-acp`, and a thread created at that moment launches.
-
-**Make `+` fast: find the waste in new-worktree creation. No caches, no pre-warming.**
-
-Arthur, 2026-10-14: profile where new-worktree time goes and make it faster by removing waste.
-He explicitly does **not** want new caches, more pre-warming or anything complicated. The
-existing spare pool stays as it is, but nothing new of that kind. From his log, same day:
-
-Local (spare claimed):
-`base already present in 303ms` → `claimed from the spare` → `window shown in 93–179ms` →
-`shell environment … took 490–699ms` → `workspace opened in 1402–3163ms`; the replacement spare
-then checks out in the background (3.9–6.0s).
-
-On the dev box over SSH:
-`the spare worktree is gone from disk; checking one out instead` → `base already present in
-208–246ms` → `worktree checked out in 3341–3567ms` → `window shown in 880–908ms` → `workspace
-opened in 4042–6748ms`.
-
-What to fix:
-1. **On a remote machine the spare is never used.** The spare's presence check is
-   `fs.is_dir(path)` in `worktree_service.rs` (around "is gone from disk"), run against the
-   *laptop's* filesystem for a path that exists on the box. So every remote `+` throws the
-   ready spare away and pays a 3.5s checkout before the window. Check through the repository
-   (`Entity<Repository>` worktree list over RPC, as the rest of the flow already does).
-2. **A remote spare checkout failed** (11:01): `git worktree add failed: Preparing worktree
-   (detached HEAD 78cbbb1281) Updating files: 40% … 51%` and the message ends there. The error
-   text is git's progress output, so the real failure (an RPC timeout, a killed process, stderr
-   mistaken for failure) is not in it. Find it and fix it. The follow-up `git worktree remove` of
-   a worktree that was never created then errors (`is not a working tree`), which shouldn't
-   happen either.
-3. **The thread waits for the whole workspace to open.** `create_new_worktree_thread` awaits
-   `create_worktree_workspace_foreground`, which returns only once the project has scanned and
-   its repositories have reported. That is 1.4–3.2s after the window is up locally, and 4–6.7s
-   remotely. A thread needs the panel and the worktree's path, not a finished scan of 20k
-   files. Create and focus the thread as soon as the new workspace's panel exists, and let the
-   scan finish behind it. Check the agent and thread pieces that read the project don't break on
-   a still-scanning worktree (upstream opens threads in fresh workspaces all the time).
-4. **300ms to learn the base is "already present".** Find what that phase runs (a git
-   subprocess, a fetch check, a ref walk) and cut it to what is needed.
-5. **Remote window shown in ~900ms vs ~100–180ms locally.** Find what runs serially before the
-   window on the remote path and move it after, the way the local path already does.
-6. Whatever else the timings show once 1–5 are done. Add one summary line per `+`: `quiet-ui
-   perf: + to thread ready in Xms (base Y, claim Z, window W, thread V)`, so Arthur's log shows
-   the whole click-to-typing time, laptop and box alike.
-
-Report before and after from tests where possible, and leave the lines in so his log confirms.
-
-**Add a machine from the sidebar, and keep its group once it has been used.**
-
-Arthur, 2026-10-14, after the machine groups landed: "how do I add it now?" The sidebar has
-no way in. A machine group only appears once a project on that machine is open, and the way to
-open one is upstream's `projects::OpenRemote` (ctrl-cmd-o), which nothing in the sidebar points
-to. Two changes:
-- An "Add Machine…" entry in the sidebar (the top `+`'s menu or the machine area's header)
-  that dispatches `projects::OpenRemote { from_existing_connection: false }`, so adding an SSH
-  host and picking its folder is upstream's own flow.
-- A machine that has been used keeps its group after its windows close: every host in the
-  user's `ssh_connections` settings that has projects listed there. Its `+` opens that host's
-  most recent project from `ssh_connections` (connecting if needed, through upstream's
-  `open_remote_project`), then makes the worktree thread there the way the group's `+` does
-  now. Its threads stay listed under it, as closed-workspace rows already are. A host the user
-  removes from `ssh_connections` loses its group.
-
-Test: with an `ssh_connections` entry and no window open on it, the group renders, and its `+`
-connects (fake remote transport) and creates the worktree thread on that host.
 
 **The memory baselines: what it would take, and the one measurement that would justify it.**
 
@@ -3678,3 +3497,167 @@ error. Two things recovered ~10G without costing a rebuild:
 of which asked for lines; roughly two fifths of the 4,015 are their tests. The new files are the
 night's own fork modules and their homes: `agent_ui/dev_servers.rs`,
 `acp_thread/plan_usage.rs`, `sidebar/machine_load.rs` and `git_ui/diff_groups.rs`.
+
+**2026-10-14, evening run** (finished in the small hours of 10-15): onto main 3e145061d (10
+upstream commits). A working night three times over: the Work queue held four buildable entries
+(the fifth, the memory baselines, is still Arthur's measurement to take), the branch carried
+nineteen commits over the merge base, and upstream had moved. Squash-then-rebase folded all
+nineteen into one, reusing the squash's own message; tree-identical to the old tip (`056c58f86`)
+before rebasing. Backup at `quiet-ui-pre-rebase51-2026-10-14`, pushed before anything else.
+
+**Three files conflicted, and two of them were upstream building what the fork had by hand.**
+- `gpui/src/app.rs` and `gpui/src/window.rs`: upstream's `Fix focus cleanup stalls during
+  conversation restoration (#65177)` queues dropped focus handles and releases only those, which
+  is what the fork's `FocusMap::take_dropped` flag did more crudely (it skipped the full sweep when
+  nothing was dropped, but still swept everything when one was). **Upstream's taken whole and the
+  fork's deleted**, its test with it; `callback_counts` now reads `focus_handles.read().handles`.
+  The fork had also dropped `use parking_lot::RwLock` from `app.rs`, which upstream now needs —
+  markerless, and the first error the workspace check found.
+- `agent_servers/src/acp.rs`: upstream's `Move the legacy ACP adapter into v1 (#65607)` moved
+  9,600 lines into `acp/v1.rs`, after `Add inactive v2 connection and auth foundation (#65582)`
+  and `Share ACP connection lifecycle across v1 and v2 (#65601)` reshaped the file. Took
+  upstream's `acp.rs` and replayed the fork's 12 hunks onto `v1.rs` with `patch -F3`: eleven
+  applied by offset, the twelfth (the import block) by hand. Worth knowing for next time: **the
+  fork's ACP changes now live in `acp/v1.rs`**, and `acp/v2.rs` carries none; when upstream
+  switches Zed to v2 the AIR extension handling (`RawSessionNotification`, `apply_async_task_update`,
+  `apply_subagent_update`, `air_session_failure`) has to move with it.
+
+**Markerless drift: four.** The `RwLock` import above; `v1.rs` needing `JsonRpcMessage`,
+`JsonRpcNotification` and `UntypedMessage` imported (the move split the import block); and
+upstream's `Allow to restart stopped servers (#65387)` dropping the `clear_stopped` argument from
+`restart_language_servers_for_buffers`, which the fork's worktree language-server switch
+(`git_ui_core/worktree_language_server_switch.rs`) and its project test both called. That last
+one had a second, quieter half the gate found: the restart now re-registers only buffers that are
+still registered, and the fork's test dropped its LSP handle straight after opening the buffer,
+so the switched-on server never started and the test **hung** rather than failed. Held the handle,
+as an editor does; the switch itself is unaffected, since the buffers it restarts are open in
+editors. A hang in the project integration suite looks like a slow suite for a long time.
+
+**What was built: all four buildable Work queue entries, in order.**
+
+- *Agents that keep running on the dev box: the relay.* Built in full, with one structural change
+  from the plan, because the code disagreed with it: **the relay is a daemon of its own, not part
+  of `remote_server`.** `remote_server` is one process per Zed window (`server-<identifier>`), and
+  `execute_proxy` *kills* the running server whenever a window connects afresh rather than
+  reconnecting — which every app restart and every update does. Agents owned by `remote_server`
+  would die exactly when the plan needs them to survive. So `remote_server acp-relay` runs
+  detached (`setsid`), started by the first server that needs it, on a socket named for its build
+  (`~/.local/share/zed/acp-relay/relay-<version>.sock`); servers are pass-throughs to it. The plan's
+  "gate `IDLE_TIMEOUT` on live agents" became moot for the agents and was done for the server
+  anyway (next entry). The rest is as planned: message-agnostic, id rewriting both ways, the
+  `initialize` cache, per-session numbered logs on disk with a 4,096-frame / 8 MiB tail, pending
+  agent requests held, `fs/*` served by the relay while detached (the Claude adapter uses client
+  fs for its own Read/Write tools; it never asks for client terminals, which the relay refuses
+  while detached), turn state from prompt request/response pairs, `_zed/relay/state_update` named
+  for v2's `state_update`. Subagent frames (`subagent_spawned` / RFD `subagent_update`) are filed
+  under the session that launched them. **Reattach has two layers**: a link (one ACP connection)
+  is numbered both ways (`lseq` out, `cseq` in), so a laptop whose server was replaced attaches
+  with the last frame it saw and resends what was not acknowledged — and a fresh client
+  (Zed restarted) loading a live session is answered by the relay from the log, never by a second
+  `session/load` to the agent. **Handover**: a newer daemon lists older ones' sessions and asks
+  them to drain; they refuse new sessions, let turns and permission prompts finish, then end their
+  agents and exit; a client asking the newer daemon for such a session is first served *through*
+  the older one (an adopting link), and the newer one resumes it with `session/resume` once the
+  older lets go — or loads it the ordinary way if the older one had already let go. The log format
+  is versioned (`{"acp_relay_log":1}` header) and only grows. The old path stays: `agent.remote_relay:
+  false` turns the relay off, and a relay that cannot start falls back to stdio for that connection
+  with `quiet-ui relay: falling back to stdio for <agent>: <reason>` — **per connection, not per
+  thread**, since the transport is chosen when the agent connection is made, which covers every
+  thread on it. **The fallback is temporary**: take it out once the relay has run cleanly on
+  Arthur's box for a week or so. The sidebar lists relayed sessions nothing here is attached to,
+  as running, under their machine (polled with the machine load), adding a row for any session
+  this machine has no thread for. **Upstream files and hooks**, for placing conflicts:
+  `agent_servers/src/acp/transport.rs` (`AgentProcess`, `spawn`), `acp/v1.rs` (one call,
+  `watch_relay`, the `RelayStateUpdate` notification), `acp/runtime.rs` (one test line),
+  `acp_thread.rs` (`apply_relay_state`, `relay_reconnecting`, cancel of a turn another client
+  started; `update_session_state`'s body moved into `apply_reported_state`), `project.rs`
+  (`acp_relay` field and its subscription), `remote_server/src/headless_project.rs` (one field),
+  `server.rs` (the subcommand), `proto` (`AcpRelay*`, envelope 498–507), `agent_settings`
+  (`remote_relay`), `thread_view.rs` ("Reconnecting…"). **When Zed switches to ACP v2**: change the
+  method names in `acp_relay/src/frame.rs`, map `_zed/relay/state_update` to v2's `state_update`
+  (and drop `RelayStateUpdate` in `v1.rs`), and let v2's `replayFrom` carry the cursor the link
+  carries now. **On the box**: systemd-logind's `KillUserProcesses=yes` kills everything a user
+  started when their last session ends, the relay included; it is off by default on most
+  distributions, and `loginctl enable-linger $USER` (or `KillUserProcesses=no` in
+  `/etc/systemd/logind.conf`) keeps it off. **Tests**: 13 in `acp_relay` (the state machine
+  against a scripted agent, including disk fallback past the tail, a fresh client attaching to a
+  running turn, fs served while detached, and the two-version handover over real sockets with real
+  shell agents), and three end to end in `remote_server/src/acp_relay_tests.rs`: a turn that
+  survives its server being replaced mid-turn while the agent asks a permission question with
+  nobody attached (every update exactly once, the answer reaches the agent, nothing sent
+  `session/cancel`, two further reconnects change nothing), a fresh client attaching to a running
+  turn whose 5,000-update history is read back from disk, and the setting falling back to stdio.
+  Disabling the laptop's reattach makes the first fail, so it is load-bearing.
+- *Reconnecting to the dev box.* The server no longer exits on its own (`IDLE_TIMEOUT` is gone;
+  Zed's `ShutdownRemoteServer` on window close and app quit is what ends it). A window whose
+  server is gone reopens its project on a fresh server by itself — the Reconnect button's
+  `open_remote_project`, called from the disconnected overlay's subscription; the overlay shows
+  only if that fails. The agent-list race: the box pushed `ExternalAgentsUpdated` a fixed second
+  after connecting and a laptop not yet listening dropped it; the client now asks
+  (`GetExternalAgents`) once subscribed and on every reconnect, and a thread asking for an agent
+  the box has not listed yet waits up to 20s for the list. Tests: a window whose server is gone
+  reconnects with no click and knows `claude-acp` before the push could have landed (fails with
+  the request removed), and a thread's wait ends when the box lists the agent.
+- *Making `+` fast.* Points 1–4 and 6 built as the morning's reading set out: the remote spare is
+  checked against the repository's worktree list; the base check is one `git show` of the ref
+  (`Repository::show_commit`, already over RPC) instead of listing every ref (the fake repository's
+  `show` learned to resolve the branches a test inserts); the foreground `+` returns once the
+  window and panels exist, with the scan, barrier and create hooks behind it; the summary line is
+  `quiet-ui perf: + to thread ready in Xms (base, claim, window, thread)`. **Point 2, the failed
+  remote spare checkout, is half done, honestly**: nothing in the code explains a `git worktree
+  add` that dies at 51% with only progress on stderr, so the message now leads with git's exit
+  status (`signal: 9 (SIGKILL)` or a code), with the progress lines dropped and a unit test on the
+  exact text from the log; the next failure will say what killed it. A rollback of a worktree git
+  never registered no longer logs an error. **Point 5, the remote window's ~900ms, is measured,
+  not cut**: `quiet-ui perf: worktree window parts: workspace Xms, panels Yms` says which half it
+  is, and that needs a real box.
+- *Add a machine from the sidebar.* An "Add Machine…" button beside the Active section's `+`
+  dispatches `projects::OpenRemote`; hosts in `ssh_connections` with projects keep their group
+  with nothing open, their threads stay under them, and their `+` connects, opens the project the
+  latest thread there was in (else the first listed), waits for git, and makes the worktree thread.
+  Tests: the group, the project choice and the removal from settings; and the `+` opening the
+  box's project over the fake transport.
+
+**Nothing else the fork carries became deletable**, beyond the focus sweep above.
+
+**The gate.** The union is the fork's core (`acp_thread`, `agent_ui`, `sidebar`) plus every crate
+tonight touched: `acp_relay`, `agent` (one settings literal in a test), `agent_servers`,
+`agent_settings`, `fs`, `git`, `git_ui_core`, `gpui` (the rebase), `project`, `proto`,
+`recent_projects`, `remote_server`, `settings_content`. The Verification queue was empty.
+`cargo test`: `agent` 791, `agent_ui` 565 (its 36 `#[ignore]`d left alone), `project` 489 (78 +
+411), `gpui` 391, `acp_thread` 344, `sidebar` 210, `agent_servers` 110, `remote_server` 84,
+`git` 80, `settings_content` 51, `fs` 49, `agent_settings` 44, `recent_projects` 38,
+`git_ui_core` 31, `acp_relay` 13, `proto` 2. **One real failure, found and fixed**: the hang
+described under markerless drift above. **Three failures that are the sandbox's**:
+`agent`'s `test_fetch_tool_follows_same_host_redirect`, `…_reauthorizes_redirect_to_new_host` and
+`…_refuses_redirect_to_loopback` resolve `example.com` for real, and this container has no DNS
+of its own (its proxy resolves hosts); the fork changes nothing in the fetch tool.
+
+**Clippy found three, all tonight's own**: two redundant clones in `acp_relay`'s state machine
+(plus three in its tests) and a `sort_by` that wanted `sort_by_key` in `saved_machines`. With
+`--keep-going` both crates' failures were visible at once; without it the first would have hidden
+everything downstream of `acp_relay` and `sidebar`, `zed` included. A second full
+`script/clippy --keep-going` came back with 0 errors and 0 warnings across the workspace, and the
+two crates whose source the fixes touched were run again on the final tree (13 + 210, identical).
+`cargo-shear`, `typos` and `buf` are not installed here, so `script/clippy` stops after the lint.
+
+**Environment: the disk was the whole fight.** Tonight's allowance is about 39G and the image
+takes ~13G of it, leaving ~25G for `target`. It ran out seven times. What is worth knowing:
+- **Each `cargo test -p` with a different set of crates builds a different feature set**, so
+  `project`, `workspace` and friends exist several times over in `target/debug/deps`. Purging all
+  but the newest of each name+extension frees 5–12G each time and costs only the rebuild of a
+  set that comes back.
+- **`cargo test -p gpui` links every gpui example** (several GB). Use `cargo test -p gpui --lib`.
+- **Link heavy test binaries one crate at a time** (`agent`, `remote_server`, `recent_projects`,
+  `sidebar`): three at once ran out mid-link (`ld terminated with signal 7 [Bus error]`), and
+  delete each test binary as soon as its suite reports.
+- `rm -rf target/debug` before `script/clippy`, and `target/release` before going back to tests.
+- The background-command limit is 30 minutes unless a longer `timeout` is given; a gate batch
+  that compiles `project` from scratch needs longer.
+
+**Diff size**: 138 files, +48,218 / -11,435 against the merge base, from 113 files,
++42,072 / -11,328 after the morning's run. The replay itself shrank it by 99 added lines (the
+focus sweep upstream now does); the four entries added 6.2k, 5.3k of them the relay, of which
+roughly 2k is tests. New files are the `acp_relay` crate, `project/src/acp_relay_client.rs`,
+`agent_servers/src/acp/relay_transport.rs`, `agent_servers/src/remote_agents.rs`,
+`remote_server/src/acp_relay_host.rs` and the two `remote_server` test files.
