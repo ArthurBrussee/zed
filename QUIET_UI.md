@@ -296,6 +296,12 @@ editor fills the pane, files sit below each other) and extend it: each group's h
 above its first file and below the previous group's last, and clicking a header folds exactly that
 group, collapsed and expanded, without any two blocks overlapping.
 
+The test group also misses files: `tests.rs` (Rust's usual `mod tests;` file) was put under Code,
+because `is_test_name` only knows `_tests.rs` and `_test.rs`. Add `tests.rs` and `test.rs` as whole
+names, `test_*.rs`, test directories beyond `tests` and `__tests__` (`test`, `spec`, `testdata`,
+`fixtures`, `test_support`/`test-support`), and the common other languages (`*Test.java`,
+`*Test.kt`, `*_spec.rb`, `*Tests.swift`), each in the existing `of_path` unit test.
+
 **Inline images from the dev box open in Zed, zoomable, with no warning.**
 Clicking an expanded image the agent sent inline in a thread on the dev box shows "This image came
 inline from the dev box, so there is no file there to open" (`open_image_data` in
