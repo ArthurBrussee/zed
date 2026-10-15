@@ -339,7 +339,9 @@ mod tests {
             std::process::Stdio::null(),
         )
         .expect("spawn waiting child");
-        let mut child = crate::acp::transport::OwnedChild(child);
+        let mut child = crate::acp::transport::OwnedChild(
+            crate::acp::transport::AgentProcess::Local(child),
+        );
         let status = child.0.status();
         drop(child);
         let timeout = cx.background_executor.timer(Duration::from_secs(5));

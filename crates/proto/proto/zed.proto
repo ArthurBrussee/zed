@@ -524,7 +524,20 @@ message Envelope {
     ExecuteLspCommandResponse execute_lsp_command_response = 492;
     RefreshDocumentHighlights refresh_document_highlights = 493;
     GetTerminalShell get_terminal_shell = 494;
-    GetTerminalShellResponse get_terminal_shell_response = 495; // current max
+    GetTerminalShellResponse get_terminal_shell_response = 495;
+    GetSystemLoad get_system_load = 496;
+    SystemLoadResponse system_load_response = 497;
+    AcpRelayOpen acp_relay_open = 498;
+    AcpRelayOpened acp_relay_opened = 499;
+    AcpRelayAttach acp_relay_attach = 500;
+    AcpRelayAttached acp_relay_attached = 501;
+    AcpRelaySend acp_relay_send = 502;
+    AcpRelayAck acp_relay_ack = 503;
+    AcpRelayClose acp_relay_close = 504;
+    AcpRelayFrame acp_relay_frame = 505;
+    AcpRelayListSessions acp_relay_list_sessions = 506;
+    AcpRelaySessions acp_relay_sessions = 507;
+    GetExternalAgents get_external_agents = 508; // current max
   }
 
   reserved 87 to 88;

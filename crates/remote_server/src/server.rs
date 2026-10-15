@@ -1,3 +1,8 @@
+mod acp_relay_host;
+#[cfg(test)]
+mod acp_relay_tests;
+#[cfg(test)]
+mod remote_agents_tests;
 mod headless_project;
 
 #[cfg(test)]
@@ -89,6 +94,11 @@ pub enum Commands {
     Version,
     #[cfg(unix)]
     Exec,
+    /// quiet-ui: the relay that keeps agents running while Zed is away.
+    AcpRelay {
+        #[arg(long)]
+        dir: PathBuf,
+    },
 }
 
 pub fn run(command: Commands) -> anyhow::Result<()> {
@@ -115,6 +125,7 @@ pub fn run(command: Commands) -> anyhow::Result<()> {
         } => execute_proxy(identifier, reconnect).context("running proxy on the remote server"),
         #[cfg(unix)]
         Commands::Exec => execute_command(),
+        Commands::AcpRelay { dir } => acp_relay_host::run_daemon(dir),
         Commands::Version => {
             let release_channel = *RELEASE_CHANNEL;
             match release_channel {
@@ -514,9 +525,6 @@ fn start_server(
     cx: &mut App,
     is_wsl_interop: bool,
 ) -> AnyProtoClient {
-    // This is the server idle timeout. If no connection comes in this timeout, the server will shut down.
-    const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
-
     let (incoming_tx, incoming_rx) = mpsc::unbounded::<Envelope>();
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded::<Envelope>();
     let (app_quit_tx, mut app_quit_rx) = mpsc::unbounded::<()>();
@@ -538,6 +546,9 @@ fn start_server(
                 listeners.stderr.accept(),
             );
 
+            // quiet-ui: no idle exit. A laptop asleep for more than the old ten
+            // minutes came back to "server not running"; the server now waits
+            // for it however long it takes, and exits when Zed shuts it down.
             log::info!("accepting new connections");
             let result = select! {
                 streams = streams.fuse() => {
@@ -547,16 +558,6 @@ fn start_server(
                     };
                     log::info!("accepted new connections");
                     anyhow::Ok((stdin_stream, stdout_stream, stderr_stream))
-                }
-                _ = futures::FutureExt::fuse(cx.background_executor().timer(IDLE_TIMEOUT)) => {
-                    log::warn!("timed out waiting for new connections after {:?}. exiting.", IDLE_TIMEOUT);
-                    cx.update(|cx| {
-                        // TODO: This is a hack, because in a headless project, shutdown isn't executed
-                        // when calling quit, but it should be.
-                        cx.shutdown();
-                        cx.quit();
-                    });
-                    break;
                 }
                 _ = app_quit_rx.next().fuse() => {
                     log::info!("app quit requested");

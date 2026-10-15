@@ -1,3 +1,4 @@
+pub mod acp_relay_client;
 pub mod agent_registry_store;
 pub mod agent_server_store;
 pub mod bookmark_store;
@@ -22,6 +23,7 @@ pub mod telemetry_snapshot;
 pub mod terminals;
 pub mod toolchain_store;
 pub mod trusted_worktrees;
+pub mod worktree_language_servers;
 pub mod worktree_store;
 
 mod environment;
@@ -220,6 +222,7 @@ pub struct Project {
     languages: Arc<LanguageRegistry>,
     dap_store: Entity<DapStore>,
     agent_server_store: Entity<AgentServerStore>,
+    acp_relay: Option<Entity<acp_relay_client::AcpRelayClient>>,
 
     bookmark_store: Entity<BookmarkStore>,
     breakpoint_store: Entity<BreakpointStore>,
@@ -1412,6 +1415,7 @@ impl Project {
                 breakpoint_store,
                 dap_store,
                 agent_server_store,
+                acp_relay: None,
 
                 buffers_needing_diff: Default::default(),
                 git_diff_debouncer: DebouncedDelay::new(),
@@ -1613,6 +1617,15 @@ impl Project {
 
             cx.subscribe(&remote, Self::on_remote_client_event).detach();
 
+            let acp_relay = cx.new(|cx| {
+                acp_relay_client::AcpRelayClient::new(
+                    REMOTE_SERVER_PROJECT_ID,
+                    remote_proto.clone(),
+                    Some(&remote),
+                    cx,
+                )
+            });
+
             let this = Self {
                 buffer_ordered_messages_tx: tx,
                 collaborators: Default::default(),
@@ -1628,6 +1641,7 @@ impl Project {
                 client_state: ProjectClientState::Local,
                 git_store,
                 agent_server_store,
+                acp_relay: Some(acp_relay),
                 client_subscriptions: Vec::new(),
                 _subscriptions: vec![
                     cx.on_release(Self::release),
@@ -1686,6 +1700,9 @@ impl Project {
             remote_proto.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &this.settings_observer);
             remote_proto.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &this.git_store);
             remote_proto.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &this.agent_server_store);
+            if let Some(acp_relay) = &this.acp_relay {
+                remote_proto.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, acp_relay);
+            }
 
             remote_proto.add_entity_message_handler(Self::handle_create_buffer_for_peer);
             remote_proto.add_entity_message_handler(Self::handle_create_image_for_peer);
@@ -1714,6 +1731,9 @@ impl Project {
             BreakpointStore::init(&remote_proto);
             GitStore::init(&remote_proto);
             AgentServerStore::init_remote(&remote_proto);
+            this.agent_server_store
+                .update(cx, |store, cx| store.refresh_remote_agents(cx));
+            acp_relay_client::AcpRelayClient::init(&remote_proto);
 
             this
         })
@@ -1950,6 +1970,7 @@ impl Project {
                 dap_store: dap_store.clone(),
                 git_store: git_store.clone(),
                 agent_server_store,
+                acp_relay: None,
                 buffers_needing_diff: Default::default(),
                 git_diff_debouncer: DebouncedDelay::new(),
                 terminals: Terminals {
@@ -3928,7 +3949,10 @@ impl Project {
                 });
                 cx.emit(Event::DisconnectedFromRemote { server_not_running });
             }
-            &remote::RemoteClientEvent::Reconnected => {}
+            &remote::RemoteClientEvent::Reconnected => {
+                self.agent_server_store
+                    .update(cx, |store, cx| store.refresh_remote_agents(cx));
+            }
         }
     }
 
@@ -6610,6 +6634,11 @@ impl Project {
 
     pub fn agent_server_store(&self) -> &Entity<AgentServerStore> {
         &self.agent_server_store
+    }
+
+    /// quiet-ui: the relay a remote project's agents run through.
+    pub fn acp_relay_client(&self) -> Option<&Entity<acp_relay_client::AcpRelayClient>> {
+        self.acp_relay.as_ref()
     }
 
     #[cfg(feature = "test-support")]

@@ -2299,8 +2299,10 @@ impl GitRepository for RealGitRepository {
                 if output.status.success() {
                     Ok(())
                 } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    anyhow::bail!("git worktree add failed: {stderr}");
+                    anyhow::bail!(worktree_add_failure(
+                        &output.status.to_string(),
+                        &String::from_utf8_lossy(&output.stderr)
+                    ));
                 }
             })
             .boxed()
@@ -3194,18 +3196,27 @@ impl GitRepository for RealGitRepository {
         self.executor
             .spawn(async move {
                 let git = git?;
+                // With `submodule.recurse` set, read-tree aborts on a fresh worktree's
+                // uninitialised submodules, so don't depend on the user's config.
                 // First, set the index AND working tree to match the unstaged
                 // tree. --reset -u computes a tree-level diff between the
                 // current index and unstaged_sha's tree and applies additions,
                 // modifications, and deletions to the working directory.
-                git.run(&["read-tree", "--reset", "-u", &unstaged_sha])
-                    .await
-                    .context("failed to restore working directory from unstaged commit")?;
+                git.run(&[
+                    "-c",
+                    "submodule.recurse=false",
+                    "read-tree",
+                    "--reset",
+                    "-u",
+                    &unstaged_sha,
+                ])
+                .await
+                .context("failed to restore working directory from unstaged commit")?;
 
                 // Then replace just the index with the staged tree. Without -u
                 // this doesn't touch the working directory, so the result is:
                 // working tree = unstaged state, index = staged state.
-                git.run(&["read-tree", &staged_sha])
+                git.run(&["-c", "submodule.recurse=false", "read-tree", &staged_sha])
                     .await
                     .context("failed to restore index from staged commit")?;
 
@@ -4298,8 +4309,39 @@ fn checkpoint_author_envs() -> HashMap<String, String> {
     ])
 }
 
+
+/// quiet-ui: git reports checkout progress on stderr too, and a checkout
+/// killed partway leaves nothing else there, so the message leads with the
+/// exit status, which is what says why it stopped.
+fn worktree_add_failure(status: &str, stderr: &str) -> String {
+    let stderr = stderr
+        .split(['\r', '\n'])
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("Updating files:"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("git worktree add failed ({status}): {stderr}")
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_killed_checkout_says_how_it_ended_instead_of_how_far_it_got() {
+        let stderr = "Preparing worktree (detached HEAD 78cbbb1281)\nUpdating files:  40% (8123/20307)\rUpdating files:  51% (10357/20307)\r";
+        assert_eq!(
+            worktree_add_failure("signal: 9 (SIGKILL)", stderr),
+            "git worktree add failed (signal: 9 (SIGKILL)): Preparing worktree (detached HEAD 78cbbb1281)"
+        );
+        assert_eq!(
+            worktree_add_failure(
+                "exit status: 128",
+                "fatal: '/w/x' already exists\n"
+            ),
+            "git worktree add failed (exit status: 128): fatal: '/w/x' already exists"
+        );
+    }
+
     use std::{
         ffi::{OsStr, OsString},
         fs,
@@ -6056,6 +6098,77 @@ mod tests {
                 .map(|entry| (entry.sha.to_string(), entry.range.clone()))
                 .collect::<Vec<_>>(),
             vec![(first_sha.clone(), 0..1)]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_restore_archive_checkpoint_with_uninitialised_submodules(
+        cx: &mut TestAppContext,
+    ) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let submodule_dir = temp_dir.path().join("submodule");
+        git_init_repo(&submodule_dir);
+        fs::write(submodule_dir.join("lib.txt"), "library\n").unwrap();
+        git_command(&submodule_dir, ["add", "lib.txt"]);
+        git_command(&submodule_dir, ["commit", "-m", "library"]);
+
+        let main_dir = temp_dir.path().join("main");
+        git_init_repo(&main_dir);
+        fs::write(main_dir.join("README.md"), "main\n").unwrap();
+        git_command(&main_dir, ["add", "README.md"]);
+        git_command(
+            &main_dir,
+            [
+                OsString::from("-c"),
+                OsString::from("protocol.file.allow=always"),
+                OsString::from("submodule"),
+                OsString::from("add"),
+                submodule_dir.clone().into_os_string(),
+                OsString::from("vendor/lib"),
+            ],
+        );
+        git_command(&main_dir, ["commit", "-m", "add submodule"]);
+        git_command(&main_dir, ["config", "submodule.recurse", "true"]);
+
+        let worktree_dir = temp_dir.path().join("worktree");
+        git_command(
+            &main_dir,
+            [
+                OsString::from("worktree"),
+                OsString::from("add"),
+                worktree_dir.clone().into_os_string(),
+                OsString::from("HEAD"),
+            ],
+        );
+        assert!(
+            !worktree_dir.join("vendor/lib/.git").exists(),
+            "the submodule of a fresh worktree should not be initialised"
+        );
+
+        let repo = RealGitRepository::new(
+            &worktree_dir.join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+
+        fs::write(worktree_dir.join("README.md"), "edited in the worktree\n").unwrap();
+        let (staged_sha, unstaged_sha) = repo.create_archive_checkpoint().await.unwrap();
+
+        fs::write(worktree_dir.join("README.md"), "clobbered\n").unwrap();
+
+        repo.restore_archive_checkpoint(staged_sha, unstaged_sha)
+            .await
+            .expect("restoring a checkpoint must not depend on submodule.recurse");
+
+        assert_eq!(
+            fs::read_to_string(worktree_dir.join("README.md")).unwrap(),
+            "edited in the worktree\n"
         );
     }
 

@@ -100,3 +100,15 @@ message RemoteProfilingLocation {
   uint32 line = 2;
   uint32 column = 3;
 }
+
+// quiet-ui: what the machine a remote project runs on is doing, so the
+// sidebar can say so for the box as well as for this machine.
+message GetSystemLoad {
+  uint64 project_id = 1;
+}
+
+message SystemLoadResponse {
+  // The one-minute load average, and the cores to read it against.
+  double load_average_one = 1;
+  uint32 cpu_count = 2;
+}

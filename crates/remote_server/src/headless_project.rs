@@ -78,6 +78,7 @@ pub struct HeadlessProject {
     pub kernels: HashMap<String, Child>,
     search_buffer_batches: async_channel::Sender<SearchBufferBatch>,
     _search_buffer_sender: Task<()>,
+    pub(crate) _acp_relay: Entity<crate::acp_relay_host::AcpRelayHost>,
 }
 
 pub struct HeadlessAppState {
@@ -312,6 +313,7 @@ impl HeadlessProject {
         session.add_request_handler(cx.weak_entity(), Self::handle_shutdown_remote_server);
         session.add_request_handler(cx.weak_entity(), Self::handle_ping);
         session.add_request_handler(cx.weak_entity(), Self::handle_get_processes);
+        session.add_request_handler(cx.weak_entity(), Self::handle_get_system_load);
         session.add_request_handler(cx.weak_entity(), Self::handle_get_remote_profiling_data);
 
         session.add_entity_request_handler(Self::handle_add_worktree);
@@ -357,6 +359,7 @@ impl HeadlessProject {
         GitStore::init(&session);
         AgentServerStore::init_headless(&session);
         ContextServerStore::init_headless(&session);
+        let acp_relay = crate::acp_relay_host::init(&session, cx);
 
         let (search_buffer_batches, batches) = async_channel::bounded::<SearchBufferBatch>(1);
         let search_buffer_sender = cx.spawn({
@@ -433,6 +436,7 @@ impl HeadlessProject {
             kernels: Default::default(),
             search_buffer_batches,
             _search_buffer_sender: search_buffer_sender,
+            _acp_relay: acp_relay,
         }
     }
 
@@ -1374,6 +1378,18 @@ impl HeadlessProject {
     ) -> Result<proto::Ack> {
         log::debug!("Received ping from client");
         Ok(proto::Ack {})
+    }
+
+    /// What this machine is doing, for the sidebar's per-machine load.
+    async fn handle_get_system_load(
+        _this: Entity<Self>,
+        _envelope: TypedEnvelope<proto::GetSystemLoad>,
+        _cx: AsyncApp,
+    ) -> Result<proto::SystemLoadResponse> {
+        Ok(proto::SystemLoadResponse {
+            load_average_one: System::load_average().one,
+            cpu_count: System::physical_core_count().unwrap_or(0) as u32,
+        })
     }
 
     async fn handle_get_processes(

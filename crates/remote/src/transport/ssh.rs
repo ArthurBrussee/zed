@@ -15,7 +15,7 @@ use futures::{
 use gpui::{App, AppContext as _, AsyncApp, Task};
 use parking_lot::Mutex;
 use paths::remote_server_dir_relative;
-use release_channel::{AppVersion, ReleaseChannel};
+use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
 use rpc::proto::Envelope;
 use semver::Version;
 pub use settings_content::SshPortForwardOption;
@@ -1018,8 +1018,17 @@ impl SshRemoteConnection {
         version: Version,
         cx: &mut AsyncApp,
     ) -> Result<Arc<RelPath>> {
-        let version_str = match release_channel {
-            ReleaseChannel::Dev => "build".to_string(),
+        // A quiet-ui build (Dev, bundled in release) names its server after its own commit.
+        // Upstream's "build" says nothing about which commit, so an updated client would find
+        // the server the previous one installed and talk to it.
+        let quiet_ui_sha = cx.update(|cx| {
+            (release_channel == ReleaseChannel::Dev && !cfg!(debug_assertions))
+                .then(|| AppCommitSha::try_global(cx))
+                .flatten()
+        });
+        let version_str = match (release_channel, &quiet_ui_sha) {
+            (ReleaseChannel::Dev, Some(sha)) => format!("quiet-ui-{}", sha.short()),
+            (ReleaseChannel::Dev, None) => "build".to_string(),
             _ => version.to_string(),
         };
         let binary_name = format!(
@@ -1076,6 +1085,9 @@ impl SshRemoteConnection {
 
         let wanted_version = cx.update(|cx| match release_channel {
             ReleaseChannel::Nightly => Ok(None),
+            // The fork's release is asked for by commit rather than by version, so a quiet-ui
+            // build has somewhere to download from and does not need a server already there.
+            ReleaseChannel::Dev if quiet_ui_sha.is_some() => Ok(None),
             ReleaseChannel::Dev => {
                 anyhow::bail!(
                     "ZED_BUILD_REMOTE_SERVER is not set and no remote server exists at ({:?})",

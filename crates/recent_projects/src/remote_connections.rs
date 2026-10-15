@@ -1014,6 +1014,136 @@ mod tests {
             .unwrap();
     }
 
+    /// quiet-ui: a box whose server has gone gets a fresh one without anyone
+    /// clicking Reconnect, and the agents it lists are known straight away,
+    /// before the list it pushes on its own (a second after connecting) lands.
+    #[gpui::test]
+    async fn test_a_window_whose_server_is_gone_reconnects_by_itself(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let app_state = init_test(cx);
+        let executor = cx.executor();
+        cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+        server_cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+
+        let (opts, server_session, connect_guard) = RemoteClient::fake_server(cx, server_cx);
+        let remote_fs = FakeFs::new(server_cx.executor());
+        remote_fs
+            .insert_tree(path!("/project"), json!({ "main.rs": "fn main() {}" }))
+            .await;
+        server_cx.update(HeadlessProject::init);
+        let headless = |session, server_cx: &mut TestAppContext| {
+            let fs = remote_fs.clone();
+            server_cx.new(|cx| {
+                HeadlessProject::new(
+                    HeadlessAppState {
+                        session,
+                        fs,
+                        http_client: Arc::new(BlockedHttpClient),
+                        node_runtime: NodeRuntime::unavailable(),
+                        languages: Arc::new(language::LanguageRegistry::new(
+                            cx.background_executor().clone(),
+                        )),
+                        extension_host_proxy: Arc::new(ExtensionHostProxy::new()),
+                        startup_time: std::time::Instant::now(),
+                    },
+                    false,
+                    cx,
+                )
+            })
+        };
+        let _headless = headless(server_session, server_cx);
+        drop(connect_guard);
+
+        let paths = vec![PathBuf::from(path!("/project"))];
+        let mut async_cx = cx.to_async();
+        open_remote_project(
+            opts.clone(),
+            paths,
+            app_state,
+            workspace::OpenOptions::default(),
+            &mut async_cx,
+        )
+        .await
+        .expect("initial open should succeed");
+        executor.run_until_parked();
+        let window = cx.update(|cx| cx.windows()[0].downcast::<MultiWorkspace>().unwrap());
+        let project_of = |cx: &mut TestAppContext| {
+            window
+                .update(cx, |multi_workspace, _, cx| {
+                    multi_workspace.workspace().read(cx).project().clone()
+                })
+                .unwrap()
+        };
+        let old_project = project_of(cx);
+
+        // The replacement server the reconnect will find, with an agent set
+        // up on the box.
+        server_cx.update(|cx| {
+            use gpui::UpdateGlobal as _;
+            settings::SettingsStore::update_global(cx, |store, cx| {
+                store
+                    .set_server_settings(
+                        &json!({ "agent_servers": { "claude-acp": { "type": "custom", "command": "claude-acp" } } })
+                            .to_string(),
+                        cx,
+                    )
+                    .unwrap();
+            })
+        });
+        let (server_session_2, connect_guard_2) =
+            RemoteClient::fake_server_with_opts(&opts, cx, server_cx);
+        let _headless_2 = headless(server_session_2, server_cx);
+        drop(connect_guard_2);
+
+        window
+            .update(cx, |multi_workspace, _, cx| {
+                let client = multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .project()
+                    .read(cx)
+                    .remote_client()
+                    .unwrap();
+                client.update(cx, |client, cx| client.force_server_not_running(cx));
+            })
+            .unwrap();
+        executor.run_until_parked();
+
+        let new_project = project_of(cx);
+        assert_ne!(
+            new_project.entity_id(),
+            old_project.entity_id(),
+            "the window reopened its project on a fresh server by itself"
+        );
+        window
+            .update(cx, |multi_workspace, _, cx| {
+                let workspace = multi_workspace.workspace().read(cx);
+                assert!(workspace.project().read(cx).is_remote());
+                assert!(
+                    workspace
+                        .active_modal::<crate::disconnected_overlay::DisconnectedOverlay>(cx)
+                        .is_none(),
+                    "nothing waits on a click"
+                );
+            })
+            .unwrap();
+        let agents = new_project.read_with(cx, |project, cx| {
+            project
+                .agent_server_store()
+                .read(cx)
+                .external_agents()
+                .map(|agent| agent.to_string())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            agents,
+            ["claude-acp"],
+            "the agents are asked for rather than left to a push that can be missed"
+        );
+    }
+
     fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
         cx.update(|cx| {
             let state = AppState::test(cx);

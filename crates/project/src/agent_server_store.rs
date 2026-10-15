@@ -8,7 +8,10 @@ use std::{
 use anyhow::{Context as _, Result, bail};
 use collections::HashMap;
 use fs::{Fs, RemoveOptions};
-use futures::StreamExt;
+use futures::{
+    FutureExt as _, StreamExt,
+    future::{BoxFuture, Shared},
+};
 use gpui::{
     AppContext as _, AsyncApp, Context, Entity, EventEmitter, SharedString, Subscription, Task,
     TaskExt,
@@ -266,6 +269,7 @@ impl AgentServerStore {
 
     pub fn init_headless(session: &AnyProtoClient) {
         session.add_entity_request_handler(Self::handle_get_agent_server_command);
+        session.add_entity_request_handler(Self::handle_get_external_agents);
     }
 
     fn agent_servers_settings_changed(&mut self, cx: &mut Context<Self>) {
@@ -707,82 +711,122 @@ impl AgentServerStore {
         })
     }
 
+    async fn handle_get_external_agents(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GetExternalAgents>,
+        cx: AsyncApp,
+    ) -> Result<proto::ExternalAgentsUpdated> {
+        Ok(proto::ExternalAgentsUpdated {
+            project_id: envelope.payload.project_id,
+            names: this.read_with(&cx, |this, _| {
+                this.external_agents().map(|name| name.to_string()).collect()
+            }),
+        })
+    }
+
+    /// quiet-ui: asks the box for its agents rather than relying on the list
+    /// it pushes on connect, which can arrive before this store is listening
+    /// and is then dropped, leaving every agent "not registered".
+    pub fn refresh_remote_agents(&self, cx: &mut Context<Self>) {
+        let AgentServerStoreState::Remote {
+            project_id,
+            upstream_client,
+            ..
+        } = &self.state
+        else {
+            return;
+        };
+        let request = upstream_client
+            .read(cx)
+            .proto_client()
+            .request(proto::GetExternalAgents {
+                project_id: *project_id,
+            });
+        cx.spawn(async move |this, cx| {
+            let response = request.await?;
+            this.update(cx, |this, cx| this.set_remote_agents(response.names, cx))?
+        })
+        .detach_and_log_err(cx);
+    }
+
     async fn handle_external_agents_updated(
         this: Entity<Self>,
         envelope: TypedEnvelope<proto::ExternalAgentsUpdated>,
         mut cx: AsyncApp,
     ) -> Result<()> {
         this.update(&mut cx, |this, cx| {
-            let AgentServerStoreState::Remote {
-                project_id,
-                upstream_client,
-                worktree_store,
-            } = &this.state
-            else {
-                debug_panic!(
-                    "handle_external_agents_updated should not be called for a non-remote project"
-                );
-                bail!("unexpected ExternalAgentsUpdated message")
-            };
+            this.set_remote_agents(envelope.payload.names, cx)
+        })
+    }
 
-            let mut previous_entries = std::mem::take(&mut this.external_agents);
-            let mut new_version_available_txs = HashMap::default();
-            let mut loading_status_txs = HashMap::default();
-            let mut metadata = HashMap::default();
+    fn set_remote_agents(&mut self, names: Vec<String>, cx: &mut Context<Self>) -> Result<()> {
+        let AgentServerStoreState::Remote {
+            project_id,
+            upstream_client,
+            worktree_store,
+        } = &self.state
+        else {
+            debug_panic!(
+                "handle_external_agents_updated should not be called for a non-remote project"
+            );
+            bail!("unexpected ExternalAgentsUpdated message")
+        };
 
-            for (name, mut entry) in previous_entries.drain() {
-                if let Some(tx) = entry.server.take_new_version_available_tx() {
-                    new_version_available_txs.insert(name.clone(), tx);
-                }
-                if let Some(tx) = entry.server.take_loading_status_tx() {
-                    loading_status_txs.insert(name.clone(), tx);
-                }
+        let mut previous_entries = std::mem::take(&mut self.external_agents);
+        let mut new_version_available_txs = HashMap::default();
+        let mut loading_status_txs = HashMap::default();
+        let mut metadata = HashMap::default();
 
-                metadata.insert(name, (entry.icon, entry.display_name, entry.source));
+        for (name, mut entry) in previous_entries.drain() {
+            if let Some(tx) = entry.server.take_new_version_available_tx() {
+                new_version_available_txs.insert(name.clone(), tx);
+            }
+            if let Some(tx) = entry.server.take_loading_status_tx() {
+                loading_status_txs.insert(name.clone(), tx);
             }
 
-            this.external_agents = envelope
-                .payload
-                .names
-                .into_iter()
-                .map(|name| {
-                    let agent_id = AgentId(name.into());
-                    let (icon, display_name, source) = metadata
-                        .remove(&agent_id)
-                        .or_else(|| {
-                            AgentRegistryStore::try_global(cx)
-                                .and_then(|store| store.read(cx).agent(&agent_id))
-                                .map(|s| {
-                                    (
-                                        s.icon_path().cloned(),
-                                        Some(s.name().clone()),
-                                        ExternalAgentSource::Registry,
-                                    )
-                                })
-                        })
-                        .unwrap_or((None, None, ExternalAgentSource::default()));
-                    let agent = RemoteExternalAgentServer {
-                        project_id: *project_id,
-                        upstream_client: upstream_client.clone(),
-                        worktree_store: worktree_store.clone(),
-                        name: agent_id.clone(),
-                        new_version_available_tx: new_version_available_txs.remove(&agent_id),
-                        loading_status_tx: loading_status_txs.remove(&agent_id),
-                    };
-                    (
-                        agent_id,
-                        ExternalAgentEntry::new(
-                            Box::new(agent) as Box<dyn ExternalAgentServer>,
-                            source,
-                            icon,
-                            display_name,
-                        ),
-                    )
-                })
-                .collect();
-            cx.emit(AgentServersUpdated);
-            Ok(())
-        })
+            metadata.insert(name, (entry.icon, entry.display_name, entry.source));
+        }
+
+        self.external_agents = names
+            .into_iter()
+            .map(|name| {
+                let agent_id = AgentId(name.into());
+                let (icon, display_name, source) = metadata
+                    .remove(&agent_id)
+                    .or_else(|| {
+                        AgentRegistryStore::try_global(cx)
+                            .and_then(|store| store.read(cx).agent(&agent_id))
+                            .map(|s| {
+                                (
+                                    s.icon_path().cloned(),
+                                    Some(s.name().clone()),
+                                    ExternalAgentSource::Registry,
+                                )
+                            })
+                    })
+                    .unwrap_or((None, None, ExternalAgentSource::default()));
+                let agent = RemoteExternalAgentServer {
+                    project_id: *project_id,
+                    upstream_client: upstream_client.clone(),
+                    worktree_store: worktree_store.clone(),
+                    name: agent_id.clone(),
+                    new_version_available_tx: new_version_available_txs.remove(&agent_id),
+                    loading_status_tx: loading_status_txs.remove(&agent_id),
+                };
+                (
+                    agent_id,
+                    ExternalAgentEntry::new(
+                        Box::new(agent) as Box<dyn ExternalAgentServer>,
+                        source,
+                        icon,
+                        display_name,
+                    ),
+                )
+            })
+            .collect();
+        cx.emit(AgentServersUpdated);
+        Ok(())
     }
 
     async fn handle_loading_status_updated(
@@ -1391,18 +1435,23 @@ impl ExternalAgentServer for LocalRegistryNpxAgent {
             fs.create_dir(&install_dir).await?;
 
             let (package_name, package_spec) = bounded_npm_package_spec(&package);
-            node_runtime
-                .run_npm_subcommand(
-                    Some(&install_dir),
-                    "install",
-                    &[package_spec.as_str(), "--save-exact"],
-                )
-                .await?;
-            let executable = node_runtime::read_package_executable(
-                install_dir.join("node_modules"),
-                package_name,
-            )
-            .await?;
+            let node_modules = install_dir.join("node_modules");
+            if let Err(error) =
+                install_npm_agent_package(&node_runtime, &install_dir, &package_spec).await
+            {
+                // The version bound is a ceiling, so an already-unpacked older copy still runs.
+                let installed =
+                    node_runtime::read_package_executable(node_modules.clone(), package_name).await;
+                if installed.is_err() {
+                    return Err(error);
+                }
+                log::warn!(
+                    "installing {package_spec} failed ({error:#}); \
+                     launching the copy already in {install_dir:?}"
+                );
+            }
+            let executable =
+                node_runtime::read_package_executable(node_modules, package_name).await?;
 
             let node_binary = node_runtime.binary_path().await?;
             env.extend(node_runtime::npm_command_env(&node_binary));
@@ -1431,6 +1480,61 @@ impl ExternalAgentServer for LocalRegistryNpxAgent {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
+}
+
+static IN_FLIGHT_NPM_INSTALLS: LazyLock<
+    parking_lot::Mutex<HashMap<PathBuf, Shared<BoxFuture<'static, Result<(), Arc<anyhow::Error>>>>>>,
+> = LazyLock::new(Default::default);
+
+async fn install_npm_agent_package(
+    node_runtime: &NodeRuntime,
+    install_dir: &Path,
+    package_spec: &str,
+) -> Result<()> {
+    let node_runtime = node_runtime.clone();
+    let dir = install_dir.to_path_buf();
+    let spec = package_spec.to_string();
+    install_once_per_directory(install_dir, move || {
+        async move {
+            node_runtime
+                .run_npm_subcommand(Some(&dir), "install", &[spec.as_str(), "--save-exact"])
+                .await
+                .map(drop)
+        }
+        .boxed()
+    })
+    .await
+}
+
+/// Joins an install already running in `install_dir`: two concurrent `npm install`s in one
+/// directory race on a rename and the loser fails with `ENOTEMPTY`.
+async fn install_once_per_directory(
+    install_dir: &Path,
+    start: impl FnOnce() -> BoxFuture<'static, Result<()>>,
+) -> Result<()> {
+    let install = {
+        let mut in_flight = IN_FLIGHT_NPM_INSTALLS.lock();
+        if let Some(install) = in_flight.get(install_dir) {
+            install.clone()
+        } else {
+            let install = start().map(|result| result.map_err(Arc::new)).boxed().shared();
+            in_flight.insert(install_dir.to_path_buf(), install.clone());
+            install
+        }
+    };
+
+    let result = install.clone().await;
+
+    // Cleared by any waiter, since the starter may have been dropped.
+    let mut in_flight = IN_FLIGHT_NPM_INSTALLS.lock();
+    if in_flight
+        .get(install_dir)
+        .is_some_and(|current| Shared::ptr_eq(current, &install))
+    {
+        in_flight.remove(install_dir);
+    }
+
+    result.map_err(|error| anyhow::anyhow!("{error:#}"))
 }
 
 /// People are using min-release-age more frequently. Which means a fresh registry will likely have
@@ -1856,6 +1960,61 @@ mod tests {
             bounded_npm_package_spec("agent-package@latest"),
             ("agent-package", "agent-package@latest".to_string())
         );
+    }
+
+    #[test]
+    fn concurrent_launches_share_one_install_per_directory() {
+        use futures::channel::oneshot;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let codex = Path::new("/agents/test-codex");
+        let gemini = Path::new("/agents/test-gemini");
+        let installs = Arc::new(AtomicUsize::new(0));
+        let (finish, finished) = oneshot::channel::<()>();
+        let finished = finished.shared();
+
+        let install = || {
+            let installs = installs.clone();
+            let finished = finished.clone();
+            move || {
+                installs.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    finished.await.ok();
+                    Ok(())
+                }
+                .boxed()
+            }
+        };
+
+        // `join` polls in order, so all three have registered before the
+        // fourth future lets the installs finish.
+        let (first, second, other_agent, ()) =
+            futures::executor::block_on(futures::future::join4(
+                install_once_per_directory(codex, install()),
+                install_once_per_directory(codex, install()),
+                install_once_per_directory(gemini, install()),
+                async move {
+                    finish.send(()).ok();
+                },
+            ));
+        assert!(first.is_ok() && second.is_ok() && other_agent.is_ok());
+        assert_eq!(
+            installs.load(Ordering::SeqCst),
+            2,
+            "the second launch of the same agent started its own install"
+        );
+
+        // A later launch installs again, which is how a version bump is picked up.
+        let installs = Arc::new(AtomicUsize::new(0));
+        let after = futures::executor::block_on(install_once_per_directory(codex, {
+            let installs = installs.clone();
+            move || {
+                installs.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(()) }.boxed()
+            }
+        }));
+        assert!(after.is_ok());
+        assert_eq!(installs.load(Ordering::SeqCst), 1);
     }
 
     #[test]
