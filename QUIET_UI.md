@@ -257,6 +257,31 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**Machine headers: the alias, an always-visible `+`, a clearer divider, and collapse per section.**
+
+Arthur, 2026-10-15, four things about the machine group headers in the sidebar:
+
+1. **The SSH alias shows in the title bar but not in the sidebar.** The title bar reads the live
+   project's `remote_connection_options(cx)` (nickname included; `render_remote_project_connection`
+   in `title_bar.rs`). The sidebar labels a machine from `mw.project_group_keys()` →
+   `key.host().display_name()` (`sidebar.rs`, the `MachineGroup` builder), and a project group
+   key's host has no nickname, so it shows the bare host. Label a machine from a live
+   workspace's `remote_connection_options(cx)` when one is open. For a saved machine with
+   nothing open, take the nickname from its `ssh_connections` entry. Use the same naming the title
+   bar uses.
+2. **The machine header's `+` is always visible**, not only on hover.
+3. **Make the header read as a divider between machines.** A full-width rule above it (except
+   for the first machine), a little more space above, the label slightly stronger than the
+   worktree headers under it (weight or size), and a machine glyph before it (laptop for This Mac,
+   `IconName::Server` for a remote, like the title bar). It should be clearly a level above the
+   worktree headers.
+4. **Collapsing a machine collapses it in that section only.** `collapsed_machines` is keyed by
+   `machine_collapse_key(host)` alone, so collapsing a machine in Active also collapses it in
+   All Threads and Archived. Key it by section and machine, persisted the same way.
+
+Test: a remote workspace with a nickname shows the nickname on its header; collapsing it in
+Active leaves it expanded in All Threads; the `+` renders without hover.
+
 **Dev server buttons: only where the task's folder exists, `{port}` in `open:`, and no menu.**
 
 Arthur, 2026-10-15, putting his portico dev server in his *global* Zed tasks
