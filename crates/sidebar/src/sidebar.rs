@@ -3327,11 +3327,24 @@ impl Sidebar {
             let workspace = result?;
             // The `+` branches from the repository, which has to be known first.
             let scanned = workspace.update(cx, |workspace, cx| {
-                workspace
-                    .project()
-                    .update(cx, |project, cx| project.git_scans_complete(cx))
+                workspace.project().read(cx).wait_for_initial_scan(cx)
             });
             scanned.await;
+            let barriers = workspace.update(cx, |workspace, cx| {
+                workspace
+                    .project()
+                    .read(cx)
+                    .repositories(cx)
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|repo| repo.update(cx, |repo, _| repo.barrier()))
+                    .collect::<Vec<_>>()
+            });
+            for barrier in barriers {
+                barrier.await.log_err();
+            }
             this.update_in(cx, |this, window, cx| {
                 this.new_worktree_thread_in(&workspace, window, cx)
             })?;
