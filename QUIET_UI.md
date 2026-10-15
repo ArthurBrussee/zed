@@ -257,6 +257,32 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**The git diff view is broken: no file contents, and the group headers pile up in one row at
+the bottom. Fix first.**
+
+Arthur's screenshot (2026-10-15), "Changes since origin/master": the editor area is empty, and
+the group headers ("Code 27 files +257 −170", "Tests 6 files +193 −39") sit side by side on a
+single row near the bottom instead of above their files. This came in with 10-14's "group the
+project diff, and hold a block to its own rows" (`git_ui/src/diff_groups.rs`, the hooks in
+`diff_multibuffer.rs`), which also changed upstream's editor internals:
+`editor/src/display_map/block_map.rs` (+91) and `editor/src/element.rs` (+23). That is the part
+to distrust.
+
+Fix:
+- Revert the fork's changes to `block_map.rs` and `element.rs` entirely. Arthur asked on 10-08 not
+  to maintain diff UI of the fork's own, and editor block layout is the last place for it.
+- Keep the grouping without touching editor internals. Files stay ordered Code, Tests, Generated
+  through `PathKey::with_sort_prefix` as now. The group headers become a strip in the diff's own
+  toolbar: `Code 27 files +257 −170 · Tests 6 files +193 −39 · Generated …`. Clicking a group
+  folds or unfolds that group's files with the editor's existing fold API; Tests and Generated
+  start folded.
+- If that can't be made to work cleanly, drop the headers and keep only the ordering and the
+  initial folding. A working diff matters more than the headers.
+- Test, as the gate for this entry: open a project diff with files in all three groups, lay it
+  out, and assert that every non-folded file's excerpt renders with non-zero height at increasing
+  y positions. Assert too that folding a group hides exactly its files. A test that only checks
+  the sort order would pass on the broken view.
+
 **Images can't be attached to a thread's first message.**
 
 Arthur, 2026-10-15: pasting or dropping an image into a new thread's message box does nothing
@@ -381,6 +407,27 @@ take. Without the numbers, neither should be built.
 one directory, and the off-screen view sweep structurally cannot release the `Markdown`, because
 none of it is owned by `EntryViewState`.)
 
+
+**Opus 5.5: audit, simplify and minimise the fork, as the night's last item.**
+
+Arthur, 2026-10-15: the routine runs on Opus 5.5 now, so do a deep pass over the whole fork to make
+it smaller and simpler without losing anything he asked for. Do it after every other queue item,
+so it covers tonight's code too. The 10-06 reduction run cut 9k added lines, mostly comments and
+dead code; this pass goes for structure:
+- **Fork-owned code** (`command_parse.rs`, `chips.rs`, `gh_status`, `dev_servers.rs`, the relay, the
+  sidebar's fork modules): remove dead paths and features superseded since, merge duplicate
+  mechanisms (several caches, predicates or state machines doing nearly the same job), replace
+  hand-rolled code with upstream utilities that already exist, and shorten what reads long.
+- **Hunks in upstream-owned files**: for each, check whether it can move into a fork file behind
+  a smaller hook, or use an upstream API that has appeared since. Every remaining hunk keeps its
+  one-line reason in the rebase log's per-file list.
+- **Tests**: merge near-duplicates; keep every behaviour Arthur asked for covered.
+- **QUIET_UI.md**: trim the rebase log to the last ten entries plus the procedure and the list of
+  what usually breaks; keep "The fork as it stands" current and short.
+
+No behaviour changes: anything a user would notice is out of scope for this item. Report the
+diff size before and after (histogram algorithm, as the Upstream first section says), per crate,
+and list what went. The gate applies in full, including `cargo check -p zed`.
 
 ## Verification queue
 
