@@ -7479,18 +7479,33 @@ impl ThreadView {
         let tooltip = match &state {
             Some(DevServerState::Starting) => format!("{} is starting", task.label),
             Some(DevServerState::Running { port: Some(port) }) => {
-                format!("{} is running on port {port}", task.label)
+                format!("Open {} (port {port})", task.label)
             }
             Some(DevServerState::Running { port: None }) => {
                 format!("{} is running; it has not printed a URL yet", task.label)
             }
             Some(DevServerState::Exited { code: Some(code) }) => {
-                format!("{} exited (code {code})", task.label)
+                format!("{} exited (code {code}); start it again", task.label)
             }
-            Some(DevServerState::Exited { code: None }) => format!("{} exited", task.label),
+            Some(DevServerState::Exited { code: None }) => {
+                format!("{} exited; start it again", task.label)
+            }
             None => format!("Start {}", task.label),
         };
 
+        let glyph_color = if running {
+            Color::Accent
+        } else if failed {
+            Color::Error
+        } else {
+            Color::Muted
+        };
+        let glyph = task.glyph.icon().size(IconSize::XSmall);
+        let glyph = if task.glyph.is_tinted() {
+            glyph.color(glyph_color)
+        } else {
+            glyph
+        };
         let content = h_flex()
             .px_1()
             .py_0p5()
@@ -7502,78 +7517,49 @@ impl ThreadView {
             } else {
                 cx.theme().colors().border
             })
-            .child(
-                Icon::new(task.icon)
-                    .size(IconSize::XSmall)
-                    .color(if running {
-                        Color::Accent
-                    } else if failed {
-                        Color::Error
-                    } else {
-                        Color::Muted
-                    }),
-            )
+            .child(glyph)
             .child(
                 Label::new(label)
                     .size(LabelSize::Small)
                     .color(if running { Color::Default } else { Color::Muted })
                     .buffer_font(cx),
-            );
-        let chip = ButtonLike::new(("dev-server-chip", index))
-            .style(ButtonStyle::Transparent)
-            .child(content);
-
-        if !running {
-            let worktree_root = worktree_root.to_path_buf();
-            let workspace = self.workspace.clone();
-            return chip
-                .tooltip(Tooltip::text(tooltip))
-                .on_click(move |_, window, cx| {
-                    let Some(workspace) = workspace.upgrade() else {
-                        return;
-                    };
-                    let Some(store) = DevServerStore::try_global(cx) else {
-                        return;
-                    };
-                    store.update(cx, |store, cx| {
-                        store.start(&task, &worktree_root, &workspace, window, cx);
-                    });
-                })
-                .into_any_element();
-        }
-
-        let workspace = self.workspace.clone();
-        PopoverMenu::new(("dev-server-menu", index))
-            .trigger_with_tooltip(chip, move |_window, cx| Tooltip::simple(&tooltip, cx))
-            .anchor(gpui::Anchor::BottomLeft)
-            .menu(move |window, cx| {
-                let workspace = workspace.upgrade()?;
-                let store = DevServerStore::try_global(cx)?;
+            )
+            .when(running, |this| {
                 let key = key.clone();
-                let task = task.clone();
-                Some(ContextMenu::build(window, cx, move |menu, _, _| {
-                    menu.entry("Open", None, {
-                        let (store, workspace, key, task) =
-                            (store.clone(), workspace.clone(), key.clone(), task.clone());
-                        move |_, cx| {
-                            store.update(cx, |store, cx| {
-                                store.open(&key, &task, &workspace, cx);
-                            });
-                        }
-                    })
-                    .entry("Show Output", None, {
-                        let (store, workspace, key) =
-                            (store.clone(), workspace.clone(), key.clone());
-                        move |window, cx| {
-                            store.update(cx, |store, cx| {
-                                store.show_output(&key, &workspace, window, cx);
-                            });
-                        }
-                    })
-                    .entry("Stop", None, move |_, cx| {
-                        store.update(cx, |store, cx| store.stop(&key, cx));
-                    })
-                }))
+                this.child(
+                    IconButton::new(("dev-server-stop", index), IconName::Stop)
+                        .icon_size(IconSize::XSmall)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text(format!("Stop {}", task.label)))
+                        .on_click(move |_, _, cx| {
+                            cx.stop_propagation();
+                            if let Some(store) = DevServerStore::try_global(cx) {
+                                store.update(cx, |store, cx| store.stop(&key, cx));
+                            }
+                        }),
+                )
+            });
+
+        let worktree_root = worktree_root.to_path_buf();
+        let workspace = self.workspace.clone();
+        ButtonLike::new(("dev-server-chip", index))
+            .style(ButtonStyle::Transparent)
+            .child(content)
+            .tooltip(Tooltip::text(tooltip))
+            .on_click(move |_, window, cx| {
+                let Some(workspace) = workspace.upgrade() else {
+                    return;
+                };
+                let Some(store) = DevServerStore::try_global(cx) else {
+                    return;
+                };
+                store.update(cx, |store, cx| {
+                    if running {
+                        store.open(&key, &task, &workspace, cx);
+                    } else {
+                        store.start(&task, &worktree_root, &workspace, window, cx);
+                    }
+                });
             })
             .into_any_element()
     }

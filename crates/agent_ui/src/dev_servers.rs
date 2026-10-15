@@ -7,8 +7,14 @@
 //!
 //! ```json
 //! { "label": "portico", "command": "pnpm dev", "cwd": "$ZED_WORKTREE_ROOT/portico",
-//!   "reveal": "never", "tags": ["bar", "icon:server", "open:/"] }
+//!   "reveal": "never", "tags": ["bar", "icon:~/.config/zed/icons/atrium.png",
+//!   "open:atrium://portico.monumental.build/?_port={port}"] }
 //! ```
+//!
+//! A task whose `cwd` is missing from a worktree gets no button there. `icon:`
+//! is a Zed icon name or an image file (an `.svg` is tinted like the other
+//! glyphs). `open:` is a path appended to the detected URL or a full URL of any
+//! scheme, and `{port}` in it is the port the server printed.
 
 use std::{
     path::{Path, PathBuf},
@@ -20,11 +26,12 @@ use std::{
 use collections::HashMap;
 use gpui::{App, AppContext as _, Context, Entity, Global, Subscription, Task, WeakEntity, Window};
 use project::{Project, TaskSourceKind, WorktreeId};
+use util::rel_path::RelPath;
 use remote::RemoteClient;
 use task::{TaskContext, TaskTemplate, TaskVariables, VariableName};
 use terminal::Terminal;
-use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
-use ui::{IconName, SharedString};
+use terminal_view::terminal_panel::TerminalPanel;
+use ui::{Icon, IconName, SharedString};
 use workspace::{Toast, Workspace, notifications::NotificationId};
 
 /// The tag that earns a task a button.
@@ -37,26 +44,77 @@ const PORT_SCAN_LINES: usize = 50;
 /// browser is pointed at it.
 const FORWARD_SETTLE: Duration = Duration::from_millis(300);
 
+/// What a dev server's button and pill wear.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DevServerGlyph {
+    Named(IconName),
+    /// Tinted like the other glyphs.
+    Svg(SharedString),
+    /// Drawn as it is.
+    Image(SharedString),
+}
+
+impl DevServerGlyph {
+    /// An icon name, else a file: absolute, `~`-relative or under
+    /// `$ZED_WORKTREE_ROOT`, read on this machine. Anything else is the
+    /// default glyph.
+    fn parse(tag: &str, worktree_root: &Path) -> Option<Self> {
+        if let Ok(name) = IconName::from_str(tag) {
+            return Some(Self::Named(name));
+        }
+        let path = expand_worktree_root(tag, worktree_root);
+        let path = match path.strip_prefix("~/") {
+            Some(rest) => util::paths::home_dir().join(rest),
+            None => PathBuf::from(path),
+        };
+        if !path.is_absolute() || !path.is_file() {
+            return None;
+        }
+        let is_svg = path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"));
+        let path = SharedString::from(path.to_string_lossy().into_owned());
+        Some(if is_svg {
+            Self::Svg(path)
+        } else {
+            Self::Image(path)
+        })
+    }
+
+    pub fn icon(&self) -> Icon {
+        match self {
+            Self::Named(name) => Icon::new(*name),
+            Self::Svg(path) => Icon::from_external_svg(path.clone()),
+            Self::Image(path) => Icon::from_path(path.clone()),
+        }
+    }
+
+    /// An image keeps its own colours.
+    pub fn is_tinted(&self) -> bool {
+        !matches!(self, Self::Image(_))
+    }
+}
+
 /// A `bar` task, with what its other tags say about it.
 #[derive(Clone, Debug)]
 pub struct DevServerTask {
     pub label: SharedString,
-    pub icon: IconName,
-    /// What `Open` goes to: a path appended to the detected URL, or a URL used
-    /// as it stands.
+    pub glyph: DevServerGlyph,
+    /// What opening it goes to: a path appended to the detected URL, or a URL
+    /// used as it stands. `{port}` is the detected port in either.
     pub open: Option<String>,
     source_kind: TaskSourceKind,
     template: TaskTemplate,
 }
 
 impl DevServerTask {
-    fn new(source_kind: TaskSourceKind, template: TaskTemplate) -> Self {
-        let mut icon = IconName::Server;
+    fn new(source_kind: TaskSourceKind, template: TaskTemplate, worktree_root: &Path) -> Self {
+        let mut glyph = DevServerGlyph::Named(IconName::Server);
         let mut open = None;
         for tag in &template.tags {
-            if let Some(name) = tag.strip_prefix(ICON_PREFIX) {
-                if let Ok(parsed) = IconName::from_str(name) {
-                    icon = parsed;
+            if let Some(icon) = tag.strip_prefix(ICON_PREFIX) {
+                if let Some(parsed) = DevServerGlyph::parse(icon, worktree_root) {
+                    glyph = parsed;
                 }
             } else if let Some(target) = tag.strip_prefix(OPEN_PREFIX) {
                 open = Some(target.to_string());
@@ -64,7 +122,7 @@ impl DevServerTask {
         }
         Self {
             label: template.label.clone().into(),
-            icon,
+            glyph,
             open,
             source_kind,
             template,
@@ -72,23 +130,56 @@ impl DevServerTask {
     }
 }
 
-/// Every `bar` task a worktree offers: the repository's and the user's own.
+/// Every `bar` task a worktree offers, the repository's and the user's own,
+/// less those whose `cwd` that worktree does not have: a global task for one
+/// repository's folder would only fail everywhere else.
 pub fn bar_tasks(project: &Entity<Project>, worktree: WorktreeId, cx: &App) -> Vec<DevServerTask> {
-    let Some(inventory) = project
-        .read(cx)
-        .task_store()
-        .read(cx)
-        .task_inventory()
-        .cloned()
-    else {
+    let project = project.read(cx);
+    let Some(inventory) = project.task_store().read(cx).task_inventory().cloned() else {
         return Vec::new();
     };
+    let Some(worktree) = project.worktree_for_id(worktree, cx) else {
+        return Vec::new();
+    };
+    let worktree = worktree.read(cx);
+    let root = worktree.abs_path();
+    let path_style = project.path_style(cx);
     inventory
         .read(cx)
-        .templates_with_tag(BAR_TAG, worktree)
+        .templates_with_tag(BAR_TAG, worktree.id())
         .into_iter()
-        .map(|(source_kind, template)| DevServerTask::new(source_kind, template))
+        .filter(|(_, template)| {
+            let Some(relative) = cwd_in_worktree(template.cwd.as_deref(), &root) else {
+                return true;
+            };
+            RelPath::new(&relative, path_style)
+                .ok()
+                .and_then(|relative| worktree.entry_for_path(&relative))
+                .is_some_and(|entry| entry.is_dir())
+        })
+        .map(|(source_kind, template)| DevServerTask::new(source_kind, template, &root))
         .collect()
+}
+
+/// A task's `cwd` relative to the worktree root, when it lies inside the
+/// worktree. `None` for no `cwd`, or one this worktree cannot say anything
+/// about (outside it, or naming variables other than the root).
+fn cwd_in_worktree(cwd: Option<&str>, worktree_root: &Path) -> Option<PathBuf> {
+    let cwd = expand_worktree_root(cwd?, worktree_root);
+    if cwd.contains('$') {
+        return None;
+    }
+    let cwd = Path::new(&cwd);
+    if cwd.is_relative() {
+        return Some(cwd.to_path_buf());
+    }
+    cwd.strip_prefix(worktree_root).ok().map(Path::to_path_buf)
+}
+
+fn expand_worktree_root(text: &str, worktree_root: &Path) -> String {
+    let root = worktree_root.to_string_lossy();
+    text.replace("${ZED_WORKTREE_ROOT}", &root)
+        .replace("$ZED_WORKTREE_ROOT", &root)
 }
 
 /// A dev server is one task running in one worktree, so two worktrees of the
@@ -123,6 +214,8 @@ pub enum DevServerState {
 #[derive(Default)]
 struct DevServer {
     state: Option<DevServerState>,
+    /// The task's, for the sidebar's pill.
+    glyph: Option<DevServerGlyph>,
     terminal: Option<WeakEntity<Terminal>>,
     /// Which machine it runs on; a box's port needs forwarding before it opens.
     remote: Option<Entity<RemoteClient>>,
@@ -160,25 +253,37 @@ impl DevServerStore {
         self.servers.get(key)?.state.as_ref()
     }
 
-    /// What the sidebar row says, read-only: the port once it is known, else
+    /// What the sidebar row shows, read-only: a pill per server running for
+    /// these worktrees, the task's glyph and its port once it is known, else
     /// the task's label. Interaction stays in the bottom bar.
-    pub fn row_label(&self, worktree_roots: &[PathBuf]) -> Option<SharedString> {
-        self.servers
+    pub fn row_pills(&self, worktree_roots: &[PathBuf]) -> Vec<(DevServerGlyph, SharedString)> {
+        let mut pills: Vec<(DevServerGlyph, SharedString)> = self
+            .servers
             .iter()
             .filter(|(key, _)| {
                 worktree_roots
                     .iter()
                     .any(|root| root.as_path() == key.worktree_root.as_ref())
             })
-            .find_map(|(key, server)| match server.state {
-                Some(DevServerState::Running { port: Some(port) }) => {
-                    Some(SharedString::from(format!(":{port}")))
-                }
-                Some(DevServerState::Running { port: None }) | Some(DevServerState::Starting) => {
-                    Some(key.label.clone())
-                }
-                _ => None,
+            .filter_map(|(key, server)| {
+                let label = match server.state {
+                    Some(DevServerState::Running { port: Some(port) }) => {
+                        SharedString::from(port.to_string())
+                    }
+                    Some(DevServerState::Running { port: None } | DevServerState::Starting) => {
+                        key.label.clone()
+                    }
+                    _ => return None,
+                };
+                let glyph = server
+                    .glyph
+                    .clone()
+                    .unwrap_or(DevServerGlyph::Named(IconName::Server));
+                Some((glyph, label))
             })
+            .collect();
+        pills.sort_by(|(_, a), (_, b)| a.cmp(b));
+        pills
     }
 
     pub fn start(
@@ -214,6 +319,7 @@ impl DevServerStore {
 
         let server = self.servers.entry(key.clone()).or_default();
         server.state = Some(DevServerState::Starting);
+        server.glyph = Some(task.glyph.clone());
         server.remote = remote;
         cx.notify();
 
@@ -257,44 +363,9 @@ impl DevServerStore {
         cx.notify();
     }
 
-    /// Reveals the task's own terminal, which is an ordinary Zed terminal item.
-    pub fn show_output(
-        &self,
-        key: &DevServerKey,
-        workspace: &Entity<Workspace>,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        let Some(terminal) = self
-            .servers
-            .get(key)
-            .and_then(|server| server.terminal.as_ref())
-            .and_then(|terminal| terminal.upgrade())
-        else {
-            return;
-        };
-        let Some(terminal_panel) = workspace.read(cx).panel::<TerminalPanel>(cx) else {
-            return;
-        };
-        workspace.update(cx, |workspace, cx| {
-            workspace.focus_panel::<TerminalPanel>(window, cx);
-        });
-        terminal_panel.update(cx, |terminal_panel, cx| {
-            for pane in terminal_panel.panes() {
-                let found = pane.read(cx).items().position(|item| {
-                    item.downcast::<TerminalView>()
-                        .is_some_and(|view| view.read(cx).terminal() == &terminal)
-                });
-                if let Some(index) = found {
-                    pane.update(cx, |pane, cx| pane.activate_item(index, true, true, window, cx));
-                    return;
-                }
-            }
-        });
-    }
-
     /// Opens what this server serves. On a dev box the port is the box's, so it
-    /// is forwarded through the connection the project already has first.
+    /// is forwarded through the connection the project already has first, and
+    /// the forwarded port is the one `{port}` stands for.
     pub fn open(
         &mut self,
         key: &DevServerKey,
@@ -302,11 +373,11 @@ impl DevServerStore {
         workspace: &Entity<Workspace>,
         cx: &mut Context<Self>,
     ) {
-        // A full URL in `open:` is used as it stands, port and all.
-        if let Some(url) = task
-            .open
+        let target = task.open.clone();
+        // A full URL that does not need the port opens as it stands.
+        if let Some(url) = target
             .as_deref()
-            .filter(|open| open.starts_with("http://") || open.starts_with("https://"))
+            .filter(|target| is_full_url(target) && !target.contains(PORT_PLACEHOLDER))
         {
             cx.open_url(url);
             return;
@@ -319,20 +390,19 @@ impl DevServerStore {
             );
             return;
         };
-        let path = task.open.clone().unwrap_or_default();
         let Some(remote) = self
             .servers
             .get(key)
             .and_then(|server| server.remote.clone())
         else {
-            cx.open_url(&local_url(port, &path));
+            cx.open_url(&open_url(target.as_deref(), port));
             return;
         };
 
-        // A forward already standing is reused, so Open twice does not pile up
-        // tunnels.
+        // A forward already standing is reused, so opening twice does not pile
+        // up tunnels.
         if let Some((local_port, _)) = self.servers.get(key).and_then(|s| s.forward.as_ref()) {
-            cx.open_url(&local_url(*local_port, &path));
+            cx.open_url(&open_url(target.as_deref(), *local_port));
             return;
         }
 
@@ -358,7 +428,7 @@ impl DevServerStore {
         }
         cx.spawn(async move |_this, cx| {
             cx.background_executor().timer(FORWARD_SETTLE).await;
-            cx.update(|cx| cx.open_url(&local_url(local_port, &path)));
+            cx.update(|cx| cx.open_url(&open_url(target.as_deref(), local_port)));
         })
         .detach();
     }
@@ -444,8 +514,29 @@ fn tail(terminal: &Entity<Terminal>, cx: &App) -> String {
         .join("\n")
 }
 
-fn local_url(port: u16, path: &str) -> String {
-    format!("http://localhost:{port}{path}")
+const PORT_PLACEHOLDER: &str = "{port}";
+
+/// Where opening a server goes: `open:` as a full URL of any scheme, or as a
+/// path on the detected URL, with `{port}` the port in either.
+fn open_url(target: Option<&str>, port: u16) -> String {
+    let target = target
+        .unwrap_or_default()
+        .replace(PORT_PLACEHOLDER, &port.to_string());
+    if is_full_url(&target) {
+        target
+    } else {
+        format!("http://localhost:{port}{target}")
+    }
+}
+
+/// `scheme://…`, the scheme being RFC 3986's letters, digits, `+`, `-` and `.`.
+fn is_full_url(target: &str) -> bool {
+    target.split_once("://").is_some_and(|(scheme, _)| {
+        scheme.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    })
 }
 
 fn toast(workspace: &Entity<Workspace>, message: String, cx: &mut App) {
@@ -550,6 +641,10 @@ mod tests {
         );
     }
 
+    fn labels(pills: Vec<(DevServerGlyph, SharedString)>) -> Vec<String> {
+        pills.into_iter().map(|(_, label)| label.to_string()).collect()
+    }
+
     #[gpui::test]
     fn test_each_worktree_runs_its_own_server(cx: &mut gpui::App) {
         let store = cx.new(|_| DevServerStore::default());
@@ -565,8 +660,8 @@ mod tests {
         });
         assert_eq!(store.read(cx).state(&here), Some(&DevServerState::Starting));
         assert_eq!(
-            store.read(cx).row_label(&a),
-            Some(label),
+            labels(store.read(cx).row_pills(&a)),
+            vec![label.to_string()],
             "before a port is known the row says which task it is"
         );
 
@@ -579,8 +674,8 @@ mod tests {
             store.read(cx).state(&here),
             Some(&DevServerState::Running { port: Some(5173) })
         );
-        assert_eq!(store.read(cx).row_label(&a), Some(":5173".into()));
-        assert_eq!(store.read(cx).row_label(&b), Some(":5174".into()));
+        assert_eq!(labels(store.read(cx).row_pills(&a)), vec!["5173"]);
+        assert_eq!(labels(store.read(cx).row_pills(&b)), vec!["5174"]);
 
         store.update(cx, |store, cx| {
             store.note_output(&there, "proxying to http://localhost:9999/api", cx);
@@ -598,11 +693,11 @@ mod tests {
             Some(&DevServerState::Exited { code: None })
         );
         assert_eq!(
-            store.read(cx).row_label(&a),
-            None,
+            labels(store.read(cx).row_pills(&a)),
+            Vec::<String>::new(),
             "a stopped server says nothing on the row"
         );
-        assert_eq!(store.read(cx).row_label(&b), Some(":5174".into()));
+        assert_eq!(labels(store.read(cx).row_pills(&b)), vec!["5174"]);
     }
 
     #[gpui::test]
@@ -636,9 +731,10 @@ mod tests {
             tags: vec!["bar".into(), "icon:server".into(), "open:/".into()],
             ..Default::default()
         };
-        let task = DevServerTask::new(TaskSourceKind::UserInput, bar.clone());
+        let root = Path::new("/worktrees/a");
+        let task = DevServerTask::new(TaskSourceKind::UserInput, bar.clone(), root);
         assert_eq!(task.label.as_ref(), "portico");
-        assert_eq!(task.icon, IconName::Server);
+        assert_eq!(task.glyph, DevServerGlyph::Named(IconName::Server));
         assert_eq!(task.open.as_deref(), Some("/"));
 
         let unknown_icon = TaskTemplate {
@@ -646,8 +742,8 @@ mod tests {
             ..bar.clone()
         };
         assert_eq!(
-            DevServerTask::new(TaskSourceKind::UserInput, unknown_icon).icon,
-            IconName::Server,
+            DevServerTask::new(TaskSourceKind::UserInput, unknown_icon, root).glyph,
+            DevServerGlyph::Named(IconName::Server),
             "a glyph nobody has falls back rather than failing the button"
         );
 
@@ -655,11 +751,134 @@ mod tests {
             tags: vec!["bar".into()],
             ..bar
         };
-        let task = DevServerTask::new(TaskSourceKind::UserInput, bare);
-        assert_eq!(task.icon, IconName::Server);
+        let task = DevServerTask::new(TaskSourceKind::UserInput, bare, root);
+        assert_eq!(task.glyph, DevServerGlyph::Named(IconName::Server));
         assert_eq!(
             task.open, None,
             "without `open:`, Open goes to the detected URL itself"
+        );
+    }
+
+    /// Arthur's log: `http://localhost:3000atrium://portico.monumental.build/?_port={port}`.
+    #[test]
+    fn test_open_takes_a_url_of_any_scheme_and_the_port() {
+        assert_eq!(
+            open_url(
+                Some("atrium://portico.monumental.build/?_port={port}"),
+                3000
+            ),
+            "atrium://portico.monumental.build/?_port=3000"
+        );
+        assert_eq!(open_url(Some("/docs"), 5173), "http://localhost:5173/docs");
+        assert_eq!(open_url(None, 5173), "http://localhost:5173");
+        assert_eq!(
+            open_url(Some("/?port={port}"), 41234),
+            "http://localhost:41234/?port=41234",
+            "a forwarded port stands for {{port}} in a path too"
+        );
+        assert_eq!(
+            open_url(Some("https://example.com/app"), 1),
+            "https://example.com/app"
+        );
+        assert!(!is_full_url("/a://b"), "a path is not a scheme");
+        assert!(!is_full_url("1x://b"));
+    }
+
+    #[test]
+    fn test_a_task_shows_only_where_its_folder_is() {
+        let root = Path::new("/worktrees/a");
+        assert_eq!(
+            cwd_in_worktree(Some("$ZED_WORKTREE_ROOT/portico"), root),
+            Some(PathBuf::from("portico"))
+        );
+        assert_eq!(
+            cwd_in_worktree(Some("${ZED_WORKTREE_ROOT}/web/app"), root),
+            Some(PathBuf::from("web/app"))
+        );
+        assert_eq!(cwd_in_worktree(Some("portico"), root), Some(PathBuf::from("portico")));
+        assert_eq!(cwd_in_worktree(None, root), None, "no cwd always shows");
+        assert_eq!(
+            cwd_in_worktree(Some("/elsewhere/portico"), root),
+            None,
+            "outside the worktree is not this worktree's to judge"
+        );
+        assert_eq!(cwd_in_worktree(Some("$HOME/portico"), root), None);
+    }
+
+    #[gpui::test]
+    async fn test_a_global_bar_task_needs_its_folder(cx: &mut gpui::TestAppContext) {
+        use fs::FakeFs;
+        use project::Project;
+        use serde_json::json;
+        use settings::SettingsStore;
+
+        cx.update(|cx| {
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            json!({ "with": { "portico": { "package.json": "{}" } }, "without": { "src": {} } }),
+        )
+        .await;
+        let project = Project::test(
+            fs,
+            [Path::new("/root/with"), Path::new("/root/without")],
+            cx,
+        )
+        .await;
+        cx.run_until_parked();
+        let inventory = project.read_with(cx, |project, cx| {
+            project
+                .task_store()
+                .read(cx)
+                .task_inventory()
+                .cloned()
+                .unwrap()
+        });
+        inventory.update(cx, |inventory, _| {
+            inventory
+                .update_file_based_tasks(
+                    project::task_store::TaskSettingsLocation::Global(Path::new("/config/tasks.json")),
+                    Some(
+                        &json!([{
+                            "label": "portico",
+                            "command": "pnpm dev",
+                            "cwd": "$ZED_WORKTREE_ROOT/portico",
+                            "tags": ["bar", "open:atrium://portico.monumental.build/?_port={port}"],
+                        }, {
+                            "label": "anywhere",
+                            "command": "make serve",
+                            "tags": ["bar"],
+                        }])
+                        .to_string(),
+                    ),
+                )
+                .unwrap();
+        });
+        let buttons = |root: &str, cx: &mut gpui::TestAppContext| {
+            cx.update(|cx| {
+                let worktree = project
+                    .read(cx)
+                    .worktrees(cx)
+                    .find(|worktree| worktree.read(cx).abs_path().as_ref() == Path::new(root))
+                    .unwrap()
+                    .read(cx)
+                    .id();
+                let mut labels: Vec<String> = bar_tasks(&project, worktree, cx)
+                    .into_iter()
+                    .map(|task| task.label.to_string())
+                    .collect();
+                labels.sort();
+                labels
+            })
+        };
+        assert_eq!(buttons("/root/with", cx), vec!["anywhere", "portico"]);
+        assert_eq!(
+            buttons("/root/without", cx),
+            vec!["anywhere"],
+            "no portico folder, no portico button; a task with no cwd still shows"
         );
     }
 }

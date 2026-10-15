@@ -6861,7 +6861,7 @@ impl Sidebar {
             .running_terminals(thread.running_work.terminals)
             .running_async_tasks(thread.running_work.async_tasks)
             .running_subagents(thread.running_work.subagents)
-            .dev_server(self.dev_server_label(&thread.metadata, cx))
+            .dev_servers(self.dev_server_pills(&thread.metadata, cx))
             .stop_reason(
                 thread
                     .stop_reason
@@ -8534,13 +8534,28 @@ impl Render for Sidebar {
 }
 
 impl Sidebar {
-    /// What a dev server running for this thread's worktree says on the row:
-    /// the port once it is known. Read-only here; it is started and stopped
-    /// from the thread's own bottom bar.
-    fn dev_server_label(&self, metadata: &ThreadMetadata, cx: &App) -> Option<SharedString> {
-        let store = agent_ui::dev_servers::DevServerStore::try_global(cx)?;
+    /// A pill per dev server running for this thread's worktree, with the
+    /// task's glyph and port. Read-only here; it is started and stopped from
+    /// the thread's own bottom bar.
+    fn dev_server_pills(&self, metadata: &ThreadMetadata, cx: &App) -> Vec<(Icon, SharedString)> {
+        let Some(store) = agent_ui::dev_servers::DevServerStore::try_global(cx) else {
+            return Vec::new();
+        };
         let roots = metadata.folder_paths().paths().to_vec();
-        store.read(cx).row_label(&roots)
+        store
+            .read(cx)
+            .row_pills(&roots)
+            .into_iter()
+            .map(|(glyph, label)| {
+                let icon = glyph.icon();
+                let icon = if glyph.is_tinted() {
+                    icon.color(Color::Accent)
+                } else {
+                    icon
+                };
+                (icon, label)
+            })
+            .collect()
     }
 }
 

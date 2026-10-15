@@ -578,7 +578,8 @@ pub struct ThreadItem {
     running_async_tasks: usize,
     running_subagents: usize,
     /// A dev server running for this thread's worktree, read-only here.
-    dev_server: Option<SharedString>,
+    /// A pill per dev server running here: the task's glyph and its port.
+    dev_servers: Vec<(Icon, SharedString)>,
     /// Why the thread stopped: a short label and the full reason for its
     /// tooltip. Drawn in place of the age, which a stopped thread's reader
     /// cares about less.
@@ -623,7 +624,7 @@ impl ThreadItem {
             running_terminals: 0,
             running_async_tasks: 0,
             running_subagents: 0,
-            dev_server: None,
+            dev_servers: Vec::new(),
             stop_reason: None,
             project_paths: None,
             project_name: None,
@@ -643,8 +644,8 @@ impl ThreadItem {
         self
     }
 
-    pub fn dev_server(mut self, dev_server: Option<SharedString>) -> Self {
-        self.dev_server = dev_server;
+    pub fn dev_servers(mut self, dev_servers: Vec<(Icon, SharedString)>) -> Self {
+        self.dev_servers = dev_servers;
         self
     }
 
@@ -850,7 +851,7 @@ fn row_backgrounds(
 }
 
 impl RenderOnce for ThreadItem {
-    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(mut self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let color = cx.theme().colors();
         let raw_bg = self.base_bg.unwrap_or(color.surface_background);
         // The fade gradient paints a solid color over the title to blend it into
@@ -1019,8 +1020,8 @@ impl RenderOnce for ThreadItem {
         let stop_reason = self.stop_reason.clone();
         let has_timestamp = !self.timestamp.is_empty() || stop_reason.is_some();
         let timestamp = self.timestamp;
-        let dev_server = self.dev_server.clone();
-        let has_dev_server = dev_server.is_some();
+        let dev_servers = std::mem::take(&mut self.dev_servers);
+        let has_dev_server = !dev_servers.is_empty();
         let has_size = !self.size.is_empty();
         let size = self.size;
 
@@ -1201,16 +1202,21 @@ impl RenderOnce for ThreadItem {
                             PrChip::new(("pr-chip", chip_ix), chip).surface(base_bg)
                         }))
                     })
-                    .when_some(dev_server, |this, dev_server| {
+                    .when(has_dev_server, |this| {
                         this.when(
                             has_project_name || has_project_paths || has_worktree || has_pr_chips,
                             |this| this.child(dot_separator()),
                         )
-                        .child(
-                            Label::new(dev_server)
-                                .size(LabelSize::Small)
-                                .color(Color::Accent),
-                        )
+                        .children(dev_servers.into_iter().map(|(icon, label)| {
+                            h_flex()
+                                .h_4()
+                                .px_1p5()
+                                .gap_1()
+                                .rounded_full()
+                                .bg(cx.theme().colors().element_background)
+                                .child(icon.size(IconSize::XSmall))
+                                .child(Label::new(label).size(LabelSize::XSmall))
+                        }))
                     })
                     .when(
                         (has_project_name
