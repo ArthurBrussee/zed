@@ -277,6 +277,25 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**The diff groups are sections in the diff, not a strip at the top.**
+
+The 10-15 run put Code, Tests and Generated in a toolbar strip (`DiffGroupsToolbar`,
+`git_ui/src/diff_groups.rs`) over the project diff. That is not what was asked: each group is a
+section **inside** the diff, a header row in the multibuffer above the group's first file with the
+group's name, file count and its own diffstat, and clicking it collapses or expands the section
+(Tests and Generated start collapsed). Scrolling down the diff reads Code, then the Tests header,
+then the Generated header. The strip goes.
+
+The groups already sort together (`DiffGroup::sort_prefix` in `diff_multibuffer.rs`), so this is
+only the headers. Make each one an editor **custom block** (`insert_blocks`, `BlockPlacement::Above`
+the group's first excerpt), re-placed when the diff's files change. The 10-14 log entry found that
+only custom blocks report a new height and get their rows re-reserved, so they are the kind that
+cannot overlap; no change to `block_map.rs` or `element.rs`. Collapsing keeps going through the
+editor's buffer folding, with the header itself left visible. Keep the 10-15 layout test (the
+editor fills the pane, files sit below each other) and extend it: each group's header renders
+above its first file and below the previous group's last, and clicking a header folds exactly that
+group, collapsed and expanded, without any two blocks overlapping.
+
 **Inline images from the dev box open in Zed, zoomable, with no warning.**
 Clicking an expanded image the agent sent inline in a thread on the dev box shows "This image came
 inline from the dev box, so there is no file there to open" (`open_image_data` in
