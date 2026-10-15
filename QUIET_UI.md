@@ -257,6 +257,22 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**The remote server lookup: find the client's own build, not just the latest.**
+
+Arthur, 2026-10-15: connecting to the dev box failed with "the quiet-ui release has a linux
+x86_64 remote server built from 6d6097e, but this Zed is f04bc31". Each build publishes the
+Linux servers about an hour before the dmg, so between the two every client sees a server from
+a commit it isn't. Any client that hasn't updated yet is locked out the same way. The build
+workflow on `main` now also publishes each server under its commit,
+`zed-remote-server-linux-<arch>-<short sha>.gz` (7 hex characters), and keeps the last six of
+those. Change the lookup in `quiet_ui_update.rs` (`remote_server_release_asset` and its callers)
+to download the asset named for the client's own `AppCommitSha::short()` first. It falls back to
+the fixed-name asset only when that one's manifest sha matches, and refuses as it does now
+when neither matches. Make the refusal say which builds are available (from the release's asset
+names) and that updating Zed fixes it. Test: a release listing several sha-named assets
+resolves the client's own, an older client resolves its own older one, and a client whose sha is
+absent gets the refusal.
+
 **The memory baselines: what it would take, and the one measurement that would justify it.**
 
 Decided on 2026-10-07 by reading the code; the 10-05 findings and the 10-07 rebase log entry hold
