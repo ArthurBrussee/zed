@@ -352,6 +352,13 @@ carry one for a non-worktree path); failing that, write the bytes to the box's t
 whatever RPC can write a file there and open that path; a separate local window only as a last
 resort. A test that a remote project's inline image opens an `ImageView` item.
 
+**The `+` on a machine header only in Active.**
+
+`render_machine_header` (`sidebar.rs` ~3443) adds `render_machine_new_thread_button` under every
+section, so the `+` shows on machine headers in All Threads and Archived too. Only
+`SidebarSection::OpenInZed` (Active) gets it; the other sections' headers keep the name, glyph,
+collapse and activity pill. Adjust any sidebar test that counts those buttons.
+
 **Reconnecting to the box: one stuck window takes the others down, and each needs its own click.**
 Seen 2026-10-15 18:35 local, after the laptop changed networks with four windows on the box
 (`Zed.log`, and `server-dev-workspace-*.log` on the box). Every remote window is its own
