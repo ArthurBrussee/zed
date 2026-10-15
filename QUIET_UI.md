@@ -314,6 +314,11 @@ Arthur, 2026-10-15, putting his portico dev server in his *global* Zed tasks
    the UI is, even for a dev box thread. A missing or unreadable file falls back to the
    default glyph. His task uses `icon:~/.config/zed/icons/atrium.png` (64px PNG).
 
+5. **The sidebar row shows a pill, not a bare port.** While a dev server runs for a thread's
+   worktree, the row shows a small pill with the task's icon (the same one the bar button uses,
+   image icons included) and the port, e.g. `[atrium-icon] 3000`, styled like the activity pill.
+   Several running tasks give several pills. It stays read-only; interaction is in the bar.
+
 Test: a global `bar` task with `cwd` `$ZED_WORKTREE_ROOT/portico` shows in a worktree that has
 `portico/` and not in one that doesn't; `open:` with `{port}` resolves to the detected port.
 
