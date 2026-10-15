@@ -257,6 +257,26 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**Dev server buttons: only where the task's folder exists, and `{port}` in `open:`.**
+
+Arthur, 2026-10-15, putting his portico dev server in his *global* Zed tasks
+(`~/.config/zed/tasks.json`: `pnpm dev` in `$ZED_WORKTREE_ROOT/portico`, tagged `bar`):
+
+1. A global `bar` task gets a button in every project's threads, including ones without a
+   `portico` folder, where it can only fail. In `dev_servers.rs` (`bar_tasks`), resolve the
+   task's `cwd` against the thread's worktree and leave the button out when that directory
+   doesn't exist there. Check through the project, so it works on the dev box too. A task with
+   no `cwd` always shows.
+2. Portico prints an Atrium link, `atrium://portico.monumental.build/?_port=<port>`, and that is
+   what Arthur wants **Open** to go to. `open:` takes a path to append or a full URL as is. Let it
+   also take `{port}`, replaced with the detected port, so
+   `"open:atrium://portico.monumental.build/?_port={port}"` works. Hand non-http schemes to the
+   OS opener (`cx.open_url`), not the browser. On a remote project the port is forwarded first,
+   as it already is; use the forwarded local port in `{port}`.
+
+Test: a global `bar` task with `cwd` `$ZED_WORKTREE_ROOT/portico` shows in a worktree that has
+`portico/` and not in one that doesn't; `open:` with `{port}` resolves to the detected port.
+
 **The remote server lookup: find the client's own build, not just the latest.**
 
 Arthur, 2026-10-15: connecting to the dev box failed with "the quiet-ui release has a linux
