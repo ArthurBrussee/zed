@@ -277,6 +277,43 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**Relay replay: prompts go missing, a second load steals the stream, and gaps stall a link.**
+Found in the 2026-10-15 logs on the box (`~/.local/share/zed/acp-relay/sessions/`) and the laptop.
+All in `crates/acp_relay` and its client.
+
+- **Prompts vanish on replay.** A thread reloaded through the relay shows none of the user messages
+  sent since the relay took the session, so consecutive agent turns run together. The relay logs
+  only agent-to-client frames, and claude-agent-acp emits `user_message_chunk` only during its own
+  replay; `forward` (`state.rs` ~450) just marks the turn running for `session/prompt`. Session
+  b4e1a129 had 2,310 logged frames, 193 tool calls and none of its 5 prompts. When forwarding a
+  prompt, append `session/update` `user_message_chunk` frames built from `params.prompt` to the
+  session log only (the sending link already shows the prompt). A test: prompt through one link,
+  load from another, and the prompt is in the replay. Arthur hits this on every reload of a box
+  thread, which is why this entry is first. Sessions logged before the fix stay without their
+  prompts; that is acceptable, so no backfill from the agent's transcript.
+- **A second load takes over the live stream.** `attach_session` (`state.rs` ~557) sets
+  `session.link = Some(link)` and never tells the previous one, and each `AgentConnectionStore`
+  has its own connection, so when a thread is loaded twice (the hazel-ivy window at 18:31:47 local
+  opened links 198 and 199 for its one session) the first stops getting updates and a prompt sent
+  from it streams to the other: it looks idle while working. Let a session fan out to every link
+  attached to it.
+- **A sequence gap stalls a link for good.** On reattach `attach_link` (`state.rs` ~263) skips frames
+  `resolve` can no longer produce (session ended while detached, a permission request answered
+  elsewhere) but keeps their `lseq`, and `handle_frame` (`project/src/acp_relay_client.rs` ~251)
+  releases frames strictly in order, so everything after the gap is held forever, `Exited` included.
+  Send a placeholder for each skipped number, or renumber. Test it.
+- **Loads answer with the opening config.** The relay answers `session/load` with the cached
+  `open_result`, so a reload shows the model and mode from when the session was opened, and
+  `apply_default_config_options` (`agent_servers/src/acp/v1.rs` ~1146) then failed 6 times with
+  "Session not found" 2 to 3s after relay-served loads. Track config changes (`set_config_option`,
+  mode and model updates) into what a load returns, and find which process lacked the session.
+- **Handover truncates the log.** `SessionLog::create` (`log.rs` ~54) uses `File::create`, so a newer
+  daemon adopting a session truncates the older daemon's still-open log. Open for append, or write
+  the newer one's log under its own name.
+- The daemon's own log (`~/.local/share/zed/logs/acp-relay.log`) records only spawns. Log attaches,
+  replay frame counts, skipped frames and link takeovers, so the next one of these can be read off
+  the log.
+
 **The diff groups are sections in the diff, not a strip at the top.**
 
 The 10-15 run put Code, Tests and Generated in a toolbar strip (`DiffGroupsToolbar`,
@@ -314,41 +351,6 @@ file (look at what `ImageItem`'s `Arc<worktree::File>` is used for and whether a
 carry one for a non-worktree path); failing that, write the bytes to the box's temp dir through
 whatever RPC can write a file there and open that path; a separate local window only as a last
 resort. A test that a remote project's inline image opens an `ImageView` item.
-
-**Relay replay: prompts go missing, a second load steals the stream, and gaps stall a link.**
-Found in the 2026-10-15 logs on the box (`~/.local/share/zed/acp-relay/sessions/`) and the laptop.
-All in `crates/acp_relay` and its client.
-
-- **Prompts vanish on replay.** A thread reloaded through the relay shows none of the user messages
-  sent since the relay took the session, so consecutive agent turns run together. The relay logs
-  only agent-to-client frames, and claude-agent-acp emits `user_message_chunk` only during its own
-  replay; `forward` (`state.rs` ~450) just marks the turn running for `session/prompt`. Session
-  b4e1a129 had 2,310 logged frames, 193 tool calls and none of its 5 prompts. When forwarding a
-  prompt, append `session/update` `user_message_chunk` frames built from `params.prompt` to the
-  session log only (the sending link already shows the prompt). A test: prompt through one link,
-  load from another, and the prompt is in the replay.
-- **A second load takes over the live stream.** `attach_session` (`state.rs` ~557) sets
-  `session.link = Some(link)` and never tells the previous one, and each `AgentConnectionStore`
-  has its own connection, so when a thread is loaded twice (the hazel-ivy window at 18:31:47 local
-  opened links 198 and 199 for its one session) the first stops getting updates and a prompt sent
-  from it streams to the other: it looks idle while working. Let a session fan out to every link
-  attached to it.
-- **A sequence gap stalls a link for good.** On reattach `attach_link` (`state.rs` ~263) skips frames
-  `resolve` can no longer produce (session ended while detached, a permission request answered
-  elsewhere) but keeps their `lseq`, and `handle_frame` (`project/src/acp_relay_client.rs` ~251)
-  releases frames strictly in order, so everything after the gap is held forever, `Exited` included.
-  Send a placeholder for each skipped number, or renumber. Test it.
-- **Loads answer with the opening config.** The relay answers `session/load` with the cached
-  `open_result`, so a reload shows the model and mode from when the session was opened, and
-  `apply_default_config_options` (`agent_servers/src/acp/v1.rs` ~1146) then failed 6 times with
-  "Session not found" 2 to 3s after relay-served loads. Track config changes (`set_config_option`,
-  mode and model updates) into what a load returns, and find which process lacked the session.
-- **Handover truncates the log.** `SessionLog::create` (`log.rs` ~54) uses `File::create`, so a newer
-  daemon adopting a session truncates the older daemon's still-open log. Open for append, or write
-  the newer one's log under its own name.
-- The daemon's own log (`~/.local/share/zed/logs/acp-relay.log`) records only spawns. Log attaches,
-  replay frame counts, skipped frames and link takeovers, so the next one of these can be read off
-  the log.
 
 **Reconnecting to the box: one stuck window takes the others down, and each needs its own click.**
 Seen 2026-10-15 18:35 local, after the laptop changed networks with four windows on the box
