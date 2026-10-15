@@ -268,7 +268,10 @@ Arthur, 2026-10-15, putting his portico dev server in his *global* Zed tasks
    doesn't exist there. Check through the project, so it works on the dev box too. A task with
    no `cwd` always shows.
 2. Portico prints an Atrium link, `atrium://portico.monumental.build/?_port=<port>`, and that is
-   what Arthur wants **Open** to go to. `open:` takes a path to append or a full URL as is. Let it
+   what Arthur wants **Open** to go to. Today the current build treats anything that isn't `http(s)://` as a path
+   and appends it: Arthur's log has `Failed to create NSURL from string:
+   http://localhost:3000atrium://portico.monumental.build/?_port={port}`. Recognise any
+   `scheme://` target as a full URL. `open:` takes a path to append or a full URL as is. Let it
    also take `{port}`, replaced with the detected port, so
    `"open:atrium://portico.monumental.build/?_port={port}"` works. Hand non-http schemes to the
    OS opener (`cx.open_url`), not the browser. On a remote project the port is forwarded first,
