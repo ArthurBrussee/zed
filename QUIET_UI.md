@@ -257,7 +257,7 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
-**Dev server buttons: only where the task's folder exists, and `{port}` in `open:`.**
+**Dev server buttons: only where the task's folder exists, `{port}` in `open:`, and no menu.**
 
 Arthur, 2026-10-15, putting his portico dev server in his *global* Zed tasks
 (`~/.config/zed/tasks.json`: `pnpm dev` in `$ZED_WORKTREE_ROOT/portico`, tagged `bar`):
@@ -276,6 +276,11 @@ Arthur, 2026-10-15, putting his portico dev server in his *global* Zed tasks
    `"open:atrium://portico.monumental.build/?_port={port}"` works. Hand non-http schemes to the
    OS opener (`cx.open_url`), not the browser. On a remote project the port is forwarded first,
    as it already is; use the forwarded local port in `{port}`.
+
+3. **No menu.** Arthur, same day: a running server's button should **open on a single click**
+   (the `open:` target, else the detected URL), with a small **stop** button at its right end.
+   "Show output" goes. The task's terminal is still reachable the way any task's is. So the
+   popup menu goes entirely. Not running: one click starts it, as now.
 
 Test: a global `bar` task with `cwd` `$ZED_WORKTREE_ROOT/portico` shows in a worktree that has
 `portico/` and not in one that doesn't; `open:` with `{port}` resolves to the detected port.
