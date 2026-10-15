@@ -4047,13 +4047,13 @@ async fn test_a_worktree_switched_off_runs_no_language_server(cx: &mut gpui::Tes
         });
     });
 
-    let buffer = project
+    // Held as an editor would: a restart only reaches buffers still registered.
+    let (buffer, _lsp_handle) = project
         .update(cx, |project, cx| {
             project.open_local_buffer_with_lsp(path!("/dir/a.rs"), cx)
         })
         .await
-        .unwrap()
-        .0;
+        .unwrap();
     cx.run_until_parked();
     assert!(
         fake_rust_servers.try_recv().is_err(),
