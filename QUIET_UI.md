@@ -277,6 +277,106 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**Inline images from the dev box open in Zed, zoomable, with no warning.**
+Clicking an expanded image the agent sent inline in a thread on the dev box shows "This image came
+inline from the dev box, so there is no file there to open" (`open_image_data` in
+`agent_ui/.../thread_view/chips.rs` ~2650) and does nothing. Arthur does not care where the bytes
+live: the image must open in a Zed pane in the same window, with the image viewer's zoom
+(`image_viewer` already has `ZoomIn`/`ZoomOut`/`ResetZoom`), exactly as on a local project. The
+bytes are already on the laptop in the `gpui::Image`, so the warning branch goes. Options, in order
+of preference: open `ImageView` on an `ImageItem` built from the in-memory image without a project
+file (look at what `ImageItem`'s `Arc<worktree::File>` is used for and whether a remote project can
+carry one for a non-worktree path); failing that, write the bytes to the box's temp dir through
+whatever RPC can write a file there and open that path; a separate local window only as a last
+resort. A test that a remote project's inline image opens an `ImageView` item.
+
+**Relay replay: prompts go missing, a second load steals the stream, and gaps stall a link.**
+Found in the 2026-10-15 logs on the box (`~/.local/share/zed/acp-relay/sessions/`) and the laptop.
+All in `crates/acp_relay` and its client.
+
+- **Prompts vanish on replay.** A thread reloaded through the relay shows none of the user messages
+  sent since the relay took the session, so consecutive agent turns run together. The relay logs
+  only agent-to-client frames, and claude-agent-acp emits `user_message_chunk` only during its own
+  replay; `forward` (`state.rs` ~450) just marks the turn running for `session/prompt`. Session
+  b4e1a129 had 2,310 logged frames, 193 tool calls and none of its 5 prompts. When forwarding a
+  prompt, append `session/update` `user_message_chunk` frames built from `params.prompt` to the
+  session log only (the sending link already shows the prompt). A test: prompt through one link,
+  load from another, and the prompt is in the replay.
+- **A second load takes over the live stream.** `attach_session` (`state.rs` ~557) sets
+  `session.link = Some(link)` and never tells the previous one, and each `AgentConnectionStore`
+  has its own connection, so when a thread is loaded twice (the hazel-ivy window at 18:31:47 local
+  opened links 198 and 199 for its one session) the first stops getting updates and a prompt sent
+  from it streams to the other: it looks idle while working. Let a session fan out to every link
+  attached to it.
+- **A sequence gap stalls a link for good.** On reattach `attach_link` (`state.rs` ~263) skips frames
+  `resolve` can no longer produce (session ended while detached, a permission request answered
+  elsewhere) but keeps their `lseq`, and `handle_frame` (`project/src/acp_relay_client.rs` ~251)
+  releases frames strictly in order, so everything after the gap is held forever, `Exited` included.
+  Send a placeholder for each skipped number, or renumber. Test it.
+- **Loads answer with the opening config.** The relay answers `session/load` with the cached
+  `open_result`, so a reload shows the model and mode from when the session was opened, and
+  `apply_default_config_options` (`agent_servers/src/acp/v1.rs` ~1146) then failed 6 times with
+  "Session not found" 2 to 3s after relay-served loads. Track config changes (`set_config_option`,
+  mode and model updates) into what a load returns, and find which process lacked the session.
+- **Handover truncates the log.** `SessionLog::create` (`log.rs` ~54) uses `File::create`, so a newer
+  daemon adopting a session truncates the older daemon's still-open log. Open for append, or write
+  the newer one's log under its own name.
+- The daemon's own log (`~/.local/share/zed/logs/acp-relay.log`) records only spawns. Log attaches,
+  replay frame counts, skipped frames and link takeovers, so the next one of these can be read off
+  the log.
+
+**Reconnecting to the box: one stuck window takes the others down, and each needs its own click.**
+Seen 2026-10-15 18:35 local, after the laptop changed networks with four windows on the box
+(`Zed.log`, and `server-dev-workspace-*.log` on the box). Every remote window is its own
+`RemoteClient`, but they share one SSH connection through the `ConnectionPool` in
+`remote/src/remote_client.rs`. `reconnect()` starts with `remote_connection.kill()`, which kills
+that shared master. So one window whose handshake kept timing out (`Timed out waiting for remote
+connection`, three times) killed the connection the other three had just reconnected over, on each
+of its attempts: their proxies exit 255 at the same second, they reconnect within a second, and
+then it happens again. After three attempts the stuck window is `reconnect exhausted`, and the
+only way back is its own Reconnect button. With one window per worktree that means one click per
+thread, and the click opens a fresh, non-`--reconnect` proxy, which kills that window's server.
+
+- A reconnect must not kill a pooled connection other clients are using. Kill it only when it is
+  actually dead (its master process exited, or no client on it is answering heartbeats); otherwise
+  take the live connection from the pool and start a new `--reconnect` proxy on it. This is an
+  upstream bug and the fix should be shaped as an upstream patch.
+- When any client on a host connects or reconnects, every client on the same connection options in
+  `ReconnectFailed` or `ReconnectExhausted` retries straight away, so one click (or one success)
+  brings back every window on that box.
+- Find out why the stuck window's handshake never completed while the other three, on the same
+  connection, did. Its server was likely stalled: the box was out of memory at the time (16:34:35
+  UTC, rust-analyzer OOM-killed). If a server is alive but not answering, the reconnect should
+  say so rather than time out three times.
+- A test in `remote_server` or `remote` with the mock connection: two clients on one pool, one
+  whose handshake hangs, and the other must stay connected through its attempts.
+
+**PR chips for worktrees on the box never load.**
+`gh_status.rs` (around line 1228) builds `gh pr list --head <branch> --state all --json`, then
+appends `--repo <owner/name>`, then the fields. So `--json` takes `--repo` as its value and gh
+fails with `unknown arguments ["BuildMonumental/mech" "number,url,..."]`, every poll, for every
+box worktree (the `--repo` is only added when there is no local checkout). Put `--json` next to
+`GH_JSON_FIELDS` in both branches. A unit test on the built argument list.
+
+**Threads that were never prompted fail to load after a restart.**
+At 18:52:50 local two restored threads with no messages (82844f2d, 44300a33) went to the agent as
+`session/load`, the agent found no transcript, and Zed logged `failed to load agent: Resource not
+found`. A thread with no messages should open as a new session, or fall back to `session/new` when
+the load says not found.
+
+**Subagent frames are dropped as "unknown session".**
+Every `session/update` for a subagent's own session id is warned about and discarded (135 times in
+one replay at 18:31:54 local, live too at 19:01), so subagent tool calls never render inside their
+card. Upstream does the same, but the fork shows subagent cards on request: route frames whose
+session id is a known child (`subagent_spawned`, AIR `nativeSubagentSessions`) to that subagent's
+card, live and on replay.
+
+**A broken submodule makes the diff stats retry forever.**
+`agent_ui`'s `branch_diff_stats.rs` (~185) runs `git diff` on a worktree whose submodule gitdir
+points into a deleted worktree (`.../mech/.git/worktrees/mech122/modules/...`) and fails on every
+refresh (131 `git diff`, 47 `diff-tree`, 18 `git status` failures in an hour). Skip submodules that
+fail, or back off for a path after a failure, and say once in the log which one.
+
 **The memory baselines: what it would take, and the one measurement that would justify it.**
 
 Decided on 2026-10-07 by reading the code; the 10-05 findings and the 10-07 rebase log entry hold
