@@ -1515,6 +1515,8 @@ fn initialize_pane(
             toolbar.add_item(staged_diff_toolbar, window, cx);
             let unstaged_diff_toolbar = cx.new(|cx| UnstagedDiffToolbar::new(workspace, cx));
             toolbar.add_item(unstaged_diff_toolbar, window, cx);
+            let diff_groups_toolbar = cx.new(|_| git_ui::diff_groups::DiffGroupsToolbar::new());
+            toolbar.add_item(diff_groups_toolbar, window, cx);
             let solo_diff_git_toolbar = cx.new(SoloDiffGitToolbar::new);
             toolbar.add_item(solo_diff_git_toolbar, window, cx);
             let commit_view_toolbar = cx.new(|_| CommitViewToolbar::new());

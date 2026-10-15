@@ -30,7 +30,7 @@ use project::{
 use settings::{GitPanelGroupBy, GitPanelSortBy, Settings, SettingsStore};
 use std::{collections::BTreeMap, sync::Arc};
 use theme::ActiveTheme;
-use ui::{CommonAnimationExt as _, DiffStat, KeyBinding, Tooltip, prelude::*};
+use ui::{CommonAnimationExt as _, KeyBinding, prelude::*};
 use util::{ResultExt as _, rel_path::RelPath};
 use workspace::{
     CloseActiveItem, ItemNavHistory, Workspace,
@@ -59,8 +59,8 @@ pub struct DiffMultibuffer {
     focus_handle: FocusHandle,
     pending_scroll: Option<PathKey>,
     review_comment_count: usize,
-    /// Groups the strip above the diff has collapsed. Tests and generated
-    /// files start that way.
+    /// Groups the toolbar's strip has folded. Tests and generated files start
+    /// that way.
     collapsed_groups: HashSet<DiffGroup>,
     empty_label: SharedString,
     _task: Task<Result<()>>,
@@ -503,7 +503,9 @@ impl DiffMultibuffer {
                 }
             })
         });
-        let repo_path_for_group = repo_path.clone();
+        let group_is_collapsed = self
+            .collapsed_groups
+            .contains(&DiffGroup::of_path(&repo_path));
         self.buffer_subscriptions.insert(
             repo_path,
             BufferSubscriptions {
@@ -575,7 +577,7 @@ impl DiffMultibuffer {
                 }
                 if is_excerpt_newly_added
                     && (file_status.is_deleted()
-                        || DiffGroup::of_path(&repo_path_for_group).starts_collapsed()
+                        || group_is_collapsed
                         || (file_status.is_untracked()
                             && GitPanelSettings::get_global(cx).collapse_untracked_diff))
                 {
@@ -976,16 +978,13 @@ impl Render for DiffMultibuffer {
                         ),
                 )
             })
-            .when(!is_empty, |el| {
-                el.children(self.render_group_strip(cx))
-                    .child(self.editor.clone())
-            })
+            .when(!is_empty, |el| el.child(self.editor.clone()))
     }
 }
 
 impl DiffMultibuffer {
     /// What is in each group, summed from the diffs the view already holds.
-    fn group_summaries(&self, cx: &App) -> Vec<(DiffGroup, DiffGroupSummary)> {
+    pub(crate) fn group_summaries(&self, cx: &App) -> Vec<(DiffGroup, DiffGroupSummary)> {
         let mut summaries: Vec<(DiffGroup, DiffGroupSummary)> = DiffGroup::ALL
             .into_iter()
             .map(|group| (group, DiffGroupSummary::default()))
@@ -1003,7 +1002,11 @@ impl DiffMultibuffer {
         summaries
     }
 
-    fn buffers_in_group(&self, group: DiffGroup, cx: &App) -> Vec<BufferId> {
+    pub(crate) fn collapsed_groups(&self) -> &HashSet<DiffGroup> {
+        &self.collapsed_groups
+    }
+
+    pub(crate) fn buffers_in_group(&self, group: DiffGroup, cx: &App) -> Vec<BufferId> {
         self.buffer_subscriptions
             .iter()
             .filter(|(repo_path, _)| DiffGroup::of_path(repo_path) == group)
@@ -1011,7 +1014,7 @@ impl DiffMultibuffer {
             .collect()
     }
 
-    fn toggle_group(&mut self, group: DiffGroup, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_group(&mut self, group: DiffGroup, cx: &mut Context<Self>) {
         let collapsed = !self.collapsed_groups.remove(&group);
         if collapsed {
             self.collapsed_groups.insert(group);
@@ -1033,73 +1036,6 @@ impl DiffMultibuffer {
             });
         });
         cx.notify();
-    }
-
-    /// A chip per group above the diff: what is in it, and a disclosure that
-    /// collapses every file in it. The files themselves are already grouped by
-    /// the ordering, so this says what the groups are rather than drawing a
-    /// diff UI of its own.
-    fn render_group_strip(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let summaries: Vec<_> = self
-            .group_summaries(cx)
-            .into_iter()
-            .filter(|(_, summary)| !summary.is_empty())
-            .collect();
-        // One group is no grouping: say nothing rather than add a row.
-        if summaries.len() < 2 {
-            return None;
-        }
-        Some(
-            h_flex()
-                .w_full()
-                .flex_none()
-                .px_2()
-                .py_1()
-                .gap_2()
-                .flex_wrap()
-                .border_b_1()
-                .border_color(cx.theme().colors().border)
-                .children(summaries.into_iter().map(|(group, summary)| {
-                    let collapsed = self.collapsed_groups.contains(&group);
-                    h_flex()
-                        .id(SharedString::from(format!("diff-group-{}", group.label())))
-                        .gap_1()
-                        .cursor_pointer()
-                        .child(
-                            Icon::new(if collapsed {
-                                IconName::ChevronRight
-                            } else {
-                                IconName::ChevronDown
-                            })
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
-                        )
-                        .child(Label::new(group.label()).size(LabelSize::Small))
-                        .child(
-                            Label::new(format!(
-                                "{} file{}",
-                                summary.files,
-                                if summary.files == 1 { "" } else { "s" }
-                            ))
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                        )
-                        .child(DiffStat::new(
-                            SharedString::from(format!("diff-group-stat-{}", group.label())),
-                            summary.lines_added as usize,
-                            summary.lines_removed as usize,
-                        ))
-                        .tooltip(Tooltip::text(if collapsed {
-                            format!("Expand {}", group.label())
-                        } else {
-                            format!("Collapse {}", group.label())
-                        }))
-                        .on_click(cx.listener(move |this, _, _window, cx| {
-                            this.toggle_group(group, cx);
-                        }))
-                }))
-                .into_any_element(),
-        )
     }
 }
 
