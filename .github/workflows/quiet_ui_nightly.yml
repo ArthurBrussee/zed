@@ -226,5 +226,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload quiet-ui-latest "$ASSET.gz" "$ASSET.json" \
+          # Also under the build's commit, so a client that hasn't updated yet
+          # still finds its own server; keep the last few of those.
+          short=$(echo "${{ steps.freshness.outputs.sha }}" | cut -c1-7)
+          cp "$ASSET.gz" "$ASSET-$short.gz"
+          gh release upload quiet-ui-latest "$ASSET.gz" "$ASSET.json" "$ASSET-$short.gz" \
             --repo "$GITHUB_REPOSITORY" --clobber
+          gh release view quiet-ui-latest --repo "$GITHUB_REPOSITORY" --json assets \
+            -q ".assets | map(select(.name | test(\"^$ASSET-[0-9a-f]{7}\\\\.gz$\"))) | sort_by(.createdAt) | reverse | .[6:] | .[].name" |
+            while read -r old; do
+              gh release delete-asset quiet-ui-latest "$old" --repo "$GITHUB_REPOSITORY" --yes
+            done
