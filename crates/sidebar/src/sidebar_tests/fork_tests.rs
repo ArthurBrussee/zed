@@ -3527,8 +3527,11 @@ async fn test_a_machine_with_no_reading_says_nothing_for_itself(cx: &mut TestApp
 fn test_collapsing_a_machine_hides_everything_under_it(cx: &mut TestAppContext) {
     let devbox = mock_host(5);
     let now = Utc::now();
-    let machine_header = |label: &str, host: Option<remote::RemoteConnectionOptions>| {
+    let machine_header = |section: SidebarSection,
+                          label: &str,
+                          host: Option<remote::RemoteConnectionOptions>| {
         ListEntry::MachineHeader(Arc::new(MachineHeaderEntry {
+            section,
             label: label.to_string().into(),
             host,
             can_create_thread: true,
@@ -3559,14 +3562,20 @@ fn test_collapsing_a_machine_hides_everything_under_it(cx: &mut TestAppContext) 
         }))
     };
 
+    let active = SidebarSection::OpenInZed;
+    let all = SidebarSection::AllThreads;
     let entries = vec![
-        ListEntry::SectionHeader(SidebarSection::OpenInZed),
-        machine_header("This Mac", None),
+        ListEntry::SectionHeader(active),
+        machine_header(active, "This Mac", None),
         worktree_header("here"),
         row("on the laptop"),
-        machine_header("mock-5", Some(devbox.clone())),
+        machine_header(active, "mock-5", Some(devbox.clone())),
         worktree_header("there"),
         row("on the box"),
+        ListEntry::SectionHeader(all),
+        machine_header(all, "mock-5", Some(devbox.clone())),
+        worktree_header("there before"),
+        row("older on the box"),
     ];
 
     let labels = |collapsed: HashSet<String>| -> Vec<String> {
@@ -3589,26 +3598,48 @@ fn test_collapsing_a_machine_hides_everything_under_it(cx: &mut TestAppContext) 
         .collect()
     };
 
+    let all_threads = ["All Threads", "mock-5", "there before", "older on the box"];
     assert_eq!(
         labels(HashSet::default()),
-        vec![
-            "Active", "This Mac", "here", "on the laptop", "mock-5", "there", "on the box"
+        [
+            "Active",
+            "This Mac",
+            "here",
+            "on the laptop",
+            "mock-5",
+            "there",
+            "on the box",
         ]
+        .iter()
+        .chain(&all_threads)
+        .map(|label| label.to_string())
+        .collect::<Vec<_>>()
     );
 
-    let collapsed: HashSet<String> = [machine_collapse_key(None)].into_iter().collect();
+    let collapsed: HashSet<String> = [machine_collapse_key(active, None)].into_iter().collect();
     assert_eq!(
         labels(collapsed),
-        vec!["Active", "This Mac", "mock-5", "there", "on the box"],
+        ["Active", "This Mac", "mock-5", "there", "on the box"]
+            .iter()
+            .chain(&all_threads)
+            .map(|label| label.to_string())
+            .collect::<Vec<_>>(),
         "a collapsed machine takes its worktree groups and rows with it, and \
          leaves the next machine alone"
     );
 
-    let collapsed: HashSet<String> = [machine_collapse_key(Some(&devbox))].into_iter().collect();
+    let collapsed: HashSet<String> = [machine_collapse_key(active, Some(&devbox))]
+        .into_iter()
+        .collect();
     assert_eq!(
         labels(collapsed),
-        vec!["Active", "This Mac", "here", "on the laptop", "mock-5"],
-        "and the header itself stays, with its +"
+        ["Active", "This Mac", "here", "on the laptop", "mock-5"]
+            .iter()
+            .chain(&all_threads)
+            .map(|label| label.to_string())
+            .collect::<Vec<_>>(),
+        "the header itself stays, with its +, and the same machine stays open in \
+         All Threads: collapsing is per section"
     );
 }
 
@@ -3624,7 +3655,7 @@ async fn test_a_collapsed_machine_survives_a_restart(cx: &mut TestAppContext) {
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
     let sidebar = setup_sidebar(&multi_workspace, cx);
 
-    let key = machine_collapse_key(Some(&devbox));
+    let key = machine_collapse_key(SidebarSection::AllThreads, Some(&devbox));
     let state = sidebar.update(cx, |sidebar, cx| {
         sidebar.collapsed_machines.insert(key.clone());
         sidebar
@@ -3731,6 +3762,7 @@ async fn test_the_top_plus_goes_once_two_machines_are_headed(cx: &mut TestAppCon
 
     let header = |host: Option<remote::RemoteConnectionOptions>| {
         ListEntry::MachineHeader(Arc::new(MachineHeaderEntry {
+            section: SidebarSection::OpenInZed,
             label: "machine".into(),
             host,
             can_create_thread: true,
@@ -3984,4 +4016,47 @@ async fn test_a_saved_machine_plus_opens_its_project(
     opened.await.expect("the box's project opens");
     cx.run_until_parked();
     assert!(on_the_box(cx), "the box's project is open in this window");
+}
+
+/// A project group key's host carries no SSH nickname, so the header asks the
+/// live connection or the saved one for it, as the title bar does.
+#[gpui::test]
+async fn test_a_machine_header_uses_the_ssh_nickname(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    let project = project::Project::test(fs, [], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let _sidebar = setup_sidebar(&multi_workspace, cx);
+    cx.update(|_, cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_user_settings(
+                    &serde_json::json!({ "ssh_connections": [
+                        { "host": "devbox.internal", "nickname": "devbox", "projects": [] },
+                    ] })
+                    .to_string(),
+                    cx,
+                )
+                .unwrap();
+        });
+    });
+
+    let keyed = |host: &str| {
+        remote::RemoteConnectionOptions::Ssh(remote::SshConnectionOptions {
+            host: host.into(),
+            ..Default::default()
+        })
+    };
+    let (named, unnamed, local) = cx.update(|_, cx| {
+        let workspaces: Vec<_> = multi_workspace.read(cx).workspaces().cloned().collect();
+        (
+            machine_label(&keyed("devbox.internal"), &workspaces, cx),
+            machine_label(&keyed("elsewhere"), &workspaces, cx),
+            machine_label(&mock_host(3), &workspaces, cx),
+        )
+    });
+    assert_eq!(named.as_ref(), "devbox", "the nickname, not the host");
+    assert_eq!(unnamed.as_ref(), "elsewhere", "a host with no nickname is its name");
+    assert_eq!(local, mock_host(3).display_name());
 }

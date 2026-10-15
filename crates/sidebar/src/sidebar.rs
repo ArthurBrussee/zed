@@ -554,6 +554,8 @@ struct MachineGroup {
 /// more than one machine has threads, so a laptop-only sidebar is unchanged.
 #[derive(Clone, PartialEq)]
 struct MachineHeaderEntry {
+    /// Collapsing a machine collapses it in this section only.
+    section: SidebarSection,
     label: SharedString,
     /// The machine this heads; `None` is this one.
     host: Option<RemoteConnectionOptions>,
@@ -1822,8 +1824,10 @@ impl Sidebar {
                 ListEntry::MachineHeader(header) => {
                     hiding_worktree = false;
                     // Everything under it, worktree groups and rows alike.
-                    hiding_machine =
-                        collapsed_machines.contains(&machine_collapse_key(header.host.as_ref()));
+                    hiding_machine = collapsed_machines.contains(&machine_collapse_key(
+                        header.section,
+                        header.host.as_ref(),
+                    ));
                     if !hiding_section {
                         visible.push(entry.clone());
                     }
@@ -2077,9 +2081,7 @@ impl Sidebar {
             });
             machines.push(MachineGroup {
                 label: match &host {
-                    // Upstream already prefers an SSH connection's nickname
-                    // over its host name.
-                    Some(host) => host.display_name().into(),
+                    Some(host) => machine_label(host, workspaces, cx),
                     None => "This Mac".into(),
                 },
                 host,
@@ -2108,15 +2110,16 @@ impl Sidebar {
         machines
     }
 
-    /// `head_empty_machines` only for the active section, where a header's `+`
-    /// means something. In the history and the archive a machine with nothing
+    /// Machines with nothing listed are headed only in the active section,
+    /// where a header's `+` means something. In the history and the archive a machine with nothing
     /// of its own in that section is not worth a header.
     fn group_rows_by_machine(
         rows: Vec<ListEntry>,
         machines: &[MachineGroup],
-        head_empty_machines: bool,
+        section: SidebarSection,
         cx: &App,
     ) -> Vec<ListEntry> {
+        let head_empty_machines = section == SidebarSection::OpenInZed;
         let host_of = |entry: &ListEntry| match entry {
             ListEntry::Thread(thread) => Some(thread.workspace.host(cx)),
             ListEntry::Terminal(terminal) => Some(terminal.workspace.host(cx)),
@@ -2163,6 +2166,7 @@ impl Sidebar {
                 }
             }
             out.push(ListEntry::MachineHeader(Arc::new(MachineHeaderEntry {
+                section,
                 label: machine.label.clone(),
                 host: machine.host.clone(),
                 can_create_thread: machine.can_create_thread,
@@ -2367,7 +2371,7 @@ impl Sidebar {
                 Self::group_rows_by_machine(
                     sort_by_tab(open_threads.into_iter().map(ListEntry::Thread).collect()),
                     machines,
-                    true,
+                    SidebarSection::OpenInZed,
                     cx,
                 ),
             ),
@@ -2382,7 +2386,7 @@ impl Sidebar {
                             .collect(),
                     ),
                     machines,
-                    false,
+                    SidebarSection::AllThreads,
                     cx,
                 ),
             ),
@@ -2396,7 +2400,7 @@ impl Sidebar {
                             .collect(),
                     ),
                     machines,
-                    false,
+                    SidebarSection::Archived,
                     cx,
                 ),
             ),
@@ -3358,9 +3362,14 @@ impl Sidebar {
         header: &MachineHeaderEntry,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let group = SharedString::from(format!("machine-header-{ix}"));
-        let key = machine_collapse_key(header.host.as_ref());
+        let key = machine_collapse_key(header.section, header.host.as_ref());
         let is_collapsed = self.collapsed_machines.contains(&key);
+        // A rule between machines; the section header stands above the first.
+        let first_in_section = matches!(
+            ix.checked_sub(1)
+                .and_then(|previous| self.contents.entries.get(previous)),
+            Some(ListEntry::SectionHeader(_)) | None
+        );
         let running_work = ui::RunningWorkCounts {
             terminals: header.running_work.terminals,
             subagents: header.running_work.subagents,
@@ -3368,10 +3377,18 @@ impl Sidebar {
         };
         h_flex()
             .id(("machine-header", ix))
-            .group(group.clone())
             .w_full()
             .px_2p5()
-            .map(|this| if ix > 0 { this.pt_3() } else { this.pt_1() })
+            .map(|this| {
+                if first_in_section {
+                    this.pt_1()
+                } else {
+                    this.mt_2()
+                        .pt_2()
+                        .border_t_1()
+                        .border_color(cx.theme().colors().border)
+                }
+            })
             .pb_0p5()
             .gap_1()
             .items_center()
@@ -3405,14 +3422,13 @@ impl Sidebar {
                     Some(_) => IconName::Server,
                     None => IconName::Screen,
                 })
-                .size(IconSize::XSmall)
+                .size(IconSize::Small)
                 .color(Color::Muted),
             )
+            // A level above the worktree headers' small, regular labels.
             .child(
                 Label::new(header.label.clone())
-                    .size(LabelSize::Small)
                     .weight(gpui::FontWeight::SEMIBOLD)
-                    .color(Color::Muted)
                     .truncate(),
             )
             // A collapsed machine still says it is working.
@@ -3425,7 +3441,7 @@ impl Sidebar {
                 ))
             })
             .child(h_flex().flex_1())
-            .children(self.render_machine_new_thread_button(ix, header, &group, cx))
+            .children(self.render_machine_new_thread_button(ix, header, cx))
             .into_any_element()
     }
 
@@ -3435,7 +3451,6 @@ impl Sidebar {
         &self,
         ix: usize,
         header: &MachineHeaderEntry,
-        group: &SharedString,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         if !header.can_create_thread {
@@ -3453,7 +3468,6 @@ impl Sidebar {
                 IconButton::new(("new-thread-on-saved-machine", ix), IconName::Plus)
                     .icon_size(IconSize::XSmall)
                     .icon_color(Color::Muted)
-                    .visible_on_hover(group.clone())
                     .tooltip(Tooltip::text("Connect and Start a Thread in a New Worktree"))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
@@ -3476,7 +3490,6 @@ impl Sidebar {
             IconButton::new(id, IconName::Plus)
                 .icon_size(IconSize::XSmall)
                 .icon_color(Color::Muted)
-                .visible_on_hover(group.clone())
         };
         match repositories.len() {
             0 => None,
@@ -3627,7 +3640,7 @@ impl Sidebar {
         let mut machines: HashSet<String> = HashSet::new();
         for entry in &self.contents.all_entries {
             if let ListEntry::MachineHeader(header) = entry {
-                machines.insert(machine_collapse_key(header.host.as_ref()));
+                machines.insert(machine_identity_key(header.host.as_ref()));
             }
         }
         machines.len()
@@ -8560,13 +8573,54 @@ impl Sidebar {
 }
 
 /// Every open workspace in the app, this window's and every other window's.
-/// A machine's key for the collapsed set: its connection identity, which a
-/// renamed SSH nickname does not change. This machine is its own key.
-fn machine_collapse_key(host: Option<&RemoteConnectionOptions>) -> String {
+/// A machine's identity: its connection's, which a renamed SSH nickname does
+/// not change. This machine is its own.
+fn machine_identity_key(host: Option<&RemoteConnectionOptions>) -> String {
     match host {
         Some(host) => remote::remote_connection_identity(host).persistence_key(),
         None => "local".to_string(),
     }
+}
+
+/// A machine's key for the collapsed set: per section, so collapsing it in one
+/// leaves it open in the others.
+fn machine_collapse_key(section: SidebarSection, host: Option<&RemoteConnectionOptions>) -> String {
+    let section = match section {
+        SidebarSection::OpenInZed => "active",
+        SidebarSection::AllThreads => "all",
+        SidebarSection::Archived => "archived",
+    };
+    format!("{section}/{}", machine_identity_key(host))
+}
+
+/// What the title bar calls a machine. A live connection's options carry its
+/// SSH nickname and a project group key's do not; with nothing open, the
+/// nickname is its `ssh_connections` entry's.
+fn machine_label(
+    host: &RemoteConnectionOptions,
+    workspaces: &[Entity<Workspace>],
+    cx: &App,
+) -> SharedString {
+    let live = workspaces.iter().find_map(|workspace| {
+        let options = workspace
+            .read(cx)
+            .project()
+            .read(cx)
+            .remote_connection_options(cx)?;
+        same_remote_connection_identity(Some(&options), Some(host)).then_some(options)
+    });
+    let saved = || {
+        cx.try_global::<SettingsStore>()?
+            .try_get::<recent_projects::RemoteSettings>(None)?
+            .ssh_connections()
+            .map(|connection| RemoteConnectionOptions::Ssh(connection.into()))
+            .find(|saved| same_remote_connection_identity(Some(saved), Some(host)))
+    };
+    live.or_else(saved)
+        .as_ref()
+        .unwrap_or(host)
+        .display_name()
+        .into()
 }
 
 fn workspaces_across_windows(cx: &App) -> Vec<Entity<Workspace>> {
