@@ -1662,6 +1662,7 @@ impl ThreadView {
 
         let mut should_auto_submit = false;
         let mut show_external_source_prompt_warning = false;
+        let mut images_refused = false;
 
         let message_editor = cx.new(|cx| {
             let mut editor = MessageEditor::new(
@@ -1688,7 +1689,14 @@ impl ThreadView {
                         blocks,
                         auto_submit,
                     } => {
-                        should_auto_submit = auto_submit;
+                        // A draft took the image on the strength of what this
+                        // agent accepted before; it no longer does.
+                        images_refused = auto_submit
+                            && !session_capabilities.read().supports_images()
+                            && blocks
+                                .iter()
+                                .any(|block| matches!(block, acp_v2::ContentBlock::Image(_)));
+                        should_auto_submit = auto_submit && !images_refused;
                         Some(blocks)
                     }
                     AgentInitialContent::FromExternalSource(prompt) => {
@@ -2036,6 +2044,20 @@ impl ThreadView {
 
         if should_auto_submit {
             this.send(window, cx);
+        }
+        if images_refused {
+            let message = format!(
+                "{} does not accept images, so this message was not sent. Remove the image and \
+                 send it again.",
+                this.agent_display_name
+            );
+            this.handle_thread_error(
+                ThreadError::Other {
+                    message: message.into(),
+                    acp_error_code: None,
+                },
+                cx,
+            );
         }
         this
     }

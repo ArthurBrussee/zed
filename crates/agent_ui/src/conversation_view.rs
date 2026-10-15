@@ -1061,6 +1061,9 @@ enum ServerState {
     /// No agent process or session until the first send.
     Unstarted {
         message_editor: Entity<MessageEditor>,
+        /// Seeded from what this agent last accepted, so an image can go in
+        /// the first message before the agent has started.
+        session_capabilities: crate::message_editor::SharedSessionCapabilities,
         _editor_subscription: Subscription,
     },
     Loading {
@@ -1274,12 +1277,19 @@ impl ConversationView {
         cx: &mut Context<Self>,
     ) -> ServerState {
         let placeholder = placeholder_text(&connection_key.label(), false);
+        let session_capabilities: crate::message_editor::SharedSessionCapabilities =
+            Arc::new(RwLock::new(SessionCapabilities::new(
+                crate::prompt_capabilities_memory::recall(&agent.agent_id(), cx)
+                    .unwrap_or_default(),
+                Vec::new(),
+                Vec::new(),
+            )));
         let message_editor = cx.new(|cx| {
             MessageEditor::new(
                 workspace,
                 project.downgrade(),
                 thread_store,
-                crate::message_editor::SharedSessionCapabilities::default(),
+                session_capabilities.clone(),
                 agent.agent_id(),
                 &placeholder,
                 editor::EditorMode::AutoHeight {
@@ -1313,6 +1323,7 @@ impl ConversationView {
         );
         ServerState::Unstarted {
             message_editor,
+            session_capabilities,
             _editor_subscription: editor_subscription,
         }
     }
@@ -1378,6 +1389,21 @@ impl ConversationView {
                     return;
                 }
                 let session_id = thread.read(cx).session_id().clone();
+                let prompt_capabilities = thread.read(cx).prompt_capabilities().clone();
+                crate::prompt_capabilities_memory::remember(
+                    &this.agent.agent_id(),
+                    &prompt_capabilities,
+                    cx,
+                );
+                if let ServerState::Unstarted {
+                    session_capabilities,
+                    ..
+                } = &this.server_state
+                {
+                    session_capabilities
+                        .write()
+                        .set_prompt_capabilities(prompt_capabilities);
+                }
                 let config_options = connection.session_config_options(&session_id, cx);
                 let offers_model = config_options
                     .as_ref()
@@ -1994,8 +2020,10 @@ impl ConversationView {
             .downcast::<agent::NativeAgentConnection>()
             .map(|native_connection| native_available_skills(&native_connection, &session_id, cx))
             .unwrap_or_default();
+        let prompt_capabilities = thread.read(cx).prompt_capabilities().clone();
+        crate::prompt_capabilities_memory::remember(&agent_id, &prompt_capabilities, cx);
         let session_capabilities = Arc::new(RwLock::new(SessionCapabilities::new(
-            thread.read(cx).prompt_capabilities().clone(),
+            prompt_capabilities,
             thread.read(cx).available_commands().to_vec(),
             available_skills,
         )));
@@ -2717,6 +2745,12 @@ impl ConversationView {
                 cx.notify();
             }
             AcpThreadEvent::PromptCapabilitiesUpdated => {
+                let prompt_capabilities = thread.read(cx).prompt_capabilities().clone();
+                crate::prompt_capabilities_memory::remember(
+                    &self.agent.agent_id(),
+                    &prompt_capabilities,
+                    cx,
+                );
                 if let Some(active) = self.thread_view(&session_id) {
                     active.update(cx, |active, _cx| {
                         active.session_capabilities.write().set_prompt_capabilities(
