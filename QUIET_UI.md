@@ -282,6 +282,13 @@ Arthur, 2026-10-15, putting his portico dev server in his *global* Zed tasks
    "Show output" goes. The task's terminal is still reachable the way any task's is. So the
    popup menu goes entirely. Not running: one click starts it, as now.
 
+4. **An image as the icon.** `icon:` takes only a Zed `IconName` today. Arthur wants Atrium's
+   own icon on the button, so `icon:` also takes a file path: absolute, `~`-relative, or with
+   `$ZED_WORKTREE_ROOT`. A `.svg` renders tinted like the other glyphs (`Icon::from_path`). A
+   `.png` renders as the image itself, at icon size, untinted. Paths read on the laptop, where
+   the UI is, even for a dev box thread. A missing or unreadable file falls back to the
+   default glyph. His task uses `icon:~/.config/zed/icons/atrium.png` (64px PNG).
+
 Test: a global `bar` task with `cwd` `$ZED_WORKTREE_ROOT/portico` shows in a worktree that has
 `portico/` and not in one that doesn't; `open:` with `{port}` resolves to the detected port.
 
