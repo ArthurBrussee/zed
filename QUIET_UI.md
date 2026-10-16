@@ -293,6 +293,19 @@ still opens a fresh server and reattaches the relay links with no click, and say
 what happens to an open terminal when its window's server idles out. A test in `remote_server`
 that a server with no connection exits after the timeout, if the existing tests can reach it.
 
+**A machine's `+` offers "mech" and "mech".**
+
+`machine_repositories` (`sidebar.rs`) lists every project group on the machine whose workspace has
+a folder, labelled by the folder's file name. On 2026-10-16 the Mac had two: `~/Code/mech` and
+`~/Code/worktrees/mech/raspy-burrow/mech`, a leftover folder of a deleted worktree (only
+`node_modules`, no `.git`) that a workspace was opened on, so it is its own group, and both are
+named `mech`. Worktrees all end in `/mech` too, so the file name is a poor label. Two changes:
+list only workspaces that have a git repository, since the `+` makes a worktree and a folder with
+no repository has nothing to branch from; and when two entries would share a label, label them
+by the shortest distinguishing path (`Code/mech`, `raspy-burrow/mech`). A test with a repository
+and a repo-less folder of the same name on one machine: the `+` is a plain button for the
+repository, with no menu.
+
 **A running dev server button looks running.**
 
 `render_dev_server_button` (`agent_ui/.../thread_view.rs` ~7443) only changes the label from Muted
