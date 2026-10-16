@@ -293,6 +293,29 @@ still opens a fresh server and reattaches the relay links with no click, and say
 what happens to an open terminal when its window's server idles out. A test in `remote_server`
 that a server with no connection exits after the timeout, if the existing tests can reach it.
 
+**Empty "New Thread" rows pile up, and land in their own `mech` group.**
+
+The sidebar on 2026-10-16 showed hetzner with two `mech` groups and a run of "New Thread / no PR"
+rows, some not under any group. From `sidebar_threads` in the dev DB: six unarchived box threads
+created that day (10:08 to 12:21 UTC) have never been interacted with, two of them in a worktree
+that already had one (`lofty-bay` at 10:08 and 10:31, `marshy-hollow` at 11:27 and 12:21). All six
+have `main_worktree_paths` set to their own worktree (`/root/worktrees/mech/<name>/mech`) instead
+of `/root/mech`, while every thread that was sent to has `/root/mech`. So two bugs:
+
+- **Threads made without being asked for.** The 12:21 one is a `session/new` at 14:21:39 local
+  with nothing in the log saying why: opening or activating a worktree's workspace, a reconnect,
+  or a failed load falling back seem to make a fresh thread, and since drafts became real threads
+  each one is a permanent row. Only the `+` (and the user's own new-thread actions) make a thread.
+  Activating a workspace shows its most recent thread; a worktree that already has an untouched
+  thread reuses it rather than making another. Find every path that calls the new-thread code
+  without the user asking, and test that opening, reconnecting and reloading a worktree with an
+  untouched thread leaves exactly one.
+- **The wrong main worktree.** A thread made before the workspace's git state is known records the
+  worktree itself as its main worktree and never corrects it, which makes it its own project group
+  (the second `mech` header, and the rows outside any group). Record it once the repository is
+  known, update rows whose recorded main worktree is a linked worktree of a known repository, and
+  fix existing rows when they load, so the six above fold back under `/root/mech`.
+
 **A machine's `+` offers "mech" and "mech".**
 
 `machine_repositories` (`sidebar.rs`) lists every project group on the machine whose workspace has
