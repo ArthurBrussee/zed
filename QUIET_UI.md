@@ -531,7 +531,8 @@ collapse and activity pill. Adjust any sidebar test that counts those buttons.
 
 **Take the stop reasons off the sidebar rows.**
 
-Arthur finds they don't match what he sees, so they go back out entirely. That is `ThreadStopReason`
+Arthur finds them flaky and redundant with the running indicators ("waiting on 1 command" says
+what the pill already says), so they go back out entirely, every kind. That is `ThreadStopReason`
 and `thread_stop_reason` (`sidebar.rs` ~8703) with the `stop_reason` fields on the row info,
 `ThreadItem::stop_reason` and its render branch in place of the timestamp (`thread_item.rs` ~1228),
 and the AIR `sessionFailure` plumbing that only exists to feed it (`AcpThread::session_failure` in
