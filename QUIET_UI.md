@@ -316,6 +316,34 @@ of `/root/mech`, while every thread that was sent to has `/root/mech`. So two bu
   known, update rows whose recorded main worktree is a linked worktree of a known repository, and
   fix existing rows when they load, so the six above fold back under `/root/mech`.
 
+**A broken submodule makes a thread impossible to archive.**
+
+Archiving the "CI woes" thread (worktree `~/Code/worktrees/mech/green-fawn/mech`) fails every time
+with `Failed to archive worktree: failed to create archive checkpoint: failed to create unstaged
+commit: … fatal: not a git repository: ios/tailnet/libtailscale/…/.git/worktrees/mech30/modules/…`,
+and nothing shows in the UI, so the click just does nothing. The submodule's git directory holds
+only a `config` (never fully initialised), so every git command that recurses into submodules fails
+in that worktree; `zinc-tundra` is the same, and it is the same cause as the diff-stats retries in
+the entry further down. The archive checkpoint (`git_store.rs` ~12852 to 12886, and the sidebar's
+archive flow) should not recurse into submodules (`--ignore-submodules`, or
+`-c submodule.recurse=false`), since the checkpoint is of the worktree's own files. If archiving
+the worktree still fails, show the error on the row and archive the thread anyway, leaving the
+worktree on disk and saying so. A test with a worktree whose submodule git dir is missing:
+archiving succeeds.
+
+**No "Active" header.**
+
+The top of the sidebar is an "Active" section header with a collapse toggle
+(`render_section_header` for `SidebarSection::OpenInZed`, `sidebar.rs` ~3550). Machines collapse on
+their own now, and everything there is active by definition, so the header goes: the open threads
+start straight under their machine headers, and the section can no longer be collapsed (drop
+`OpenInZed` from `collapsed_sections`, ignoring a saved collapsed state). The header also carries
+the "Add Machine…" button and, with one machine, the new-thread `+`. Show the machine header in
+Active even when there is only one machine, so its `+` is always where a thread is made, and move
+"Add Machine…" to the bottom of the Active machines (a quiet row under the last machine) or the
+sidebar's footer, whichever reads better. All Threads and Archived keep their headers. Adjust the
+sidebar tests that expect the Active header.
+
 **A machine's `+` offers "mech" and "mech".**
 
 `machine_repositories` (`sidebar.rs`) lists every project group on the machine whose workspace has
