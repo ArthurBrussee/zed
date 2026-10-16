@@ -293,6 +293,17 @@ still opens a fresh server and reattaches the relay links with no click, and say
 what happens to an open terminal when its window's server idles out. A test in `remote_server`
 that a server with no connection exits after the timeout, if the existing tests can reach it.
 
+**A running dev server button looks running.**
+
+`render_dev_server_button` (`agent_ui/.../thread_view.rs` ~7443) only changes the label from Muted
+to Default and adds the stop button when the server runs; the glyph tint is the other cue, and a
+raster icon (Arthur's `atrium.png`) is never tinted, so a running atrium and a stopped one look
+almost the same. Running gets a state that reads at a glance: a tinted background and border (the
+theme's success or accent colours, the way the PR chips mark a state), a small status dot before
+the label, and the port in the accent colour. Starting is visibly different from running (the dot
+pulsing, or `ui`'s small spinner), and a failed exit keeps the error border. Use the same states on
+the sidebar row's dev server pill (`ThreadItem::dev_servers`) so the two agree.
+
 **Relay replay: prompts go missing, a second load steals the stream, and gaps stall a link.**
 Found in the 2026-10-15 logs on the box (`~/.local/share/zed/acp-relay/sessions/`) and the laptop.
 All in `crates/acp_relay` and its client.
