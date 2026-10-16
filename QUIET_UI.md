@@ -563,6 +563,14 @@ thread, and the click opens a fresh, non-`--reconnect` proxy, which kills that w
   connection, did. Its server was likely stalled: the box was out of memory at the time (16:34:35
   UTC, rust-analyzer OOM-killed). If a server is alive but not answering, the reconnect should
   say so rather than time out three times.
+- Attempts have no delay between them. On 2026-10-16 at 18:36:37 local the laptop briefly had no
+  network ("ssh: connect to host … port 22: Network is unreachable"), and four windows each burned
+  all three attempts within the same second and went to `reconnect exhausted`, needing a click each.
+  `reconnect()` re-calls itself straight from `ReconnectFailed`. Back off between attempts (about
+  1s, 2s, 5s), and do not give up on a network-level failure: an exhausted client keeps retrying
+  quietly every 15 to 30s, and immediately when the machine wakes or the network changes, until
+  it reconnects or its window is closed. "Reconnect exhausted" is only for failures that retrying
+  cannot fix (authentication, a refused host key).
 - A test in `remote_server` or `remote` with the mock connection: two clients on one pool, one
   whose handshake hangs, and the other must stay connected through its attempts.
 
