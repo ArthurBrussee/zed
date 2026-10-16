@@ -359,6 +359,16 @@ section, so the `+` shows on machine headers in All Threads and Archived too. On
 `SidebarSection::OpenInZed` (Active) gets it; the other sections' headers keep the name, glyph,
 collapse and activity pill. Adjust any sidebar test that counts those buttons.
 
+**Take the stop reasons off the sidebar rows.**
+
+Arthur finds they don't match what he sees, so they go back out entirely. That is `ThreadStopReason`
+and `thread_stop_reason` (`sidebar.rs` ~8703) with the `stop_reason` fields on the row info,
+`ThreadItem::stop_reason` and its render branch in place of the timestamp (`thread_item.rs` ~1228),
+and the AIR `sessionFailure` plumbing that only exists to feed it (`AcpThread::session_failure` in
+`acp_thread.rs`, its parsing in `agent_servers/src/acp/v1.rs`, and the capability advertised for it),
+if nothing else reads them. Rows show the timestamp again. The running-work activity pill stays.
+Remove the fork tests that cover them.
+
 **Reconnecting to the box: one stuck window takes the others down, and each needs its own click.**
 Seen 2026-10-15 18:35 local, after the laptop changed networks with four windows on the box
 (`Zed.log`, and `server-dev-workspace-*.log` on the box). Every remote window is its own
