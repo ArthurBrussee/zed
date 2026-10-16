@@ -329,6 +329,31 @@ by the shortest distinguishing path (`Code/mech`, `raspy-burrow/mech`). A test w
 and a repo-less folder of the same name on one machine: the `+` is a plain button for the
 repository, with no menu.
 
+**Atrium from the dev box: one click, working.**
+
+The dev server button on a box project forwards the detected port (`spawn_port_forward` in
+`agent_ui/src/dev_servers.rs` ~565), but two things in it stop `atrium://…?_port={port}` from ever
+reaching the box's portico:
+
+- **The local port is random.** It binds `127.0.0.1:0`, so the OS hands back an ephemeral port
+  (49152 and up). Atrium derives its own service ports from `_port` (`port * 10` to `port * 10 + 4`,
+  `mech/atrium/src/devPort.ts`), and portico keeps its dev port at or below 6553 for exactly that
+  reason (`portico/vite.config.ts`), so an ephemeral port gives Atrium ports past 65535. Forward to
+  the **same** port number locally when it is free, else scan upward from it for the first free
+  one (the way portico picks its own), and substitute that for `{port}`.
+- **The tunnel targets the wrong address.** It forwards to `127.0.0.1` on the box, but vite's
+  default host `localhost` binds `[::1]` on Linux (on 2026-10-16 the box had portico on
+  `[::1]:3000`), so the tunnel connects to nothing. Forward to the address the server printed
+  (`localhost`, `127.0.0.1`, `[::1]`, `0.0.0.0`; `detect_port` should return the host with the port
+  and know `[::1]:`), with `localhost` resolved on the box rather than here.
+
+Separate ports per worktree on the box need no config: portico already scans upward from 3000 for
+a free one and writes `.context/dev-port`. Log each step on the box path (`quiet-ui dev server:`
+detected host and port, local port chosen, forward started, forward exited and why) and show a
+forward that dies within its settle time as an error on the button. Tests: the local port for a
+remote 3001 is 3001 when free and the next free one when not, never an ephemeral one; and
+`detect_port` on vite's `[::1]` and `localhost` lines.
+
 **A running dev server button looks running.**
 
 `render_dev_server_button` (`agent_ui/.../thread_view.rs` ~7443) only changes the label from Muted
