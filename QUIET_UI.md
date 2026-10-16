@@ -316,6 +316,54 @@ of `/root/mech`, while every thread that was sent to has `/root/mech`. So two bu
   known, update rows whose recorded main worktree is a linked worktree of a known repository, and
   fix existing rows when they load, so the six above fold back under `/root/mech`.
 
+**Running state: only the agent's own turn looks busy.**
+
+Arthur cannot tell whether an agent is thinking or asleep, because any background work makes a row
+look exactly like a live turn: `thread_item.rs` ~851 sets `running = status == Running ||
+!running_work.is_empty()`, and that one flag drives the row tint and the pill's rotating
+indicator, so a backgrounded `pnpm dev` keeps the thread "working" until it dies. ACP and
+claude-agent-acp cannot say a task never ends (every Claude background task wakes the model when it
+finishes), so the split has to be inferred: work expected to finish versus long-lived services.
+
+States, highest priority first, each with one look:
+
+- **Needs input** (`RequiresAction`, a pending permission or question): the warning dot. It always
+  shows, whatever else is running; today background work hides it (`thread_item.rs` ~909 to 935).
+- **Working**: the foreground turn is running, including the adapter's autonomous wake-ups
+  (`startAutonomousCycle` reports as running). The only state that animates or tints the row.
+- **Failed**: an error or session failure: the error dot, no text (the stop reasons are gone, see
+  the entry below).
+- **Waiting**: the turn ended and finite agent work is alive (subagents, background commands that
+  are not services): a static muted icon and count, tooltip "continues when … finishes". No
+  spinner, no tint.
+- **Serving**: the only live tasks are services: a server pill with the port, styled like the dev
+  server buttons and clicking through to it. Not counted as work anywhere.
+- **Idle.**
+
+Detection: give `AsyncTask` its `taskType` (today `apply_async_task_update`, `v1.rs` ~9554, drops it)
+and a start time, and classify a task as a service when the tail of its output (the task's output
+file, read through the project's fs so it works on a box) matches `dev_servers::detect_port`, keeping
+the port. Call tasks by their kind ("command", "workflow", "task") instead of "command" for all.
+`RunningWork` becomes waiting subagents, waiting commands and services; the thread view's popover,
+the counts, the collapsed machine header (which today ignores a generating thread with no
+background work, `sidebar.rs` ~3435) and the footer totals all read the same lists, and the
+machine header and totals count Working agents separately from Waiting ones.
+
+Bugs to fix on the way:
+
+- A fast backgrounded command spins forever: the adapter publishes the task's spawn and terminal
+  state before the tool-call update carrying `backgrounded: true`, and `mark_tool_call_backgrounded`
+  (`acp_thread.rs` ~4462) inserts the marker unconditionally, with nothing releasing it. That is the
+  "row idle but 1 chips running" log line (14 of them on 10-15). Skip the marker when the call's task
+  is already terminal, and release markers with no live task when the turn goes idle.
+- When the Claude CLI dies the adapter clears its tasks without publishing terminal states, so
+  they likely stay running here: mark the session's tasks and subagents stopped on that error.
+
+Tests: a backgrounded fast command leaves the row idle; a task that printed a localhost URL shows as
+a server and not as work; a needs-input thread with background work shows the warning dot; the
+popover and the count agree. Keep the "row idle but N chips running" log until the first bug is
+seen fixed.
+
 **A broken submodule makes a thread impossible to archive.**
 
 Archiving the "CI woes" thread (worktree `~/Code/worktrees/mech/green-fawn/mech`) fails every time
