@@ -335,24 +335,30 @@ The dev server button on a box project forwards the detected port (`spawn_port_f
 `agent_ui/src/dev_servers.rs` ~565), but two things in it stop `atrium://…?_port={port}` from ever
 reaching the box's portico:
 
-- **The local port is random.** It binds `127.0.0.1:0`, so the OS hands back an ephemeral port
-  (49152 and up). Atrium derives its own service ports from `_port` (`port * 10` to `port * 10 + 4`,
-  `mech/atrium/src/devPort.ts`), and portico keeps its dev port at or below 6553 for exactly that
-  reason (`portico/vite.config.ts`), so an ephemeral port gives Atrium ports past 65535. Forward to
-  the **same** port number locally when it is free, else scan upward from it for the first free
-  one (the way portico picks its own), and substitute that for `{port}`.
+- **The local port is random, and the two ends pick ports separately.** It binds `127.0.0.1:0`, so
+  the OS hands back an ephemeral port (49152 and up). Atrium derives its own service ports from
+  `_port` (`port * 10` to `port * 10 + 4`, `mech/atrium/src/devPort.ts`), and portico keeps its dev
+  port at or below 6553 for exactly that reason, so an ephemeral port gives Atrium ports past
+  65535. And the box's portico scans for a free port on the box only, so it happily takes 3000
+  while the laptop's own portico holds 3000 here; portico's page also uses its own port number
+  (`DEV_PORT`, the direct HMR socket), so a box server on 3000 reached through local 3001 points
+  back at the laptop's 3000. The port has to be the same number on both ends, so Zed picks it: a
+  new tag `port-env:VAR` (Arthur's task: `port-env:VITE_PORT`, which portico honours with
+  `strictPort`) makes Zed choose the first port from 3000 up that is free here and not held by
+  another dev server it runs, start the task with `VAR=<port>` in its env, forward the same number,
+  and, if the server exits on a taken port on the box, try the next. Without the tag, keep the
+  detected port, forward to the same number locally when free, and never to an ephemeral one.
 - **The tunnel targets the wrong address.** It forwards to `127.0.0.1` on the box, but vite's
   default host `localhost` binds `[::1]` on Linux (on 2026-10-16 the box had portico on
   `[::1]:3000`), so the tunnel connects to nothing. Forward to the address the server printed
   (`localhost`, `127.0.0.1`, `[::1]`, `0.0.0.0`; `detect_port` should return the host with the port
   and know `[::1]:`), with `localhost` resolved on the box rather than here.
 
-Separate ports per worktree on the box need no config: portico already scans upward from 3000 for
-a free one and writes `.context/dev-port`. Log each step on the box path (`quiet-ui dev server:`
+Log each step on the box path (`quiet-ui dev server:`
 detected host and port, local port chosen, forward started, forward exited and why) and show a
-forward that dies within its settle time as an error on the button. Tests: the local port for a
-remote 3001 is 3001 when free and the next free one when not, never an ephemeral one; and
-`detect_port` on vite's `[::1]` and `localhost` lines.
+forward that dies within its settle time as an error on the button. Tests: with `port-env`, a task
+started while 3000 is held here gets 3001 in its env and is forwarded on 3001; without it, the
+local port is never an ephemeral one; and `detect_port` on vite's `[::1]` and `localhost` lines.
 
 **A running dev server button looks running.**
 
