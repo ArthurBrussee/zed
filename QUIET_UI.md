@@ -277,6 +277,22 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**`remote_server` processes leak on the box: put upstream's idle exit back.**
+
+`start_server` in `remote_server/src/server.rs` (~548) carries a fork change, "quiet-ui: no idle
+exit", so a server whose window closed, crashed or was replaced by an update waits for a client
+forever, and keeps its language servers. On 2026-10-16 the box had 14 `run` processes; nine had no
+proxy attached, four of them from the previous day's build (`6d6097e`), which no client can reach
+any more. Each holds its own rust-analyzer (up to 8 GB) or tsc (up to 16 GB), which is a large
+part of why the box keeps running out of memory.
+
+The reason for the change has gone: agents live in the relay daemon, not the server, and since
+10-14 a window whose server has exited gets a fresh one without a click. So restore upstream's
+`IDLE_TIMEOUT` loop as it is, and delete the comment. Check that reconnecting after a long sleep
+still opens a fresh server and reattaches the relay links with no click, and say in the report
+what happens to an open terminal when its window's server idles out. A test in `remote_server`
+that a server with no connection exits after the timeout, if the existing tests can reach it.
+
 **Relay replay: prompts go missing, a second load steals the stream, and gaps stall a link.**
 Found in the 2026-10-15 logs on the box (`~/.local/share/zed/acp-relay/sessions/`) and the laptop.
 All in `crates/acp_relay` and its client.
