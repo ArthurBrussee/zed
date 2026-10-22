@@ -332,6 +332,12 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub prevent_idle_sleep: Option<bool>,
+    /// quiet-ui: whether a remote project's agents run under the relay on the
+    /// box, which keeps them going while Zed is away. Off starts them over
+    /// SSH from here, as before.
+    ///
+    /// Default: true
+    pub remote_relay: Option<bool>,
     /// Whether to display agent edits in single-file editors in addition to the review multibuffer pane.
     ///
     /// Default: false

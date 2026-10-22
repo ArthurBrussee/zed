@@ -65,6 +65,10 @@ pub struct EntryViewState {
     user_toggled_thinking_blocks: HashSet<(usize, usize)>,
     expanded_compactions: HashSet<usize>,
     expanded_tool_calls: HashSet<acp_v2::ToolCallId>,
+    user_collapsed_tool_calls: HashSet<acp_v2::ToolCallId>,
+    /// False while an off-screen thread has dropped its views. Everything else
+    /// here is keyed by index or id, so it survives the drop.
+    views_built: bool,
 }
 
 impl EntryViewState {
@@ -87,7 +91,23 @@ impl EntryViewState {
             user_toggled_thinking_blocks: HashSet::default(),
             expanded_compactions: HashSet::default(),
             expanded_tool_calls: HashSet::default(),
+            user_collapsed_tool_calls: HashSet::default(),
+            views_built: true,
         }
+    }
+
+    pub fn views_are_built(&self) -> bool {
+        self.views_built
+    }
+
+    /// The caller is responsible for the list state holding their focus handles.
+    pub fn drop_views(&mut self) {
+        self.entries.clear();
+        self.views_built = false;
+    }
+
+    pub fn mark_views_built(&mut self) {
+        self.views_built = true;
     }
 
     pub(crate) fn is_tool_call_expanded(&self, tool_call_id: &acp_v2::ToolCallId) -> bool {
@@ -112,6 +132,26 @@ impl EntryViewState {
         }
     }
 
+    /// Whether the user explicitly collapsed this tool call, overriding any
+    /// auto-expansion (e.g. a failed terminal command opening its output).
+    pub(crate) fn is_tool_call_user_collapsed(&self, tool_call_id: &acp_v2::ToolCallId) -> bool {
+        self.user_collapsed_tool_calls.contains(tool_call_id)
+    }
+
+    pub(crate) fn set_tool_call_expanded(
+        &mut self,
+        tool_call_id: &acp_v2::ToolCallId,
+        expanded: bool,
+    ) {
+        if expanded {
+            self.expanded_tool_calls.insert(tool_call_id.clone());
+            self.user_collapsed_tool_calls.remove(tool_call_id);
+        } else {
+            self.expanded_tool_calls.remove(tool_call_id);
+            self.user_collapsed_tool_calls.insert(tool_call_id.clone());
+        }
+    }
+
     pub(crate) fn is_compaction_expanded(&self, entry_ix: usize) -> bool {
         self.expanded_compactions.contains(&entry_ix)
     }
@@ -128,10 +168,6 @@ impl EntryViewState {
 
     pub(crate) fn clear_auto_expand_tracking(&mut self) {
         self.auto_expanded_thinking_block = None;
-    }
-
-    pub(crate) fn is_auto_expanded_thinking_block(&self, key: (usize, usize)) -> bool {
-        self.auto_expanded_thinking_block == Some(key)
     }
 
     pub(crate) fn auto_expand_streaming_thought(&mut self, thread: &AcpThread, cx: &App) -> bool {
@@ -175,6 +211,8 @@ impl EntryViewState {
         false
     }
 
+    // Thoughts no longer expand in the transcript; only tests toggle them.
+    #[cfg(test)]
     pub(crate) fn toggle_thinking_block_expansion(&mut self, key: (usize, usize), cx: &App) {
         match AgentSettings::get_global(cx).thinking_display {
             ThinkingBlockDisplay::Auto => {
@@ -293,6 +331,10 @@ impl EntryViewState {
         );
         let run_terminal_lifecycle =
             matches!(tool_call_sync, ToolCallSync::Live | ToolCallSync::Restore);
+        // The rebuild syncs every entry anyway.
+        if !self.views_built {
+            return;
+        }
         let Some(thread_entry) = thread.read(cx).entries().get(index) else {
             return;
         };
@@ -347,6 +389,8 @@ impl EntryViewState {
                         if !is_editable {
                             editor.set_read_only(true, cx);
                         }
+                        // Its own background would paint over the bubble's tint.
+                        editor.set_transparent_background(true, cx);
                         editor.set_source_message(source_blocks, window, cx);
                         editor
                     });
@@ -368,8 +412,8 @@ impl EntryViewState {
             }
             AgentThreadEntry::ToolCall(tool_call) => {
                 let id = tool_call.id.clone();
-                let materialize_content =
-                    materialize_tool_calls || self.is_tool_call_content_visible(tool_call);
+                let content_visible = self.is_tool_call_content_visible(tool_call);
+                let materialize_content = materialize_tool_calls || content_visible;
                 let terminals = tool_call.terminals().cloned().collect::<Vec<_>>();
                 let diffs = tool_call.diffs().cloned().collect::<Vec<_>>();
                 let patch_hunk_buffers = tool_call
@@ -422,6 +466,14 @@ impl EntryViewState {
                         let terminal_id = terminal.entity_id();
                         match views.entry(terminal_id) {
                             collections::hash_map::Entry::Vacant(entry) => {
+                                // A command already exited when first synced is history
+                                // being replayed: no view until its call is opened.
+                                if !content_visible
+                                    && is_tool_call_completed
+                                    && terminal.read(cx).output().is_some()
+                                {
+                                    continue;
+                                }
                                 let element = create_terminal(
                                     self.workspace.clone(),
                                     self.project.clone(),
@@ -587,7 +639,10 @@ impl EntryViewState {
     }
 
     pub fn remove(&mut self, range: Range<usize>) {
-        self.entries.drain(range.clone());
+        // The reindexing below still applies with the views dropped.
+        if self.views_built {
+            self.entries.drain(range.clone());
+        }
 
         self.expanded_compactions = self
             .expanded_compactions
@@ -879,7 +934,7 @@ fn create_multibuffer_diff_editor(
     })
 }
 
-fn diff_editor_text_style_refinement(cx: &mut App) -> TextStyleRefinement {
+pub(crate) fn diff_editor_text_style_refinement(cx: &mut App) -> TextStyleRefinement {
     TextStyleRefinement {
         font_size: Some(
             TextSize::Small
@@ -1146,6 +1201,213 @@ mod tests {
                 view_state.entry(1),
                 Some(Entry::AssistantMessage(_))
             ));
+        });
+    }
+
+    async fn setup_view_state(
+        cx: &mut TestAppContext,
+    ) -> (
+        Rc<StubAgentConnection>,
+        gpui::Entity<acp_thread::AcpThread>,
+        gpui::Entity<EntryViewState>,
+        &mut gpui::VisualTestContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({})).await;
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        let connection = Rc::new(StubAgentConnection::new());
+        let thread = cx
+            .update(|_, cx| {
+                connection.clone().new_session(
+                    project.clone(),
+                    PathList::new(&[Path::new(path!("/project"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        let view_state = cx.new(|_cx| {
+            EntryViewState::new(
+                workspace.downgrade(),
+                project.downgrade(),
+                None,
+                Arc::new(RwLock::new(SessionCapabilities::default())),
+                "Test Agent".into(),
+            )
+        });
+        (connection, thread, view_state, cx)
+    }
+
+    #[gpui::test]
+    async fn test_dropped_views_are_rebuilt_with_the_entries_that_arrived_meanwhile(
+        cx: &mut TestAppContext,
+    ) {
+        let (connection, thread, view_state, cx) = setup_view_state(cx).await;
+        let session_id = thread.update(cx, |thread, _| thread.session_id().clone());
+
+        cx.update(|_, cx| {
+            connection.send_update(
+                session_id.clone(),
+                acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                    acp_v1::ContentBlock::Text(acp_v1::TextContent::new("first")),
+                )),
+                cx,
+            );
+        });
+        view_state.update_in(cx, |view_state, window, cx| {
+            view_state.sync_entry(0, &thread, window, cx);
+        });
+        view_state.read_with(cx, |view_state, _cx| {
+            assert!(view_state.views_are_built());
+            assert!(matches!(
+                view_state.entry(0),
+                Some(Entry::AssistantMessage(_))
+            ));
+        });
+
+        view_state.update(cx, |view_state, _cx| view_state.drop_views());
+        view_state.read_with(cx, |view_state, _cx| {
+            assert!(!view_state.views_are_built());
+            assert!(view_state.entry(0).is_none());
+        });
+
+        // Syncing while dropped must be a no-op rather than index past the end.
+        cx.update(|_, cx| {
+            connection.send_update(
+                session_id.clone(),
+                acp_v1::SessionUpdate::ToolCall(
+                    acp_v1::ToolCall::new("tool", "Tool call")
+                        .status(acp_v1::ToolCallStatus::InProgress),
+                ),
+                cx,
+            );
+        });
+        view_state.update_in(cx, |view_state, window, cx| {
+            view_state.sync_entry(1, &thread, window, cx);
+        });
+        view_state.read_with(cx, |view_state, _cx| {
+            assert!(!view_state.views_are_built());
+            assert!(view_state.entry(0).is_none());
+            assert!(view_state.entry(1).is_none());
+        });
+
+        let count = thread.read_with(cx, |thread, _cx| thread.entries().len());
+        assert_eq!(count, 2);
+        view_state.update_in(cx, |view_state, window, cx| {
+            view_state.mark_views_built();
+            for ix in 0..count {
+                view_state.sync_entry(ix, &thread, window, cx);
+            }
+        });
+        view_state.read_with(cx, |view_state, _cx| {
+            assert!(view_state.views_are_built());
+            assert!(matches!(
+                view_state.entry(0),
+                Some(Entry::AssistantMessage(_))
+            ));
+            assert!(matches!(view_state.entry(1), Some(Entry::ToolCall(_))));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_truncation_while_dropped_still_reindexes_expansions(cx: &mut TestAppContext) {
+        let (_connection, _thread, view_state, cx) = setup_view_state(cx).await;
+
+        view_state.update(cx, |view_state, _cx| {
+            view_state.toggle_compaction_expansion(3);
+            assert!(view_state.is_compaction_expanded(3));
+            view_state.drop_views();
+            view_state.remove(0..2);
+            assert!(!view_state.is_compaction_expanded(3));
+            assert!(view_state.is_compaction_expanded(1));
+        });
+    }
+
+    /// A command already finished when first synced (history being restored)
+    /// gets no terminal view until the call is opened.
+    #[gpui::test]
+    async fn test_a_finished_commands_output_has_no_view_until_the_call_is_opened(
+        cx: &mut TestAppContext,
+    ) {
+        use agent_client_protocol::schema::{MaybeUndefined, v2 as acp_v2};
+
+        let (_connection, thread, view_state, cx) = setup_view_state(cx).await;
+
+        // A finished command, exit status and all, before anything draws it.
+        thread.update(cx, |thread, cx| {
+            thread
+                .upsert_wire_tool_call(
+                    acp_v2::ToolCallUpdate::new("tool")
+                        .title("Run command")
+                        .kind(acp_v2::ToolKind::Execute)
+                        .status(acp_v2::ToolCallStatus::Completed)
+                        .content(vec![acp_v2::ToolCallContent::Terminal(
+                            acp_v2::Terminal::new("display"),
+                        )]),
+                    cx,
+                )
+                .expect("a tool call carrying a terminal");
+            thread
+                .upsert_display_terminal(
+                    "display".into(),
+                    acp_thread::DisplayTerminalPatch {
+                        command: MaybeUndefined::Value("cargo test".into()),
+                        output: MaybeUndefined::Value(acp_thread::DisplayTerminalOutput {
+                            data: b"ok".to_vec(),
+                            meta: None,
+                        }),
+                        exit_status: MaybeUndefined::Value(
+                            acp_v2::TerminalExitStatus::new().exit_code(0),
+                        ),
+                        ..Default::default()
+                    },
+                    cx,
+                )
+                .expect("the command's captured output");
+        });
+        cx.run_until_parked();
+
+        let terminal = thread.read_with(cx, |thread, _| {
+            thread
+                .terminal(acp_v2::TerminalId::new("display"))
+                .expect("the terminal the tool call named")
+        });
+
+        view_state.update_in(cx, |view_state, window, cx| {
+            view_state.sync_entry(0, &thread, window, cx);
+        });
+        view_state.read_with(cx, |view_state, _cx| {
+            assert!(
+                view_state
+                    .entry(0)
+                    .expect("the tool call entry")
+                    .terminal(&terminal)
+                    .is_none(),
+                "a command nobody has opened should not hold a terminal view"
+            );
+        });
+
+        view_state.update_in(cx, |view_state, window, cx| {
+            view_state.expand_tool_call(acp_v2::ToolCallId::new("tool"));
+            view_state.sync_entry(0, &thread, window, cx);
+        });
+        view_state.read_with(cx, |view_state, _cx| {
+            assert!(
+                view_state
+                    .entry(0)
+                    .expect("the tool call entry")
+                    .terminal(&terminal)
+                    .is_some(),
+                "opening the call should build the view its output is drawn with"
+            );
         });
     }
 

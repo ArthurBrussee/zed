@@ -73,6 +73,7 @@ struct StateInner {
     measuring_behavior: ListMeasuringBehavior,
     item_measurement_ready: Option<Box<dyn Fn(usize, &App) -> bool>>,
     follow_state: FollowState,
+    report_stale_measurements: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -325,9 +326,16 @@ impl ListState {
             measuring_behavior: ListMeasuringBehavior::default(),
             item_measurement_ready: None,
             follow_state: FollowState::default(),
+            report_stale_measurements: false,
         })));
         state.splice(0..0, item_count);
         state
+    }
+
+    /// Log any item that lays out taller than its remembered height, which is what makes a grown
+    /// item paint over its neighbours.
+    pub fn report_stale_measurements(&self) {
+        self.0.borrow_mut().report_stale_measurements = true;
     }
 
     /// Set the list to measure all items in the list in the first layout phase.
@@ -1033,6 +1041,29 @@ impl StateInner {
             ListMeasuringBehavior::Measure(self.items.summary().unrendered_count == 0);
     }
 
+    fn report_stale_measurement(
+        &self,
+        item_index: usize,
+        remembered_height: Option<Pixels>,
+        painted_height: Pixels,
+    ) {
+        if !self.report_stale_measurements {
+            return;
+        }
+        let Some(remembered) = remembered_height else {
+            return;
+        };
+        // A fraction of a pixel is rounding, not a stale measurement.
+        if painted_height <= remembered + px(0.5) {
+            return;
+        }
+        log::info!(
+            "quiet-ui layout: list item {item_index} painted {:.0}px, measured {:.0}px",
+            painted_height.0,
+            remembered.0,
+        );
+    }
+
     fn layout_items(
         &mut self,
         available_width: Option<Pixels>,
@@ -1084,6 +1115,7 @@ impl StateInner {
             }
 
             let item_index = scroll_top.item_ix + ix;
+            let remembered_height = item.size().map(|size| size.height);
             let (size, ready) = if visible_height >= available_height
                 && let Some(size) = item.size()
             {
@@ -1091,6 +1123,7 @@ impl StateInner {
             } else {
                 let mut element = render_item(item_index, window, cx);
                 let element_size = element.layout_as_root(available_item_space, window, cx);
+                self.report_stale_measurement(item_index, remembered_height, element_size.height);
                 let ready = self.is_item_ready(item_index, cx);
                 if ix == 0
                     && ready

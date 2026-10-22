@@ -83,6 +83,8 @@ pub struct FakeGitRepositoryState {
     pub stash_entries: GitStash,
     pub commit_template: Option<GitCommitTemplate>,
     pub blob_read_gate: Option<FakeBlobReadGate>,
+    pub fetched_remotes: Vec<String>,
+    pub simulated_fetch_error: Option<String>,
 }
 
 impl FakeGitRepositoryState {
@@ -111,6 +113,8 @@ impl FakeGitRepositoryState {
             commit_history: Vec::new(),
             stash_entries: Default::default(),
             commit_template: None,
+            fetched_remotes: Vec::new(),
+            simulated_fetch_error: None,
         }
     }
 }
@@ -405,8 +409,19 @@ impl GitRepository for FakeGitRepository {
 
     fn show(&self, commit: String) -> BoxFuture<'_, Result<CommitDetails>> {
         self.with_state_async(false, move |state| {
-            let sha = match state.refs.get(&commit) {
-                Some(sha) => sha.clone(),
+            // A branch the test inserted by name resolves under its full ref
+            // name, as `branches()` reports it.
+            let branch_sha = state
+                .branches
+                .iter()
+                .any(|branch| {
+                    branch == &commit
+                        || format!("refs/remotes/{branch}") == commit
+                        || format!("refs/heads/{branch}") == commit
+                })
+                .then(|| format!("{:040x}", commit.len()));
+            let sha = match state.refs.get(&commit).cloned().or(branch_sha) {
+                Some(sha) => sha,
                 // Real git fails to show an unresolvable revision (e.g. HEAD on an
                 // unborn branch), so only fall back to treating the input as a sha.
                 None => {
@@ -1321,12 +1336,24 @@ impl GitRepository for FakeGitRepository {
 
     fn fetch(
         &self,
-        _fetch_options: FetchOptions,
+        fetch_options: FetchOptions,
         _askpass: AskPassDelegate,
         _env: Arc<HashMap<String, String>>,
         _cx: AsyncApp,
     ) -> BoxFuture<'_, Result<git::repository::RemoteCommandOutput>> {
-        unimplemented!()
+        let remote = fetch_options
+            .to_proto()
+            .unwrap_or_else(|| "<all>".to_string());
+        self.with_state_async(true, move |state| {
+            state.fetched_remotes.push(remote);
+            if let Some(message) = state.simulated_fetch_error.clone() {
+                bail!("{message}");
+            }
+            Ok(git::repository::RemoteCommandOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        })
     }
 
     fn get_all_remotes(&self) -> BoxFuture<'_, Result<Vec<Remote>>> {

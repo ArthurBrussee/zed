@@ -278,6 +278,11 @@ pub struct CustomBlock {
     priority: usize,
 }
 
+/// A custom block with this priority, placed above the first row of a buffer's
+/// excerpt, is drawn above that buffer's header, and stays when the buffer is
+/// folded: a heading for a run of files rather than a line inside one.
+pub const ABOVE_BUFFER_HEADER_PRIORITY: usize = usize::MAX;
+
 #[derive(Clone)]
 pub struct BlockProperties<P> {
     pub placement: BlockPlacement<P>,
@@ -934,6 +939,29 @@ impl BlockMap {
             let mut old_start = edit.old.start;
             let mut new_start = edit.new.start;
 
+            // A replacement block that contains the start of the edit, or ends at it, is
+            // rebuilt from the start of the rows it replaces, and so is one ending there in
+            // turn. Move the edit's start back before keeping what precedes it, or a block
+            // placed above those rows is kept and rebuilt. The main cursor has
+            // already moved past rows an earlier edit rebuilt, so stop there.
+            let mut probe = transforms.cursor::<WrapRow>(());
+            loop {
+                probe.seek(&old_start, Bias::Left);
+                let Some(transform) = probe.item() else {
+                    break;
+                };
+                if !transform.block.as_ref().is_some_and(|b| b.is_replacement())
+                    || *probe.start() >= old_start
+                    || *probe.start() < *cursor.start()
+                {
+                    break;
+                }
+                let rows_into_block = old_start - *probe.start();
+                old_start -= rows_into_block;
+                new_start -= rows_into_block;
+            }
+            drop(probe);
+
             // Only preserve transforms that:
             // * Strictly precedes this edit
             // * Isomorphic transforms that end *at* the start of the edit
@@ -1569,10 +1597,20 @@ impl BlockMap {
 
     #[ztracing::instrument(skip_all)]
     fn sort_blocks(blocks: &mut Vec<(BlockPlacement<WrapRow>, Block)>) {
+        let above_headers = |placement: &BlockPlacement<WrapRow>, block: &Block| {
+            matches!(
+                (placement, block),
+                (BlockPlacement::Above(_), Block::Custom(custom))
+                    if custom.priority == ABOVE_BUFFER_HEADER_PRIORITY
+            )
+        };
         blocks.sort_unstable_by(|(placement_a, block_a), (placement_b, block_b)| {
             placement_a
                 .start()
                 .cmp(placement_b.start())
+                .then_with(|| {
+                    above_headers(placement_b, block_b).cmp(&above_headers(placement_a, block_a))
+                })
                 .then_with(|| placement_b.end().cmp(placement_a.end()))
                 .then_with(|| placement_a.tie_break().cmp(&placement_b.tie_break()))
                 .then_with(|| {
@@ -4050,6 +4088,168 @@ mod tests {
             vec![None, None],
             "When fully folded, should be no buffer rows"
         );
+    }
+
+    /// A block above a folded buffer sits at the start of the rows that buffer replaces. An
+    /// edit that starts where that buffer ends, or inside the folded buffer after it, is rebuilt
+    /// from those rows, and the block must come out of it once.
+    #[gpui::test]
+    fn test_block_above_a_folded_buffer_survives_edits_after_it_once(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(init_test);
+
+        let buffer = cx.update(|cx| {
+            MultiBuffer::build_multi(
+                [
+                    ("a1\na2", vec![Point::new(0, 0)..Point::new(1, 2)]),
+                    ("b1\nb2", vec![Point::new(0, 0)..Point::new(1, 2)]),
+                    ("c1\nc2", vec![Point::new(0, 0)..Point::new(1, 2)]),
+                ],
+                cx,
+            )
+        });
+        let buffer_snapshot = cx.update(|cx| buffer.read(cx).snapshot(cx));
+        let buffer_ids = buffer_snapshot
+            .excerpts()
+            .map(|excerpt| excerpt.context.start.buffer_id)
+            .dedup()
+            .collect::<Vec<_>>();
+
+        let (_, inlay_snapshot) = InlayMap::new(buffer_snapshot.clone());
+        let (_, fold_snapshot) = FoldMap::new(inlay_snapshot);
+        let (_, tab_snapshot) = TabMap::new(fold_snapshot, 4.try_into().unwrap());
+        let (_, wrap_snapshot) =
+            cx.update(|cx| WrapMap::new(tab_snapshot, font("Helvetica"), px(14.0), None, cx));
+        let mut block_map = BlockMap::new(wrap_snapshot.clone(), 2, 1);
+
+        let mut writer = block_map.write(wrap_snapshot.clone(), Patch::default(), None);
+        buffer.read_with(cx, |buffer, cx| {
+            writer.fold_buffers([buffer_ids[0], buffer_ids[1]], buffer, cx);
+        });
+        let heading = writer.insert([BlockProperties {
+            style: BlockStyle::Fixed,
+            placement: BlockPlacement::Above(buffer_snapshot.anchor_after(Point::new(0, 0))),
+            height: Some(2),
+            render: Arc::new(|_| div().into_any()),
+            priority: ABOVE_BUFFER_HEADER_PRIORITY,
+        }])[0];
+
+        let headings = |edit: Option<Range<u32>>| {
+            let edits = Patch::new(
+                edit.into_iter()
+                    .map(|rows| Edit {
+                        old: WrapRow(rows.start)..WrapRow(rows.end),
+                        new: WrapRow(rows.start)..WrapRow(rows.end),
+                    })
+                    .collect(),
+            );
+            block_map
+                .read(wrap_snapshot.clone(), edits, None)
+                .blocks_in_range(BlockRow(0)..BlockRow(u32::MAX))
+                .filter(|(_, block)| block.id() == BlockId::Custom(heading))
+                .map(|(row, _)| row)
+                .collect::<Vec<_>>()
+        };
+        let before = headings(None);
+        assert_eq!(
+            before.len(),
+            1,
+            "the heading is drawn above the folded buffer"
+        );
+        // Where the first folded buffer ends and the second begins.
+        assert_eq!(headings(Some(2..3)), before);
+        // Inside the second, which is rebuilt along with the first.
+        assert_eq!(headings(Some(3..4)), before);
+        assert_eq!(headings(Some(2..5)), before);
+    }
+
+    /// 2026-10-22: Zed exited after git activity in a diff whose groups fold
+    /// files. Moving an edit's start back over the folded files it is rebuilt
+    /// from must not take it behind rows the edit before it already rebuilt.
+    #[gpui::test]
+    fn test_edits_in_one_sync_around_folded_buffers(cx: &mut gpui::TestAppContext) {
+        cx.update(init_test);
+
+        let buffer = cx.update(|cx| {
+            MultiBuffer::build_multi(
+                [
+                    ("a1\na2", vec![Point::new(0, 0)..Point::new(1, 2)]),
+                    ("b1\nb2", vec![Point::new(0, 0)..Point::new(1, 2)]),
+                    ("c1\nc2", vec![Point::new(0, 0)..Point::new(1, 2)]),
+                    ("d1\nd2", vec![Point::new(0, 0)..Point::new(1, 2)]),
+                ],
+                cx,
+            )
+        });
+        let buffer_snapshot = cx.update(|cx| buffer.read(cx).snapshot(cx));
+        let buffer_ids = buffer_snapshot
+            .excerpts()
+            .map(|excerpt| excerpt.context.start.buffer_id)
+            .dedup()
+            .collect::<Vec<_>>();
+        let (_, inlay_snapshot) = InlayMap::new(buffer_snapshot.clone());
+        let (_, fold_snapshot) = FoldMap::new(inlay_snapshot);
+        let (_, tab_snapshot) = TabMap::new(fold_snapshot, 4.try_into().unwrap());
+        let (_, wrap_snapshot) =
+            cx.update(|cx| WrapMap::new(tab_snapshot, font("Helvetica"), px(14.0), None, cx));
+        let max_row = wrap_snapshot.max_point().row().0 + 1;
+
+        let edit = |rows: Range<u32>| Edit {
+            old: WrapRow(rows.start)..WrapRow(rows.end),
+            new: WrapRow(rows.start)..WrapRow(rows.end),
+        };
+        for folded in [
+            vec![0, 1],
+            vec![1, 2],
+            vec![0, 1, 2],
+            vec![0, 2],
+            vec![1, 2, 3],
+        ] {
+            let mut block_map = BlockMap::new(wrap_snapshot.clone(), 2, 1);
+            let mut writer = block_map.write(wrap_snapshot.clone(), Patch::default(), None);
+            buffer.read_with(cx, |buffer, cx| {
+                writer.fold_buffers(folded.iter().map(|ix| buffer_ids[*ix]), buffer, cx);
+            });
+            let heading = writer.insert([BlockProperties {
+                style: BlockStyle::Fixed,
+                placement: BlockPlacement::Above(buffer_snapshot.anchor_after(Point::new(0, 0))),
+                height: Some(2),
+                render: Arc::new(|_| div().into_any()),
+                priority: ABOVE_BUFFER_HEADER_PRIORITY,
+            }])[0];
+            drop(writer);
+            let expected = block_map
+                .read(wrap_snapshot.clone(), Patch::default(), None)
+                .text();
+
+            for first_start in 0..max_row {
+                for first_end in first_start + 1..=max_row {
+                    for second_start in first_end + 1..max_row {
+                        for second_end in second_start + 1..=max_row {
+                            let edits = Patch::new(vec![
+                                edit(first_start..first_end),
+                                edit(second_start..second_end),
+                            ]);
+                            let snapshot = block_map.read(wrap_snapshot.clone(), edits, None);
+                            let description = format!(
+                                "folded {folded:?}, edits {first_start}..{first_end} and \
+                                 {second_start}..{second_end}"
+                            );
+                            assert_eq!(snapshot.text(), expected, "{description}");
+                            assert_eq!(
+                                snapshot
+                                    .blocks_in_range(BlockRow(0)..BlockRow(u32::MAX))
+                                    .filter(|(_, block)| block.id() == BlockId::Custom(heading))
+                                    .count(),
+                                1,
+                                "{description}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[gpui::test(iterations = 60)]

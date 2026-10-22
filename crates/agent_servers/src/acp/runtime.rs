@@ -344,9 +344,12 @@ mod tests {
             std::process::Stdio::null(),
         )
         .expect("spawn waiting child");
-        let mut child = crate::acp::transport::OwnedChild(child);
+        let mut child = child;
         // status() closes stdin, which must not end the child before the guard kills it.
-        let stdin = child.0.stdin.take().expect("child stdin");
+        let stdin = child.stdin.take().expect("child stdin");
+        let mut child = crate::acp::transport::OwnedChild(
+            crate::acp::transport::AgentProcess::Local(child),
+        );
         let status = child.0.status();
         drop(child);
         let timeout = cx.background_executor.timer(Duration::from_secs(5));

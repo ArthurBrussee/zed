@@ -105,6 +105,18 @@ where
             })
     }
 
+    /// `(subscribers, emitters)`. For diagnostics only: it walks the set.
+    pub fn counts(&self) -> (usize, usize) {
+        let lock = self.0.borrow();
+        let subscribers = lock
+            .subscribers
+            .values()
+            .filter_map(|subscribers| subscribers.as_ref())
+            .map(|subscribers| subscribers.len())
+            .sum();
+        (subscribers, lock.subscribers.len())
+    }
+
     /// Call the given callback for each subscriber to the given emitter.
     /// If the callback returns false, the subscriber is removed.
     pub fn retain<F>(&self, emitter: &EmitterKey, mut f: F)

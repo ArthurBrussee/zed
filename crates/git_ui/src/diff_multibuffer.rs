@@ -1,5 +1,6 @@
 use crate::{
     conflict_view,
+    diff_groups::{DiffGroup, DiffGroupSummary, render_group_header},
     git_panel::{GitPanel, GitStatusEntry},
     git_panel_settings::GitPanelSettings,
 };
@@ -7,8 +8,13 @@ use anyhow::Result;
 use buffer_diff::BufferDiff;
 use collections::{HashMap, HashSet};
 use editor::{
-    EditorEvent, EditorSettings, SelectionEffects, SplittableEditor, actions::GoToHunk,
-    multibuffer_context_lines, scroll::Autoscroll,
+    EditorEvent, EditorSettings, SelectionEffects, SplittableEditor,
+    actions::GoToHunk,
+    display_map::{
+        ABOVE_BUFFER_HEADER_PRIORITY, BlockPlacement, BlockProperties, BlockStyle, CustomBlockId,
+    },
+    multibuffer_context_lines,
+    scroll::Autoscroll,
 };
 use futures::{FutureExt as _, StreamExt as _, stream};
 use futures_lite::future::yield_now;
@@ -42,7 +48,7 @@ use ztracing::instrument;
 const MAX_CONCURRENT_BUFFER_LOADS: usize = 16;
 
 struct BufferSubscriptions {
-    _diff: Entity<BufferDiff>,
+    diff: Entity<BufferDiff>,
     display_buffer: Entity<Buffer>,
     _diff_subscription: Subscription,
     _conflict_set: Option<Entity<ConflictSet>>,
@@ -58,6 +64,11 @@ pub struct DiffMultibuffer {
     focus_handle: FocusHandle,
     pending_scroll: Option<PathKey>,
     review_comment_count: usize,
+    /// Groups folded from their headers. Tests and generated files start that
+    /// way.
+    collapsed_groups: HashSet<DiffGroup>,
+    /// Each group's header block and the file it sits above.
+    group_headers: Vec<(DiffGroup, BufferId, CustomBlockId)>,
     empty_label: SharedString,
     _task: Task<Result<()>>,
     _subscription: Subscription,
@@ -170,6 +181,11 @@ impl DiffMultibuffer {
             buffer_subscriptions: Default::default(),
             pending_scroll: None,
             review_comment_count: 0,
+            collapsed_groups: DiffGroup::ALL
+                .into_iter()
+                .filter(|group| group.starts_collapsed())
+                .collect(),
+            group_headers: Vec::new(),
             empty_label: empty_label.into(),
             _task: task,
             _subscription: Subscription::join(
@@ -495,10 +511,13 @@ impl DiffMultibuffer {
                 }
             })
         });
+        let group_is_collapsed = self
+            .collapsed_groups
+            .contains(&DiffGroup::of_path(&repo_path));
         self.buffer_subscriptions.insert(
             repo_path,
             BufferSubscriptions {
-                _diff: diff.clone(),
+                diff: diff.clone(),
                 display_buffer: display_buffer.clone(),
                 _diff_subscription: diff_subscription,
                 _conflict_set: conflict_set.clone(),
@@ -566,6 +585,7 @@ impl DiffMultibuffer {
                 }
                 if is_excerpt_newly_added
                     && (file_status.is_deleted()
+                        || group_is_collapsed
                         || (file_status.is_untracked()
                             && GitPanelSettings::get_global(cx).collapse_untracked_diff))
                 {
@@ -590,6 +610,7 @@ impl DiffMultibuffer {
         if self.pending_scroll.as_ref() == Some(&path_key) {
             self.move_to_path(path_key, window, cx);
         }
+        self.sync_group_headers(cx);
 
         needs_fold.then_some(buffer_id)
     }
@@ -678,6 +699,7 @@ impl DiffMultibuffer {
 
             this.buffer_subscriptions
                 .retain(|repo_path, _| live_repo_paths.contains(repo_path));
+            this.sync_group_headers(cx);
 
             entries
         })?;
@@ -970,6 +992,139 @@ impl Render for DiffMultibuffer {
     }
 }
 
+impl DiffMultibuffer {
+    /// What is in each group, summed from the diffs the view already holds.
+    pub(crate) fn group_summaries(&self, cx: &App) -> Vec<(DiffGroup, DiffGroupSummary)> {
+        let mut summaries: Vec<(DiffGroup, DiffGroupSummary)> = DiffGroup::ALL
+            .into_iter()
+            .map(|group| (group, DiffGroupSummary::default()))
+            .collect();
+        for (repo_path, subscriptions) in &self.buffer_subscriptions {
+            let group = DiffGroup::of_path(repo_path);
+            let (added, removed) = subscriptions.diff.read(cx).changed_row_counts();
+            let Some((_, summary)) = summaries.iter_mut().find(|(known, _)| *known == group) else {
+                continue;
+            };
+            summary.files += 1;
+            summary.lines_added += added;
+            summary.lines_removed += removed;
+        }
+        summaries
+    }
+
+    pub(crate) fn collapsed_groups(&self) -> &HashSet<DiffGroup> {
+        &self.collapsed_groups
+    }
+
+    #[cfg(test)]
+    pub(crate) fn group_header_blocks(&self) -> Vec<(DiffGroup, CustomBlockId)> {
+        self.group_headers
+            .iter()
+            .map(|(group, _, id)| (*group, *id))
+            .collect()
+    }
+
+    /// A header row above each group's first file, re-placed when which file
+    /// that is changes. The files are already sorted by group.
+    fn sync_group_headers(&mut self, cx: &mut Context<Self>) {
+        let group_of_buffer: HashMap<BufferId, DiffGroup> = self
+            .buffer_subscriptions
+            .iter()
+            .map(|(repo_path, subscriptions)| {
+                (
+                    subscriptions.display_buffer.read(cx).remote_id(),
+                    DiffGroup::of_path(repo_path),
+                )
+            })
+            .collect();
+        let rhs_editor = self.editor.read(cx).rhs_editor().clone();
+        let snapshot = rhs_editor.read(cx).buffer().read(cx).snapshot(cx);
+        let mut firsts: Vec<(DiffGroup, BufferId, multi_buffer::Anchor)> = Vec::new();
+        for excerpt in snapshot.excerpts() {
+            let buffer_id = excerpt.context.start.buffer_id;
+            let Some(group) = group_of_buffer.get(&buffer_id).copied() else {
+                continue;
+            };
+            if firsts.iter().any(|(known, _, _)| *known == group) {
+                continue;
+            }
+            if let Some(anchor) = snapshot.anchor_in_excerpt(excerpt.context.start) {
+                firsts.push((group, buffer_id, anchor));
+            }
+        }
+        let unchanged = firsts.len() == self.group_headers.len()
+            && firsts
+                .iter()
+                .zip(&self.group_headers)
+                .all(|((group, buffer, _), (known_group, known_buffer, _))| {
+                    group == known_group && buffer == known_buffer
+                });
+        if unchanged {
+            return;
+        }
+        let stale: HashSet<CustomBlockId> =
+            self.group_headers.drain(..).map(|(_, _, id)| id).collect();
+        let diff = cx.weak_entity();
+        let blocks: Vec<BlockProperties<multi_buffer::Anchor>> = firsts
+            .iter()
+            .map(|(group, _, anchor)| {
+                let group = *group;
+                let diff = diff.clone();
+                BlockProperties {
+                    placement: BlockPlacement::Above(*anchor),
+                    height: Some(2),
+                    style: BlockStyle::Fixed,
+                    render: Arc::new(move |cx| render_group_header(&diff, group, cx)),
+                    priority: ABOVE_BUFFER_HEADER_PRIORITY,
+                }
+            })
+            .collect();
+        let ids = rhs_editor.update(cx, |editor, cx| {
+            if !stale.is_empty() {
+                editor.remove_blocks(stale, None, cx);
+            }
+            editor.insert_blocks(blocks, None, cx)
+        });
+        self.group_headers = firsts
+            .into_iter()
+            .zip(ids)
+            .map(|((group, buffer, _), id)| (group, buffer, id))
+            .collect();
+    }
+
+    pub(crate) fn buffers_in_group(&self, group: DiffGroup, cx: &App) -> Vec<BufferId> {
+        self.buffer_subscriptions
+            .iter()
+            .filter(|(repo_path, _)| DiffGroup::of_path(repo_path) == group)
+            .map(|(_, subscriptions)| subscriptions.display_buffer.read(cx).remote_id())
+            .collect()
+    }
+
+    pub(crate) fn toggle_group(&mut self, group: DiffGroup, cx: &mut Context<Self>) {
+        let collapsed = !self.collapsed_groups.remove(&group);
+        if collapsed {
+            self.collapsed_groups.insert(group);
+        }
+        let buffers = self.buffers_in_group(group, cx);
+        if buffers.is_empty() {
+            cx.notify();
+            return;
+        }
+        self.editor.update(cx, |editor, cx| {
+            editor.rhs_editor().update(cx, |editor, cx| {
+                if collapsed {
+                    editor.fold_buffers(buffers, cx);
+                } else {
+                    for buffer_id in buffers {
+                        editor.unfold_buffer(buffer_id, cx);
+                    }
+                }
+            });
+        });
+        cx.notify();
+    }
+}
+
 const CONFLICT_SORT_PREFIX: u64 = 1;
 const TRACKED_SORT_PREFIX: u64 = 2;
 const NEW_SORT_PREFIX: u64 = 3;
@@ -1004,6 +1159,9 @@ pub(crate) fn project_diff_path_key(
         TRACKED_SORT_PREFIX
     };
     let path = project_diff_sort_path(repo_path, settings.tree_view, settings.sort_by);
+    // The group is the outer key: code first, then tests, then generated, with
+    // upstream's status ordering inside each.
+    let sort_prefix = DiffGroup::of_path(repo_path).sort_prefix() * 10 + sort_prefix;
     PathKey::with_sort_prefix(sort_prefix, path)
 }
 

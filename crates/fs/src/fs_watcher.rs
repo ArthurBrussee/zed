@@ -1243,6 +1243,12 @@ fn dispatch(
 ) {
     let event = match event {
         Ok(event) => event,
+        // inotify drops a watch itself when its directory is deleted, so a
+        // removed worktree reports this for every directory it watched.
+        Err(error) if matches!(error.kind, notify::ErrorKind::WatchNotFound) => {
+            log::debug!("{kind:?} watcher: {error}");
+            return;
+        }
         Err(error) => {
             log::warn!("{kind:?} watcher error: {error}");
             return;

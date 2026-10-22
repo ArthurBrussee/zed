@@ -80,9 +80,9 @@ mod wrap_map;
 
 pub use crate::display_map::{fold_map::FoldMap, inlay_map::InlayMap, tab_map::TabMap};
 pub use block_map::{
-    Block, BlockChunks as DisplayChunks, BlockContext, BlockId, BlockMap, BlockPlacement,
-    BlockPoint, BlockProperties, BlockRows, BlockStyle, CompanionView, CompanionViewMut,
-    CustomBlockId, EditorMargins, RenderBlock, StickyHeaderExcerpt,
+    ABOVE_BUFFER_HEADER_PRIORITY, Block, BlockChunks as DisplayChunks, BlockContext, BlockId,
+    BlockMap, BlockPlacement, BlockPoint, BlockProperties, BlockRows, BlockStyle, CompanionView,
+    CompanionViewMut, CustomBlockId, EditorMargins, RenderBlock, StickyHeaderExcerpt,
 };
 pub use crease_map::*;
 pub use fold_map::{

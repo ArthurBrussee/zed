@@ -716,6 +716,18 @@ impl Inventory {
             .collect()
     }
 
+    /// Returns all task templates (worktree and global) carrying the tag given.
+    pub fn templates_with_tag(
+        &self,
+        tag: &str,
+        worktree: WorktreeId,
+    ) -> Vec<(TaskSourceKind, TaskTemplate)> {
+        self.worktree_templates_from_settings(worktree)
+            .chain(self.global_templates_from_settings())
+            .filter(|(_, template)| template.tags.iter().any(|template_tag| template_tag == tag))
+            .collect()
+    }
+
     /// Returns all task templates (worktree and global) that have at least one
     /// hook in the provided set.
     pub fn templates_with_hooks(
@@ -1169,6 +1181,48 @@ mod tests {
             args: vec!["$ZED_CUSTOM_GREETING".to_string()],
             ..TaskTemplate::default()
         }
+    }
+
+    #[gpui::test]
+    fn templates_with_tag_takes_only_the_tagged_ones(cx: &mut gpui::App) {
+        let inventory = Inventory::new(cx);
+        let worktree = WorktreeId::from_usize(1);
+        inventory.update(cx, |inventory, _cx| {
+            inventory
+                .update_file_based_tasks(
+                    crate::task_store::TaskSettingsLocation::Worktree(
+                        settings::SettingsLocation {
+                            worktree_id: worktree,
+                            path: RelPath::empty(),
+                        },
+                    ),
+                    Some(
+                        r#"[
+                            { "label": "portico", "command": "pnpm dev",
+                              "tags": ["bar", "icon:server", "open:/"] },
+                            { "label": "tests", "command": "cargo test" }
+                        ]"#,
+                    ),
+                )
+                .expect("the tasks file should parse");
+        });
+
+        let tagged = inventory.read(cx).templates_with_tag("bar", worktree);
+        assert_eq!(
+            tagged
+                .iter()
+                .map(|(_, template)| template.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["portico"],
+            "an untagged task is not one of these"
+        );
+        assert!(
+            inventory
+                .read(cx)
+                .templates_with_tag("bar", WorktreeId::from_usize(2))
+                .is_empty(),
+            "another worktree's tasks are its own"
+        );
     }
 
     #[test]

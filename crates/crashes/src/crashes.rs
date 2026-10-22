@@ -24,6 +24,8 @@ use std::{
 
 pub use minidumper::Client;
 
+pub mod quiet_ui;
+
 const CRASH_HANDLER_PING_TIMEOUT: Duration = Duration::from_secs(60);
 const CRASH_HANDLER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -32,6 +34,13 @@ pub fn force_backtrace() {
     let old_hook = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
         unsafe { env::set_var("RUST_BACKTRACE", "1") };
+        // quiet-ui: launched from the Dock, stderr goes nowhere, so the log is
+        // the only record of the panic before the exit below.
+        log::error!(
+            "panic: {info}\n{}",
+            std::backtrace::Backtrace::force_capture()
+        );
+        log::logger().flush();
         old_hook(info);
         // prevent the macOS crash dialog from popping up
         if cfg!(target_os = "macos") {
@@ -581,6 +590,8 @@ pub fn panic_hook(crash_client: Arc<Client>, message: &str, location: Option<&Lo
 
     let location = location.map_or_else(|| "<unknown>".to_owned(), |location| location.to_string());
     log::error!("thread '{thread_name}' panicked at {location}:\n{message}...");
+    // quiet-ui: the abort below gives the logger no chance to write it.
+    log::logger().flush();
 
     send_crash_server_message(
         &crash_client,
