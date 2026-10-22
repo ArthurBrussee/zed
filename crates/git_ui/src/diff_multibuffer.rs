@@ -1,6 +1,6 @@
 use crate::{
     conflict_view,
-    diff_groups::{DiffGroup, DiffGroupSummary, render_group_header},
+    diff_groups::{DiffGroup, DiffGroupSummary, GroupHeaderAddon},
     git_panel::{GitPanel, GitStatusEntry},
     git_panel_settings::GitPanelSettings,
 };
@@ -8,13 +8,8 @@ use anyhow::Result;
 use buffer_diff::BufferDiff;
 use collections::{HashMap, HashSet};
 use editor::{
-    EditorEvent, EditorSettings, SelectionEffects, SplittableEditor,
-    actions::GoToHunk,
-    display_map::{
-        ABOVE_BUFFER_HEADER_PRIORITY, BlockPlacement, BlockProperties, BlockStyle, CustomBlockId,
-    },
-    multibuffer_context_lines,
-    scroll::Autoscroll,
+    EditorEvent, EditorSettings, SelectionEffects, SplittableEditor, actions::GoToHunk,
+    multibuffer_context_lines, scroll::Autoscroll,
 };
 use futures::{FutureExt as _, StreamExt as _, stream};
 use futures_lite::future::yield_now;
@@ -67,8 +62,8 @@ pub struct DiffMultibuffer {
     /// Groups folded from their headers. Tests and generated files start that
     /// way.
     collapsed_groups: HashSet<DiffGroup>,
-    /// Each group's header block and the file it sits above.
-    group_headers: Vec<(DiffGroup, BufferId, CustomBlockId)>,
+    /// Each group and the file whose header carries its header row.
+    group_headers: Vec<(DiffGroup, BufferId)>,
     empty_label: SharedString,
     _task: Task<Result<()>>,
     _subscription: Subscription,
@@ -86,6 +81,7 @@ impl DiffMultibuffer {
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
+        let this = cx.weak_entity();
         let multibuffer = cx.new(|cx| {
             let mut multibuffer = MultiBuffer::new(multibuffer_capability);
             multibuffer.set_all_diff_hunks_expanded(cx);
@@ -103,6 +99,7 @@ impl DiffMultibuffer {
             configure_editor(&mut diff_display_editor, cx);
             diff_display_editor.rhs_editor().update(cx, |editor, cx| {
                 editor.set_show_diff_review_button(true, cx);
+                editor.register_addon(GroupHeaderAddon { diff: this });
             });
             diff_display_editor
         });
@@ -1016,16 +1013,22 @@ impl DiffMultibuffer {
         &self.collapsed_groups
     }
 
-    #[cfg(test)]
-    pub(crate) fn group_header_blocks(&self) -> Vec<(DiffGroup, CustomBlockId)> {
+    /// The group whose header row is drawn above this file's header.
+    pub(crate) fn group_headed_by(&self, buffer_id: BufferId) -> Option<DiffGroup> {
         self.group_headers
             .iter()
-            .map(|(group, _, id)| (*group, *id))
-            .collect()
+            .find(|(_, first)| *first == buffer_id)
+            .map(|(group, _)| *group)
     }
 
-    /// A header row above each group's first file, re-placed when which file
-    /// that is changes. The files are already sorted by group.
+    #[cfg(test)]
+    pub(crate) fn group_headers(&self) -> &[(DiffGroup, BufferId)] {
+        &self.group_headers
+    }
+
+    /// A header row above each group's first file, part of that file's
+    /// header, moved when which file that is changes. The files are already
+    /// sorted by group.
     fn sync_group_headers(&mut self, cx: &mut Context<Self>) {
         let group_of_buffer: HashMap<BufferId, DiffGroup> = self
             .buffer_subscriptions
@@ -1039,57 +1042,27 @@ impl DiffMultibuffer {
             .collect();
         let rhs_editor = self.editor.read(cx).rhs_editor().clone();
         let snapshot = rhs_editor.read(cx).buffer().read(cx).snapshot(cx);
-        let mut firsts: Vec<(DiffGroup, BufferId, multi_buffer::Anchor)> = Vec::new();
+        let mut firsts: Vec<(DiffGroup, BufferId)> = Vec::new();
         for excerpt in snapshot.excerpts() {
             let buffer_id = excerpt.context.start.buffer_id;
             let Some(group) = group_of_buffer.get(&buffer_id).copied() else {
                 continue;
             };
-            if firsts.iter().any(|(known, _, _)| *known == group) {
-                continue;
-            }
-            if let Some(anchor) = snapshot.anchor_in_excerpt(excerpt.context.start) {
-                firsts.push((group, buffer_id, anchor));
+            if !firsts.iter().any(|(known, _)| *known == group) {
+                firsts.push((group, buffer_id));
             }
         }
-        let unchanged = firsts.len() == self.group_headers.len()
-            && firsts
-                .iter()
-                .zip(&self.group_headers)
-                .all(|((group, buffer, _), (known_group, known_buffer, _))| {
-                    group == known_group && buffer == known_buffer
-                });
-        if unchanged {
+        if firsts == self.group_headers {
             return;
         }
-        let stale: HashSet<CustomBlockId> =
-            self.group_headers.drain(..).map(|(_, _, id)| id).collect();
-        let diff = cx.weak_entity();
-        let blocks: Vec<BlockProperties<multi_buffer::Anchor>> = firsts
+        let rows = firsts
             .iter()
-            .map(|(group, _, anchor)| {
-                let group = *group;
-                let diff = diff.clone();
-                BlockProperties {
-                    placement: BlockPlacement::Above(*anchor),
-                    height: Some(2),
-                    style: BlockStyle::Fixed,
-                    render: Arc::new(move |cx| render_group_header(&diff, group, cx)),
-                    priority: ABOVE_BUFFER_HEADER_PRIORITY,
-                }
-            })
+            .map(|(_, buffer_id)| (*buffer_id, GROUP_HEADER_ROWS))
             .collect();
-        let ids = rhs_editor.update(cx, |editor, cx| {
-            if !stale.is_empty() {
-                editor.remove_blocks(stale, None, cx);
-            }
-            editor.insert_blocks(blocks, None, cx)
+        self.group_headers = firsts;
+        rhs_editor.update(cx, |editor, cx| {
+            editor.set_buffer_header_extra_rows(rows, cx);
         });
-        self.group_headers = firsts
-            .into_iter()
-            .zip(ids)
-            .map(|((group, buffer, _), id)| (group, buffer, id))
-            .collect();
     }
 
     pub(crate) fn buffers_in_group(&self, group: DiffGroup, cx: &App) -> Vec<BufferId> {
@@ -1124,6 +1097,9 @@ impl DiffMultibuffer {
         cx.notify();
     }
 }
+
+/// A group's header row is as tall as a file's header.
+const GROUP_HEADER_ROWS: u32 = 2;
 
 const CONFLICT_SORT_PREFIX: u64 = 1;
 const TRACKED_SORT_PREFIX: u64 = 2;

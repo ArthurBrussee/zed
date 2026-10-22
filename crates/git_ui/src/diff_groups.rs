@@ -3,11 +3,12 @@
 //! Which group a file is in is a question about its name, not its content, so
 //! this is a table of name rules and nothing else. The group is folded into
 //! the sort prefix upstream already orders the diff by, so the files group
-//! themselves; a header row above each group's first file says what is in it
-//! and folds it, through the editor's own buffer folding.
+//! themselves; a header row on top of each group's first file header says
+//! what is in it and folds it, through the editor's own buffer folding.
 
-use editor::display_map::BlockContext;
-use gpui::{Empty, WeakEntity};
+use editor::{Addon, BUFFER_HEADER_PADDING};
+use gpui::{Entity, WeakEntity};
+use multi_buffer::ExcerptBoundaryInfo;
 use ui::{DiffStat, Tooltip, prelude::*};
 use util::rel_path::RelPath;
 
@@ -137,16 +138,32 @@ pub(crate) struct DiffGroupSummary {
     pub lines_removed: u32,
 }
 
+/// Draws each group's header row on top of its first file's header, where
+/// `DiffMultibuffer` makes room for it.
+pub(crate) struct GroupHeaderAddon {
+    pub(crate) diff: WeakEntity<DiffMultibuffer>,
+}
+
+impl Addon for GroupHeaderAddon {
+    fn to_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn render_above_buffer_header(
+        &self,
+        excerpt: &ExcerptBoundaryInfo,
+        _: &Window,
+        cx: &App,
+    ) -> Option<AnyElement> {
+        let diff = self.diff.upgrade()?;
+        let group = diff.read(cx).group_headed_by(excerpt.buffer_id())?;
+        Some(render_group_header(diff, group, cx))
+    }
+}
+
 /// A group's header row in the diff: its name, how many files and their stats,
 /// and a click folds or unfolds every file in it.
-pub(crate) fn render_group_header(
-    diff: &WeakEntity<DiffMultibuffer>,
-    group: DiffGroup,
-    cx: &mut BlockContext,
-) -> AnyElement {
-    let Some(diff) = diff.upgrade() else {
-        return Empty.into_any_element();
-    };
+fn render_group_header(diff: Entity<DiffMultibuffer>, group: DiffGroup, cx: &App) -> AnyElement {
     let (summary, is_collapsed) = {
         let diff = diff.read(cx);
         let summary = diff
@@ -158,53 +175,53 @@ pub(crate) fn render_group_header(
         (summary, diff.collapsed_groups().contains(&group))
     };
     let id = format!("diff-group-header-{}", group.label());
-    h_flex()
-        .id(SharedString::from(id.clone()))
-        .debug_selector(move || id)
-        .w_full()
-        .h_full()
-        .pl(cx.margins.gutter.full_width())
-        .gap_1p5()
-        .items_center()
-        .cursor_pointer()
-        .border_b_1()
-        .border_color(cx.theme().colors().border_variant)
+    // The file header's own padding, so the two line up.
+    div()
+        .size_full()
+        .p(BUFFER_HEADER_PADDING)
         .child(
-            Icon::new(if is_collapsed {
-                IconName::ChevronRight
-            } else {
-                IconName::ChevronDown
-            })
-            .size(IconSize::Small)
-            .color(Color::Muted),
+            h_flex()
+                .id(SharedString::from(id.clone()))
+                .debug_selector(move || id)
+                .size_full()
+                .pl_1()
+                .pr_2()
+                .gap_1p5()
+                .items_center()
+                .cursor_pointer()
+                .rounded_sm()
+                .hover(|style| style.bg(cx.theme().colors().element_hover))
+                .child(
+                    Icon::new(if is_collapsed {
+                        IconName::ChevronRight
+                    } else {
+                        IconName::ChevronDown
+                    })
+                    .color(Color::Muted),
+                )
+                .child(Label::new(group.label()).weight(gpui::FontWeight::SEMIBOLD))
+                .child(
+                    Label::new(format!(
+                        "{} file{}",
+                        summary.files,
+                        if summary.files == 1 { "" } else { "s" }
+                    ))
+                    .color(Color::Muted),
+                )
+                .child(DiffStat::new(
+                    SharedString::from(format!("diff-group-stat-{}", group.label())),
+                    summary.lines_added as usize,
+                    summary.lines_removed as usize,
+                ))
+                .tooltip(Tooltip::text(if is_collapsed {
+                    format!("Expand {}", group.label())
+                } else {
+                    format!("Collapse {}", group.label())
+                }))
+                .on_click(move |_, _, cx| {
+                    diff.update(cx, |diff, cx| diff.toggle_group(group, cx));
+                }),
         )
-        .child(
-            Label::new(group.label())
-                .size(LabelSize::Default)
-                .weight(gpui::FontWeight::SEMIBOLD),
-        )
-        .child(
-            Label::new(format!(
-                "{} file{}",
-                summary.files,
-                if summary.files == 1 { "" } else { "s" }
-            ))
-            .size(LabelSize::Small)
-            .color(Color::Muted),
-        )
-        .child(DiffStat::new(
-            SharedString::from(format!("diff-group-stat-{}", group.label())),
-            summary.lines_added as usize,
-            summary.lines_removed as usize,
-        ))
-        .tooltip(Tooltip::text(if is_collapsed {
-            format!("Expand {}", group.label())
-        } else {
-            format!("Collapse {}", group.label())
-        }))
-        .on_click(move |_, _, cx| {
-            diff.update(cx, |diff, cx| diff.toggle_group(group, cx));
-        })
         .into_any_element()
 }
 
@@ -313,7 +330,7 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         use crate::project_diff::{self, ProjectDiff};
-        use editor::display_map::{BlockId, DisplayRow};
+        use editor::display_map::{Block, DisplayRow};
         use gpui::{Action as _, VisualTestContext};
         use multi_buffer::MultiBufferOffset;
         use project::{FakeFs, Project};
@@ -465,14 +482,16 @@ mod tests {
             }
         };
 
-        // Each group's header is one block on the right-hand editor, in order, and
-        // the left-hand one, when split, balances each with one block of its own.
+        // Each group's header row sits on one file's header, in order: that
+        // header's block is taller by the row, on the right-hand editor and, when
+        // split, on the left-hand one, which keeps the two level. No custom blocks
+        // are involved. The row spans the whole view, both panes when split.
         let one_header_per_group = |split: bool, cx: &mut VisualTestContext| {
             cx.run_until_parked();
             let (headers, rhs, lhs) = diff.read_with(cx, |diff, cx| {
                 let editor = diff.editor().read(cx);
                 (
-                    diff.group_header_blocks(),
+                    diff.group_headers().to_vec(),
                     editor.rhs_editor().clone(),
                     editor.lhs_editor().cloned(),
                 )
@@ -481,31 +500,67 @@ mod tests {
                 headers.iter().map(|(group, _)| *group).collect::<Vec<_>>(),
                 [DiffGroup::Code, DiffGroup::Tests, DiffGroup::Generated]
             );
-            let custom_blocks = |editor: &gpui::Entity<editor::Editor>,
-                                 cx: &mut VisualTestContext| {
+            // The buffers whose header blocks are taller than a file header, and
+            // whether any custom block is in the view.
+            let tall_headers = |editor: &gpui::Entity<editor::Editor>,
+                                cx: &mut VisualTestContext| {
                 editor.update_in(cx, |editor, window, cx| {
                     let snapshot = editor.snapshot(window, cx);
+                    let header_height = snapshot.buffer_header_height();
                     let max_row = snapshot.max_point().row();
-                    snapshot
+                    let blocks: Vec<_> = snapshot
                         .blocks_in_range(DisplayRow(0)..DisplayRow(max_row.0 + 1))
-                        .filter_map(|(_, block)| match block.id() {
-                            BlockId::Custom(id) => Some(id),
+                        .map(|(_, block)| block.clone())
+                        .collect();
+                    let tall = blocks
+                        .iter()
+                        .filter_map(|block| match block {
+                            Block::BufferHeader { excerpt, height }
+                            | Block::FoldedBuffer {
+                                first_excerpt: excerpt,
+                                height,
+                            } => (*height > header_height).then(|| excerpt.buffer_id()),
                             _ => None,
                         })
-                        .collect::<Vec<_>>()
+                        .collect::<Vec<_>>();
+                    let custom = blocks.iter().any(|block| matches!(block, Block::Custom(_)));
+                    (tall, custom)
                 })
             };
+            let (tall, custom) = tall_headers(&rhs, cx);
             assert_eq!(
-                custom_blocks(&rhs, cx),
-                headers.iter().map(|(_, id)| *id).collect::<Vec<_>>(),
-                "each group's header is drawn once"
+                tall,
+                headers
+                    .iter()
+                    .map(|(_, buffer)| *buffer)
+                    .collect::<Vec<_>>(),
+                "each group's header row is on its first file's header, once"
             );
+            assert!(!custom);
             assert_eq!(lhs.is_some(), split, "the view is split: {split}");
-            if let Some(lhs) = lhs {
-                let mut balancing = custom_blocks(&lhs, cx);
-                assert_eq!(balancing.len(), headers.len(), "{balancing:?}");
-                balancing.dedup();
-                assert_eq!(balancing.len(), headers.len(), "each is balanced once");
+            let mut view_width = rhs
+                .read_with(cx, |editor, _| editor.last_bounds().copied())
+                .expect("laid out")
+                .size
+                .width;
+            if let Some(lhs) = &lhs {
+                let (tall, custom) = tall_headers(lhs, cx);
+                assert_eq!(tall.len(), headers.len(), "{tall:?}");
+                assert!(!custom);
+                view_width += lhs
+                    .read_with(cx, |editor, _| editor.last_bounds().copied())
+                    .expect("laid out")
+                    .size
+                    .width;
+            }
+            for (group, _) in &headers {
+                let bounds = cx
+                    .debug_bounds(header_selector(*group))
+                    .unwrap_or_else(|| panic!("{group:?} has a header in the diff"));
+                assert!(
+                    bounds.size.width > view_width * 0.9,
+                    "{group:?}'s header spans the view: {bounds:?} of {view_width:?}"
+                );
             }
         };
         let split = style == DiffViewStyle::Split;

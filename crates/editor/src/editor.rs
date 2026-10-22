@@ -796,6 +796,17 @@ pub trait Addon: 'static {
         None
     }
 
+    /// What is drawn in the rows `Editor::set_buffer_header_extra_rows` makes
+    /// above a buffer's header, across the header's whole width.
+    fn render_above_buffer_header(
+        &self,
+        _: &ExcerptBoundaryInfo,
+        _: &Window,
+        _: &App,
+    ) -> Option<AnyElement> {
+        None
+    }
+
     fn extend_buffer_header_context_menu(
         &self,
         menu: ui::ContextMenu,
