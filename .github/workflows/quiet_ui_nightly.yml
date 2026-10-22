@@ -18,7 +18,21 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # The commit every job builds, read once. Jobs that check out `quiet-ui`
+  # themselves can each see a different tip, and a re-run of one failed job
+  # would build whatever the branch points at by then: on 2026-10-22 that left a
+  # dmg and remote servers from different commits, and the app could not connect.
+  # A re-run reuses this job's output, so it builds the same commit.
+  resolve:
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.tip.outputs.sha }}
+    steps:
+      - id: tip
+        run: echo "sha=$(git ls-remote https://github.com/$GITHUB_REPOSITORY refs/heads/quiet-ui | cut -f1)" >> "$GITHUB_OUTPUT"
+
   bundle-mac:
+    needs: resolve
     runs-on: macos-15
     timeout-minutes: 300
     permissions:
@@ -29,7 +43,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: quiet-ui
+          ref: ${{ needs.resolve.outputs.sha }}
           fetch-depth: 1
 
       # `quiet-ui-built` marks the commit the last successful bundle came from.
@@ -171,6 +185,7 @@ jobs:
   # ships these, under fixed names, with the commit they came from beside them.
   # Separate from the mac job so a failure here never costs the dmg.
   remote-server:
+    needs: resolve
     strategy:
       fail-fast: false
       matrix:
@@ -189,7 +204,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: quiet-ui
+          ref: ${{ needs.resolve.outputs.sha }}
           fetch-depth: 1
 
       # Skip a commit this arch already has a server for, unless asked by hand.
