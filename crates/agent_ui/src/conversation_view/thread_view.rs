@@ -914,6 +914,14 @@ pub struct ThreadView {
     /// Set on window activation: a branch switched in an outside terminal
     /// reaches us no other way.
     diff_stats_stale: bool,
+    /// The message being sent takes the diff's pending review comments in
+    /// front of it, once its contents resolve.
+    review_on_send: bool,
+    /// Whether the last render showed the pending review chip.
+    pub(crate) review_chip_shown: bool,
+    /// The diff and comment count whose chip was dismissed; one more comment
+    /// brings it back.
+    pub(crate) dismissed_review: Option<(gpui::EntityId, usize)>,
 }
 impl Focusable for ThreadView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -2242,6 +2250,9 @@ impl ThreadView {
             thread_search_visible: false,
             branch_diff_stats,
             diff_stats_stale: false,
+            review_on_send: false,
+            review_chip_shown: false,
+            dismissed_review: None,
         };
 
         this.sync_reported_activity(cx);
@@ -2432,9 +2443,9 @@ impl ThreadView {
     /// that do not enable any tools, directory mentions are expanded to inline
     /// file contents since the agent can't read files on its own.
     fn resolve_message_contents(
-        &self,
+        &mut self,
         message_editor: &Entity<MessageEditor>,
-        cx: &mut App,
+        cx: &mut Context<Self>,
     ) -> Task<Result<(Vec<acp_v2::ContentBlock>, Vec<Entity<Buffer>>)>> {
         if message_editor.read(cx).editor().read(cx).read_only(cx) {
             return Task::ready(Err(anyhow!(
@@ -2448,7 +2459,21 @@ impl ThreadView {
                 .get(thread.profile())
                 .is_some_and(|profile| profile.tools.is_empty())
         });
-        message_editor.update(cx, |message_editor, cx| message_editor.contents(expand, cx))
+        let contents =
+            message_editor.update(cx, |message_editor, cx| message_editor.contents(expand, cx));
+        if !std::mem::take(&mut self.review_on_send) {
+            return contents;
+        }
+        // Taken once nothing is being updated: the panel and the views it
+        // reads can be while a message is sent.
+        cx.spawn(async move |this, cx| {
+            let (mut contents, tracked_buffers) = contents.await?;
+            let review = this.update(cx, |this, cx| {
+                crate::diff_review::take_pending_review(this, cx)
+            })?;
+            contents.splice(0..0, review);
+            Ok((contents, tracked_buffers))
+        })
     }
 
     pub fn current_model_id(&self, cx: &App) -> Option<String> {
@@ -3131,6 +3156,11 @@ impl ThreadView {
         let is_generating = thread.read(cx).status() == ThreadStatus::Generating;
 
         if is_editor_empty {
+            if self.review_chip_shown {
+                cx.emit(AcpThreadViewEvent::Interacted);
+                crate::diff_review::send_pending_review(window, cx);
+                return;
+            }
             if self.message_queue.can_fast_track()
                 && let Some(id) = self.message_queue.first_id()
                 && !self.validate_queued_entry(id, cx)
@@ -3145,6 +3175,7 @@ impl ThreadView {
 
         if is_generating {
             cx.emit(AcpThreadViewEvent::Interacted);
+            self.review_on_send = true;
             self.queue_message(message_editor, window, cx);
             return;
         }
@@ -3199,6 +3230,7 @@ impl ThreadView {
         }
 
         cx.emit(AcpThreadViewEvent::Interacted);
+        self.review_on_send = true;
         self.send_impl(message_editor, window, cx)
     }
 
@@ -7725,6 +7757,7 @@ impl ThreadView {
                     .flex_wrap()
                     .gap_0p5()
                     .child(self.render_add_context_button(cx))
+                    .children(crate::diff_review::render_review_chip(self, cx))
                     .children(self.profile_selector.clone())
                     .map(|this| match self.config_options_view.clone() {
                         // ConversationView only keeps a model selector beside
