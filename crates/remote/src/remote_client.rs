@@ -21,7 +21,7 @@ use futures::{
         mpsc::{self, Sender, UnboundedReceiver, UnboundedSender},
         oneshot,
     },
-    future::{BoxFuture, Shared, WeakShared},
+    future::{BoxFuture, FusedFuture as _, Shared, WeakShared},
     select, select_biased,
     stream::BoxStream,
 };
@@ -167,6 +167,9 @@ const INITIAL_CONNECTION_TIMEOUT: Duration =
 const RECONNECT_HANDSHAKE_TIMEOUT: Duration =
     Duration::from_secs(if cfg!(debug_assertions) { 5 } else { 15 });
 const RESYNC_TIMEOUT: Duration = Duration::from_secs(if cfg!(debug_assertions) { 5 } else { 15 });
+/// A proxy's output closes a moment before its exit status arrives, so a
+/// failed handshake waits this long to hear why the proxy stopped.
+const PROXY_EXIT_GRACE: Duration = Duration::from_secs(2);
 
 pub const MAX_RECONNECT_ATTEMPTS: usize = 3;
 
@@ -846,16 +849,18 @@ impl RemoteClient {
             // A proxy that exits before the handshake (its SSH connection is
             // gone) fails the attempt now, with what it said, rather than
             // after the handshake's timeout.
-            let (proxy_exited_tx, proxy_exited_rx) = oneshot::channel::<String>();
+            let (proxy_exited_tx, proxy_exited_rx) = oneshot::channel::<(Option<i32>, String)>();
             let io_task = cx.background_spawn(async move {
                 let result = io_task.await;
                 let exited = match &result {
-                    Ok(status) => format!("it exited with status {status}"),
-                    Err(error) => format!("{error:#}"),
+                    Ok(status) => (Some(*status), format!("it exited with status {status}")),
+                    Err(error) => (None, format!("{error:#}")),
                 };
                 proxy_exited_tx.send(exited).ok();
                 result
             });
+            let mut proxy_exited = proxy_exited_rx.fuse();
+            let mut exit_code = None;
             let multiplex_task = Self::monitor(this.clone(), io_task, cx);
             let connection_ready_rx = client.reconnect(incoming_rx, outgoing_tx, cx);
             let resync = client.resync(RESYNC_TIMEOUT);
@@ -864,15 +869,17 @@ impl RemoteClient {
                 let ready = connection_ready_rx
                     .with_timeout(RECONNECT_HANDSHAKE_TIMEOUT, cx.background_executor())
                     .fuse();
-                let exited = proxy_exited_rx.fuse();
-                futures::pin_mut!(ready, exited);
+                futures::pin_mut!(ready);
                 let ready = select_biased! {
                     ready = ready => ready,
-                    exited = exited => match exited {
-                        Ok(exited) => anyhow::bail!(
-                            "The proxy to the remote server stopped before the server \
-                             answered: {exited}"
-                        ),
+                    exited = &mut proxy_exited => match exited {
+                        Ok((code, exited)) => {
+                            exit_code = code;
+                            anyhow::bail!(
+                                "The proxy to the remote server stopped before the server \
+                                 answered: {exited}"
+                            )
+                        }
                         Err(_) => ready.await,
                     },
                 };
@@ -890,6 +897,21 @@ impl RemoteClient {
             }
             .await
             {
+                if exit_code.is_none() && !proxy_exited.is_terminated() {
+                    exit_code = (&mut proxy_exited)
+                        .with_timeout(PROXY_EXIT_GRACE, cx.background_executor())
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .and_then(|(code, _)| code);
+                }
+                // The server exited (it does after two idle hours), so no
+                // number of retries reaches it: a fresh one has to be started.
+                if let Some(ProxyLaunchError::ServerNotRunning) =
+                    exit_code.and_then(ProxyLaunchError::from_exit_code)
+                {
+                    return State::ServerNotRunning;
+                }
                 failed!(error, attempts, remote_connection, delegate);
             };
 
@@ -906,13 +928,19 @@ impl RemoteClient {
             this.update(cx, |this, cx| {
                 let reconnected = this.state_is(State::is_reconnecting)
                     && matches!(&new_state, State::Connected { .. });
+                let server_gone =
+                    this.state_is(State::is_reconnecting) && new_state.is_server_not_running();
                 this.try_set_state(cx, |old_state| {
                     if old_state.is_reconnecting() {
                         match &new_state {
                             State::Connecting
                             | State::Reconnecting
-                            | State::HeartbeatMissed { .. }
-                            | State::ServerNotRunning => {}
+                            | State::HeartbeatMissed { .. } => {}
+                            State::ServerNotRunning => {
+                                log::error!(
+                                    "Reconnect attempt {attempts} found the remote server not running"
+                                );
+                            }
                             State::Connected { .. } => {
                                 log::info!("Successfully reconnected");
                             }
@@ -945,6 +973,11 @@ impl RemoteClient {
                 if reconnected {
                     cx.emit(RemoteClientEvent::Reconnected);
                     this.retry_stuck_peers(cx);
+                }
+                if server_gone {
+                    cx.emit(RemoteClientEvent::Disconnected {
+                        server_not_running: true,
+                    });
                 }
 
                 if this.state_is(State::is_reconnect_failed) {
@@ -2256,6 +2289,7 @@ mod tests {
     use crate::transport::mock::{MockConnection, MockConnectionRegistry, MockDelegate};
     use gpui::TestAppContext;
     use rpc::{ErrorCodeExt, proto::ErrorCode};
+    use std::{cell::RefCell, rc::Rc};
 
     #[test]
     fn test_ssh_display_name_prefers_nickname() {
@@ -2741,7 +2775,7 @@ mod tests {
         second.update(cx, |second, cx| second.reconnect(cx).unwrap());
         let _unanswered = proxy_rx.next().await.unwrap();
         cx.background_executor
-            .timer(RECONNECT_HANDSHAKE_TIMEOUT)
+            .timer(RECONNECT_HANDSHAKE_TIMEOUT + PROXY_EXIT_GRACE)
             .await;
         cx.run_until_parked();
         assert!(second.read_with(cx, |second, _| second.state_is(State::is_reconnect_failed)));
@@ -2765,6 +2799,86 @@ mod tests {
         assert_eq!(
             second.read_with(cx, |second, _| second.connection_state()),
             ConnectionState::Connected
+        );
+    }
+
+    /// 2026-10-23: overnight every box window's server exited, as it does after
+    /// two idle hours, and in the morning each window retried forever: the
+    /// failed handshake ended the attempt before the proxy's exit code (90,
+    /// no server running) was read, so a fresh server was never started.
+    #[gpui::test]
+    async fn test_a_reconnect_that_finds_no_server_stops_at_once(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let (options, _, connect_guard) = MockConnection::new(cx, server_cx);
+        drop(connect_guard);
+        let mock = cx
+            .update(|cx| {
+                cx.default_global::<MockConnectionRegistry>()
+                    .take(&options)
+                    .unwrap()
+            })
+            .await;
+        let (proxy_tx, mut proxy_rx) = mpsc::unbounded();
+        *mock.proxy_tx.lock() = Some(proxy_tx);
+        let proxies = mock.clone();
+        let connection: Arc<dyn RemoteConnection> = mock;
+        let (_cancellation_tx, cancellation_rx) = oneshot::channel();
+        let client = cx.update(|cx| {
+            release_channel::init_test(Version::new(0, 0, 0), ReleaseChannel::Dev, cx);
+            cx.default_global::<ConnectionPool>().connections.insert(
+                connection.connection_options(),
+                ConnectionPoolEntry::Connected(Arc::downgrade(&connection)),
+            );
+            RemoteClient::new(
+                ConnectionIdentifier::setup(),
+                connection.clone(),
+                cancellation_rx,
+                Arc::new(MockDelegate),
+                cx,
+            )
+        });
+        let (incoming_tx, mut outgoing_rx) = proxy_rx.next().await.unwrap();
+        outgoing_rx.next().await.unwrap();
+        incoming_tx
+            .unbounded_send(proto::RemoteStarted {}.into_envelope(0, None, None))
+            .unwrap();
+        outgoing_rx.next().await.unwrap();
+        let ping = outgoing_rx.next().await.unwrap();
+        let mut ping_response = proto::Ack {}.into_envelope(2, Some(ping.id), None);
+        ping_response.ack_id = Some(ping.id);
+        incoming_tx.unbounded_send(ping_response).unwrap();
+        let client = client.await.unwrap().unwrap();
+        let disconnects = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = cx.update(|cx| {
+            let disconnects = disconnects.clone();
+            cx.subscribe(&client, move |_, event, _| {
+                if let RemoteClientEvent::Disconnected { server_not_running } = event {
+                    disconnects.borrow_mut().push(*server_not_running);
+                }
+            })
+        });
+
+        *proxies.proxy_exit_code.lock() = Some(ProxyLaunchError::ServerNotRunning.to_exit_code());
+        client.update(cx, |client, cx| client.reconnect(cx).unwrap());
+        // The proxy's output closes first, failing the handshake, and its
+        // exit status follows.
+        let (incoming_tx, _outgoing_rx) = proxy_rx.next().await.unwrap();
+        drop(incoming_tx);
+        cx.run_until_parked();
+        cx.background_executor.timer(Duration::from_secs(1)).await;
+        cx.run_until_parked();
+
+        assert!(client.read_with(cx, |client, _| client.state_is(State::is_server_not_running)));
+        assert_eq!(*disconnects.borrow(), [true]);
+        cx.background_executor
+            .timer(QUIET_RECONNECT_INTERVAL * 2)
+            .await;
+        cx.run_until_parked();
+        assert!(
+            proxy_rx.next().now_or_never().flatten().is_none(),
+            "one attempt, and no retries"
         );
     }
 

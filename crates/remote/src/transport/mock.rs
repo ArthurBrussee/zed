@@ -55,6 +55,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::Duration,
 };
 use util::paths::{PathStyle, RemotePathBuf};
 
@@ -75,6 +76,9 @@ pub struct MockRemoteConnection {
     /// Set when a test has the connection die by itself, as an SSH
     /// connection does when its master exits.
     dead: AtomicBool,
+    /// When set, a proxy started through `proxy_tx` exits with this code a
+    /// moment after it starts, as a proxy that finds no server does.
+    pub(crate) proxy_exit_code: parking_lot::Mutex<Option<i32>>,
     pub(crate) proxy_tx: parking_lot::Mutex<
         Option<
             mpsc::UnboundedSender<(
@@ -196,6 +200,7 @@ impl MockConnection {
             server_cx: SendableCx::new(server_cx),
             kills: Default::default(),
             dead: Default::default(),
+            proxy_exit_code: Default::default(),
             proxy_tx: Default::default(),
         });
 
@@ -308,9 +313,17 @@ impl RemoteConnection for MockRemoteConnection {
             proxy_tx
                 .unbounded_send((client_incoming_tx, client_outgoing_rx))
                 .unwrap();
+            let exit_code = *self.proxy_exit_code.lock();
+            let executor = cx.background_executor().clone();
             return cx.background_spawn(async move {
                 let _connection_activity_tx = connection_activity_tx;
-                futures::future::pending().await
+                match exit_code {
+                    Some(exit_code) => {
+                        executor.timer(Duration::from_millis(100)).await;
+                        Ok(exit_code)
+                    }
+                    None => futures::future::pending().await,
+                }
             });
         }
 

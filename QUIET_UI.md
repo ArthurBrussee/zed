@@ -27,8 +27,10 @@ clock; both were wrong.
 
 ## Upstream first (from 2026-10-01)
 
-The fork stands at +57.6k / -11.8k lines across 165 files against upstream (the exact figures
-after the 2026-10-22 evening run were +57,600 / -11,823 across 165 files, up from +57,166 / -11,808
+The fork stands at +57.9k / -11.8k lines across 165 files against upstream (the exact figures
+after the 2026-10-23 run were +57,852 / -11,827 across 165 files, up from +57,600 / -11,823 after
+the 10-22 evening run, for two queue entries, two thirds of it tests; after the 2026-10-22 evening
+run they were +57,600 / -11,823 across 165 files, up from +57,166 / -11,808
 after that day's first run, for two queue entries, a third of it tests; after the 2026-10-22 run
 they were +57,166 / -11,808, up from +55,053 / -11,746 after the 10-21 run,
 for five queue entries, about half of it their tests; after the 2026-10-21 run they were
@@ -318,35 +320,8 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
-**Reconnecting crashes Zed, and never recovers once the box's server has gone: fix both first.**
-
-1. **The crash.** On 2026-10-23 at 10:41 local the app panicked with `cannot read
-   remote::remote_client::RemoteClient while it is already being updated`
-   (`gpui/src/app/entity_map.rs:188`; the crash report and minidump are in `~/Library/Logs/Zed`).
-   `retry_stuck_peers` (`remote/src/remote_client.rs` ~1147) runs inside one client's update and
-   calls `peer.update(|peer| peer.reconnect(cx))`; the peer's `reconnect` calls `self.peers(cx)`,
-   which reads every other client with the same options, including the one whose update this all
-   runs inside. Defer the peers' reconnects until the current update has ended (`cx.defer`, or
-   spawn), and make sure nothing else in `reconnect`, `set_state` or `retry_stuck_peers` reads or
-   updates another client synchronously from inside a client's update. A test with two clients
-   where one reconnecting wakes the other: no panic, both reconnect.
-2. **Never recovers when the server is gone.** Overnight every box window's server exited (the
-   2-hour idle exit, as intended), and in the morning each window retried forever (attempt 43 and
-   counting, "(remote proxy) attempted to reconnect, but no server running", then
-   "Reconnect attempt N failed: Remote connection closed before becoming ready"); the title bar's
-   Reconnect only retries the same way. The proxy says why with exit code 90
-   (`ProxyLaunchError::ServerNotRunning`), but in `reconnect()` the handshake failure returns
-   `ReconnectFailed` first and drops the monitor task that would have read that code, so
-   `State::ServerNotRunning` is never set and the fork's automatic fresh-server reopen
-   (`recent_projects/src/disconnected_overlay.rs`) never runs. During a reconnect attempt, race the
-   handshake against the proxy's exit, and when it exits with 90 go to `ServerNotRunning` at once
-   (no retry); with the 2-hour idle exit this is now the normal morning path, so it has to open a
-   fresh server without a click and the window's threads reattach to their relay sessions.
-   A test with the mock transport: a reconnect whose proxy exits with 90 ends in
-   `ServerNotRunning` after one attempt.
-
-**Empty.** Everything queued on 2026-10-22 was built that evening, the two filed late in the day by
-the evening run.
+**Empty.** Both entries queued on 2026-10-23 (the reconnect crash and the reconnect that never
+recovered once the box's server had gone) were built that evening.
 
 ## Verification queue
 
@@ -567,9 +542,9 @@ churn and goes back. Fork-only files are listed last.
 - `crates/recent_projects/src/disconnected_overlay.rs` (+79/-22): remote dev: auto-start a fresh server when the box's is gone.
 - `crates/recent_projects/src/remote_connections.rs` (+130/-0): test for that auto-reconnect; reopening a dead window reuses its server's name (10-20).
 - `crates/remote/src/remote.rs`: exports `OFFER_FRESH_CONNECTION_AFTER` (10-22).
-- `crates/remote/src/remote_client.rs`: remote dev: reconnect backoff and the shared connection (10-19); setup names unique across launches, `Reused` names (10-20); a connection is kept only when a peer uses that same live one, an early proxy exit fails the attempt, `reconnect_failure` and `reconnect_fresh` (10-22).
+- `crates/remote/src/remote_client.rs`: remote dev: reconnect backoff and the shared connection (10-19); setup names unique across launches, `Reused` names (10-20); a connection is kept only when a peer uses that same live one, an early proxy exit fails the attempt, `reconnect_failure` and `reconnect_fresh` (10-22); stuck peers retried after the update ends, and a reconnect whose proxy exits with 90 ends in `ServerNotRunning` (10-23).
 - `crates/remote/src/transport.rs`: the proxy's last stderr lines in its error when it exits (10-22).
-- `crates/remote/src/transport/mock.rs`: a mock connection that dies by itself, for the test of the above (10-22).
+- `crates/remote/src/transport/mock.rs`: a mock connection that dies by itself, for the test of the above (10-22); a mock proxy that exits with a given code (10-23).
 - `crates/remote/src/transport/ssh.rs` (+15/-3): remote dev: server binary named after the client's commit; ssh keepalives on the master unless the user's config sets them (10-20); `has_been_killed` counts an exited master or a missing control socket (10-22).
 - `crates/remote_server/Cargo.toml` (+3/-1): relay deps and test deps.
 - `crates/remote_server/src/headless_project.rs` (+16/-0): relay host entity; `GetSystemLoad` handler.
@@ -2937,3 +2912,56 @@ ones by name instead. `pkill -f <binary>` matches the shell running it and kills
 348 the group headers, whose `block_map.rs` shrank from +200 to +119 against upstream. The four
 files that joined are `editor`'s `fold.rs`, `element.rs`, `element/header.rs` and
 `split_editor_view.rs`.
+
+**2026-10-23**: onto main 27ea42bf0 (4 upstream commits). A working night on the queue: both
+entries Arthur filed that morning, both built, two commits over the replayed one. The branch
+carried 4 commits over the merge base (the 10-22 evening run's three and Arthur's queue commit);
+squash-then-rebase folded them into one, tree-identical to the old tip before rebasing. Backup at
+`quiet-ui-pre-rebase59-2026-10-23`, kept locally and not pushed.
+
+**Conflicts**: none. Upstream's four commits (an fs watch fix, scrollbar settings, the threads
+database read after every save, dependency bumps) touch nothing the fork changes. **Markerless
+drift**: none; `cargo check --workspace --all-targets` was clean right after the replay.
+
+**What upstream provides that the fork might delete**: nothing tonight.
+
+**What was built, each its own commit with its tests:**
+- *The reconnect crash.* `retry_stuck_peers` now retries the host's other clients in a `cx.defer`
+  callback, after the reconnected client's update has ended; each peer is checked again for still
+  being stuck when the callback runs. The rest of the path was read for the same pattern: `reconnect`
+  reads its peers only from inside its own update, `set_state` only emits, and every other caller
+  of `reconnect` (heartbeat, monitor, backoff timer, the title bar's `reconnect_fresh`) runs in that
+  client's own update, so nothing else reads or updates another client synchronously from inside
+  one. Test: two clients on one host, the second's attempt goes unanswered and fails, the first
+  reconnects; the second retries at once without waiting out its backoff, and both end connected.
+  Without the fix it panics with the exact message from the crash (`entity_map.rs:188`).
+- *The reconnect that never recovered once the server had gone.* The proxy's exit status now
+  travels with its message (`(Option<i32>, String)`), and a failed handshake waits up to
+  `PROXY_EXIT_GRACE` (2s) for it when it has not already arrived, since the proxy's output closes
+  (failing the handshake) a moment before its exit status is known. An exit code of 90 returns
+  `State::ServerNotRunning` instead of `ReconnectFailed`: no retry, and the outer handler emits
+  `Disconnected { server_not_running: true }`, which `disconnected_overlay.rs`'s existing automatic
+  fresh-server reopen answers without a click (that path and its agents-reattach test,
+  `test_a_window_whose_server_is_gone_reconnects_by_itself`, are unchanged and passed). If the
+  monitor reads the 90 first, it sets the state itself, and the handler then emits nothing more.
+  The mock gained `proxy_exit_code`: a proxy started through `proxy_tx` exits with it 100ms after
+  starting. Test: a reconnect whose output closes and whose proxy then exits with 90 ends in
+  `ServerNotRunning` after one attempt, emits exactly one server-not-running disconnect, and starts
+  no further proxy over two quiet intervals. It fails without the fix. A stuck handshake whose
+  proxy is still alive now fails 2s later than before (the grace wait); the 10-15 stuck-peer test
+  needed nothing, and tonight's crash test advances its clock by the grace as well.
+
+**The gate**: `cargo test` over the core three, every crate touched (`remote`), and
+`recent_projects` (whose reopen the second fix feeds): `remote` 62, `acp_thread` 369,
+`recent_projects` 38, `agent_ui` 620 (its 36 `#[ignore]`d left alone), `sidebar` 215. No
+failures. `./script/clippy --keep-going` over the same five was clean on the first pass.
+`cargo check -p zed` was clean.
+
+**Environment.** 4 cores, 15G. The `apt-get` and `CARGO_NET_GIT_FETCH_WITH_CLI` steps worked as
+written; `CARGO_PROFILE_DEV_DEBUG=0` all night. The disk went from 30G free to 5.6G over the test
+suites (deleting test binaries over 50MB after each); `rm -rf target/debug` before clippy.
+
+**Diff size**: 165 files, +57,852 / -11,827 against the merge base, from 165 files,
++57,600 / -11,823 after the 10-22 evening run (unchanged by the replay). Up 252 added lines for
+tonight's two commits, about two thirds of them their tests, all in `remote_client.rs` and the
+mock transport.
