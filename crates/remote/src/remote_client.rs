@@ -1144,17 +1144,26 @@ impl RemoteClient {
 
     /// One client getting through means the host is back, so the others on it
     /// waiting out a backoff try now rather than each needing a click.
+    /// Deferred, because a reconnect reads every client on the host, this one
+    /// included, which panics while this one is being updated.
     fn retry_stuck_peers(&self, cx: &mut Context<Self>) {
         let stuck: Vec<Entity<Self>> = self
             .peers(cx)
             .filter(|peer| peer.read(cx).state_is(State::is_reconnect_failed))
             .collect();
-        for peer in stuck {
-            peer.update(cx, |peer, cx| {
-                log::info!("another client reconnected to this host; retrying now");
-                peer.reconnect(cx).log_err();
-            });
+        if stuck.is_empty() {
+            return;
         }
+        cx.defer(move |cx| {
+            for peer in stuck {
+                peer.update(cx, |peer, cx| {
+                    if peer.state_is(State::is_reconnect_failed) {
+                        log::info!("another client reconnected to this host; retrying now");
+                        peer.reconnect(cx).log_err();
+                    }
+                });
+            }
+        });
     }
 
     fn state_is(&self, check: impl FnOnce(&State) -> bool) -> bool {
@@ -2643,6 +2652,118 @@ mod tests {
         assert_eq!(live.kill_count(), 0, "the peer's connection is left alone");
         assert_eq!(
             peer.read_with(cx, |peer, _| peer.connection_state()),
+            ConnectionState::Connected
+        );
+    }
+
+    /// A server that answers a client's handshakes, flushes and heartbeats.
+    fn answer_client(
+        incoming_tx: mpsc::UnboundedSender<Envelope>,
+        mut outgoing_rx: mpsc::UnboundedReceiver<Envelope>,
+        cx: &TestAppContext,
+    ) -> Task<()> {
+        cx.background_spawn(async move {
+            let mut next_id = 1000;
+            while let Some(message) = outgoing_rx.next().await {
+                if matches!(
+                    message.payload,
+                    Some(
+                        proto::envelope::Payload::RemoteStarted(_)
+                            | proto::envelope::Payload::FlushBufferedMessages(_)
+                            | proto::envelope::Payload::Ping(_)
+                    )
+                ) {
+                    let mut ack = proto::Ack {}.into_envelope(next_id, Some(message.id), None);
+                    ack.ack_id = Some(message.id);
+                    incoming_tx.unbounded_send(ack).ok();
+                    next_id += 1;
+                }
+            }
+        })
+    }
+
+    /// 2026-10-23: one window reconnecting retried the others on the host from
+    /// inside its own update, and their reconnects read it back: Zed panicked
+    /// with "cannot read RemoteClient while it is already being updated".
+    #[gpui::test]
+    async fn test_a_reconnect_wakes_a_stuck_peer_without_panicking(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let (options, _, connect_guard) = MockConnection::new(cx, server_cx);
+        drop(connect_guard);
+        let mock = cx
+            .update(|cx| {
+                cx.default_global::<MockConnectionRegistry>()
+                    .take(&options)
+                    .unwrap()
+            })
+            .await;
+        let (proxy_tx, mut proxy_rx) = mpsc::unbounded();
+        *mock.proxy_tx.lock() = Some(proxy_tx);
+        let connection: Arc<dyn RemoteConnection> = mock;
+        cx.update(|cx| {
+            release_channel::init_test(Version::new(0, 0, 0), ReleaseChannel::Dev, cx);
+            cx.default_global::<ConnectionPool>().connections.insert(
+                connection.connection_options(),
+                ConnectionPoolEntry::Connected(Arc::downgrade(&connection)),
+            );
+        });
+
+        let mut connect = async |cx: &mut TestAppContext| {
+            let (_cancellation_tx, cancellation_rx) = oneshot::channel();
+            let client = cx.update(|cx| {
+                RemoteClient::new(
+                    ConnectionIdentifier::setup(),
+                    connection.clone(),
+                    cancellation_rx,
+                    Arc::new(MockDelegate),
+                    cx,
+                )
+            });
+            let (incoming_tx, mut outgoing_rx) = proxy_rx.next().await.unwrap();
+            outgoing_rx.next().await.unwrap();
+            incoming_tx
+                .unbounded_send(proto::RemoteStarted {}.into_envelope(0, None, None))
+                .unwrap();
+            outgoing_rx.next().await.unwrap();
+            let ping = outgoing_rx.next().await.unwrap();
+            let mut ping_response = proto::Ack {}.into_envelope(2, Some(ping.id), None);
+            ping_response.ack_id = Some(ping.id);
+            incoming_tx.unbounded_send(ping_response).unwrap();
+            client.await.unwrap().unwrap()
+        };
+        let first = connect(cx).await;
+        let second = connect(cx).await;
+
+        // The second window's attempt goes unanswered and fails, leaving it
+        // waiting out its backoff.
+        second.update(cx, |second, cx| second.reconnect(cx).unwrap());
+        let _unanswered = proxy_rx.next().await.unwrap();
+        cx.background_executor
+            .timer(RECONNECT_HANDSHAKE_TIMEOUT)
+            .await;
+        cx.run_until_parked();
+        assert!(second.read_with(cx, |second, _| second.state_is(State::is_reconnect_failed)));
+
+        // The first window gets through, which retries the second at once.
+        first.update(cx, |first, cx| first.reconnect(cx).unwrap());
+        let (incoming_tx, outgoing_rx) = proxy_rx.next().await.unwrap();
+        let _first_server = answer_client(incoming_tx, outgoing_rx, cx);
+        cx.run_until_parked();
+        assert_eq!(
+            first.read_with(cx, |first, _| first.connection_state()),
+            ConnectionState::Connected
+        );
+        let (incoming_tx, outgoing_rx) = proxy_rx
+            .next()
+            .now_or_never()
+            .flatten()
+            .expect("the stuck window retried without waiting out its backoff");
+        let _second_server = answer_client(incoming_tx, outgoing_rx, cx);
+        cx.run_until_parked();
+        assert_eq!(
+            second.read_with(cx, |second, _| second.connection_state()),
             ConnectionState::Connected
         );
     }
