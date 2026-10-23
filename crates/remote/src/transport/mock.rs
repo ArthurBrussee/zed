@@ -53,7 +53,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 use util::paths::{PathStyle, RemotePathBuf};
@@ -69,6 +69,12 @@ pub struct MockRemoteConnection {
     options: MockConnectionOptions,
     server_channel: Arc<ChannelClient>,
     server_cx: SendableCx,
+    /// How often `kill` was called, so a test can see whether a connection
+    /// other clients share was taken down. The mock stays usable after one.
+    kills: AtomicU64,
+    /// Set when a test has the connection die by itself, as an SSH
+    /// connection does when its master exits.
+    dead: AtomicBool,
     pub(crate) proxy_tx: parking_lot::Mutex<
         Option<
             mpsc::UnboundedSender<(
@@ -115,6 +121,14 @@ pub struct MockConnectionRegistry {
 impl Global for MockConnectionRegistry {}
 
 impl MockConnectionRegistry {
+    /// The connection the next `ConnectionPool::connect` for `opts` gets.
+    #[cfg(test)]
+    pub(crate) fn peek(&self, opts: &MockConnectionOptions) -> Option<Arc<MockRemoteConnection>> {
+        self.pending
+            .get(&opts.id)
+            .map(|(_, connection)| connection.clone())
+    }
+
     /// Called by `ConnectionPool::connect` to retrieve a pre-registered mock connection.
     pub fn take(
         &mut self,
@@ -180,6 +194,8 @@ impl MockConnection {
             options: opts.clone(),
             server_channel: server_client.clone(),
             server_cx: SendableCx::new(server_cx),
+            kills: Default::default(),
+            dead: Default::default(),
             proxy_tx: Default::default(),
         });
 
@@ -195,14 +211,26 @@ impl MockConnection {
     }
 }
 
+#[cfg(test)]
+impl MockRemoteConnection {
+    pub(crate) fn kill_count(&self) -> u64 {
+        self.kills.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn simulate_master_exit(&self) {
+        self.dead.store(true, Ordering::SeqCst);
+    }
+}
+
 #[async_trait(?Send)]
 impl RemoteConnection for MockRemoteConnection {
     async fn kill(&self) -> Result<()> {
+        self.kills.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
     fn has_been_killed(&self) -> bool {
-        false
+        self.dead.load(Ordering::SeqCst)
     }
 
     fn build_command(

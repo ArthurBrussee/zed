@@ -824,6 +824,20 @@ impl Default for TerminalBounds {
     }
 }
 
+fn one_cell_bounds(bounds: TerminalBounds) -> TerminalBounds {
+    TerminalBounds::new(
+        bounds.line_height,
+        bounds.cell_width,
+        Bounds {
+            origin: bounds.bounds.origin,
+            size: Size {
+                width: bounds.cell_width,
+                height: bounds.line_height,
+            },
+        },
+    )
+}
+
 fn normalize_terminal_bounds(mut bounds: TerminalBounds) -> TerminalBounds {
     bounds.bounds.size.height = cmp::max(bounds.line_height, bounds.height());
     bounds.bounds.size.width = cmp::max(bounds.cell_width, bounds.width());
@@ -1017,9 +1031,12 @@ impl TerminalBuilder {
         let config = display_only_term_config(scrolling_history, cursor_shape);
 
         let (events_tx, events_rx) = unbounded();
+        // quiet-ui: one cell until something writes to it or draws it. A
+        // thread loaded from history holds thousands of these, most never
+        // opened, and each grid at full size is a few kilobytes.
         let term = new_term(
             &config,
-            terminal_bounds,
+            one_cell_bounds(terminal_bounds),
             events_tx.clone(),
             alternate_scroll,
             0,
@@ -1035,6 +1052,7 @@ impl TerminalBuilder {
             output_processor: None,
             output_events_tx: Some(events_tx),
             output_generation: 0,
+            grid_deferred: true,
             title_override: None,
             events: VecDeque::with_capacity(10),
             last_content: Content {
@@ -1325,6 +1343,7 @@ impl TerminalBuilder {
                 output_processor: None,
                 output_events_tx: None,
                 output_generation: 0,
+                grid_deferred: false,
                 title_override: terminal_title_override,
                 events: VecDeque::with_capacity(10), //Should never get this high.
                 last_content: Default::default(),
@@ -1530,6 +1549,9 @@ pub struct Terminal {
     output_processor: Option<Processor<StdSyncHandler>>,
     output_events_tx: Option<futures::channel::mpsc::UnboundedSender<PtyEvent>>,
     output_generation: u64,
+    /// The grid is one cell until it is first written to or drawn, and then
+    /// takes `last_content.terminal_bounds`.
+    grid_deferred: bool,
     events: VecDeque<InternalEvent>,
     /// This is only used for mouse mode cell change detection
     last_mouse: Option<(Point, SelectionSide)>,
@@ -1994,6 +2016,7 @@ impl Terminal {
 
     /// Terminal byte streams already contain their control sequences and must not be normalized.
     pub fn write_raw_output(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+        self.ensure_grid();
         let mut term = self.term.lock();
         self.output_processor
             .get_or_insert_with(Processor::<StdSyncHandler>::new)
@@ -2024,6 +2047,7 @@ impl Terminal {
         );
         self.output_generation = generation;
         self.term = term;
+        self.grid_deferred = false;
         self.output_processor = None;
         // The new emulator already has the latest requested size; older resizes can truncate it.
         self.events.clear();
@@ -2059,11 +2083,23 @@ impl Terminal {
     }
 
     pub fn total_lines(&self) -> usize {
+        if self.grid_deferred {
+            return self.last_content.terminal_bounds.num_lines();
+        }
         total_lines(&self.term.lock_unfair())
     }
 
     pub fn viewport_lines(&self) -> usize {
+        if self.grid_deferred {
+            return self.last_content.terminal_bounds.num_lines();
+        }
         screen_lines(&self.term.lock_unfair())
+    }
+
+    fn ensure_grid(&mut self) {
+        if std::mem::take(&mut self.grid_deferred) {
+            resize(&mut self.term.lock(), self.last_content.terminal_bounds);
+        }
     }
 
     pub fn used_lines(&self) -> usize {
@@ -2120,6 +2156,7 @@ impl Terminal {
     }
 
     pub fn shrink_to_used(&mut self) {
+        self.ensure_grid();
         shrink_to_used(&mut self.term.lock());
     }
 
@@ -2496,6 +2533,7 @@ impl Terminal {
     }
 
     pub fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ensure_grid();
         let term = self.term.clone();
         let mut terminal = term.lock_unfair();
         //Note that the ordering of events matters for event processing
@@ -3701,6 +3739,33 @@ mod tests {
                 "startup marker command for {shell_kind:?} should not contain the full marker, got {command:?}"
             );
         }
+    }
+
+    #[gpui::test]
+    async fn test_a_display_only_terminal_allocates_its_grid_when_written(
+        cx: &mut TestAppContext,
+    ) {
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                SettingsCursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+        terminal.update(cx, |terminal, cx| {
+            assert_eq!(terminal.term.lock_unfair().columns(), 1);
+            assert_eq!(terminal.viewport_lines(), TerminalBounds::default().num_lines());
+            terminal.write_output(b"hello", cx);
+            assert_eq!(
+                terminal.term.lock_unfair().columns(),
+                TerminalBounds::default().num_columns()
+            );
+            assert_eq!(terminal.get_content().trim(), "hello");
+        });
     }
 
     #[gpui::test]

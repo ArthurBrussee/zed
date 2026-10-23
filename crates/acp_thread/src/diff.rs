@@ -326,6 +326,7 @@ impl Diff {
                 new_text,
                 language_registry,
                 has_changes: OnceCell::new(),
+                line_counts: OnceCell::new(),
             }),
         })
     }
@@ -468,6 +469,32 @@ impl Diff {
                         .normalized_changed_text(deferred.new_text.clone())
                         .is_some()
                 }),
+            },
+        }
+    }
+
+    /// Lines added and removed, without building a deferred diff's buffers.
+    pub fn changed_line_counts(&self, cx: &App) -> (u32, u32) {
+        match self {
+            Self::Pending(PendingDiff { diff, .. }) => diff.read(cx).changed_row_counts(),
+            Self::Finalized(finalized) => match &finalized.state {
+                FinalizedDiffState::Resolved(resolved) => {
+                    let buffer_id = resolved.new_buffer.read(cx).remote_id();
+                    resolved
+                        .multibuffer
+                        .read(cx)
+                        .diff_for(buffer_id)
+                        .map_or((0, 0), |diff| diff.read(cx).changed_row_counts())
+                }
+                FinalizedDiffState::Deferred(deferred) => {
+                    *deferred.line_counts.get_or_init(|| {
+                        language::line_diff(&finalized.base_text, &deferred.new_text)
+                            .into_iter()
+                            .fold((0, 0), |(added, removed), (old, new)| {
+                                (added + new.len() as u32, removed + old.len() as u32)
+                            })
+                    })
+                }
             },
         }
     }
@@ -689,6 +716,7 @@ struct DeferredSource {
     new_text: String,
     language_registry: Arc<LanguageRegistry>,
     has_changes: OnceCell<bool>,
+    line_counts: OnceCell<(u32, u32)>,
 }
 
 struct ResolvedFinalized {

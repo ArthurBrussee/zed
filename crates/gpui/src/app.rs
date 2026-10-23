@@ -3158,6 +3158,29 @@ impl App {
             .expect("asset cache entries are keyed by their asset type")
     }
 
+    /// Counts that climbing while idle indicate leaked subscriptions or focus handles. Walks the
+    /// sets, so call it on a timer rather than per frame.
+    pub fn callback_counts(&self) -> CallbackCounts {
+        let (observers, observed_entities) = self.observers.counts();
+        let (event_listeners, emitting_entities) = self.event_listeners.counts();
+        let (release_listeners, _) = self.release_listeners.counts();
+        let (global_observers, _) = self.global_observers.counts();
+        CallbackCounts {
+            observers,
+            observed_entities,
+            event_listeners,
+            emitting_entities,
+            release_listeners,
+            global_observers,
+            focus_handles: self.focus_handles.read().handles.len(),
+        }
+    }
+
+    /// Live entities per concrete type, largest first. Walks the entity map, so call it on a timer.
+    pub fn entity_counts_by_type(&self) -> Vec<(&'static str, usize)> {
+        self.entities.counts_by_type()
+    }
+
     /// Obtain a new [`FocusHandle`], which allows you to track and manipulate the keyboard focus
     /// for elements rendered within this window.
     #[track_caller]
@@ -3336,6 +3359,25 @@ impl App {
         };
         self.to_async()
     }
+}
+
+/// See [`App::callback_counts`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CallbackCounts {
+    /// Live `observe` callbacks.
+    pub observers: usize,
+    /// Entities those observers watch.
+    pub observed_entities: usize,
+    /// Live `subscribe` callbacks.
+    pub event_listeners: usize,
+    /// Entities those listeners watch.
+    pub emitting_entities: usize,
+    /// Live `observe_release` callbacks.
+    pub release_listeners: usize,
+    /// Live `observe_global` callbacks.
+    pub global_observers: usize,
+    /// Live focus handles.
+    pub focus_handles: usize,
 }
 
 impl AppContext for App {

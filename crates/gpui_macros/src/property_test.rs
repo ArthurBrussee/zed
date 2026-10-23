@@ -184,10 +184,14 @@ fn remove_cxs(parsed: &mut ParsedArgs, args: &mut Vec<FnArg>, test_name: &Ident)
                 Some(stringify!(#test_name)),
             );
         ));
+        // Quit inside `update`, as `#[gpui::test]` does, so the effect cycle flushes what shutdown
+        // released before the leak detector runs.
         parsed.cx_teardowns.extend(quote!(
             dispatcher.run_until_parked();
-            #cx_varname.executor().forbid_parking();
-            #cx_varname.quit();
+            #cx_varname.update(|cx| {
+                cx.background_executor().forbid_parking();
+                cx.quit();
+            });
             dispatcher.run_until_parked();
         ));
 

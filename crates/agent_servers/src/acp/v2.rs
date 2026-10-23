@@ -7226,9 +7226,10 @@ exec sleep 60
             std::process::Stdio::null(),
         )
         .expect("spawn waiting child");
-        let mut child = transport::OwnedChild(child);
+        let mut child = child;
         // status() closes the child's stdin; keep it open so only shutdown ends the process.
-        let stdin = child.0.stdin.take().expect("child stdin");
+        let stdin = child.stdin.take().expect("child stdin");
+        let mut child = transport::OwnedChild(transport::AgentProcess::Local(child));
         let status = child.0.status();
         let (transport, _peer) = agent_client_protocol::Channel::duplex();
         let connecting = cx.spawn(async move |mut cx| {

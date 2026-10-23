@@ -552,6 +552,8 @@ impl Item for ProjectDiff {
     ) -> Option<gpui::AnyEntity> {
         if type_id == TypeId::of::<Self>() {
             Some(self_handle.clone().into())
+        } else if type_id == TypeId::of::<DiffMultibuffer>() {
+            Some(self.diff.clone().into())
         } else if type_id == TypeId::of::<Editor>() {
             Some(
                 self.diff

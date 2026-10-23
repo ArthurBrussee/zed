@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/acp_relay",
     "crates/acp_thread",
     "crates/acp_tools",
     "crates/action_log",
@@ -87,6 +88,7 @@ members = [
     "crates/fs_benchmarks",
     "crates/fuzzy",
     "crates/fuzzy_nucleo",
+    "crates/gh_status",
     "crates/git",
     "crates/git_hosting_providers",
     "crates/git_ui",
@@ -282,6 +284,7 @@ edition = "2024"
 # Workspace member crates
 #
 
+acp_relay = { path = "crates/acp_relay" }
 acp_thread = { path = "crates/acp_thread" }
 acp_tools = { path = "crates/acp_tools" }
 action_log = { path = "crates/action_log" }
@@ -360,6 +363,7 @@ file_icons = { path = "crates/file_icons" }
 fs = { path = "crates/fs" }
 fuzzy = { path = "crates/fuzzy" }
 fuzzy_nucleo = { path = "crates/fuzzy_nucleo" }
+gh_status = { path = "crates/gh_status" }
 git = { path = "crates/git" }
 git_hosting_providers = { path = "crates/git_hosting_providers" }
 git_ui = { path = "crates/git_ui" }
@@ -694,6 +698,7 @@ mdbook = { version = "=0.4.40", default-features = false, features = ["search"] 
 merman = { version = "=0.8.0-alpha.5", default-features = false }
 metal = "0.33"
 mime = "0.3.17"
+minidump-common = "0.26"
 minidumper = "0.11"
 moka = { version = "0.12.10", features = ["sync"] }
 nanoid = "0.4"
@@ -886,6 +891,7 @@ rustls = "0.23.26"
 rustls-platform-verifier = "0.7"
 # WARNING: If you change this, you must also publish a new version of zed-scap to crates.io
 scap = { git = "https://github.com/zed-industries/scap", rev = "4afea48c3b002197176fb19cd0f9b180dd36eaac", default-features = false, package = "zed-scap", version = "0.0.8-zed" }
+scroll = "0.12"
 schemars = { version = "1.0", default-features = false, features = ["std", "indexmap2"] }
 sea-orm = { version = "=1.1.10", default-features = false }
 seccompiler = "0.5"
@@ -1063,7 +1069,9 @@ scratch = { path = "tooling/corgi/patches/scratch" }
 
 [profile.dev]
 split-debuginfo = "unpacked"
-incremental = true
+# The incremental cache regrows to 80GB+ within days on this fork and has
+# filled the disk repeatedly; whole-crate rebuilds are the cheaper trade.
+incremental = false
 codegen-units = 16
 debug = "limited"
 

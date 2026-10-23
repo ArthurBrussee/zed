@@ -1,0 +1,23 @@
+# Starts the quiet-ui build whenever this branch moves with code in it, so a
+# build follows the routine's push instead of waiting for a fixed hour. The
+# build itself lives on the default branch (quiet_ui_nightly.yml) so there is
+# one copy of it; a push that only edits QUIET_UI.md starts nothing.
+name: quiet-ui kick
+
+on:
+  push:
+    branches: [quiet-ui]
+    paths-ignore:
+      - QUIET_UI.md
+
+permissions:
+  actions: write
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch the build on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run quiet_ui_nightly.yml --repo "$GITHUB_REPOSITORY" --ref main

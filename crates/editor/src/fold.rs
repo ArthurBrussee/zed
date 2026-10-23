@@ -697,6 +697,20 @@ impl Editor {
         cx.notify();
     }
 
+    /// Makes room above each listed buffer's header for rows that
+    /// [`Addon::render_above_buffer_header`] draws, replacing what was set
+    /// before.
+    pub fn set_buffer_header_extra_rows(
+        &mut self,
+        rows: HashMap<BufferId, u32>,
+        cx: &mut Context<Self>,
+    ) {
+        self.display_map.update(cx, |display_map, cx| {
+            display_map.set_buffer_header_extra_rows(rows, cx);
+        });
+        cx.notify();
+    }
+
     /// Removes any folds with the given ranges.
     pub fn remove_folds_with_type<T: ToOffset + Clone>(
         &mut self,

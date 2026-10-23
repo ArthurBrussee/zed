@@ -763,7 +763,7 @@ impl<D: PickerDelegate> Picker<D> {
         self
     }
 
-    pub(crate) fn set_popover(&mut self) {
+    pub fn set_popover(&mut self) {
         self.presentation = Presentation::Popover;
     }
 
