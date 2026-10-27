@@ -54,6 +54,10 @@ jobs:
           if [ -n "$xcode" ]; then sudo xcode-select -s "$xcode"; fi
           xcode-select -p
           xcrun --sdk macosx --show-sdk-version
+          # Xcode 26 ships the Metal compiler as a separate component, and gpui's
+          # build script compiles its shaders with it.
+          xcrun -f metal >/dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain
+          xcrun -f metal
 
       # `quiet-ui-built` marks the commit the last successful bundle came from.
       # A night where the routine found nothing to do, or a day already built by
