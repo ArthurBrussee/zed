@@ -91,11 +91,16 @@ jobs:
         if: steps.freshness.outputs.build == 'true'
         run: |
           df -h / | tail -1
-          active=$(xcode-select -p 2>/dev/null | sed 's|/Contents/Developer||')
+          # Compare real paths: on macos-26 the Xcode_26.x.y.app names are symlinks
+          # to differently named apps, and comparing names deleted the active one.
+          active=$(cd "$(xcode-select -p)/../.." && pwd -P)
+          echo "keeping $active"
           for app in /Applications/Xcode*.app; do
-            [ "$app" = "$active" ] && continue
+            [ -L "$app" ] && continue
+            [ "$(cd "$app" && pwd -P)" = "$active" ] && continue
             sudo rm -rf "$app" || true
           done
+          xcode-select -p
           sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* || true
           sudo rm -rf ~/Library/Developer/CoreSimulator/Caches || true
           df -h / | tail -1
