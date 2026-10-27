@@ -33,7 +33,9 @@ jobs:
 
   bundle-mac:
     needs: resolve
-    runs-on: macos-15
+    # Upstream needs the macOS 26 SDK (since its gpui_macos objc2 move, 10-22); the
+    # macos-15 image's default Xcode 16.4 only has the 15.5 SDK.
+    runs-on: macos-26
     timeout-minutes: 300
     permissions:
       # For the marker tag written at the end.
@@ -45,6 +47,13 @@ jobs:
         with:
           ref: ${{ needs.resolve.outputs.sha }}
           fetch-depth: 1
+
+      - name: Select the newest Xcode 26
+        run: |
+          xcode=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          if [ -n "$xcode" ]; then sudo xcode-select -s "$xcode"; fi
+          xcode-select -p
+          xcrun --sdk macosx --show-sdk-version
 
       # `quiet-ui-built` marks the commit the last successful bundle came from.
       # A night where the routine found nothing to do, or a day already built by
