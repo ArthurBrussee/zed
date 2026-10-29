@@ -35,7 +35,7 @@ use gpui::{
     AnyElement, App, BorderStyle, Bounds, ClipboardItem, CursorStyle, DispatchPhase, Edges, Entity,
     FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId, Hitbox, Hsla, Image,
     ImageFormat, ImageSource, InputHandler, KeyContext, Length, MouseButton, MouseDownEvent,
-    MouseEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollHandle, Stateful,
+    MouseEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, Point, ScrollHandle, Stateful,
     StrikethroughStyle, StyleRefinement, StyledImage, StyledText, Subscription, Task, TextAlign,
     TextLayout, TextRun, TextStyle, TextStyleRefinement, UTF16Selection, WrappedLineLayout,
     actions, canvas, img, point, quad, relative, size,
@@ -133,6 +133,9 @@ pub struct MarkdownStyle {
     pub prevent_mouse_interaction: bool,
     pub table_columns_min_size: bool,
     pub soft_break_as_hard_break: bool,
+    /// A fixed height for inline images that don't declare one, for markdown inside a `ListState`,
+    /// which would otherwise paint an image that loads late over the entries below.
+    pub inline_image_height: Option<AbsoluteLength>,
 }
 
 impl Default for MarkdownStyle {
@@ -162,6 +165,7 @@ impl Default for MarkdownStyle {
             prevent_mouse_interaction: false,
             table_columns_min_size: false,
             soft_break_as_hard_break: false,
+            inline_image_height: None,
         }
     }
 }
@@ -1011,7 +1015,12 @@ impl Markdown {
     }
 
     pub fn append(&mut self, text: &str, cx: &mut Context<Self>) {
-        self.source = SharedString::new(self.source.to_string() + text);
+        // One copy of the source per append rather than three; streaming
+        // appends every 16ms to a message that only grows.
+        let mut source = String::with_capacity(self.source.len() + text.len());
+        source.push_str(&self.source);
+        source.push_str(text);
+        self.source = source.into();
         self.parse(cx);
     }
 
@@ -1086,6 +1095,11 @@ impl Markdown {
     #[cfg(any(test, feature = "test-support"))]
     pub fn parsed_markdown(&self) -> &ParsedMarkdown {
         &self.parsed_markdown
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn renders_mermaid_diagrams(&self) -> bool {
+        self.options.render_mermaid_diagrams
     }
 
     pub fn escape(s: &str) -> Cow<'_, str> {
@@ -1229,6 +1243,32 @@ impl Markdown {
             self.options.defer_parsing = false;
             self.parse(cx);
         }
+    }
+
+    /// Drops the parse and what was rendered from it, keeping the source, so
+    /// that a Markdown nothing shows costs little more than its text. The next
+    /// layout parses it again, as for [`Self::new_deferred`]. Returns whether
+    /// there was anything to drop.
+    pub fn release_parsed(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.options.defer_parsing || self.source.is_empty() {
+            return false;
+        }
+        self.options.defer_parsing = true;
+        self.pending_parse = None;
+        self.should_reparse = false;
+        self.parsed_markdown = ParsedMarkdown {
+            source: self.source.clone(),
+            ..Default::default()
+        };
+        self.active_root_block = None;
+        self.images_by_source_offset.clear();
+        self.mermaid_state.clear(cx);
+        self.code_block_scroll_handles.clear();
+        true
+    }
+
+    pub fn is_parse_released(&self) -> bool {
+        self.options.defer_parsing
     }
 
     /// Returns whether Markdown parsing or Mermaid rendering is in progress.
@@ -1982,6 +2022,7 @@ impl MarkdownElement {
             .map(|link| link.destination_url.clone());
         let fallback_opens_image_url = enclosing_link_url.is_none();
 
+        let inline_image_height = self.style.inline_image_height.filter(|_| height.is_none());
         let image_element = {
             let image_start = range.start;
             let wrapper = div()
@@ -2026,24 +2067,29 @@ impl MarkdownElement {
             } else {
                 wrapper
             };
-            wrapper.child(
-                img(source)
-                    .id(("markdown-image", range.start))
-                    .min_w_0()
-                    .max_w_full()
-                    .rounded_md()
-                    .mr_1()
-                    .mb_1()
-                    .when_some(height, |this, height| this.h(height))
-                    .when_some(width, |this, width| this.w(width))
-                    .with_fallback(move || {
-                        image_fallback_element(
-                            dest_url.clone(),
-                            alt_text.clone(),
-                            fallback_opens_image_url,
-                        )
-                    }),
-            )
+            wrapper
+                .when_some(inline_image_height, |this, h| this.h(h))
+                .child(
+                    img(source)
+                        .id(("markdown-image", range.start))
+                        .min_w_0()
+                        .max_w_full()
+                        .rounded_md()
+                        // Margins on a `size_full` image would overflow a fixed-height wrapper.
+                        .when(inline_image_height.is_none(), |this| this.mr_1().mb_1())
+                        .when_some(height, |this, height| this.h(height))
+                        .when_some(width, |this, width| this.w(width))
+                        .when_some(inline_image_height, |this, _| {
+                            this.size_full().object_fit(ObjectFit::Contain)
+                        })
+                        .with_fallback(move || {
+                            image_fallback_element(
+                                dest_url.clone(),
+                                alt_text.clone(),
+                                fallback_opens_image_url,
+                            )
+                        }),
+                )
         };
 
         builder.push_image_child(image_element);
@@ -5292,6 +5338,36 @@ mod tests {
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[gpui::test]
+    fn test_a_released_parse_is_rebuilt_by_the_next_layout(cx: &mut TestAppContext) {
+        ensure_theme_initialized(cx);
+        let cx = cx.add_empty_window();
+        let markdown = cx.new(|cx| Markdown::new("one **two**".into(), None, None, cx));
+        cx.run_until_parked();
+        markdown.update(cx, |markdown, cx| {
+            assert!(!markdown.parsed_markdown.events.is_empty());
+            assert!(markdown.release_parsed(cx));
+            assert!(!markdown.release_parsed(cx), "nothing left to release");
+            assert!(markdown.parsed_markdown.events.is_empty());
+            assert_eq!(markdown.parsed_markdown.source(), "one **two**");
+            markdown.append(" three", cx);
+            assert!(
+                !markdown.has_pending_render(),
+                "a released parse waits for layout"
+            );
+        });
+
+        cx.draw(Point::default(), size(px(600.0), px(600.0)), |_, _| {
+            MarkdownElement::new(markdown.clone(), MarkdownStyle::default())
+        });
+        cx.run_until_parked();
+        markdown.read_with(cx, |markdown, _| {
+            assert!(!markdown.is_parse_released());
+            assert_eq!(markdown.parsed_markdown.source(), "one **two** three");
+            assert!(!markdown.parsed_markdown.events.is_empty());
+        });
+    }
 
     #[gpui::test]
     fn test_deferred_parsing_preserves_updates_and_autoscroll(cx: &mut TestAppContext) {

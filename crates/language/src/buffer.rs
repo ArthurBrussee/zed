@@ -589,6 +589,10 @@ pub struct Chunk<'a> {
     pub underline: bool,
 }
 
+/// A reload whose diff has more hunks than this replaces the text whole.
+const MAX_RELOAD_HUNKS: usize = 1000;
+const SLOW_RELOAD: Duration = Duration::from_millis(100);
+
 /// A set of edits to a given version of a buffer, computed asynchronously.
 #[derive(Debug, Clone)]
 pub struct Diff {
@@ -1691,13 +1695,14 @@ impl Buffer {
         let prev_version = self.text.version();
 
         self.reload_task = Some(cx.spawn(async move |this, cx| {
-            let Some((new_mtime, load_bytes_task, current_encoding)) =
+            let Some((new_mtime, load_bytes_task, current_encoding, path)) =
                 this.update(cx, |this, cx| {
                     let file = this.file.as_ref()?.as_local()?;
                     Some((
                         file.disk_state().mtime(),
                         file.load_bytes(cx),
                         this.encoding,
+                        file.full_path(cx),
                     ))
                 })?
             else {
@@ -1735,9 +1740,17 @@ impl Buffer {
                 (cow.into_owned(), actual_has_bom, used_enc)
             };
 
-            let diff = this.update(cx, |this, cx| this.diff(new_text, cx))?.await;
+            let replacement: Arc<str> = Arc::from(new_text.as_str());
+            let mut diff = this.update(cx, |this, cx| this.diff(new_text, cx))?.await;
+            let edit_count = diff.edits.len();
+            let apply_started = Instant::now();
             this.update(cx, |this, cx| {
                 if this.version() == diff.base_version {
+                    // quiet-ui: thousands of hunks reach every observer one by
+                    // one; a file rewritten that thoroughly is replaced whole.
+                    if diff.edits.len() > MAX_RELOAD_HUNKS {
+                        diff.edits = vec![(0..this.len(), replacement)];
+                    }
                     this.finalize_last_transaction();
                     let old_encoding = this.encoding;
                     let old_has_bom = this.has_bom;
@@ -1768,7 +1781,17 @@ impl Buffer {
                 }
 
                 this.reload_task.take();
-            })
+            })?;
+            let elapsed = apply_started.elapsed();
+            if elapsed > SLOW_RELOAD {
+                log::warn!(
+                    "reloading {} ({} bytes, {edit_count} hunks) blocked the main thread for {:.0}ms",
+                    path.display(),
+                    bytes.len(),
+                    elapsed.as_secs_f64() * 1000.
+                );
+            }
+            Ok(())
         }));
         rx
     }

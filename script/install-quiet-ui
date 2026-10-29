@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+#
+# Installs the latest quiet-ui build into /Applications.
+
+set -euo pipefail
+
+URL=https://github.com/ArthurBrussee/zed/releases/download/quiet-ui-latest/Zed-quiet-ui.dmg
+
+work=$(mktemp -d)
+mount="$work/mnt"
+mkdir "$mount"
+cleanup() {
+    hdiutil detach -quiet "$mount" >/dev/null 2>&1 || true
+    rm -rf "$work"
+}
+trap cleanup EXIT
+
+echo "Downloading the latest quiet-ui build"
+curl -fL --progress-bar -o "$work/Zed-quiet-ui.dmg" "$URL"
+
+hdiutil attach -quiet -nobrowse -readonly -mountpoint "$mount" "$work/Zed-quiet-ui.dmg"
+app=$(find "$mount" -maxdepth 1 -name "*.app" | head -1)
+if [ -z "$app" ]; then
+    echo "No application in the disk image" >&2
+    exit 1
+fi
+name=$(basename "$app")
+
+# Replaced rather than merged, so no stale files from the previous install remain.
+echo "Installing $name"
+rm -rf "/Applications/$name"
+cp -R "$app" "/Applications/$name"
+
+# Ad-hoc signed, so macOS refuses it with a quarantine flag (set by browser downloads).
+xattr -dr com.apple.quarantine "/Applications/$name" 2>/dev/null || true
+
+echo "Installed /Applications/$name"

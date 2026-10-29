@@ -45,6 +45,9 @@ pub struct BlockMap {
     excerpt_header_height: u32,
     pub(super) folded_buffers: HashSet<BufferId>,
     buffers_with_disabled_headers: HashSet<BufferId>,
+    /// Rows above a buffer's header, inside its header block, for an addon to
+    /// draw in.
+    pub(super) buffer_header_extra_rows: HashMap<BufferId, u32>,
     pub(super) deferred_edits: Cell<Patch<WrapRow>>,
 }
 
@@ -79,6 +82,7 @@ pub struct BlockSnapshot {
     pub(super) buffer_header_height: u32,
     pub(super) excerpt_header_height: u32,
     pub(super) buffers_with_disabled_headers: HashSet<BufferId>,
+    pub(super) buffer_header_extra_rows: HashMap<BufferId, u32>,
 }
 
 impl Deref for BlockSnapshot {
@@ -664,6 +668,7 @@ impl BlockMap {
             custom_blocks_by_id: TreeMap::default(),
             folded_buffers: HashSet::default(),
             buffers_with_disabled_headers: HashSet::default(),
+            buffer_header_extra_rows: HashMap::default(),
             transforms: RefCell::new(transforms),
             wrap_snapshot: RefCell::new(wrap_snapshot.clone()),
             buffer_header_height,
@@ -699,6 +704,7 @@ impl BlockMap {
                 buffer_header_height: self.buffer_header_height,
                 excerpt_header_height: self.excerpt_header_height,
                 buffers_with_disabled_headers: self.buffers_with_disabled_headers.clone(),
+                buffer_header_extra_rows: self.buffer_header_extra_rows.clone(),
             },
         }
     }
@@ -1243,6 +1249,13 @@ impl BlockMap {
                     let first_excerpt = excerpt_boundary.next.clone();
                     if self.buffers_with_disabled_headers.contains(&new_buffer_id) {
                         continue;
+                    }
+                    if buffer.show_headers() {
+                        height += self
+                            .buffer_header_extra_rows
+                            .get(&new_buffer_id)
+                            .copied()
+                            .unwrap_or_default();
                     }
                     if self.folded_buffers.contains(&new_buffer_id) && buffer.show_headers() {
                         let mut last_excerpt_end_row = first_excerpt.end_row;
@@ -2075,6 +2088,88 @@ impl BlockMapWriter<'_> {
         self.block_map
             .buffers_with_disabled_headers
             .insert(buffer_id);
+    }
+
+    /// Makes room above each listed buffer's header for rows an addon draws
+    /// there, replacing what was set before. A companion gets the same rows
+    /// above its buffer for each, so the two sides stay aligned.
+    pub fn set_buffer_header_extra_rows(
+        &mut self,
+        rows: HashMap<BufferId, u32>,
+        multi_buffer: &MultiBuffer,
+        cx: &App,
+    ) {
+        let current = &self.block_map.buffer_header_extra_rows;
+        let changed: Vec<BufferId> = rows
+            .iter()
+            .filter(|(buffer_id, rows)| current.get(buffer_id) != Some(rows))
+            .map(|(buffer_id, _)| *buffer_id)
+            .chain(
+                current
+                    .keys()
+                    .filter(|buffer_id| !rows.contains_key(buffer_id))
+                    .copied(),
+            )
+            .collect();
+        if changed.is_empty() {
+            return;
+        }
+        let multi_buffer_snapshot = multi_buffer.snapshot(cx);
+        let companion_rows = self
+            .companion
+            .as_ref()
+            .filter(|companion| companion.inverse.is_some())
+            .map(|companion| {
+                rows.iter()
+                    .filter_map(|(buffer_id, rows)| {
+                        let diff = multi_buffer_snapshot.diff_for_buffer_id(*buffer_id)?;
+                        let companion_buffer_id =
+                            if companion.companion.is_rhs(companion.display_map_id) {
+                                diff.base_text().remote_id()
+                            } else {
+                                diff.buffer_id()
+                            };
+                        Some((companion_buffer_id, *rows))
+                    })
+                    .collect::<HashMap<_, _>>()
+            });
+        self.block_map.buffer_header_extra_rows = rows;
+
+        let mut ranges: Vec<_> = changed
+            .into_iter()
+            .flat_map(|buffer_id| multi_buffer_snapshot.range_for_buffer(buffer_id))
+            .collect();
+        ranges.sort_unstable_by_key(|range| range.start);
+        let mut edits = Patch::default();
+        let wrap_snapshot = self.block_map.wrap_snapshot.borrow().clone();
+        for range in ranges {
+            let last_edit_row = cmp::min(
+                wrap_snapshot.make_wrap_point(range.end, Bias::Right).row() + WrapRow(1),
+                wrap_snapshot.max_point().row(),
+            ) + WrapRow(1);
+            let range = wrap_snapshot.make_wrap_point(range.start, Bias::Left).row()..last_edit_row;
+            edits.push(Edit {
+                old: range.clone(),
+                new: range,
+            });
+        }
+        self.block_map.sync(
+            &wrap_snapshot,
+            edits,
+            self.companion
+                .as_ref()
+                .map(BlockMapWriterCompanion::companion_view),
+        );
+        if let Some(companion) = &mut self.companion
+            && let Some(inverse) = &mut companion.inverse
+            && let Some(companion_rows) = companion_rows
+        {
+            inverse.companion_writer.set_buffer_header_extra_rows(
+                companion_rows,
+                inverse.companion_multibuffer,
+                cx,
+            );
+        }
     }
 
     #[ztracing::instrument(skip_all)]
@@ -4203,7 +4298,7 @@ mod tests {
                     );
                     block_map.remove(block_ids_to_remove);
                 }
-                60..=79 => {
+                60..=74 => {
                     if buffer.read_with(cx, |buffer, _| buffer.is_singleton()) {
                         log::info!("Noop fold/unfold operation on a singleton buffer");
                         continue;
@@ -4280,6 +4375,28 @@ mod tests {
                         log::info!(
                             "Unfolded buffers: {unfolded_count}, folded buffers: {folded_count}"
                         );
+                    });
+                }
+                75..=79 => {
+                    let (inlay_snapshot, inlay_edits) =
+                        inlay_map.sync(buffer_snapshot.clone(), vec![]);
+                    let (fold_snapshot, fold_edits) = fold_map.read(inlay_snapshot, inlay_edits);
+                    let (tab_snapshot, tab_edits) =
+                        tab_map.sync(fold_snapshot, fold_edits, tab_size);
+                    let (wraps_snapshot, wrap_edits) = wrap_map.update(cx, |wrap_map, cx| {
+                        wrap_map.sync(tab_snapshot, tab_edits, cx)
+                    });
+                    let mut block_map = block_map.write(wraps_snapshot, wrap_edits, None);
+                    let rows: HashMap<BufferId, u32> = buffer_snapshot
+                        .buffer_ids_for_range(Anchor::Min..Anchor::Max)
+                        .filter_map(|buffer_id| {
+                            rng.random_bool(0.3)
+                                .then(|| (buffer_id, rng.random_range(1..=3)))
+                        })
+                        .collect();
+                    log::info!("Setting header rows {rows:?}");
+                    buffer.read_with(cx, |buffer, cx| {
+                        block_map.set_buffer_header_extra_rows(rows, buffer, cx);
                     });
                 }
                 _ => {

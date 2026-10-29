@@ -1,4 +1,5 @@
 mod debug_log;
+mod relay_transport;
 mod runtime;
 mod session_updates;
 mod terminal_updates;

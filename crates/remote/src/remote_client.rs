@@ -21,13 +21,13 @@ use futures::{
         mpsc::{self, Sender, UnboundedReceiver, UnboundedSender},
         oneshot,
     },
-    future::{BoxFuture, Shared, WeakShared},
+    future::{BoxFuture, FusedFuture as _, Shared, WeakShared},
     select, select_biased,
     stream::BoxStream,
 };
 use gpui::{
     App, AppContext as _, AsyncApp, BackgroundExecutor, BorrowAppContext, Context, Entity,
-    EventEmitter, FutureExt, Global, Task, TaskExt, WeakEntity,
+    EventEmitter, FutureExt, Global, SharedString, Task, TaskExt, WeakEntity,
 };
 use parking_lot::Mutex;
 
@@ -43,10 +43,10 @@ use std::{
     ops::ControlFlow,
     path::PathBuf,
     sync::{
-        Arc, Weak,
+        Arc, LazyLock, Weak,
         atomic::{AtomicU32, AtomicU64, Ordering::SeqCst},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use util::{
     ResultExt,
@@ -166,8 +166,50 @@ const INITIAL_CONNECTION_TIMEOUT: Duration =
 const RECONNECT_HANDSHAKE_TIMEOUT: Duration =
     Duration::from_secs(if cfg!(debug_assertions) { 5 } else { 15 });
 const RESYNC_TIMEOUT: Duration = Duration::from_secs(if cfg!(debug_assertions) { 5 } else { 15 });
+/// A proxy's output closes a moment before its exit status arrives, so a
+/// failed handshake waits this long to hear why the proxy stopped.
+const PROXY_EXIT_GRACE: Duration = Duration::from_secs(2);
 
 pub const MAX_RECONNECT_ATTEMPTS: usize = 3;
+
+/// How long to wait before each reconnect attempt after the first, so a
+/// network that is down for a moment does not burn every attempt at once.
+const RECONNECT_BACKOFF: [Duration; 4] = [
+    Duration::ZERO,
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+];
+/// Past the attempts, a client whose failures retrying can fix keeps trying
+/// at this interval until it connects or its window closes.
+const QUIET_RECONNECT_INTERVAL: Duration = Duration::from_secs(20);
+
+fn reconnect_delay(attempt: usize) -> Duration {
+    RECONNECT_BACKOFF
+        .get(attempt.saturating_sub(1))
+        .copied()
+        .unwrap_or(QUIET_RECONNECT_INTERVAL)
+}
+
+/// Failures no number of retries fixes; anything else (the network down, a
+/// host unreachable, a server too busy to answer) is worth trying again.
+fn is_unrecoverable_reconnect_error(error: &anyhow::Error) -> bool {
+    let error = format!("{error:#}").to_lowercase();
+    [
+        "permission denied",
+        "host key verification failed",
+        "authentication",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle))
+}
+
+/// Every live client, so a reconnect can tell whether a connection it shares
+/// is still serving others.
+#[derive(Default)]
+struct RemoteClients(Vec<WeakEntity<RemoteClient>>);
+
+impl Global for RemoteClients {}
 
 enum State {
     Connecting,
@@ -338,7 +380,18 @@ pub struct RemoteClient {
     platform: RemotePlatform,
     os_version: Option<String>,
     state: Option<State>,
+    pending_retry: Option<Task<()>>,
+    /// quiet-ui: the last failed reconnect's attempt and error, for the
+    /// window to say what is wrong and offer a fresh connection.
+    reconnect_failure: Option<(usize, SharedString)>,
+    /// The next reconnect drops this client's SSH connection rather than
+    /// reusing it.
+    fresh_connection: bool,
 }
+
+/// quiet-ui: failed reconnects after which the window offers to drop the
+/// connection and open a fresh one.
+pub const OFFER_FRESH_CONNECTION_AFTER: usize = 3;
 
 #[derive(Debug)]
 pub enum RemoteClientEvent {
@@ -353,9 +406,34 @@ impl EventEmitter<RemoteClientEvent> for RemoteClient {}
 pub enum ConnectionIdentifier {
     Setup(u64),
     Workspace(i64),
+    /// quiet-ui: the name of a server an earlier client ran, so connecting
+    /// replaces that server rather than leaving it running beside a new one.
+    Reused(String),
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// quiet-ui: tells this launch's setup connections from an earlier launch's,
+/// whose servers may still run on the box. The counter starts at 1 every
+/// launch, and a fresh connection kills the server whose name it takes.
+static LAUNCH_TAG: LazyLock<String> = LazyLock::new(|| {
+    let seconds = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    launch_tag(seconds)
+});
+
+/// Five base-36 digits of the launch time, which repeat every two years.
+fn launch_tag(seconds: u64) -> String {
+    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut value = seconds % 36u64.pow(5);
+    let mut tag = [b'0'; 5];
+    for digit in tag.iter_mut().rev() {
+        *digit = DIGITS[(value % 36) as usize];
+        value /= 36;
+    }
+    String::from_utf8_lossy(&tag).into_owned()
+}
 
 impl ConnectionIdentifier {
     pub fn setup() -> Self {
@@ -374,10 +452,13 @@ impl ConnectionIdentifier {
             release_channel => format!("{}-", release_channel.dev_name()),
         };
         match self {
-            Self::Setup(setup_id) => format!("{identifier_prefix}setup-{setup_id}"),
+            Self::Setup(setup_id) => {
+                format!("{identifier_prefix}setup-{}-{setup_id}", *LAUNCH_TAG)
+            }
             Self::Workspace(workspace_id) => {
                 format!("{identifier_prefix}workspace-{workspace_id}",)
             }
+            Self::Reused(name) => name.clone(),
         }
     }
 }
@@ -448,6 +529,14 @@ impl RemoteClient {
                     platform,
                     os_version: os_version.clone(),
                     state: Some(State::Connecting),
+                    pending_retry: None,
+                    reconnect_failure: None,
+                    fresh_connection: false,
+                });
+                cx.update(|cx| {
+                    let clients = cx.default_global::<RemoteClients>();
+                    clients.0.retain(|client| client.upgrade().is_some());
+                    clients.0.push(this.downgrade());
                 });
 
                 let io_task = remote_connection.start_proxy(
@@ -506,13 +595,14 @@ impl RemoteClient {
 
                 let heartbeat_task = Self::heartbeat(this.downgrade(), connection_activity_rx, cx);
 
-                this.update(cx, |this, _| {
+                this.update(cx, |this, cx| {
                     this.state = Some(State::Connected {
                         remote_connection,
                         delegate,
                         multiplex_task,
                         heartbeat_task,
                     });
+                    this.retry_stuck_peers(cx);
                 });
 
                 // Use the same `remote_*` property schema as the forwarded
@@ -608,8 +698,30 @@ impl RemoteClient {
             );
         }
 
+        self.pending_retry = None;
+        let fresh = std::mem::take(&mut self.fresh_connection);
+        // One SSH connection serves every window on a host: killing it while
+        // another client is talking over it takes that window down too. Only
+        // this client's own connection counts, and only while it is alive: on
+        // 10-21 a window kept reusing a connection whose master had exited
+        // because other windows were connected over a different one.
+        let own_connection = self.state.as_ref().and_then(State::remote_connection);
+        let own_alive = own_connection
+            .as_ref()
+            .is_some_and(|connection| !connection.has_been_killed());
+        let shared_with_live_peer = own_alive
+            && self.peers(cx).any(|peer| {
+                let peer = peer.read(cx);
+                peer.state_is(|state| matches!(state, State::Connected { .. }))
+                    && peer
+                        .state
+                        .as_ref()
+                        .and_then(State::remote_connection)
+                        .zip(own_connection.as_ref())
+                        .is_some_and(|(theirs, ours)| same_connection(&theirs, ours))
+            });
         let state = self.state.take().unwrap();
-        let (attempts, remote_connection, delegate) = match state {
+        let (attempts, remote_connection, delegate, last_error) = match state {
             State::Connected {
                 remote_connection,
                 delegate,
@@ -625,14 +737,14 @@ impl RemoteClient {
             } => {
                 drop(multiplex_task);
                 drop(heartbeat_task);
-                (0, remote_connection, delegate)
+                (0, remote_connection, delegate, None)
             }
             State::ReconnectFailed {
                 attempts,
                 remote_connection,
                 delegate,
-                ..
-            } => (attempts, remote_connection, delegate),
+                error,
+            } => (attempts, remote_connection, delegate, Some(error)),
             State::Connecting
             | State::Reconnecting
             | State::ReconnectExhausted
@@ -640,7 +752,11 @@ impl RemoteClient {
         };
 
         let attempts = attempts + 1;
-        if attempts > MAX_RECONNECT_ATTEMPTS {
+        if attempts > MAX_RECONNECT_ATTEMPTS
+            && last_error
+                .as_ref()
+                .is_none_or(is_unrecoverable_reconnect_error)
+        {
             log::error!(
                 "Failed to reconnect to after {} attempts, giving up",
                 MAX_RECONNECT_ATTEMPTS
@@ -671,15 +787,31 @@ impl RemoteClient {
                 };
             }
 
-            if let Err(error) = remote_connection
+            let connection_options = remote_connection.connection_options();
+            if !own_alive {
+                let message = format!(
+                    "The SSH connection to {} was lost; opening a new one",
+                    connection_options.display_name()
+                );
+                log::info!("{message}");
+                delegate.set_status(Some(&message), cx);
+            }
+            if shared_with_live_peer && !fresh {
+                log::info!("another client is connected over this connection, so it is kept");
+            } else if shared_with_live_peer {
+                log::info!("opening a fresh connection beside the one other clients use");
+            } else if let Err(error) = remote_connection
                 .kill()
                 .await
                 .context("Failed to kill remote_connection process")
             {
                 failed!(error, attempts, remote_connection, delegate);
             };
-
-            let connection_options = remote_connection.connection_options();
+            if fresh {
+                cx.update_global(|pool: &mut ConnectionPool, _| {
+                    pool.forget(&connection_options, &remote_connection)
+                });
+            }
 
             let (outgoing_tx, outgoing_rx) = mpsc::unbounded::<Envelope>();
             let (incoming_tx, incoming_rx) = mpsc::unbounded::<Envelope>();
@@ -717,21 +849,72 @@ impl RemoteClient {
                 }
             };
 
+            // A proxy that exits before the handshake (its SSH connection is
+            // gone) fails the attempt now, with what it said, rather than
+            // after the handshake's timeout.
+            let (proxy_exited_tx, proxy_exited_rx) = oneshot::channel::<(Option<i32>, String)>();
+            let io_task = cx.background_spawn(async move {
+                let result = io_task.await;
+                let exited = match &result {
+                    Ok(status) => (Some(*status), format!("it exited with status {status}")),
+                    Err(error) => (None, format!("{error:#}")),
+                };
+                proxy_exited_tx.send(exited).ok();
+                result
+            });
+            let mut proxy_exited = proxy_exited_rx.fuse();
+            let mut exit_code = None;
             let multiplex_task = Self::monitor(this.clone(), io_task, cx);
             let connection_ready_rx = client.reconnect(incoming_rx, outgoing_tx, cx);
             let resync = client.resync(RESYNC_TIMEOUT);
 
             if let Err(error) = async {
-                connection_ready_rx
+                let ready = connection_ready_rx
                     .with_timeout(RECONNECT_HANDSHAKE_TIMEOUT, cx.background_executor())
-                    .await
-                    .context("Timed out waiting for remote connection")?
+                    .fuse();
+                futures::pin_mut!(ready);
+                let ready = select_biased! {
+                    ready = ready => ready,
+                    exited = &mut proxy_exited => match exited {
+                        Ok((code, exited)) => {
+                            exit_code = code;
+                            anyhow::bail!(
+                                "The proxy to the remote server stopped before the server \
+                                 answered: {exited}"
+                            )
+                        }
+                        Err(_) => ready.await,
+                    },
+                };
+                ready
+                    .with_context(|| {
+                        format!(
+                            "The proxy to the remote server is running, but the server did not \
+                             answer within {:?}; it may be stalled, for instance out of memory",
+                            RECONNECT_HANDSHAKE_TIMEOUT
+                        )
+                    })?
                     .context("Remote connection closed before becoming ready")?;
 
                 resync.await
             }
             .await
             {
+                if exit_code.is_none() && !proxy_exited.is_terminated() {
+                    exit_code = (&mut proxy_exited)
+                        .with_timeout(PROXY_EXIT_GRACE, cx.background_executor())
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .and_then(|(code, _)| code);
+                }
+                // The server exited (it does after two idle hours), so no
+                // number of retries reaches it: a fresh one has to be started.
+                if let Some(ProxyLaunchError::ServerNotRunning) =
+                    exit_code.and_then(ProxyLaunchError::from_exit_code)
+                {
+                    return State::ServerNotRunning;
+                }
                 failed!(error, attempts, remote_connection, delegate);
             };
 
@@ -748,13 +931,19 @@ impl RemoteClient {
             this.update(cx, |this, cx| {
                 let reconnected = this.state_is(State::is_reconnecting)
                     && matches!(&new_state, State::Connected { .. });
+                let server_gone =
+                    this.state_is(State::is_reconnecting) && new_state.is_server_not_running();
                 this.try_set_state(cx, |old_state| {
                     if old_state.is_reconnecting() {
                         match &new_state {
                             State::Connecting
                             | State::Reconnecting
-                            | State::HeartbeatMissed { .. }
-                            | State::ServerNotRunning => {}
+                            | State::HeartbeatMissed { .. } => {}
+                            State::ServerNotRunning => {
+                                log::error!(
+                                    "Reconnect attempt {attempts} found the remote server not running"
+                                );
+                            }
                             State::Connected { .. } => {
                                 log::info!("Successfully reconnected");
                             }
@@ -777,12 +966,26 @@ impl RemoteClient {
                     }
                 });
 
+                this.reconnect_failure = match this.state.as_ref() {
+                    Some(State::ReconnectFailed {
+                        attempts, error, ..
+                    }) => Some((*attempts, format!("{error:#}").into())),
+                    Some(State::Connected { .. }) => None,
+                    _ => this.reconnect_failure.take(),
+                };
                 if reconnected {
                     cx.emit(RemoteClientEvent::Reconnected);
+                    this.retry_stuck_peers(cx);
+                }
+                if server_gone {
+                    cx.emit(RemoteClientEvent::Disconnected {
+                        server_not_running: true,
+                    });
                 }
 
                 if this.state_is(State::is_reconnect_failed) {
-                    this.reconnect(cx)
+                    this.schedule_reconnect(attempts, cx);
+                    anyhow::Ok(())
                 } else if this.state_is(State::is_reconnect_exhausted) {
                     Ok(())
                 } else {
@@ -936,6 +1139,70 @@ impl RemoteClient {
         })
     }
 
+    /// quiet-ui: how many reconnects have failed in a row, and the last
+    /// one's error, while the client is still trying.
+    pub fn reconnect_failure(&self) -> Option<(usize, SharedString)> {
+        self.reconnect_failure.clone()
+    }
+
+    /// quiet-ui: reconnects now over a new SSH connection, for when reusing
+    /// this one keeps failing.
+    pub fn reconnect_fresh(&mut self, cx: &mut Context<Self>) {
+        log::info!("reconnecting over a fresh connection, as asked");
+        self.fresh_connection = true;
+        if self.state.as_ref().is_some_and(State::can_reconnect) {
+            self.reconnect(cx).log_err();
+        }
+    }
+
+    /// The other live clients on this client's connection options.
+    fn peers<'a>(&'a self, cx: &'a Context<Self>) -> impl Iterator<Item = Entity<Self>> + 'a {
+        let this = cx.entity_id();
+        cx.try_global::<RemoteClients>()
+            .into_iter()
+            .flat_map(|clients| clients.0.iter())
+            .filter_map(|client| client.upgrade())
+            .filter(move |client| {
+                client.entity_id() != this
+                    && client.read(cx).connection_options == self.connection_options
+            })
+    }
+
+    /// The next attempt waits a little longer each time, and past the
+    /// attempts keeps trying quietly.
+    fn schedule_reconnect(&mut self, attempts: usize, cx: &mut Context<Self>) {
+        let delay = reconnect_delay(attempts + 1);
+        self.pending_retry = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            this.update(cx, |this, cx| this.reconnect(cx).log_err())
+                .ok();
+        }));
+    }
+
+    /// One client getting through means the host is back, so the others on it
+    /// waiting out a backoff try now rather than each needing a click.
+    /// Deferred, because a reconnect reads every client on the host, this one
+    /// included, which panics while this one is being updated.
+    fn retry_stuck_peers(&self, cx: &mut Context<Self>) {
+        let stuck: Vec<Entity<Self>> = self
+            .peers(cx)
+            .filter(|peer| peer.read(cx).state_is(State::is_reconnect_failed))
+            .collect();
+        if stuck.is_empty() {
+            return;
+        }
+        cx.defer(move |cx| {
+            for peer in stuck {
+                peer.update(cx, |peer, cx| {
+                    if peer.state_is(State::is_reconnect_failed) {
+                        log::info!("another client reconnected to this host; retrying now");
+                        peer.reconnect(cx).log_err();
+                    }
+                });
+            }
+        });
+    }
+
     fn state_is(&self, check: impl FnOnce(&State) -> bool) -> bool {
         self.state.as_ref().is_some_and(check)
     }
@@ -1030,6 +1297,11 @@ impl RemoteClient {
 
     pub fn proto_client(&self) -> AnyProtoClient {
         self.client.clone().into()
+    }
+
+    /// The name the server on the other end runs under.
+    pub fn unique_identifier(&self) -> &str {
+        &self.unique_identifier
     }
 
     pub fn connection_options(&self) -> &RemoteConnectionOptions {
@@ -1136,6 +1408,11 @@ impl RemoteClient {
         } else {
             log::warn!("force_heartbeat_timeout: not in Connected state, ignoring");
         }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_unique_identifier_for_test(&mut self, identifier: &str) {
+        self.unique_identifier = identifier.to_string();
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1257,7 +1534,23 @@ struct ConnectionPool {
 
 impl Global for ConnectionPool {}
 
+fn same_connection(a: &Arc<dyn RemoteConnection>, b: &Arc<dyn RemoteConnection>) -> bool {
+    std::ptr::addr_eq(Arc::as_ptr(a), Arc::as_ptr(b))
+}
+
 impl ConnectionPool {
+    /// quiet-ui: the next connect for `opts` opens a new connection rather
+    /// than handing out `connection` again.
+    fn forget(&mut self, opts: &RemoteConnectionOptions, connection: &Arc<dyn RemoteConnection>) {
+        if let Some(ConnectionPoolEntry::Connected(pooled)) = self.connections.get(opts)
+            && pooled
+                .upgrade()
+                .is_some_and(|pooled| same_connection(&pooled, connection))
+        {
+            self.connections.remove(opts);
+        }
+    }
+
     fn connect(
         &mut self,
         opts: RemoteConnectionOptions,
@@ -2026,10 +2319,13 @@ impl ProtoClient for ChannelClient {
 
 #[cfg(test)]
 mod tests {
+    mod fork_tests;
+
     use super::*;
     use crate::transport::mock::{MockConnection, MockConnectionRegistry, MockDelegate};
     use gpui::TestAppContext;
     use rpc::{ErrorCodeExt, proto::ErrorCode};
+    use std::{cell::RefCell, rc::Rc};
 
     #[test]
     fn test_ssh_display_name_prefers_nickname() {

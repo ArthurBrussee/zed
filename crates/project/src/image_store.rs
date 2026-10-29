@@ -149,6 +149,23 @@ pub fn project_image_source(project: WeakEntity<Project>, path: ProjectPath) -> 
 }
 
 impl ImageItem {
+    /// An image that is no file anywhere, such as one an agent sent inline, for
+    /// a viewer to show. `file` names it; nothing is read from it or watched.
+    pub fn from_image(
+        file: Arc<worktree::File>,
+        image: Arc<gpui::Image>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let image_metadata = Self::compute_metadata_from_bytes(&image.bytes).log_err();
+        Self {
+            id: cx.entity_id().as_non_zero_u64().into(),
+            file,
+            image,
+            image_metadata,
+            reload_task: None,
+        }
+    }
+
     pub fn compute_metadata_from_bytes(image_bytes: &[u8]) -> Result<ImageMetadata> {
         let image_format = image::guess_format(image_bytes)?;
 

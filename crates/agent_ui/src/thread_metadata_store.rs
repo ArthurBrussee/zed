@@ -85,6 +85,8 @@ pub(crate) fn run_thread_metadata_migrations(connection: &db::sqlez::connection:
         .expect("thread metadata migrations should succeed");
 }
 
+use crate::conversation_view::thread_view::bookmarks::ThreadBookmarks;
+
 pub fn init(cx: &mut App) {
     ThreadMetadataStore::init_global(cx);
     let migration_task = migrate_thread_metadata(cx);
@@ -325,6 +327,131 @@ pub struct ThreadMetadata {
     pub archived: bool,
 }
 
+/// The last PR state observed for a thread's branches, persisted because an
+/// archived thread's worktree (and so its branch) is gone.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ThreadPrSnapshot {
+    pub branches: Vec<SharedString>,
+    pub prs: Vec<gh_status::PrStatus>,
+    /// PRs this thread watches, whatever branch they are on.
+    #[serde(default)]
+    pub watched: Vec<WatchedPr>,
+    /// Kept so the next mining pass does not put back what was removed.
+    #[serde(default)]
+    pub dismissed: Vec<WatchedPr>,
+    /// Watched PRs the user asked for; the rest are the miner's to take back.
+    #[serde(default)]
+    pub user_added: Vec<WatchedPr>,
+    /// Kept so a PR nothing polls any more is not shown as a bare number.
+    #[serde(default)]
+    pub titles: Vec<(WatchedPr, SharedString)>,
+    /// See [`ThreadPrSnapshot::adopt_mining_rules`].
+    #[serde(default)]
+    pub mining_rules: u32,
+}
+
+/// Bump whenever a rule change would leave PRs in a set that the new rules
+/// would not have put there; older sets are re-mined when their thread opens.
+///
+/// 2: reading half-written text mined the numbers a URL passes through on its
+/// way, so a set can hold a PR that is a prefix of the one beside it.
+pub const MINING_RULES: u32 = 2;
+
+/// `repo` is `None` for a PR of the thread's own branch's repository.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct WatchedPr {
+    #[serde(default)]
+    pub repo: Option<String>,
+    pub number: u64,
+}
+
+impl ThreadPrSnapshot {
+    pub fn is_empty(&self) -> bool {
+        self.branches.is_empty() && self.prs.is_empty() && self.watched.is_empty()
+    }
+
+    fn position_of(set: &[WatchedPr], pr: &WatchedPr) -> Option<usize> {
+        set.iter().position(|watched| watched == pr)
+    }
+
+    /// Adds a PR the thread named itself, unless the user took it out.
+    pub fn mine(&mut self, pr: WatchedPr) -> bool {
+        if Self::position_of(&self.dismissed, &pr).is_some()
+            || Self::position_of(&self.watched, &pr).is_some()
+        {
+            return false;
+        }
+        self.watched.push(pr);
+        true
+    }
+
+    /// Adds a PR the user asked for, undoing an earlier dismissal.
+    pub fn add(&mut self, pr: WatchedPr) -> bool {
+        if let Some(ix) = Self::position_of(&self.dismissed, &pr) {
+            self.dismissed.remove(ix);
+        }
+        if Self::position_of(&self.user_added, &pr).is_none() {
+            self.user_added.push(pr.clone());
+        }
+        if Self::position_of(&self.watched, &pr).is_some() {
+            return false;
+        }
+        self.watched.push(pr);
+        true
+    }
+
+    /// Re-decides the mined part of the set under the current rules: `mined`
+    /// is what a full pass found, and what the user added stays. Dropped PRs
+    /// are not dismissed, so a later pass may bring them back.
+    pub fn adopt_mining_rules(&mut self, mined: &[WatchedPr]) -> bool {
+        if self.mining_rules >= MINING_RULES {
+            return false;
+        }
+        self.mining_rules = MINING_RULES;
+        let user_added = &self.user_added;
+        self.watched
+            .retain(|pr| user_added.contains(pr) || mined.contains(pr));
+        // The version itself has to be written back.
+        true
+    }
+
+    pub fn remember_title(&mut self, pr: &WatchedPr, title: SharedString) -> bool {
+        match self.titles.iter_mut().find(|(known, _)| known == pr) {
+            Some((_, known_title)) if *known_title == title => false,
+            Some((_, known_title)) => {
+                *known_title = title;
+                true
+            }
+            None => {
+                self.titles.push((pr.clone(), title));
+                true
+            }
+        }
+    }
+
+    pub fn title_of(&self, pr: &WatchedPr) -> Option<SharedString> {
+        self.titles
+            .iter()
+            .find(|(known, _)| known == pr)
+            .map(|(_, title)| title.clone())
+    }
+
+    /// Recorded even when nothing was watched: a branch's PR is never in
+    /// `watched`, and the record keeps the next poll from putting it back.
+    pub fn dismiss(&mut self, pr: &WatchedPr) -> bool {
+        let was_watched = Self::position_of(&self.watched, pr)
+            .map(|ix| self.watched.remove(ix))
+            .is_some();
+        let newly_dismissed = if Self::position_of(&self.dismissed, pr).is_none() {
+            self.dismissed.push(pr.clone());
+            true
+        } else {
+            false
+        };
+        was_watched || newly_dismissed
+    }
+}
+
 impl ThreadMetadata {
     /// A thread is a draft until its first message is sent, at which point
     /// it gets an ACP `session_id`.
@@ -454,6 +581,24 @@ impl From<&ThreadMetadata> for acp_thread::AgentSessionInfo {
     }
 }
 
+/// One initialised submodule of an archived worktree. The superproject's
+/// checkpoint records only its gitlink, so each submodule gets its own two WIP
+/// commits and its git directory is kept aside rather than deleted.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ArchivedSubmodule {
+    /// Relative to the worktree root, as `.gitmodules` spells it.
+    pub path: String,
+    /// The submodule's `.git` file, recreated verbatim on restore because its
+    /// git directory is not filed under its path.
+    pub git_file: String,
+    /// See [`ArchivedGitWorktree::staged_commit_hash`], for this submodule.
+    pub staged_commit_hash: String,
+    /// See [`ArchivedGitWorktree::unstaged_commit_hash`], for this submodule.
+    pub unstaged_commit_hash: String,
+    /// See [`ArchivedGitWorktree::original_commit_hash`], for this submodule.
+    pub original_commit_hash: String,
+}
+
 /// Record of a git worktree that was archived (deleted from disk) when its
 /// last thread was archived.
 pub struct ArchivedGitWorktree {
@@ -494,6 +639,8 @@ pub struct ArchivedGitWorktree {
     /// pre-restore sanity check (abort if this commit no longer exists in the
     /// repo) and as a fallback target if the WIP resets fail.
     pub original_commit_hash: String,
+    /// Usually empty: `git worktree add` leaves submodules uninitialised.
+    pub submodules: Vec<ArchivedSubmodule>,
 }
 
 /// The store holds all metadata needed to show threads in the sidebar/the archive.
@@ -501,10 +648,13 @@ pub struct ArchivedGitWorktree {
 /// Listens to ConversationView events and updates metadata when the root thread changes.
 pub struct ThreadMetadataStore {
     db: ThreadMetadataDb,
-    threads: HashMap<ThreadId, ThreadMetadata>,
+    /// `Arc`s so the sidebar's frequent rebuilds share rows instead of cloning.
+    threads: HashMap<ThreadId, Arc<ThreadMetadata>>,
     threads_by_paths: HashMap<PathList, HashSet<ThreadId>>,
     threads_by_main_paths: HashMap<PathList, HashSet<ThreadId>>,
     threads_by_session: HashMap<acp::SessionId, ThreadId>,
+    pr_snapshots: HashMap<ThreadId, ThreadPrSnapshot>,
+    bookmarks: HashMap<ThreadId, ThreadBookmarks>,
     reload_task: Option<Shared<Task<()>>>,
     conversation_subscriptions: HashMap<gpui::EntityId, Subscription>,
     pending_thread_ops_tx: async_channel::Sender<DbOperation>,
@@ -589,17 +739,22 @@ impl ThreadMetadataStore {
 
     /// Returns the metadata for a specific thread, if it exists.
     pub fn entry(&self, thread_id: ThreadId) -> Option<&ThreadMetadata> {
+        self.threads.get(&thread_id).map(Arc::as_ref)
+    }
+
+    /// The shared row for a thread, for callers that keep it rather than read it.
+    pub fn entry_arc(&self, thread_id: ThreadId) -> Option<&Arc<ThreadMetadata>> {
         self.threads.get(&thread_id)
     }
 
     /// Returns the metadata for a thread identified by its ACP session ID.
     pub fn entry_by_session(&self, session_id: &acp::SessionId) -> Option<&ThreadMetadata> {
         let thread_id = self.threads_by_session.get(session_id)?;
-        self.threads.get(thread_id)
+        self.threads.get(thread_id).map(Arc::as_ref)
     }
 
-    /// Returns all threads.
-    pub fn entries(&self) -> impl Iterator<Item = &ThreadMetadata> + '_ {
+    /// Returns all threads, as the shared rows the store holds.
+    pub fn entries(&self) -> impl Iterator<Item = &Arc<ThreadMetadata>> + '_ {
         self.threads.values()
     }
 
@@ -611,7 +766,7 @@ impl ThreadMetadataStore {
 
     /// Returns all archived threads.
     pub fn archived_entries(&self) -> impl Iterator<Item = &ThreadMetadata> + '_ {
-        self.entries().filter(|t| t.archived)
+        self.entries().map(Arc::as_ref).filter(|t| t.archived)
     }
 
     /// Returns all threads for the given path list and remote connection,
@@ -629,7 +784,7 @@ impl ThreadMetadataStore {
             .get(path_list)
             .into_iter()
             .flatten()
-            .filter_map(|s| self.threads.get(s))
+            .filter_map(|s| self.threads.get(s).map(Arc::as_ref))
             .filter(|s| !s.archived)
             .filter(move |s| s.matches_remote_connection(remote_connection))
     }
@@ -651,21 +806,90 @@ impl ThreadMetadataStore {
             .get(path_list)
             .into_iter()
             .flatten()
-            .filter_map(|s| self.threads.get(s))
+            .filter_map(|s| self.threads.get(s).map(Arc::as_ref))
             .filter(|s| !s.archived)
             .filter(move |s| s.matches_remote_connection(remote_connection))
+    }
+
+    pub fn pr_snapshot(&self, thread_id: ThreadId) -> Option<&ThreadPrSnapshot> {
+        self.pr_snapshots.get(&thread_id)
+    }
+
+    /// A no-op when unchanged, so callers can refresh on every poll.
+    pub fn set_pr_snapshot(
+        &mut self,
+        thread_id: ThreadId,
+        snapshot: ThreadPrSnapshot,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pr_snapshots.get(&thread_id) == Some(&snapshot) {
+            return;
+        }
+        self.pr_snapshots.insert(thread_id, snapshot.clone());
+
+        let db = self.db.clone();
+        cx.background_spawn(async move { db.save_pr_snapshot(thread_id, snapshot).await })
+            .detach_and_log_err(cx);
+        cx.notify();
+    }
+
+    pub fn bookmarks(&self, thread_id: ThreadId) -> Option<&ThreadBookmarks> {
+        self.bookmarks.get(&thread_id)
+    }
+
+    pub fn set_bookmarks(
+        &mut self,
+        thread_id: ThreadId,
+        bookmarks: ThreadBookmarks,
+        cx: &mut Context<Self>,
+    ) {
+        if self.bookmarks.get(&thread_id) == Some(&bookmarks) {
+            return;
+        }
+        self.bookmarks.insert(thread_id, bookmarks.clone());
+
+        let db = self.db.clone();
+        cx.background_spawn(async move { db.save_bookmarks(thread_id, bookmarks).await })
+            .detach_and_log_err(cx);
+        cx.notify();
+    }
+
+    /// `edit` returns whether it changed anything; an unchanged one costs no write.
+    pub fn update_pr_snapshot(
+        &mut self,
+        thread_id: ThreadId,
+        edit: impl FnOnce(&mut ThreadPrSnapshot) -> bool,
+        cx: &mut Context<Self>,
+    ) {
+        let mut snapshot = self
+            .pr_snapshots
+            .get(&thread_id)
+            .cloned()
+            .unwrap_or_default();
+        if !edit(&mut snapshot) {
+            return;
+        }
+        self.set_pr_snapshot(thread_id, snapshot, cx);
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) -> Shared<Task<()>> {
         let db = self.db.clone();
         self.reload_task.take();
 
-        let list_task = cx
-            .background_spawn(async move { db.list().context("Failed to fetch sidebar metadata") });
+        let list_task = cx.background_spawn(async move {
+            let rows = db.list().context("Failed to fetch sidebar metadata")?;
+            let pr_snapshots = db
+                .list_pr_snapshots()
+                .context("Failed to fetch thread PR snapshots")?;
+            let bookmarks = db
+                .list_bookmarks()
+                .context("Failed to fetch thread bookmarks")?;
+            anyhow::Ok((rows, pr_snapshots, bookmarks))
+        });
 
         let reload_task = cx
             .spawn(async move |this, cx| {
-                let Some(rows) = list_task.await.log_err() else {
+                let Some((rows, pr_snapshots, bookmarks)) = list_task.await.log_err() else {
                     return;
                 };
 
@@ -674,9 +898,35 @@ impl ThreadMetadataStore {
                     this.threads_by_paths.clear();
                     this.threads_by_main_paths.clear();
                     this.threads_by_session.clear();
+                    this.pr_snapshots = pr_snapshots;
+                    this.bookmarks = bookmarks;
 
+                    let corrections = main_worktree_corrections(&rows);
+                    let superseded = superseded_rows(&rows);
                     for row in rows {
-                        this.cache_thread_metadata(row);
+                        if !superseded.contains(&row.thread_id) {
+                            this.cache_thread_metadata(row);
+                        }
+                    }
+                    if !superseded.is_empty() {
+                        log::info!(
+                            "quiet-ui: dropping {} thread rows that repeat another's session or \
+                             were only ever listed",
+                            superseded.len()
+                        );
+                    }
+                    for thread_id in superseded {
+                        this.pending_thread_ops_tx
+                            .try_send(DbOperation::Delete(thread_id))
+                            .log_err();
+                    }
+                    for (thread_id, worktree_paths) in corrections {
+                        if let Some(thread) = this.threads.get(&thread_id) {
+                            this.save_internal(ThreadMetadata {
+                                worktree_paths,
+                                ..ThreadMetadata::clone(thread)
+                            });
+                        }
                     }
 
                     cx.notify();
@@ -715,6 +965,25 @@ impl ThreadMetadataStore {
         }
         let metadata = ThreadMetadata {
             title_override: Some(title_override),
+            ..existing.clone()
+        };
+        self.save(metadata, cx);
+    }
+
+    pub fn set_agent_id(
+        &mut self,
+        thread_id: ThreadId,
+        agent_id: project::AgentId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(existing) = self.entry(thread_id) else {
+            return;
+        };
+        if existing.agent_id == agent_id {
+            return;
+        }
+        let metadata = ThreadMetadata {
+            agent_id,
             ..existing.clone()
         };
         self.save(metadata, cx);
@@ -773,7 +1042,8 @@ impl ThreadMetadataStore {
                 .insert(session_id.clone(), metadata.thread_id);
         }
 
-        self.threads.insert(metadata.thread_id, metadata.clone());
+        self.threads
+            .insert(metadata.thread_id, Arc::new(metadata.clone()));
 
         self.threads_by_paths
             .entry(metadata.folder_paths().clone())
@@ -805,7 +1075,7 @@ impl ThreadMetadataStore {
                     work_dirs.clone(),
                 )
                 .unwrap_or_else(|_| WorktreePaths::from_folder_paths(&work_dirs)),
-                ..thread.clone()
+                ..ThreadMetadata::clone(thread)
             });
             cx.notify();
         }
@@ -833,7 +1103,7 @@ impl ThreadMetadataStore {
             }
             self.save_internal(ThreadMetadata {
                 worktree_paths: worktree_paths.clone(),
-                ..thread.clone()
+                ..ThreadMetadata::clone(thread)
             });
             changed = true;
         }
@@ -851,7 +1121,7 @@ impl ThreadMetadataStore {
         if let Some(thread) = self.threads.get(thread_id) {
             self.save_internal(ThreadMetadata {
                 interacted_at: Some(time),
-                ..thread.clone()
+                ..ThreadMetadata::clone(thread)
             });
             cx.notify();
         };
@@ -870,6 +1140,18 @@ impl ThreadMetadataStore {
         }
 
         cx.emit(ThreadMetadataStoreEvent::ThreadArchived(thread_id));
+    }
+
+    /// Lets an unarchive cancel a teardown started after archiving. Dropped,
+    /// and so cancelled, if the thread is no longer archived.
+    pub fn attach_archive_job(
+        &mut self,
+        thread_id: ThreadId,
+        archive_job: (Task<()>, async_channel::Sender<()>),
+    ) {
+        if self.entry(thread_id).is_some_and(|thread| thread.archived) {
+            self.in_flight_archives.insert(thread_id, archive_job);
+        }
     }
 
     pub fn unarchive(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
@@ -939,7 +1221,7 @@ impl ThreadMetadataStore {
                     new_folder_paths.clone(),
                 )
                 .unwrap_or_else(|_| WorktreePaths::from_folder_paths(&new_folder_paths)),
-                ..thread
+                ..Arc::unwrap_or_clone(thread)
             });
             cx.notify();
         }
@@ -967,7 +1249,7 @@ impl ThreadMetadataStore {
                     new_folder_paths.clone(),
                 )
                 .unwrap_or_else(|_| WorktreePaths::from_folder_paths(&new_folder_paths)),
-                ..thread
+                ..Arc::unwrap_or_clone(thread)
             });
             cx.notify();
         }
@@ -1011,7 +1293,7 @@ impl ThreadMetadataStore {
         }
 
         for thread_id in thread_ids {
-            if let Some(thread) = self.threads.get_mut(thread_id) {
+            if let Some(thread) = self.threads.get_mut(thread_id).map(Arc::make_mut) {
                 if let Some(ids) = self
                     .threads_by_main_paths
                     .get_mut(thread.main_worktree_paths())
@@ -1050,6 +1332,7 @@ impl ThreadMetadataStore {
         staged_commit_hash: String,
         unstaged_commit_hash: String,
         original_commit_hash: String,
+        submodules: Vec<ArchivedSubmodule>,
         cx: &App,
     ) -> Task<anyhow::Result<i64>> {
         let db = self.db.clone();
@@ -1061,6 +1344,7 @@ impl ThreadMetadataStore {
                 staged_commit_hash,
                 unstaged_commit_hash,
                 original_commit_hash,
+                submodules,
             )
             .await
         })
@@ -1129,7 +1413,7 @@ impl ThreadMetadataStore {
         if let Some(thread) = self.threads.get(&thread_id) {
             self.save_internal(ThreadMetadata {
                 archived,
-                ..thread.clone()
+                ..ThreadMetadata::clone(thread)
             });
             cx.notify();
         }
@@ -1153,6 +1437,8 @@ impl ThreadMetadataStore {
             }
         }
         self.threads.remove(&thread_id);
+        self.pr_snapshots.remove(&thread_id);
+        self.bookmarks.remove(&thread_id);
         self.pending_thread_ops_tx
             .try_send(DbOperation::Delete(thread_id))
             .log_err();
@@ -1239,6 +1525,8 @@ impl ThreadMetadataStore {
             threads_by_paths: HashMap::default(),
             threads_by_main_paths: HashMap::default(),
             threads_by_session: HashMap::default(),
+            pr_snapshots: HashMap::default(),
+            bookmarks: HashMap::default(),
             reload_task: None,
             conversation_subscriptions: HashMap::default(),
             pending_thread_ops_tx: tx,
@@ -1258,6 +1546,45 @@ impl ThreadMetadataStore {
             ops.insert(operation.id(), operation);
         }
         ops.into_values().collect()
+    }
+
+    /// The event-driven path below only writes rows once a session connects,
+    /// which an unstarted draft never has.
+    pub fn save_unstarted_draft(
+        &mut self,
+        thread_id: ThreadId,
+        agent_id: project::AgentId,
+        title: Option<SharedString>,
+        project: &Entity<project::Project>,
+        cx: &mut Context<Self>,
+    ) {
+        if project.read(cx).is_via_collab() {
+            return;
+        }
+        if self.entry(thread_id).is_some() {
+            return;
+        }
+        let updated_at = Utc::now();
+        let project = project.read(cx);
+        let worktree_paths = project.worktree_paths(cx);
+        let remote_connection = project.remote_connection_options(cx).cloned();
+        let archived = worktree_paths.is_empty();
+        self.save(
+            ThreadMetadata {
+                thread_id,
+                session_id: None,
+                agent_id,
+                title,
+                title_override: None,
+                created_at: Some(updated_at),
+                interacted_at: Some(updated_at),
+                updated_at,
+                worktree_paths,
+                remote_connection,
+                archived,
+            },
+            cx,
+        );
     }
 
     fn handle_conversation_event(
@@ -1460,6 +1787,24 @@ impl Domain for ThreadMetadataDb {
         sql!(
             ALTER TABLE sidebar_threads ADD COLUMN title_override TEXT;
         ),
+        sql!(
+            ALTER TABLE sidebar_threads ADD COLUMN done INTEGER DEFAULT 0;
+        ),
+        sql!(
+            CREATE TABLE IF NOT EXISTS thread_pr_snapshots(
+                thread_id BLOB PRIMARY KEY,
+                snapshot TEXT NOT NULL
+            ) STRICT;
+        ),
+        sql!(
+            CREATE TABLE IF NOT EXISTS thread_bookmarks(
+                thread_id BLOB PRIMARY KEY,
+                bookmarks TEXT NOT NULL
+            ) STRICT;
+        ),
+        sql!(
+            ALTER TABLE archived_git_worktrees ADD COLUMN submodules TEXT;
+        ),
     ];
 }
 
@@ -1573,9 +1918,93 @@ impl ThreadMetadataDb {
             let mut stmt =
                 Statement::prepare(conn, "DELETE FROM sidebar_threads WHERE thread_id = ?")?;
             stmt.bind(&thread_id, 1)?;
+            stmt.exec()?;
+
+            let mut stmt =
+                Statement::prepare(conn, "DELETE FROM thread_pr_snapshots WHERE thread_id = ?")?;
+            stmt.bind(&thread_id, 1)?;
+            stmt.exec()?;
+
+            let mut stmt =
+                Statement::prepare(conn, "DELETE FROM thread_bookmarks WHERE thread_id = ?")?;
+            stmt.bind(&thread_id, 1)?;
             stmt.exec()
         })
         .await
+    }
+
+    pub async fn save_pr_snapshot(
+        &self,
+        thread_id: ThreadId,
+        snapshot: ThreadPrSnapshot,
+    ) -> anyhow::Result<()> {
+        let snapshot = serde_json::to_string(&snapshot).context("serialize thread PR snapshot")?;
+        self.write(move |conn| {
+            let mut stmt = Statement::prepare(
+                conn,
+                "INSERT INTO thread_pr_snapshots(thread_id, snapshot) VALUES (?1, ?2) \
+                 ON CONFLICT(thread_id) DO UPDATE SET snapshot = excluded.snapshot",
+            )?;
+            let i = stmt.bind(&thread_id, 1)?;
+            stmt.bind(&snapshot, i)?;
+            stmt.exec()
+        })
+        .await
+    }
+
+    pub fn list_pr_snapshots(&self) -> anyhow::Result<HashMap<ThreadId, ThreadPrSnapshot>> {
+        let rows = self
+            .select::<(ThreadId, String)>("SELECT thread_id, snapshot FROM thread_pr_snapshots")?(
+        )?;
+        let mut snapshots = HashMap::default();
+        for (thread_id, json) in rows {
+            match serde_json::from_str::<ThreadPrSnapshot>(&json) {
+                Ok(snapshot) => {
+                    snapshots.insert(thread_id, snapshot);
+                }
+                Err(error) => {
+                    log::warn!("failed to parse PR snapshot for thread {thread_id:?}: {error:#}")
+                }
+            }
+        }
+        Ok(snapshots)
+    }
+
+    pub async fn save_bookmarks(
+        &self,
+        thread_id: ThreadId,
+        bookmarks: ThreadBookmarks,
+    ) -> anyhow::Result<()> {
+        let bookmarks = serde_json::to_string(&bookmarks).context("serialize thread bookmarks")?;
+        self.write(move |conn| {
+            let mut stmt = Statement::prepare(
+                conn,
+                "INSERT INTO thread_bookmarks(thread_id, bookmarks) VALUES (?1, ?2) \
+                 ON CONFLICT(thread_id) DO UPDATE SET bookmarks = excluded.bookmarks",
+            )?;
+            let i = stmt.bind(&thread_id, 1)?;
+            stmt.bind(&bookmarks, i)?;
+            stmt.exec()
+        })
+        .await
+    }
+
+    pub fn list_bookmarks(&self) -> anyhow::Result<HashMap<ThreadId, ThreadBookmarks>> {
+        let rows = self
+            .select::<(ThreadId, String)>("SELECT thread_id, bookmarks FROM thread_bookmarks")?(
+        )?;
+        let mut bookmarks = HashMap::default();
+        for (thread_id, json) in rows {
+            match serde_json::from_str::<ThreadBookmarks>(&json) {
+                Ok(marks) => {
+                    bookmarks.insert(thread_id, marks);
+                }
+                Err(error) => {
+                    log::warn!("failed to parse bookmarks for thread {thread_id:?}: {error:#}")
+                }
+            }
+        }
+        Ok(bookmarks)
     }
 
     pub async fn create_archived_worktree(
@@ -1586,12 +2015,14 @@ impl ThreadMetadataDb {
         staged_commit_hash: String,
         unstaged_commit_hash: String,
         original_commit_hash: String,
+        submodules: Vec<ArchivedSubmodule>,
     ) -> anyhow::Result<i64> {
+        let submodules = serde_json::to_string(&submodules)?;
         self.write(move |conn| {
             let mut stmt = Statement::prepare(
                 conn,
-                "INSERT INTO archived_git_worktrees(worktree_path, main_repo_path, branch_name, staged_commit_hash, unstaged_commit_hash, original_commit_hash) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                "INSERT INTO archived_git_worktrees(worktree_path, main_repo_path, branch_name, staged_commit_hash, unstaged_commit_hash, original_commit_hash, submodules) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
                  RETURNING id",
             )?;
             let mut i = stmt.bind(&worktree_path, 1)?;
@@ -1599,7 +2030,8 @@ impl ThreadMetadataDb {
             i = stmt.bind(&branch_name, i)?;
             i = stmt.bind(&staged_commit_hash, i)?;
             i = stmt.bind(&unstaged_commit_hash, i)?;
-            stmt.bind(&original_commit_hash, i)?;
+            i = stmt.bind(&original_commit_hash, i)?;
+            stmt.bind(&submodules, i)?;
             stmt.maybe_row::<i64>()?.context("expected RETURNING id")
         })
         .await
@@ -1628,7 +2060,7 @@ impl ThreadMetadataDb {
         thread_id: ThreadId,
     ) -> anyhow::Result<Vec<ArchivedGitWorktree>> {
         self.select_bound::<ThreadId, ArchivedGitWorktree>(
-            "SELECT a.id, a.worktree_path, a.main_repo_path, a.branch_name, a.staged_commit_hash, a.unstaged_commit_hash, a.original_commit_hash \
+            "SELECT a.id, a.worktree_path, a.main_repo_path, a.branch_name, a.staged_commit_hash, a.unstaged_commit_hash, a.original_commit_hash, a.submodules \
              FROM archived_git_worktrees a \
              JOIN thread_archived_worktrees t ON a.id = t.archived_worktree_id \
              WHERE t.thread_id = ?1",
@@ -1800,6 +2232,12 @@ impl Column for ArchivedGitWorktree {
         let (staged_commit_hash, next): (String, i32) = Column::column(statement, next)?;
         let (unstaged_commit_hash, next): (String, i32) = Column::column(statement, next)?;
         let (original_commit_hash, next): (String, i32) = Column::column(statement, next)?;
+        // Older rows have none; unreadable JSON must not block a restore.
+        let (submodules_json, next): (Option<String>, i32) = Column::column(statement, next)?;
+        let submodules = submodules_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).log_err())
+            .unwrap_or_default();
 
         Ok((
             ArchivedGitWorktree {
@@ -1810,10 +2248,73 @@ impl Column for ArchivedGitWorktree {
                 staged_commit_hash,
                 unstaged_commit_hash,
                 original_commit_hash,
+                submodules,
             },
             next,
         ))
     }
+}
+
+/// A thread saved before its worktree's repository was known recorded the
+/// worktree as its own main worktree, which makes it a project group of its
+/// own. Another thread in the same folders knows the real one.
+fn main_worktree_corrections(rows: &[ThreadMetadata]) -> Vec<(ThreadId, WorktreePaths)> {
+    rows.iter()
+        .filter(|row| {
+            !row.folder_paths().is_empty() && row.main_worktree_paths() == row.folder_paths()
+        })
+        .filter_map(|row| {
+            let known = rows.iter().find(|other| {
+                other.folder_paths() == row.folder_paths()
+                    && other.remote_connection == row.remote_connection
+                    && other.main_worktree_paths() != other.folder_paths()
+            })?;
+            Some((row.thread_id, known.worktree_paths.clone()))
+        })
+        .collect()
+}
+
+/// quiet-ui: one row per session. A session listed off a box before the
+/// thread holding it had saved its session id got a second row; the one that
+/// was interacted with stays. A row that was only ever listed (no title, never
+/// opened, never updated since) goes too, which is what the relay listing
+/// left behind for every draft's model-preview session.
+fn superseded_rows(rows: &[ThreadMetadata]) -> HashSet<ThreadId> {
+    let mut superseded = HashSet::default();
+    let mut by_session: HashMap<&acp::SessionId, Vec<&ThreadMetadata>> = HashMap::default();
+    for row in rows {
+        if let Some(session_id) = &row.session_id {
+            by_session.entry(session_id).or_default().push(row);
+        }
+        let only_listed = !row.archived
+            && row.session_id.is_some()
+            && row.interacted_at.is_none()
+            && row.title.is_none()
+            && row.title_override.is_none()
+            && row.created_at == Some(row.updated_at);
+        if only_listed {
+            superseded.insert(row.thread_id);
+        }
+    }
+    for rows in by_session.into_values().filter(|rows| rows.len() > 1) {
+        let kept = rows.iter().max_by_key(|row| {
+            (
+                row.interacted_at.is_some(),
+                row.title.is_some() || row.title_override.is_some(),
+                !row.archived,
+                row.updated_at,
+            )
+        });
+        if let Some(kept) = kept {
+            superseded.remove(&kept.thread_id);
+            superseded.extend(
+                rows.iter()
+                    .filter(|row| row.thread_id != kept.thread_id)
+                    .map(|row| row.thread_id),
+            );
+        }
+    }
+    superseded
 }
 
 #[cfg(test)]
@@ -1878,6 +2379,50 @@ mod tests {
         }
     }
 
+    /// 2026-10-27, ruddy-falcon: "Investigate memory retention and leaks", then
+    /// seven seconds later an untitled row of its session under another thread
+    /// id, beside a row for a draft's model preview that was only ever listed.
+    #[test]
+    fn a_session_keeps_one_row_and_a_row_only_listed_goes() {
+        let at = |seconds: i64| DateTime::from_timestamp(1_793_000_000 + seconds, 0).unwrap();
+        let paths = PathList::new(&[Path::new("/box/ruddy-falcon")]);
+        let real = ThreadMetadata {
+            interacted_at: Some(at(0)),
+            updated_at: at(30),
+            ..make_metadata(
+                "01a178ae-1",
+                "Investigate memory retention and leaks",
+                at(0),
+                paths.clone(),
+            )
+        };
+        let duplicate = make_metadata("01a178ae-1", "", at(7), paths.clone());
+        let preview = make_metadata("01a178ae-2", "", at(9), paths.clone());
+        let elsewhere = make_metadata(
+            "started-elsewhere",
+            "Atrium tab clearing",
+            at(5),
+            paths.clone(),
+        );
+        let imported = ThreadMetadata {
+            archived: true,
+            ..make_metadata("imported", "", at(1), paths.clone())
+        };
+        let unstarted = ThreadMetadata {
+            session_id: None,
+            ..make_metadata("unstarted", "", at(2), paths)
+        };
+        let rows = [
+            &duplicate, &real, &preview, &elsewhere, &imported, &unstarted,
+        ]
+        .map(|row| row.clone())
+        .to_vec();
+        assert_eq!(
+            superseded_rows(&rows),
+            HashSet::from_iter([duplicate.thread_id, preview.thread_id])
+        );
+    }
+
     fn init_test(cx: &mut TestAppContext) {
         let fs = FakeFs::new(cx.executor());
         cx.update(|cx| {
@@ -1924,6 +2469,37 @@ mod tests {
             migrate_thread_remote_connections(cx, migration_task);
         });
         cx.run_until_parked();
+    }
+
+    #[test]
+    fn test_a_thread_saved_before_its_repository_was_known_gets_the_main_worktree() {
+        let worktree = PathList::new(&[Path::new("/root/worktrees/mech/lofty-bay/mech")]);
+        let sent = ThreadMetadata {
+            worktree_paths: WorktreePaths::from_path_lists(
+                PathList::new(&[Path::new("/root/mech")]),
+                worktree.clone(),
+            )
+            .unwrap(),
+            ..make_metadata("sent", "Sent", Utc::now(), worktree.clone())
+        };
+        let untouched = make_metadata("untouched", "", Utc::now(), worktree);
+        let main_checkout = PathList::new(&[Path::new("/root/mech")]);
+        let in_main = make_metadata("main", "Main", Utc::now(), main_checkout);
+        let alone = make_metadata(
+            "alone",
+            "",
+            Utc::now(),
+            PathList::new(&[Path::new("/root/worktrees/mech/marshy-hollow/mech")]),
+        );
+
+        let corrections =
+            main_worktree_corrections(&[sent.clone(), untouched.clone(), in_main, alone]);
+
+        assert_eq!(
+            corrections,
+            vec![(untouched.thread_id, sent.worktree_paths)],
+            "only the row that named itself, in folders another row knows, moves"
+        );
     }
 
     #[test]
@@ -2015,6 +2591,46 @@ mod tests {
         assert_eq!(rows[0].title.as_deref(), Some("Agent Generated Title"));
         assert_eq!(rows[0].title_override.as_deref(), Some("User Title"));
         assert_eq!(rows[0].title().as_deref(), Some("User Title"));
+    }
+
+    #[gpui::test]
+    async fn test_pr_snapshot_round_trips_and_is_deleted_with_the_thread() {
+        let thread = std::thread::current();
+        let test_name = thread.name().unwrap_or("unknown_test");
+        let db_name = format!("THREAD_METADATA_DB_{}", test_name);
+        let db = ThreadMetadataDb(gpui::block_on(db::open_test_db::<ThreadMetadataDb>(
+            &db_name,
+        )));
+
+        let metadata = make_metadata("session-1", "Thread", Utc::now(), PathList::default());
+        let thread_id = metadata.thread_id;
+        db.save(metadata).await.unwrap();
+
+        let snapshot = ThreadPrSnapshot {
+            branches: vec!["feature".into()],
+            prs: vec![gh_status::PrStatus {
+                number: 42,
+                url: "https://github.com/org/repo/pull/42".into(),
+                title: "Ship it".into(),
+                state: gh_status::PrState::Merged,
+                checks: gh_status::ChecksState::Passing,
+                review: gh_status::ReviewState::Approved,
+                failing_checks: Vec::new(),
+                extra_failing_checks: 0,
+                merge: gh_status::MergeState::Unknown,
+                check_counts: Default::default(),
+            }],
+            ..Default::default()
+        };
+        db.save_pr_snapshot(thread_id, snapshot.clone())
+            .await
+            .unwrap();
+
+        let snapshots = db.list_pr_snapshots().unwrap();
+        assert_eq!(snapshots.get(&thread_id), Some(&snapshot));
+
+        db.delete(thread_id).await.unwrap();
+        assert!(db.list_pr_snapshots().unwrap().is_empty());
     }
 
     #[gpui::test]
@@ -2397,7 +3013,7 @@ mod tests {
             .iter()
             .filter_map(|metadata| {
                 let session_id = metadata.session_id.as_ref()?.0.to_string();
-                (session_id != "a-session-0").then_some((session_id, metadata))
+                (session_id != "a-session-0").then_some((session_id, metadata.as_ref()))
             })
             .collect();
         assert!(!migrated_by_session["a-session-1"].archived);
@@ -2523,16 +3139,29 @@ mod tests {
         cx.update(|cx| {
             migrate_thread_remote_connections(cx, Task::ready(Ok(())));
         });
-        cx.run_until_parked();
 
-        let metadata = cx.update(|cx| {
-            let store = ThreadMetadataStore::global(cx);
-            store
-                .read(cx)
-                .entry_by_session(&acp::SessionId::new("remote-session"))
-                .cloned()
-                .expect("expected migrated metadata row")
-        });
+        // The migration reads the database on a real thread the test executor
+        // does not wait for. Poll for the connection it writes, not the row,
+        // which the `save` above already wrote.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let metadata = loop {
+            cx.run_until_parked();
+            let migrated = cx.update(|cx| {
+                ThreadMetadataStore::global(cx)
+                    .read(cx)
+                    .entry_by_session(&acp::SessionId::new("remote-session"))
+                    .cloned()
+            });
+            if let Some(metadata) = migrated
+                && metadata.remote_connection.is_some()
+            {
+                break metadata;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "expected the migration to backfill the thread's remote connection"
+            );
+        };
 
         assert_eq!(
             metadata.remote_connection,
@@ -3401,7 +4030,8 @@ mod tests {
             let store = ThreadMetadataStore::global(cx);
             let store = store.read(cx);
 
-            let entries: Vec<ThreadMetadata> = store.entries().cloned().collect();
+            let entries: Vec<ThreadMetadata> =
+                store.entries().map(|t| t.as_ref().clone()).collect();
             pretty_assertions::assert_eq!(
                 entries,
                 vec![ThreadMetadata {
@@ -3426,6 +4056,7 @@ mod tests {
                     "staged_aaa".to_string(),
                     "unstaged_bbb".to_string(),
                     "original_000".to_string(),
+                    Vec::new(),
                     cx,
                 )
             })
@@ -3473,6 +4104,7 @@ mod tests {
                     "deadbeef".to_string(),
                     "deadbeef".to_string(),
                     "original_000".to_string(),
+                    Vec::new(),
                     cx,
                 )
             })
@@ -3516,6 +4148,7 @@ mod tests {
                     "abc123".to_string(),
                     "abc123".to_string(),
                     "original_000".to_string(),
+                    Vec::new(),
                     cx,
                 )
             })
@@ -3730,6 +4363,7 @@ mod tests {
                     "staged_a".to_string(),
                     "unstaged_a".to_string(),
                     "original_000".to_string(),
+                    Vec::new(),
                     cx,
                 )
             })
@@ -3745,6 +4379,7 @@ mod tests {
                     "staged_b".to_string(),
                     "unstaged_b".to_string(),
                     "original_000".to_string(),
+                    Vec::new(),
                     cx,
                 )
             })
@@ -4095,6 +4730,12 @@ mod tests {
 
         let thread = panel.read_with(&vcx, |panel, cx| panel.active_agent_thread(cx).unwrap());
         let thread_id = crate::test_support::active_thread_id(&panel, &vcx);
+        // quiet-ui: archiving closes the thread's tab, which releases its
+        // view, and the view is what carries thread events to the store.
+        // Keep it, as upstream's panel does, for the event after archiving.
+        let _view = panel.read_with(&vcx, |panel, _| {
+            panel.active_conversation_view().unwrap().clone()
+        });
 
         // Push content so the event handler saves metadata with the
         // project's worktree paths.

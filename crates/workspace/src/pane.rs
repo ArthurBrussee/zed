@@ -2205,8 +2205,10 @@ impl Pane {
         cx.emit(Event::RemovedItem { item: item.clone() });
         if self.items.is_empty() {
             item.deactivated(window, cx);
+            // A pane kept open when empty would otherwise keep the item alive
+            // through its toolbar.
+            self.update_toolbar(window, cx);
             if close_pane_if_empty {
-                self.update_toolbar(window, cx);
                 cx.emit(Event::Remove {
                     focus_on_pane: focus_on_pane_if_closed,
                 });
@@ -7780,6 +7782,29 @@ mod tests {
         .await
         .unwrap();
         assert_item_labels(&pane, ["A*"], cx);
+    }
+
+    #[gpui::test]
+    async fn test_a_pane_kept_open_when_empty_releases_its_last_item(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+
+        let item = add_labeled_item(&pane, "A", false, cx);
+        let weak_item = item.downgrade();
+        let item_id = item.item_id();
+        drop(item);
+        pane.update_in(cx, |pane, window, cx| {
+            pane.remove_item(item_id, false, false, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            weak_item.upgrade().is_none(),
+            "the toolbar should not keep a removed item alive"
+        );
     }
 
     #[gpui::test]

@@ -1,6 +1,6 @@
 use crate::{AcpThread, ElicitationStore, ReceiptSubmission};
 use agent_client_protocol::schema::{MaybeUndefined, v1 as acp_v1, v2 as acp_v2};
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use collections::{HashMap, HashSet, IndexMap};
 use gpui::{Context, Entity, SharedString, Task};
@@ -130,6 +130,17 @@ pub trait AgentConnection {
         Task::ready(Err(anyhow::Error::msg("Loading sessions is not supported")))
     }
 
+    /// The thread an in-flight [`Self::load_session`] or
+    /// [`Self::resume_session`] is filling, so a long replay can be watched
+    /// before the load task resolves.
+    fn loading_thread(
+        &self,
+        _session_id: &acp_v2::SessionId,
+        _cx: &App,
+    ) -> Option<Entity<AcpThread>> {
+        None
+    }
+
     /// Whether this agent supports explicitly closing existing sessions.
     fn supports_close_session(&self) -> bool {
         false
@@ -253,6 +264,18 @@ pub trait AgentConnection {
 
     /// Requests cancellation; success does not establish that execution stopped.
     fn cancel(&self, session_id: &acp_v2::SessionId, cx: &mut App) -> Result<()>;
+
+    /// Asks the agent to stop one task it detached, leaving the turn alone.
+    fn stop_async_task(
+        &self,
+        _session_id: &acp_v2::SessionId,
+        _async_task_id: SharedString,
+        _cx: &mut App,
+    ) -> Task<Result<()>> {
+        Task::ready(Err(anyhow!(
+            "this agent does not support stopping background tasks"
+        )))
+    }
 
     /// Request-scoped elicitations are connection-level because they can arrive before a session
     /// thread exists. Session-scoped elicitations stay in the thread timeline, but use

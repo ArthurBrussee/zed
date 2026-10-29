@@ -53,7 +53,8 @@ use ui::{
 use update_version::UpdateVersion;
 use util::ResultExt;
 use workspace::{
-    AccessibleMode, MultiWorkspace, ToggleWorktreeSecurity, Workspace,
+    AccessibleMode, MultiWorkspace, SidebarSide, ToggleWorkspaceSidebar, ToggleWorktreeSecurity,
+    Workspace,
     notifications::{NotifyResultExt, NotifyTaskExt as _},
 };
 
@@ -298,6 +299,7 @@ impl Render for TitleBar {
             h_flex()
                 .h_full()
                 .gap_0p5()
+                .children(self.render_collapsed_sidebar_toggle(cx))
                 .map(|title_bar| {
                     let mut render_project_items = title_bar_settings.show_branch_name
                         || title_bar_settings.show_project_items;
@@ -625,7 +627,12 @@ impl TitleBar {
             ),
             remote::ConnectionState::Reconnecting => (
                 Color::Warning,
-                format!("Lost connection to {host}. Reconnecting..."),
+                match self.reconnect_failure(cx) {
+                    Some((_, error)) => {
+                        format!("Lost connection to {host}. Reconnecting...\n{error}")
+                    }
+                    None => format!("Lost connection to {host}. Reconnecting..."),
+                },
             ),
             remote::ConnectionState::Disconnected => {
                 (Color::Error, format!("Disconnected from {host}"))
@@ -686,6 +693,49 @@ impl TitleBar {
                 .anchor(gpui::Anchor::TopLeft)
                 .into_any_element(),
         )
+        .map(|host| {
+            h_flex()
+                .gap_1()
+                .child(host)
+                .children(self.render_fresh_connection_button(cx))
+                .into_any_element()
+        })
+    }
+
+    fn reconnect_failure(&self, cx: &App) -> Option<(usize, SharedString)> {
+        let client = self.project.read(cx).remote_client()?;
+        let client = client.read(cx);
+        (client.connection_state() != remote::ConnectionState::Connected)
+            .then(|| client.reconnect_failure())
+            .flatten()
+    }
+
+    /// quiet-ui: after a few failed reconnects, one click drops the window's
+    /// SSH connection and reconnects over a new one.
+    fn render_fresh_connection_button(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (attempts, error) = self.reconnect_failure(cx)?;
+        if attempts < remote::OFFER_FRESH_CONNECTION_AFTER {
+            return None;
+        }
+        Some(
+            Button::new("reconnect-fresh", "Reconnect")
+                .style(ButtonStyle::Tinted(TintColor::Warning))
+                .label_size(LabelSize::Small)
+                .tooltip(move |_, cx| {
+                    Tooltip::with_meta(
+                        "Drop this connection and open a new one",
+                        None,
+                        error.clone(),
+                        cx,
+                    )
+                })
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if let Some(client) = this.project.read(cx).remote_client() {
+                        client.update(cx, |client, cx| client.reconnect_fresh(cx));
+                    }
+                }))
+                .into_any_element(),
+        )
     }
 
     pub fn render_restricted_mode(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -728,6 +778,46 @@ impl TitleBar {
         } else {
             Some(button.into_any_element())
         }
+    }
+
+    /// While the sidebar is open, its own header carries the toggle instead.
+    fn render_collapsed_sidebar_toggle(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let multi_workspace = self.multi_workspace.clone()?.upgrade()?;
+        let multi_workspace = multi_workspace.read(cx);
+        if !multi_workspace.multi_workspace_enabled(cx) || multi_workspace.sidebar_open() {
+            return None;
+        }
+
+        let icon = match multi_workspace.sidebar_side(cx) {
+            SidebarSide::Left => IconName::ThreadsSidebarLeftClosed,
+            SidebarSide::Right => IconName::ThreadsSidebarRightClosed,
+        };
+        let has_notifications = multi_workspace.sidebar_has_notifications(cx);
+
+        Some(
+            h_flex()
+                .gap_0p5()
+                .child(
+                    IconButton::new("toggle-workspace-sidebar", icon)
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Muted)
+                        .when(has_notifications, |this| {
+                            this.indicator(Indicator::dot().color(Color::Accent))
+                        })
+                        .tooltip(|_window, cx| {
+                            Tooltip::for_action(
+                                "Open Threads Sidebar",
+                                &ToggleWorkspaceSidebar,
+                                cx,
+                            )
+                        })
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(ToggleWorkspaceSidebar.boxed_clone(), cx);
+                        }),
+                )
+                .child(ui::Divider::vertical().color(ui::DividerColor::Border))
+                .into_any_element(),
+        )
     }
 
     pub fn render_project_host(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -822,18 +912,12 @@ impl TitleBar {
             .map(|w| w.read(cx).focus_handle(cx))
             .unwrap_or_else(|| cx.focus_handle());
 
-        let window_project_groups: Vec<_> = self
-            .multi_workspace
-            .as_ref()
-            .and_then(|mw| mw.upgrade())
-            .map(|mw| mw.read(cx).project_group_keys())
-            .unwrap_or_default();
-
         PopoverMenu::new("recent-projects-menu")
             .menu(move |window, cx| {
+                // The sidebar is the workspace switcher.
                 Some(recent_projects::RecentProjects::popover(
                     workspace.clone(),
-                    window_project_groups.clone(),
+                    Vec::new(),
                     None,
                     focus_handle.clone(),
                     window,
@@ -874,18 +958,12 @@ impl TitleBar {
             .map(|w| w.read(cx).focus_handle(cx))
             .unwrap_or_else(|| cx.focus_handle());
 
-        let window_project_groups: Vec<_> = self
-            .multi_workspace
-            .as_ref()
-            .and_then(|mw| mw.upgrade())
-            .map(|mw| mw.read(cx).project_group_keys())
-            .unwrap_or_default();
-
         PopoverMenu::new("sidebar-title-recent-projects-menu")
             .menu(move |window, cx| {
+                // The sidebar is the workspace switcher.
                 Some(recent_projects::RecentProjects::popover(
                     workspace.clone(),
-                    window_project_groups.clone(),
+                    Vec::new(),
                     None,
                     focus_handle.clone(),
                     window,

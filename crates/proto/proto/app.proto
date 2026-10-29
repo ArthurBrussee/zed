@@ -100,3 +100,35 @@ message RemoteProfilingLocation {
   uint32 line = 2;
   uint32 column = 3;
 }
+
+// quiet-ui: what the machine a remote project runs on is doing, so the
+// sidebar can say so for the box as well as for this machine.
+message GetSystemLoad {
+  uint64 project_id = 1;
+}
+
+// quiet-ui: a remote project's worktrees run no language servers until the
+// client's switch turns them on, as on this machine.
+message SetWorktreeLanguageServers {
+  uint64 project_id = 1;
+  repeated string enabled_paths = 2;
+  repeated string disabled_paths = 3;
+}
+
+// quiet-ui: the end of a file outside any worktree, such as a background
+// command's output, to tell a dev server from a command that will finish.
+message ReadFileTail {
+  uint64 project_id = 1;
+  string path = 2;
+  uint64 max_bytes = 3;
+}
+
+message ReadFileTailResponse {
+  string content = 1;
+}
+
+message SystemLoadResponse {
+  // The one-minute load average, and the cores to read it against.
+  double load_average_one = 1;
+  uint32 cpu_count = 2;
+}

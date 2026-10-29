@@ -15,7 +15,7 @@ use futures::{
 use gpui::{App, AppContext as _, AsyncApp, Task};
 use parking_lot::Mutex;
 use paths::remote_server_dir_relative;
-use release_channel::{AppVersion, ReleaseChannel};
+use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
 use rpc::proto::Envelope;
 use semver::Version;
 pub use settings_content::SshPortForwardOption;
@@ -437,7 +437,22 @@ impl RemoteConnection for SshRemoteConnection {
     }
 
     fn has_been_killed(&self) -> bool {
-        self.killed.load(Ordering::Acquire)
+        if self.killed.load(Ordering::Acquire) {
+            return true;
+        }
+        // quiet-ui: a master that exits by itself (the network dropped, the
+        // laptop slept) leaves a connection nothing killed, and every proxy
+        // started over its socket then dies at once.
+        let master_exited = self
+            .master_process
+            .lock()
+            .as_mut()
+            .is_some_and(|master| master.as_mut().try_status().ok().flatten().is_some());
+        #[cfg(not(windows))]
+        let socket_gone = !self.socket.socket_path.exists();
+        #[cfg(windows)]
+        let socket_gone = false;
+        master_exited || socket_gone
     }
 
     fn connection_options(&self) -> RemoteConnectionOptions {
@@ -720,6 +735,49 @@ impl RemoteConnection for SshRemoteConnection {
     }
 }
 
+/// quiet-ui: without keepalives the master notices a silently dropped path
+/// only when TCP gives up, minutes later, so Zed's own heartbeat is the first
+/// to notice. The user's ssh config wins where it sets an interval.
+#[cfg(not(windows))]
+async fn keepalive_args(destination_args: &[String], additional_args: &[String]) -> Vec<String> {
+    let output = util::command::new_command("ssh")
+        .args(additional_args)
+        .arg("-G")
+        .args(destination_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .await;
+    match output {
+        Ok(output) if output.status.success() => {
+            keepalive_args_for(&String::from_utf8_lossy(&output.stdout))
+        }
+        _ => keepalive_args_for(""),
+    }
+}
+
+#[cfg(any(not(windows), test))]
+/// From `ssh -G` output: the keepalive options to add, none when the
+/// configuration already sets an interval.
+fn keepalive_args_for(ssh_config: &str) -> Vec<String> {
+    let configured = ssh_config.lines().any(|line| {
+        line.strip_prefix("serveraliveinterval ")
+            .is_some_and(|interval| interval.trim() != "0")
+    });
+    if configured {
+        return Vec::new();
+    }
+    [
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=3",
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
 /// Check if the user already has an active SSH ControlMaster session for the
 /// given destination. See: https://github.com/zed-industries/zed/issues/45271
 #[cfg(not(windows))]
@@ -842,11 +900,14 @@ impl SshRemoteConnection {
             // for establish the connection and keep it open, allowing other ssh
             // commands to reuse it via a control socket.
             let socket_path = temp_dir.path().join("ssh.sock");
+            let destination_args = connection_options.ssh_destination_args();
+            let mut master_args = connection_options.additional_args();
+            master_args.extend(keepalive_args(&destination_args, &master_args).await);
             let mut master_process = MasterProcess::new(
                 askpass.script_path().as_ref(),
-                connection_options.additional_args(),
+                master_args,
                 &socket_path,
-                connection_options.ssh_destination_args(),
+                destination_args,
             )?;
 
             let result = select_biased! {
@@ -1022,8 +1083,17 @@ impl SshRemoteConnection {
         version: Version,
         cx: &mut AsyncApp,
     ) -> Result<Arc<RelPath>> {
-        let version_str = match release_channel {
-            ReleaseChannel::Dev => "build".to_string(),
+        // A quiet-ui build (Dev, bundled in release) names its server after its own commit.
+        // Upstream's "build" says nothing about which commit, so an updated client would find
+        // the server the previous one installed and talk to it.
+        let quiet_ui_sha = cx.update(|cx| {
+            (release_channel == ReleaseChannel::Dev && !cfg!(debug_assertions))
+                .then(|| AppCommitSha::try_global(cx))
+                .flatten()
+        });
+        let version_str = match (release_channel, &quiet_ui_sha) {
+            (ReleaseChannel::Dev, Some(sha)) => format!("quiet-ui-{}", sha.short()),
+            (ReleaseChannel::Dev, None) => "build".to_string(),
             _ => version.to_string(),
         };
         let binary_name = format!(
@@ -1080,6 +1150,9 @@ impl SshRemoteConnection {
 
         let wanted_version = cx.update(|cx| match release_channel {
             ReleaseChannel::Nightly => Ok(None),
+            // The fork's release is asked for by commit rather than by version, so a quiet-ui
+            // build has somewhere to download from and does not need a server already there.
+            ReleaseChannel::Dev if quiet_ui_sha.is_some() => Ok(None),
             ReleaseChannel::Dev => {
                 anyhow::bail!(
                     "ZED_BUILD_REMOTE_SERVER is not set and no remote server exists at ({:?})",
@@ -2297,6 +2370,72 @@ fn build_command_windows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keepalives_are_added_unless_the_ssh_config_sets_them() {
+        let unset = "host box\nserveraliveinterval 0\nserveralivecountmax 3\n";
+        assert_eq!(
+            keepalive_args_for(unset),
+            [
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=3"
+            ]
+        );
+        assert_eq!(keepalive_args_for(""), keepalive_args_for(unset));
+        let configured = "host box\nserveraliveinterval 30\nserveralivecountmax 4\n";
+        assert!(keepalive_args_for(configured).is_empty());
+    }
+
+    /// 2026-10-21: two of a laptop's three SSH masters had exited, and the
+    /// connections over them were handed out again because nothing had
+    /// killed them.
+    #[cfg(not(windows))]
+    #[test]
+    fn test_a_connection_whose_master_exited_counts_as_killed() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let socket_path = temp_dir.path().join("ssh.sock");
+        std::fs::write(&socket_path, "")?;
+        let master = util::command::new_command("sleep").arg("30").spawn()?;
+        let connection = SshRemoteConnection {
+            socket: SshSocket {
+                connection_options: SshConnectionOptions::default(),
+                socket_path: socket_path.clone(),
+                envs: HashMap::default(),
+            },
+            master_process: Mutex::new(Some(MasterProcess { process: master })),
+            killed: AtomicBool::new(false),
+            remote_binary_path: None,
+            ssh_platform: RemotePlatform {
+                os: RemoteOs::Linux,
+                arch: RemoteArch::X86_64,
+            },
+            ssh_os_version: None,
+            ssh_path_style: PathStyle::Unix,
+            ssh_shell: String::from("/bin/bash"),
+            ssh_shell_kind: ShellKind::Posix,
+            ssh_default_system_shell: String::from("/bin/sh"),
+            ssh_home_dir: None,
+            _temp_dir: temp_dir,
+        };
+        assert!(!connection.has_been_killed());
+
+        std::fs::remove_file(&socket_path)?;
+        assert!(connection.has_been_killed(), "its control socket is gone");
+        std::fs::write(&socket_path, "")?;
+        assert!(!connection.has_been_killed());
+
+        if let Some(master) = connection.master_process.lock().as_mut() {
+            master.as_mut().kill()?;
+        }
+        let exited = (0..100).any(|_| {
+            std::thread::sleep(Duration::from_millis(20));
+            connection.has_been_killed()
+        });
+        assert!(exited, "its master exited by itself");
+        Ok(())
+    }
 
     #[cfg(not(windows))]
     #[test]
