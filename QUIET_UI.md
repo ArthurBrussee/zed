@@ -53,8 +53,10 @@ this, it outranks every other section:
 
 ## Upstream first (from 2026-10-01)
 
-The fork stands at +58.4k / -11.8k lines across 162 files against upstream (the exact figures
-after the 2026-10-28 run were +58,413 / -11,849 across 162 files, up from +57,663 / -11,845 across
+The fork stands at +58.3k / -11.8k lines across 162 files against upstream (the exact figures
+after the 2026-10-29 run were +58,295 / -11,823 across 162 files, down from +58,413 / -11,849 after
+10-28 for no queue entries: the npm-install dedupe went to upstream's own lock and the fake git
+fetch to upstream's recorder; after the 2026-10-28 run they were +58,413 / -11,849 across 162 files, up from +57,663 / -11,845 across
 158 after 10-27 for the one queue entry, about half of it tests; after the 2026-10-27 run they were
 +57,663 / -11,845 across 158 files, down from +57,870 / -11,861
 across 165 after 10-26; the fork's changes to upstream-owned files went from 121 files and
@@ -356,8 +358,8 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
-**Empty.** The one entry queued on 2026-10-28 (Zed growing to 6.8 GB over a day, after the
-WindowServer hang) was built that evening.
+**Empty.** Nothing was queued for 2026-10-29; the one entry queued on 2026-10-28 (Zed growing
+to 6.8 GB over a day, after the WindowServer hang) was built that evening.
 
 ## Verification queue
 
@@ -514,8 +516,8 @@ churn and goes back. Fork-only files are listed last.
 
 #### fs / git
 
-- `crates/fs/src/fake_git_repo.rs` (+31/-4): worktree threads tests: fake fetch and branch-name resolution.
-- `crates/fs/src/fs.rs` (+12/-0): worktree threads tests: `set_fetch_error`/`fetched_remotes` on FakeFs.
+- `crates/fs/src/fake_git_repo.rs`: worktree threads tests: a fake fetch that can fail (on upstream's `fetches` record since 10-29), and branch-name resolution.
+- `crates/fs/src/fs.rs`: worktree threads tests: `set_fetch_error`/`fetched_remotes` on FakeFs, the latter read off upstream's `fetches`.
 - `crates/fs/src/fs_watcher.rs`: log noise: inotify's `WatchNotFound` for a deleted worktree's directories is debug, not a warning (10-20).
 - `crates/git/src/repository.rs` (+119/-6): worktree add failure names exit status; archive restore with `submodule.recurse` set.
 
@@ -547,7 +549,7 @@ property-test teardown went back to upstream.
 
 #### project
 
-- `crates/project/src/agent_server_store.rs` (+237/-78): remote dev: `GetExternalAgents` refresh; npm-install dedupe per directory (reliability).
+- `crates/project/src/agent_server_store.rs`: remote dev: `GetExternalAgents` refresh. (The npm-install dedupe went on 10-29: upstream's #66235 locks each install directory itself.)
 - `crates/project/src/environment.rs` (+106/-20): reliability: capped/shared/timed-out shell environment capture.
 - `crates/project/src/git_store.rs` (+2/-2): reliability: submodules reuse their worktree's environment capture.
 - `crates/project/src/manifest_tree/server_tree.rs` (+7/-0): language servers off in worktrees: the per-worktree gate.
@@ -639,7 +641,7 @@ property-test teardown went back to upstream.
 - `crates/remote_server/src/acp_relay_host.rs`: relay: pass-through on the box.
 - `crates/remote_server/src/acp_relay_tests.rs`: relay end-to-end tests.
 - `crates/remote_server/src/remote_agents_tests.rs`: remote agent list tests.
-- `crates/sidebar/src/machine_load.rs`: sidebar machine load and relay sessions.
+- `crates/sidebar/src/machine_load.rs`: sidebar machine load and relay sessions; a machine's identity key and same-machine comparison (10-29: upstream dropped `same_remote_connection_identity` and `persistence_key`).
 - `crates/sidebar/src/sidebar_tests/fork_tests.rs`: sidebar fork tests.
 
 #### The weakest reasons
@@ -3251,3 +3253,64 @@ two hours, so the long gate ran under `nohup setsid`.
 +57,663 / -11,845 after 10-27: 750 added lines, about 400 of them tests; upstream-owned files
 went from 108 files and +26,629 to 110 and +27,115 (`workspace/src/pane.rs` and
 `zed/src/reliability.rs` joined).
+
+**2026-10-29**: onto main 0373366f4 (37 upstream commits). A working night on the branch's shape:
+both queues were empty, but the branch carried seven commits on the merge base (10-28's queue
+entry, its gate fixes and the log). Squash-then-rebase folded them into one, tree-identical to the
+old tip, and replayed it. Backup at `quiet-ui-pre-rebase-2026-10-29`, kept locally and not
+pushed. **The previous build (quiet-ui nightly build #79, 10-28 17:45 UTC) failed**, and not on
+the code: its `bundle-mac` job sat 15 minutes without a `macos-26` runner and was cancelled with no
+step run; both remote servers built and published. So the 10-28 memory work never reached the
+app, and tonight's build is its first. #78 before it succeeded.
+
+**Crash reports**: none in this file tonight. **Conflicts** (five):
+- `fs/fake_git_repo.rs`: upstream's git auto fetch (#53089) gave the fake repository a real
+  `fetch` that records each `FetchOptions` in `fetches`. The fork's own `fetched_remotes` field
+  went; `FakeFs::fetched_remotes` reads upstream's record, and only `simulated_fetch_error` is
+  still the fork's.
+- `project/agent_server_store.rs`: **upstream now does what the fork did.** #66235 locks each npm
+  install directory (`npx_install_lock`) and repairs a half-extracted package, which is the race
+  the fork's `IN_FLIGHT_NPM_INSTALLS` dedupe covered. Took upstream's side whole: the dedupe, its
+  test and the fork's "install failed, launch the copy already there" fallback are gone (the
+  fallback had no recorded request; an offline launch with a stale bound now fails as upstream's
+  does).
+- `remote/remote_client.rs`: upstream's `connection_options` returns a reference now; took it,
+  kept the fork's `unique_identifier`.
+- `sidebar/sidebar.rs` (eleven hunks): upstream's side of each was a change to code the fork had
+  already replaced, so the fork's side throughout. One of them dropped upstream's new
+  `find_workspace_for_thread`, which upstream's auto-merged hunks call; restored as upstream's.
+- `thread_view.rs` (two): the `acp_thread` import list (upstream's `SessionMessageSide` added to
+  ours), and upstream's `revealed_unsettled_submissions` set up beside the fork's diff stats.
+
+**Markerless drift**, all from #65771 (connection identity unified, options borrowed) and #65966
+(`PathStyle::join` reimplemented): `remote_connection_options` and `ProjectGroupKey::host` return
+`Option<&RemoteConnectionOptions>` (`.cloned()` where the fork keeps one, the `.as_ref()`s gone
+where it passes one on: `worktree_service.rs`, `thread_metadata_store.rs`, eleven places in
+`sidebar.rs`, `machine_load.rs`); `same_remote_connection_identity` and
+`RemoteConnectionIdentity::persistence_key` are gone upstream, so `machine_load.rs` has a
+three-line comparison and `machine_identity_key`, which keeps the old key format so a collapsed
+machine stays collapsed (Docker's changes: upstream's identity dropped the container name);
+`join_path_preserving_components` became `join`, which cannot fail; and upstream added a
+`scroll_to_entry` identical to the fork's bookmarks one, so the fork's went.
+
+**What upstream provides that the fork can delete**: done tonight for the npm-install dedupe and
+the fake fetch recorder (above). Worth a look next night, not examined tonight: #66255 (native
+subagents report state like ACP ones) and #66102/#66101 (linked ACP subagent messages), beside the
+fork's subagent chip and its AIR-reported state; both merged without conflict.
+
+**Built**: nothing; no queue entries.
+
+**The gate**: `cargo test` over the core three and every crate the rebase touched: `fs` 57,
+`remote` 63, `acp_thread` 375, `git_ui_core` 38, `project` 526 (4 ignored), `sidebar` 215,
+`agent_ui` 640 (36 `#[ignore]`d left alone). All passed first time; no failures to sort.
+`./script/clippy --keep-going -j 2` over the same seven: clean. `cargo check -p zed`: clean.
+
+**Environment.** 4 cores, 15G. The `apt-get` and `CARGO_NET_GIT_FETCH_WITH_CLI` steps worked as
+written. The disk allowance filled once, as `script/clippy` began its release-profile tree on top
+of the test build (~30G between them); `rm -rf target/debug/{deps,incremental,build,.fingerprint}`
+freed it and clippy ran clean from there. **Waiting on cargo**: a waiter of the form
+`until ! pgrep -f "cargo check --workspace"` matches its own command line and never ends; wait
+on `pgrep -x cargo` or on a marker file the command writes.
+
+**Diff size**: 162 files, +58,295 / -11,823 against the merge base, from 162 files,
++58,413 / -11,849 after 10-28: 118 added lines fewer, all of it handed to upstream.
