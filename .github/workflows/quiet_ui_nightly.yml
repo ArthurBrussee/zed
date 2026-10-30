@@ -253,7 +253,7 @@ jobs:
           # The same separate, musl-linked build script/bundle-linux does.
           export "CC_$(echo "$triple" | tr '-' '_')"=musl-gcc
           cargo --config .cargo/bundle-config.toml build --release --target "$triple" --package remote_server
-          gzip -c "target/$triple/release/remote_server" > "$ASSET.gz"
+          gzip -c "target/$triple/release/remote-server" > "$ASSET.gz"
           printf '{"sha":"%s","built_at":"%s"}\n' "${{ steps.freshness.outputs.sha }}" \
             "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$ASSET.json"
 
