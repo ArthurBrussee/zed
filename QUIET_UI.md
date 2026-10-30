@@ -358,8 +358,14 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
-**Empty.** Nothing was queued for 2026-10-29; the one entry queued on 2026-10-28 (Zed growing
-to 6.8 GB over a day, after the WindowServer hang) was built that evening.
+**PR chips don't say a PR is a draft** (2026-10-30). In the thread's PR chips (and the sidebar
+row's), a draft reads almost the same as an open PR: `pr_chip` in `gh_status/src/gh_status.rs`
+gives it the same `IconName::PullRequest` and `#123` label, only `Color::Muted` instead of
+`Success`, so at a glance it is a grey open PR. The data is already there (`PrState::Draft` from
+`isDraft`). Make a draft recognisable on the chip itself, the way GitHub does: its draft icon
+(Lucide's `git-pull-request-draft`, the dashed one, would match the existing `pull_request.svg`),
+or the word "draft" beside the number if an icon does not read at chip size. Small and contained
+to the chip; the hover detail already says "draft".
 
 ## Verification queue
 
