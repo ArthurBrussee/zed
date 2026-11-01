@@ -53,8 +53,10 @@ this, it outranks every other section:
 
 ## Upstream first (from 2026-10-01)
 
-The fork stands at +58.3k / -11.8k lines across 162 files against upstream (the exact figures
-after the 2026-10-29 run were +58,295 / -11,823 across 162 files, down from +58,413 / -11,849 after
+The fork stands at +58.3k / -11.8k lines across 164 files against upstream (the exact figures
+after the 2026-11-01 run were +58,301 / -11,825 across 164 files, up from +58,295 / -11,823 across
+162 after 10-29 for the one queue entry: a new icon file, its `IconName` variant and four lines in
+`gh_status` and the chip's hover card; the exact figures after the 2026-10-29 run were +58,295 / -11,823 across 162 files, down from +58,413 / -11,849 after
 10-28 for no queue entries: the npm-install dedupe went to upstream's own lock and the fake git
 fetch to upstream's recorder; after the 2026-10-28 run they were +58,413 / -11,849 across 162 files, up from +57,663 / -11,845 across
 158 after 10-27 for the one queue entry, about half of it tests; after the 2026-10-27 run they were
@@ -540,6 +542,7 @@ property-test teardown went back to upstream.
 #### language_model / markdown / picker
 
 - `crates/language_model/src/registry.rs` (+5/-0): `try_read_global` for thread view's model lookup.
+- `assets/icons/pull_request_draft.svg`, `crates/icons/src/icons.rs` (+1/-0): PR chips: the draft icon a draft PR's chip draws (11-01).
 - `crates/markdown/src/markdown.rs` (+34/-19): thread view: fixed inline image height so late images don't overpaint the list; streaming `append` copies the source once (10-20); memory: `release_parsed` puts a parse back to deferred (10-28).
 - `crates/language/src/buffer.rs`: reliability: a reload with over 1,000 hunks applies as one edit, and a slow reload is logged with its path and size (10-20).
 - `crates/lsp/src/lsp.rs`: reliability: exited servers reaped (10-19); `exited()` so the store notices a server that died, and `simulate_exit` for its test (10-20).
@@ -3313,3 +3316,51 @@ on `pgrep -x cargo` or on a marker file the command writes.
 
 **Diff size**: 162 files, +58,295 / -11,823 against the merge base, from 162 files,
 +58,413 / -11,849 after 10-28: 118 added lines fewer, all of it handed to upstream.
+
+**2026-11-01**: onto main d94f32a1d (12 upstream commits). A working night on the queue: one
+entry, and the branch carried two commits on the merge base (10-29's log and the queued entry).
+Squash-then-rebase folded them into one, tree-identical to the old tip. Backup at
+`quiet-ui-pre-rebase-2026-11-01`, kept locally and not pushed. **The previous builds**: #80
+(10-29 21:14 UTC, from that night's push) published the Mac app, so 10-28's memory work and 10-29's
+rebase are in the app, but both remote servers failed to build; Arthur's `main` fix (gzip the
+remote server under its new name) and rerun #81 (10-30 14:54) built and published both servers,
+and its `bundle-mac` was cancelled after 15 minutes with no `macos-26` runner, no step run.
+
+**Crash reports**: none in this file tonight. **Conflicts** (two):
+- `markdown/markdown.rs` (three hunks): upstream's #65474 added `rounded_images` (the preview
+  keeps an image's own corners) beside the fork's `inline_image_height`. Kept both fields, and the
+  fork's fixed-height image wrapper with upstream's `rounded_images` switch on its `rounded_md`.
+- `thread_view.rs`: the recurring seam. #66367 rounded `TerminalToolHeader`'s corners and moved the
+  `terminal_view` binding above it; the fork draws its own one-line chip there, so the fork's side,
+  with `terminal_view` put back where the fork's code reads it. Upstream's other half of #66367
+  (the command block's background moved from `render_collapsible_command` to its caller) merged
+  cleanly and changes nothing the fork draws: the fork's one call site is that caller.
+
+**Markerless drift**: none; `cargo check --workspace --all-targets` was clean after the replay.
+
+**What upstream provides that the fork can delete**: nothing new tonight. The two leads 10-29
+named (#66255, #66102/#66101 on subagent state and linked subagent messages) are still not
+examined.
+
+**Built**: *PR chips don't say a PR is a draft.* `pr_chip` gives a draft `IconName::PullRequestDraft`,
+a new `pull_request_draft.svg` drawn on `pull_request.svg`'s strokes with the arrow swapped for
+the two dashes of Lucide's `git-pull-request-draft`; the chip's hover card draws the chip's icon
+rather than always the open one. Read as within **Stability first**: it adds no behaviour, only
+makes a state the chip already carried visible, and Arthur filed it after the rule. Tested by the
+existing draft test in `gh_status` (asserts the icon) and by the icons crate's own
+every-variant-has-a-file and no-dangling-file tests. Not checked: how the dashes read at chip
+size, which only the app shows.
+
+**The gate**: `cargo test`: `acp_thread` 375, `gh_status` 58, `icons` 2, `ui` 190, `markdown` 99
++ 41, `agent_ui` 640 (36 `#[ignore]`d left alone), `sidebar` 215. All passed first time; no
+failures to sort. `./script/clippy --keep-going -j 2` over the same seven: clean.
+`cargo check -p zed`: clean.
+
+**Environment.** 4 cores, 15G. The `apt-get` and `CARGO_NET_GIT_FETCH_WITH_CLI` steps worked as
+written. Clearing `target/debug/{deps,incremental,build,.fingerprint}` before clippy, per 10-29,
+kept the disk clear. A background command's `timeout` is its run limit: the first workspace
+check, given 10 minutes, was killed and rerun.
+
+**Diff size**: 164 files, +58,301 / -11,825 against the merge base, from 162 files,
++58,295 / -11,823 after 10-29. The replay alone left it at 162 files, +58,293 / -11,825 (upstream's
+image-rounding field took two of the fork's lines); tonight's entry is the other 8 and both files.
