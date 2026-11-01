@@ -362,6 +362,7 @@ impl RenderOnce for PrChip {
             })
             .map(|this| match chip.detail {
                 Some(detail) => this.tooltip(Tooltip::element(move |_, _| {
+                    let state_icon = chip.state_icon;
                     let detail = detail.clone();
                     v_flex()
                         .gap_1()
@@ -384,7 +385,7 @@ impl RenderOnce for PrChip {
                                     h_flex()
                                         .gap_0p5()
                                         .child(
-                                            Icon::new(IconName::PullRequest)
+                                            Icon::new(state_icon)
                                                 .size(IconSize::XSmall)
                                                 .color(detail.state_color),
                                         )

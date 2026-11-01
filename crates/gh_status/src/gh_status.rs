@@ -859,7 +859,11 @@ fn pr_chip(pr: &PrStatus) -> ThreadItemPrChip {
         });
     ThreadItemPrChip {
         label: SharedString::from(format!("#{}", pr.number)),
-        state_icon: IconName::PullRequest,
+        state_icon: if pr.state == PrState::Draft {
+            IconName::PullRequestDraft
+        } else {
+            IconName::PullRequest
+        },
         state_color,
         checks,
         check_counts,
@@ -1814,6 +1818,7 @@ mod tests {
         assert_eq!(pr.merge, MergeState::Blocked);
 
         let chip = pr_chip(&pr);
+        assert_eq!(chip.state_icon, IconName::PullRequestDraft);
         assert_eq!(chip.checks, Some(passing_glyph()));
         assert!(!chip.tooltip.contains("blocked"), "{}", chip.tooltip);
         assert_eq!(chip.detail.unwrap().merge_blocker, None);
