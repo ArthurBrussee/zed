@@ -166,6 +166,16 @@ pub(super) struct DiffHunkKey {
     pub(super) hunk_start_anchor: Anchor,
 }
 
+/// A review comment taken out of the editor to be sent, resolved to its file.
+pub struct TakenReviewComment {
+    pub path: Arc<util::rel_path::RelPath>,
+    /// Zero-based buffer rows, inclusive.
+    pub rows: std::ops::RangeInclusive<u32>,
+    /// The text of the rows the comment covers.
+    pub code: String,
+    pub comment: String,
+}
+
 /// A review comment stored locally before being sent to the Agent panel.
 #[derive(Clone)]
 pub(super) struct StoredReviewComment {
@@ -745,8 +755,43 @@ impl Editor {
         cx.notify();
     }
 
+    /// Takes every stored review comment, resolved to its file, rows and code.
+    pub fn take_review_comments(&mut self, cx: &mut Context<Self>) -> Vec<TakenReviewComment> {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let buffer_row = |point: Point| {
+            snapshot
+                .point_to_buffer_point(point)
+                .map_or(point.row, |(_, point)| point.row)
+        };
+        self.dismiss_all_diff_review_overlays(cx);
+        let comments = std::mem::take(&mut self.stored_review_comments);
+        self.next_review_comment_id = 0;
+        cx.emit(EditorEvent::ReviewCommentsChanged { total_count: 0 });
+        cx.notify();
+        comments
+            .into_iter()
+            .flat_map(|(key, comments)| {
+                comments
+                    .into_iter()
+                    .map(move |comment| (key.file_path.clone(), comment))
+            })
+            .map(|(path, comment)| {
+                let start = comment.range.start.to_point(&snapshot);
+                let end = comment.range.end.to_point(&snapshot);
+                let code_range = Point::new(start.row, 0)
+                    ..Point::new(end.row, snapshot.line_len(MultiBufferRow(end.row)));
+                TakenReviewComment {
+                    path,
+                    rows: buffer_row(start)..=buffer_row(end),
+                    code: snapshot.text_for_range(code_range).collect(),
+                    comment: comment.comment,
+                }
+            })
+            .collect()
+    }
+
     /// Returns the total count of stored review comments across all hunks.
-    pub(super) fn total_review_comment_count(&self) -> usize {
+    pub fn total_review_comment_count(&self) -> usize {
         self.stored_review_comments
             .iter()
             .map(|(_, v)| v.len())

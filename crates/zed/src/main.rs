@@ -286,6 +286,13 @@ fn main() {
         return;
     }
 
+    // quiet-ui: read before this session writes to the log, so its last line
+    // is still the previous session's.
+    let quiet_ui_build = auto_update::is_quiet_ui_build(*release_channel::RELEASE_CHANNEL);
+    let unfinished_session = quiet_ui_build
+        .then(|| crashes::quiet_ui::unfinished_session(paths::logs_dir(), paths::log_file()))
+        .flatten();
+
     zlog::init();
 
     if stdout_is_a_pty() {
@@ -355,6 +362,35 @@ fn main() {
     ));
     let background_executor = app.background_executor();
 
+    if quiet_ui_build {
+        let commit = app_commit_sha.as_ref().map(|sha| sha.full());
+        std::thread::spawn(move || {
+            if let Some((previous, last_line)) = unfinished_session {
+                log::warn!(
+                    "{}",
+                    crashes::quiet_ui::report(
+                        paths::logs_dir(),
+                        &previous,
+                        last_line.as_deref(),
+                        commit.as_deref(),
+                    )
+                );
+            }
+            crashes::quiet_ui::prune_minidumps(
+                paths::logs_dir(),
+                crashes::quiet_ui::MINIDUMPS_KEPT,
+            );
+        });
+        crashes::quiet_ui::record_session(
+            paths::logs_dir(),
+            &crashes::quiet_ui::SessionMarker {
+                session_id: session_id.clone(),
+                version: app_version.to_string(),
+                started_at: chrono::Local::now().to_rfc3339(),
+            },
+        );
+    }
+
     let (open_listener, mut open_rx) = OpenListener::new();
 
     let failed_single_instance_check = if *zed_env_vars::ZED_STATELESS
@@ -383,8 +419,11 @@ fn main() {
         return;
     }
 
+    // quiet-ui: there is no endpoint to upload to, but the minidumps it keeps
+    // beside the log are the only record of a crash.
     let should_install_crash_handler =
-        client::telemetry::should_install_crash_handler(*release_channel::RELEASE_CHANNEL);
+        client::telemetry::should_install_crash_handler(*release_channel::RELEASE_CHANNEL)
+            || quiet_ui_build;
 
     let crash_handler = if should_install_crash_handler {
         Some(
@@ -478,6 +517,15 @@ fn main() {
 
     app.run(move |cx| {
         cx.set_global(app_db);
+        if quiet_ui_build {
+            cx.on_app_quit(|_| {
+                crashes::quiet_ui::end_session(paths::logs_dir());
+                async {}
+            })
+            .detach();
+            cx.on_app_restart(|_| crashes::quiet_ui::end_session(paths::logs_dir()))
+                .detach();
+        }
         let db_trusted_paths = match workspace::WorkspaceDb::global(cx).fetch_trusted_worktrees() {
             Ok(trusted_paths) => trusted_paths,
             Err(e) => {
@@ -718,6 +766,8 @@ fn main() {
             false,
             cx,
         );
+        gh_status::init(cx);
+        git_ui_core::worktree_language_server_switch::init(cx);
         zed::watch_user_agents_md(app_state.fs.clone(), cx);
 
         repl::init(app_state.fs.clone(), cx);

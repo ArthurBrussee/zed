@@ -1856,10 +1856,12 @@ mod tests {
         // lens row so the line is reserved while the resolve is in flight.
         // Those placeholder blocks add display height, so after scrolling to
         // the end the visible buffer-row range is slightly smaller than it
-        // would be without them, and lens row 60 is just outside it.
+        // would be without them. Row 60 sits on that boundary: upstream's
+        // uniform_list precision fix (#65288) computes the last visible index
+        // in f64 rather than f32, which brings row 60 just inside the range.
         assert_eq!(
             after_scroll_resolved,
-            HashSet::from_iter([70, 80, 90]),
+            HashSet::from_iter([60, 70, 80, 90]),
             "Only newly visible lenses at the bottom should be resolved, not middle ones"
         );
 

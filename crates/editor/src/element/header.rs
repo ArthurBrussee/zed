@@ -197,6 +197,10 @@ impl EditorElement {
             .into_any_element();
 
         let mut origin = hitbox.origin;
+        origin.y += Pixels::from(
+            sticky_header_drop(snapshot, excerpt, scroll_position.y)
+                * ScrollPixelOffset::from(line_height),
+        );
         // Move floating header up to avoid colliding with the next buffer header.
         for block in blocks.iter() {
             if !block.is_buffer_header {
@@ -625,6 +629,57 @@ pub(crate) fn header_jump_data(
     }
 }
 
+/// The rows `Editor::set_buffer_header_extra_rows` makes above a buffer's
+/// header, with what an addon draws there. They belong to the header's block,
+/// so they stay put when the header below them is the sticky one.
+pub(crate) fn render_above_buffer_header(
+    editor: &Entity<Editor>,
+    for_excerpt: &ExcerptBoundaryInfo,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<AnyElement> {
+    let editor = editor.read(cx);
+    let rows = editor
+        .display_map
+        .read(cx)
+        .buffer_header_extra_rows(for_excerpt.buffer_id());
+    (rows > 0).then(|| {
+        div()
+            .w_full()
+            .h(rows as f32 * window.line_height())
+            .children(
+                editor
+                    .addons
+                    .values()
+                    .find_map(|addon| addon.render_above_buffer_header(for_excerpt, window, cx)),
+            )
+            .into_any_element()
+    })
+}
+
+/// How many rows below the top of the view a sticky header still sits while
+/// the rows above it in its block are in view.
+pub(crate) fn sticky_header_drop(
+    snapshot: &EditorSnapshot,
+    excerpt: &ExcerptBoundaryInfo,
+    scroll_top: f64,
+) -> f64 {
+    let extra = snapshot.buffer_header_extra_rows(excerpt.buffer_id());
+    if extra == 0 {
+        return 0.;
+    }
+    let top_row = scroll_top as u32;
+    snapshot
+        .blocks_in_range(DisplayRow(top_row.saturating_sub(extra))..DisplayRow(top_row + 1))
+        .find_map(|(row, block)| match block {
+            crate::display_map::Block::BufferHeader {
+                excerpt: header, ..
+            } if header == excerpt => Some(row),
+            _ => None,
+        })
+        .map_or(0., |row| ((row.0 + extra) as f64 - scroll_top).max(0.))
+}
+
 pub(crate) fn render_buffer_header(
     editor: &Entity<Editor>,
     for_excerpt: &ExcerptBoundaryInfo,
@@ -642,6 +697,9 @@ pub(crate) fn render_buffer_header(
         |_, _| false,
     );
     let header_hovered = *header_hovered_state.read(cx);
+    let above_header = (!is_sticky)
+        .then(|| render_above_buffer_header(editor, for_excerpt, window, cx))
+        .flatten();
     let editor_read = editor.read(cx);
     let multi_buffer = editor_read.buffer.read(cx);
     let is_read_only = editor_read.read_only(cx);
@@ -998,7 +1056,7 @@ pub(crate) fn render_buffer_header(
     let editor = editor.clone();
     let buffer_snapshot = buffer.clone();
 
-    right_click_menu(("buffer-header-context-menu", buffer_id.to_proto()))
+    let header = right_click_menu(("buffer-header-context-menu", buffer_id.to_proto()))
         .trigger(move |_, _, _| header)
         .menu(move |window, cx| {
             let menu_context = focus_handle.clone();
@@ -1106,7 +1164,9 @@ pub(crate) fn render_buffer_header(
 
                 menu.context(menu_context)
             })
-        })
+        });
+
+    v_flex().w_full().children(above_header).child(header)
 }
 
 pub fn file_status_label_color(file_status: Option<FileStatus>) -> Color {

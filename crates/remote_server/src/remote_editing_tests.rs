@@ -1432,6 +1432,110 @@ async fn test_remote_settings(cx: &mut TestAppContext, server_cx: &mut TestAppCo
 }
 
 #[gpui::test]
+async fn test_a_box_worktree_runs_language_servers_only_when_switched_on(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(
+        path!("/code"),
+        json!({
+            "project1": {
+                ".git": {},
+                "src": { "lib.rs": "fn one() -> usize { 1 }" }
+            },
+        }),
+    )
+    .await;
+    let (project, headless) = init_test(&fs, cx, server_cx).await;
+    server_cx.update(project::worktree_language_servers::init);
+
+    project.update(cx, |project, _| {
+        project.languages().register_test_language(LanguageConfig {
+            name: "Rust".into(),
+            matcher: (LanguageMatcher {
+                path_suffixes: vec!["rs".into()],
+                ..Default::default()
+            })
+            .into(),
+            ..Default::default()
+        });
+        project.languages().register_fake_lsp_adapter(
+            "Rust",
+            FakeLspAdapter {
+                name: "rust-analyzer",
+                ..FakeLspAdapter::default()
+            },
+        );
+    });
+    let mut fake_lsp = server_cx.update(|cx| {
+        headless.read(cx).languages.register_fake_lsp_server(
+            LanguageServerName("rust-analyzer".into()),
+            lsp::ServerCapabilities::default(),
+            None,
+        )
+    });
+    cx.run_until_parked();
+
+    let worktree_id = project
+        .update(cx, |project, cx| {
+            project.languages().add(rust_lang());
+            project.find_or_create_worktree(path!("/code/project1"), true, cx)
+        })
+        .await
+        .unwrap()
+        .0
+        .read_with(cx, |worktree, _| worktree.id());
+    cx.run_until_parked();
+    let (_buffer, _handle) = project
+        .update(cx, |project, cx| {
+            project.open_buffer_with_lsp((worktree_id, rel_path("src/lib.rs")), cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    let running = |server_cx: &mut TestAppContext| {
+        server_cx.read(|cx| {
+            headless
+                .read(cx)
+                .lsp_store
+                .read(cx)
+                .as_local()
+                .unwrap()
+                .language_servers
+                .len()
+        })
+    };
+    assert_eq!(running(server_cx), 0, "off until the switch says otherwise");
+
+    let client = project.read_with(cx, |project, cx| {
+        project.remote_client().unwrap().read(cx).proto_client()
+    });
+    project::worktree_language_servers::send_to_remote(
+        &client,
+        vec![PathBuf::from(path!("/code/project1"))],
+        Vec::new(),
+    )
+    .await;
+    cx.run_until_parked();
+    server_cx.run_until_parked();
+    let _fake_server = fake_lsp.next().await.expect("switching on starts the server");
+    assert_eq!(running(server_cx), 1);
+
+    project::worktree_language_servers::send_to_remote(
+        &client,
+        Vec::new(),
+        vec![PathBuf::from(path!("/code/project1"))],
+    )
+    .await;
+    cx.run_until_parked();
+    // Stopping waits on the server's shutdown handshake.
+    server_cx.executor().advance_clock(std::time::Duration::from_secs(10));
+    server_cx.run_until_parked();
+    assert_eq!(running(server_cx), 0, "switching off stops it");
+}
+
+#[gpui::test]
 async fn test_remote_lsp(cx: &mut TestAppContext, server_cx: &mut TestAppContext) {
     let fs = FakeFs::new(server_cx.executor());
     fs.insert_tree(
@@ -6414,6 +6518,95 @@ async fn test_log_store_keys_remote_events_by_primary_kind_on_supplementary_id_c
     });
 }
 
+/// quiet-ui: the sidebar footer asks the box what it is doing, over the
+/// connection the project already has rather than a shell of its own.
+#[gpui::test]
+async fn test_the_box_reports_its_own_load(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(path!("/code"), json!({ "project1": { "src": {} } }))
+        .await;
+    let (project, _headless) = init_test(&fs, cx, server_cx).await;
+
+    let response = project
+        .update(cx, |project, cx| {
+            let remote_client = project
+                .remote_client()
+                .expect("the harness gives a remote project");
+            let proto_client = remote_client.read(cx).proto_client();
+            cx.background_spawn(async move {
+                proto_client
+                    .request(proto::GetSystemLoad {
+                        project_id: proto::REMOTE_SERVER_PROJECT_ID,
+                    })
+                    .await
+            })
+        })
+        .await
+        .expect("the box should answer over the existing connection");
+
+    assert!(
+        response.load_average_one >= 0.0 && response.load_average_one.is_finite(),
+        "a load average, even where it is zero: {}",
+        response.load_average_one
+    );
+}
+
+/// 2026-10-19: 732 `LspQuery` failures on the box, "unknown buffer id" for
+/// the same ids for 45 minutes: the server no longer had buffers the editors
+/// still showed. A buffer the server sends again arrives as a second copy,
+/// and dropping that copy closed the server's buffer under the first.
+#[gpui::test]
+async fn test_a_resent_buffer_does_not_close_the_one_still_open(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(path!("/code"), json!({ "lib.rs": "fn one() {}" }))
+        .await;
+    let (project, headless) = init_test(&fs, cx, server_cx).await;
+    let (worktree, _) = project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/code"), true, cx)
+        })
+        .await
+        .unwrap();
+    cx.executor().run_until_parked();
+    let worktree_id = worktree.read_with(cx, |worktree, _| worktree.id());
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_buffer((worktree_id, rel_path("lib.rs")), cx)
+        })
+        .await
+        .unwrap();
+    let buffer_id = buffer.read_with(cx, |buffer, _| buffer.remote_id());
+    cx.executor().run_until_parked();
+
+    // The server forgets it shared the buffer and sends it again.
+    headless.update(server_cx, |headless, cx| {
+        headless.buffer_store.update(cx, |store, cx| {
+            let buffer = store.get(buffer_id).unwrap();
+            store.forget_shared_buffers();
+            store
+                .create_buffer_for_peer(&buffer, proto::REMOTE_SERVER_PEER_ID, cx)
+                .detach();
+        })
+    });
+    server_cx.executor().run_until_parked();
+    cx.executor().run_until_parked();
+    server_cx.executor().run_until_parked();
+
+    headless.read_with(server_cx, |headless, cx| {
+        assert!(
+            headless.buffer_store.read(cx).is_shared(buffer_id, cx),
+            "the copy the client dropped did not close the server's buffer"
+        );
+    });
+    buffer.read_with(cx, |buffer, _| assert_eq!(buffer.text(), "fn one() {}"));
+}
+
 pub async fn init_test(
     server_fs: &Arc<FakeFs>,
     cx: &mut TestAppContext,
@@ -6498,7 +6691,7 @@ fn read_stdio_launch(output_path: &Path) -> (RemoteCommand, serde_json::Value) {
     (command, serde_json::from_str(first_line).unwrap())
 }
 
-fn build_project(ssh: Entity<RemoteClient>, cx: &mut TestAppContext) -> Entity<Project> {
+pub(crate) fn build_project(ssh: Entity<RemoteClient>, cx: &mut TestAppContext) -> Entity<Project> {
     cx.update(|cx| {
         if !cx.has_global::<SettingsStore>() {
             let settings_store = SettingsStore::test(cx);

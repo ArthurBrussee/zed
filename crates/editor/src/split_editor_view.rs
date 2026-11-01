@@ -19,7 +19,10 @@ use crate::{
     DisplayRow, Editor, EditorSnapshot, EditorStyle, FILE_HEADER_HEIGHT,
     MULTI_BUFFER_EXCERPT_HEADER_HEIGHT, RowExt, StickyHeaderExcerpt,
     display_map::Block,
-    element::{EditorElement, SplitSide, header_jump_data, render_buffer_header},
+    element::{
+        EditorElement, SplitSide, header_jump_data, render_above_buffer_header,
+        render_buffer_header, sticky_header_drop,
+    },
     scroll::ScrollOffset,
     split::SplittableEditor,
 };
@@ -584,6 +587,9 @@ impl SplitBufferHeadersElement {
             .into_any_element();
 
         let mut origin = bounds.origin;
+        origin.y += Pixels::from(
+            sticky_header_drop(snapshot, excerpt, scroll_position.y) * f64::from(line_height),
+        );
 
         for (block_row, block) in snapshot.blocks_in_range(start_row..end_row) {
             if !block.is_buffer_header() {
@@ -631,9 +637,29 @@ impl SplitBufferHeadersElement {
         let mut headers = Vec::new();
 
         for (block_row, block) in snapshot.blocks_in_range(start_row..end_row) {
+            let y_offset = (block_row.0 as f64 - scroll_position.y) * f64::from(line_height);
+            let origin = point(bounds.origin.x, bounds.origin.y + Pixels::from(y_offset));
+            let available_size = size(
+                AvailableSpace::Definite(available_width),
+                AvailableSpace::MinContent,
+            );
             let (excerpt, is_folded) = match block {
                 Block::BufferHeader { excerpt, .. } => {
                     if sticky_header == Some(excerpt) {
+                        // The rows above it stay with its block.
+                        if let Some(mut above) =
+                            render_above_buffer_header(&self.rhs_editor, excerpt, window, cx)
+                        {
+                            Self::prepaint_header(
+                                &mut above,
+                                origin,
+                                available_size,
+                                bounds,
+                                window,
+                                cx,
+                            );
+                            headers.push(BufferHeaderLayout { element: above });
+                        }
                         continue;
                     }
                     (excerpt, false)
@@ -663,14 +689,6 @@ impl SplitBufferHeadersElement {
                 cx,
             )
             .into_any_element();
-
-            let y_offset = (block_row.0 as f64 - scroll_position.y) * f64::from(line_height);
-            let origin = point(bounds.origin.x, bounds.origin.y + Pixels::from(y_offset));
-
-            let available_size = size(
-                AvailableSpace::Definite(available_width),
-                AvailableSpace::MinContent,
-            );
 
             Self::prepaint_header(&mut header, origin, available_size, bounds, window, cx);
 

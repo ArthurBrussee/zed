@@ -512,6 +512,14 @@ impl DisplayMap {
             for buffer_id in buffers_to_unfold {
                 self.block_map.folded_buffers.remove(&buffer_id);
             }
+            for (my_buffer, rows) in &self.block_map.buffer_header_extra_rows {
+                if let Some(diff) = rhs_snapshot.diff_for_buffer_id(*my_buffer) {
+                    companion_display_map
+                        .block_map
+                        .buffer_header_extra_rows
+                        .insert(diff.base_text().remote_id(), *rows);
+                }
+            }
 
             for block in all_blocks {
                 let Some(their_block) = block_map::balancing_block(
@@ -865,6 +873,33 @@ impl DisplayMap {
         self.block_map
             .write(self_wrap_snapshot, self_wrap_edits, None)
             .disable_header_for_buffer(buffer_id);
+    }
+
+    /// See `BlockMapWriter::set_buffer_header_extra_rows`.
+    pub fn set_buffer_header_extra_rows(
+        &mut self,
+        rows: HashMap<BufferId, u32>,
+        cx: &mut Context<Self>,
+    ) {
+        let (self_wrap_snapshot, self_wrap_edits) = self.sync_through_wrap(cx);
+        Self::with_synced_companion_mut(
+            self.entity_id,
+            &self.companion,
+            cx,
+            |companion_view, cx| {
+                self.block_map
+                    .write(self_wrap_snapshot, self_wrap_edits, companion_view)
+                    .set_buffer_header_extra_rows(rows, self.buffer.read(cx), cx);
+            },
+        )
+    }
+
+    pub(crate) fn buffer_header_extra_rows(&self, buffer_id: BufferId) -> u32 {
+        self.block_map
+            .buffer_header_extra_rows
+            .get(&buffer_id)
+            .copied()
+            .unwrap_or_default()
     }
 
     #[instrument(skip_all)]
@@ -2517,6 +2552,14 @@ impl DisplaySnapshot {
 
     pub fn buffer_header_height(&self) -> u32 {
         self.block_snapshot.buffer_header_height
+    }
+
+    pub(crate) fn buffer_header_extra_rows(&self, buffer_id: BufferId) -> u32 {
+        self.block_snapshot
+            .buffer_header_extra_rows
+            .get(&buffer_id)
+            .copied()
+            .unwrap_or_default()
     }
 
     pub fn excerpt_header_height(&self) -> u32 {
