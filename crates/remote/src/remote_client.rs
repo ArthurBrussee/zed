@@ -204,6 +204,27 @@ fn is_unrecoverable_reconnect_error(error: &anyhow::Error) -> bool {
     .any(|needle| error.contains(needle))
 }
 
+/// quiet-ui: how long reconnects may fail without ever reaching the host
+/// before the client stops trying and says the host is unreachable.
+const GIVE_UP_ON_UNREACHABLE_HOST_AFTER: Duration = Duration::from_secs(3 * 60);
+
+/// Why a failed attempt never got as far as the host, or `None` when it did
+/// (or when the error does not say).
+fn unreachable_reason(error: &str) -> Option<&'static str> {
+    let error = error.to_lowercase();
+    [
+        ("connecting to host timed out", "connecting timed out"),
+        ("connection timed out", "connecting timed out"),
+        ("operation timed out", "connecting timed out"),
+        ("network is unreachable", "the network is unreachable"),
+        ("no route to host", "no route to the host"),
+        ("connection refused", "the connection was refused"),
+        ("could not resolve hostname", "the host name did not resolve"),
+    ]
+    .into_iter()
+    .find_map(|(needle, reason)| error.contains(needle).then_some(reason))
+}
+
 /// Every live client, so a reconnect can tell whether a connection it shares
 /// is still serving others.
 #[derive(Default)]
@@ -387,6 +408,12 @@ pub struct RemoteClient {
     /// The next reconnect drops this client's SSH connection rather than
     /// reusing it.
     fresh_connection: bool,
+    /// quiet-ui: since when every reconnect has failed before reaching the host.
+    unreachable_since: Option<Instant>,
+    /// Set once this client stopped retrying a host it cannot reach, with
+    /// why; cleared by the next reconnect, which only a click (or a peer
+    /// getting through) starts.
+    host_unreachable: Option<SharedString>,
 }
 
 /// quiet-ui: failed reconnects after which the window offers to drop the
@@ -532,6 +559,8 @@ impl RemoteClient {
                     pending_retry: None,
                     reconnect_failure: None,
                     fresh_connection: false,
+                    unreachable_since: None,
+                    host_unreachable: None,
                 });
                 cx.update(|cx| {
                     let clients = cx.default_global::<RemoteClients>();
@@ -699,6 +728,7 @@ impl RemoteClient {
         }
 
         self.pending_retry = None;
+        self.host_unreachable = None;
         let fresh = std::mem::take(&mut self.fresh_connection);
         // One SSH connection serves every window on a host: killing it while
         // another client is talking over it takes that window down too. Only
@@ -973,6 +1003,20 @@ impl RemoteClient {
                     Some(State::Connected { .. }) => None,
                     _ => this.reconnect_failure.take(),
                 };
+                let now = cx.background_executor().now();
+                match this.reconnect_failure.as_ref() {
+                    Some((_, error)) if this.state_is(State::is_reconnect_failed) => {
+                        if unreachable_reason(error).is_some() {
+                            this.unreachable_since.get_or_insert(now);
+                        } else {
+                            this.unreachable_since = None;
+                        }
+                    }
+                    _ if this.state_is(|state| matches!(state, State::Connected { .. })) => {
+                        this.unreachable_since = None;
+                    }
+                    _ => {}
+                }
                 if reconnected {
                     cx.emit(RemoteClientEvent::Reconnected);
                     this.retry_stuck_peers(cx);
@@ -984,7 +1028,11 @@ impl RemoteClient {
                 }
 
                 if this.state_is(State::is_reconnect_failed) {
-                    this.schedule_reconnect(attempts, cx);
+                    if let Some(reason) = this.unreachable_host_reason(now, cx) {
+                        this.give_up_on_host(reason, cx);
+                    } else {
+                        this.schedule_reconnect(attempts, cx);
+                    }
                     anyhow::Ok(())
                 } else if this.state_is(State::is_reconnect_exhausted) {
                     Ok(())
@@ -1143,6 +1191,65 @@ impl RemoteClient {
     /// one's error, while the client is still trying.
     pub fn reconnect_failure(&self) -> Option<(usize, SharedString)> {
         self.reconnect_failure.clone()
+    }
+
+    /// quiet-ui: why this client stopped retrying its host, if it has.
+    pub fn host_unreachable(&self) -> Option<SharedString> {
+        self.host_unreachable.clone()
+    }
+
+    /// Whether to stop retrying: the host has not been reached for long
+    /// enough, or another client on it already stopped.
+    fn unreachable_host_reason(&self, now: Instant, cx: &Context<Self>) -> Option<SharedString> {
+        if let Some(reason) = self
+            .peers(cx)
+            .find_map(|peer| peer.read(cx).host_unreachable.clone())
+        {
+            return Some(reason);
+        }
+        let since = self.unreachable_since?;
+        if now.saturating_duration_since(since) < GIVE_UP_ON_UNREACHABLE_HOST_AFTER {
+            return None;
+        }
+        let (_, error) = self.reconnect_failure.as_ref()?;
+        unreachable_reason(error).map(SharedString::new_static)
+    }
+
+    /// Stops retrying, for this client and every other one on the host still
+    /// waiting out a backoff, so nothing spawns `ssh` again until asked.
+    /// Deferred for the peers, as in `retry_stuck_peers`.
+    fn give_up_on_host(&mut self, reason: SharedString, cx: &mut Context<Self>) {
+        if self.host_unreachable.is_none() {
+            log::warn!(
+                "{} is unreachable ({reason}); not retrying until asked",
+                self.connection_options.display_name()
+            );
+        }
+        self.pending_retry = None;
+        self.host_unreachable = Some(reason.clone());
+        cx.notify();
+        let peers: Vec<Entity<Self>> = self
+            .peers(cx)
+            .filter(|peer| {
+                let peer = peer.read(cx);
+                peer.host_unreachable.is_none() && peer.state_is(State::is_reconnect_failed)
+            })
+            .collect();
+        if peers.is_empty() {
+            return;
+        }
+        cx.defer(move |cx| {
+            for peer in peers {
+                peer.update(cx, |peer, cx| {
+                    if peer.host_unreachable.is_none() && peer.state_is(State::is_reconnect_failed)
+                    {
+                        peer.pending_retry = None;
+                        peer.host_unreachable = Some(reason.clone());
+                        cx.notify();
+                    }
+                });
+            }
+        });
     }
 
     /// quiet-ui: reconnects now over a new SSH connection, for when reusing
@@ -1614,9 +1721,20 @@ impl ConnectionPool {
                                 .take(&opts)
                         }) {
                             Some(connection) => Ok(connection.await as Arc<dyn RemoteConnection>),
-                            None => Err(anyhow!(
-                                "Mock connection not found. Call MockConnection::new() first."
-                            )),
+                            None => Err(cx.update(|cx| {
+                                let registry = cx.default_global::<
+                                    crate::transport::mock::MockConnectionRegistry,
+                                >();
+                                match registry.connect_errors.get_mut(&opts.id) {
+                                    Some((error, failures)) => {
+                                        *failures += 1;
+                                        anyhow!("{error}")
+                                    }
+                                    None => anyhow!(
+                                        "Mock connection not found. Call MockConnection::new() first."
+                                    ),
+                                }
+                            })),
                         },
                     };
 

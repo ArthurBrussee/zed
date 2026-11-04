@@ -714,21 +714,29 @@ impl TitleBar {
     /// SSH connection and reconnects over a new one.
     fn render_fresh_connection_button(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let (attempts, error) = self.reconnect_failure(cx)?;
-        if attempts < remote::OFFER_FRESH_CONNECTION_AFTER {
+        // Once the client stops retrying a host it cannot reach, this is the
+        // only thing that tries again.
+        let unreachable = self
+            .project
+            .read(cx)
+            .remote_client()
+            .and_then(|client| client.read(cx).host_unreachable());
+        if unreachable.is_none() && attempts < remote::OFFER_FRESH_CONNECTION_AFTER {
             return None;
         }
+        let (label, title) = match &unreachable {
+            Some(_) => ("Host Unreachable · Retry", "Not retrying until you click"),
+            None => ("Reconnect", "Drop this connection and open a new one"),
+        };
+        let meta: SharedString = match unreachable {
+            Some(reason) => format!("{reason}: {error}").into(),
+            None => error,
+        };
         Some(
-            Button::new("reconnect-fresh", "Reconnect")
+            Button::new("reconnect-fresh", label)
                 .style(ButtonStyle::Tinted(TintColor::Warning))
                 .label_size(LabelSize::Small)
-                .tooltip(move |_, cx| {
-                    Tooltip::with_meta(
-                        "Drop this connection and open a new one",
-                        None,
-                        error.clone(),
-                        cx,
-                    )
-                })
+                .tooltip(move |_, cx| Tooltip::with_meta(title, None, meta.clone(), cx))
                 .on_click(cx.listener(|this, _, _, cx| {
                     if let Some(client) = this.project.read(cx).remote_client() {
                         client.update(cx, |client, cx| client.reconnect_fresh(cx));

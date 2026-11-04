@@ -120,6 +120,9 @@ unsafe impl Sync for SendableCx {}
 #[derive(Default)]
 pub struct MockConnectionRegistry {
     pending: HashMap<u64, (oneshot::Receiver<()>, Arc<MockRemoteConnection>)>,
+    /// What a connect to these options fails with when no connection is
+    /// pending, and how many have failed.
+    pub(crate) connect_errors: HashMap<u64, (String, usize)>,
 }
 
 impl Global for MockConnectionRegistry {}

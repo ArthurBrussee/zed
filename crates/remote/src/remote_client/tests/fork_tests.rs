@@ -444,3 +444,136 @@ fn test_only_failures_retrying_cannot_fix_end_the_attempts() {
     assert_eq!(reconnect_delay(4), Duration::from_secs(5));
     assert_eq!(reconnect_delay(9), QUIET_RECONNECT_INTERVAL);
 }
+
+/// 2026-10-30 to 11-02: with the box's inbound TCP dropped, every window
+/// retried every ~37 seconds for three days and only ever said it was
+/// reconnecting.
+#[test]
+fn test_failures_that_never_reach_the_host_name_why() {
+    assert_eq!(
+        unreachable_reason(
+            "Failed to connect: connecting to host timed out"
+        ),
+        Some("connecting timed out")
+    );
+    assert_eq!(
+        unreachable_reason("ssh: connect to host box port 22: Network is unreachable"),
+        Some("the network is unreachable")
+    );
+    assert_eq!(
+        unreachable_reason("ssh: connect to host box port 22: Connection refused"),
+        Some("the connection was refused")
+    );
+    assert_eq!(
+        unreachable_reason("ssh: Could not resolve hostname box: nodename nor servname provided"),
+        Some("the host name did not resolve")
+    );
+    assert_eq!(
+        unreachable_reason(
+            "The proxy to the remote server is running, but the server did not answer within 15s"
+        ),
+        None,
+        "a server that is reached but slow is not an unreachable host"
+    );
+}
+
+/// Past a few minutes of attempts that never reach the host, every client
+/// on it stops spawning connections until one is asked to retry.
+#[gpui::test]
+async fn test_an_unreachable_host_stops_being_retried(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let (options, _, connect_guard) = MockConnection::new(cx, server_cx);
+    drop(connect_guard);
+    let mock_options = options.clone();
+    let mock = cx
+        .update(|cx| {
+            cx.default_global::<MockConnectionRegistry>()
+                .take(&mock_options)
+                .unwrap()
+        })
+        .await;
+    let (proxy_tx, mut proxy_rx) = mpsc::unbounded();
+    *mock.proxy_tx.lock() = Some(proxy_tx);
+    let master = mock.clone();
+    let connection: Arc<dyn RemoteConnection> = mock;
+    cx.update(|cx| {
+        release_channel::init_test(Version::new(0, 0, 0), ReleaseChannel::Dev, cx);
+        cx.default_global::<ConnectionPool>().connections.insert(
+            connection.connection_options(),
+            ConnectionPoolEntry::Connected(Arc::downgrade(&connection)),
+        );
+    });
+    let mut connect = async |cx: &mut TestAppContext| {
+        let (_cancellation_tx, cancellation_rx) = oneshot::channel();
+        let client = cx.update(|cx| {
+            RemoteClient::new(
+                ConnectionIdentifier::setup(),
+                connection.clone(),
+                cancellation_rx,
+                Arc::new(MockDelegate),
+                cx,
+            )
+        });
+        let (incoming_tx, mut outgoing_rx) = proxy_rx.next().await.unwrap();
+        outgoing_rx.next().await.unwrap();
+        incoming_tx
+            .unbounded_send(proto::RemoteStarted {}.into_envelope(0, None, None))
+            .unwrap();
+        outgoing_rx.next().await.unwrap();
+        let ping = outgoing_rx.next().await.unwrap();
+        let mut ping_response = proto::Ack {}.into_envelope(2, Some(ping.id), None);
+        ping_response.ack_id = Some(ping.id);
+        incoming_tx.unbounded_send(ping_response).unwrap();
+        let client = client.await.unwrap().unwrap();
+        (client, incoming_tx, outgoing_rx)
+    };
+    let (first, _first_in, _first_out) = connect(cx).await;
+    let (second, _second_in, _second_out) = connect(cx).await;
+
+    cx.update(|cx| {
+        cx.default_global::<MockConnectionRegistry>()
+            .connect_errors
+            .insert(
+                mock_options.id,
+                ("connecting to host timed out".to_string(), 0),
+            );
+    });
+    let failed_connects = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            cx.default_global::<MockConnectionRegistry>().connect_errors[&mock_options.id].1
+        })
+    };
+    master.simulate_master_exit();
+    first.update(cx, |client, cx| client.reconnect(cx).unwrap());
+    second.update(cx, |client, cx| client.reconnect(cx).unwrap());
+    cx.run_until_parked();
+
+    for _ in 0..(GIVE_UP_ON_UNREACHABLE_HOST_AFTER.as_secs() / 20 + 2) {
+        cx.executor().advance_clock(QUIET_RECONNECT_INTERVAL);
+        cx.run_until_parked();
+    }
+    for client in [&first, &second] {
+        assert_eq!(
+            client.read_with(cx, |client, _| client.host_unreachable()),
+            Some("connecting timed out".into()),
+            "both clients on the host say why they stopped"
+        );
+    }
+    let attempts = failed_connects(cx);
+    cx.executor().advance_clock(Duration::from_secs(60 * 60));
+    cx.run_until_parked();
+    assert_eq!(failed_connects(cx), attempts, "no attempts once it gave up");
+
+    first.update(cx, |client, cx| client.reconnect_fresh(cx));
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_secs(60 * 60));
+    cx.run_until_parked();
+    assert_eq!(failed_connects(cx), attempts + 1, "a retry is one attempt");
+    assert!(
+        first
+            .read_with(cx, |client, _| client.host_unreachable())
+            .is_some()
+    );
+}
