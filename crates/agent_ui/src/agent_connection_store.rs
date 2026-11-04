@@ -1,4 +1,5 @@
 use std::rc::{Rc, Weak};
+use std::time::{Duration, Instant};
 
 use acp_thread::{AgentConnection, LoadError};
 use agent_servers::{AcpConnection, AcpDebugMessage, AcpV2Connection};
@@ -12,6 +13,11 @@ use project::{AgentServerStore, AgentServersUpdated, Project};
 use watch::Receiver;
 
 use crate::Agent;
+
+/// Generous, since a first launch installs the agent's package. A launch that
+/// never finishes would otherwise leave every later thread joining a
+/// `Connecting` entry forever.
+const LAUNCH_DEADLINE: Duration = Duration::from_secs(180);
 
 pub enum AgentConnectionEntry {
     Connecting {
@@ -283,8 +289,13 @@ impl AgentConnectionStore {
         cx.spawn({
             let entry = entry.downgrade();
             async move |this, cx| {
+                let started = Instant::now();
                 while let Ok(status) = loading_status_rx.recv().await {
                     let status = status.map(SharedString::from);
+                    // The last of these lines is the step a stuck launch stopped at.
+                    if let Some(step) = status.as_ref() {
+                        log::info!("quiet-ui launch: {} after {:?}", step, started.elapsed());
+                    }
                     let key = key.clone();
                     let entry = entry.clone();
                     this.update(cx, move |this, cx| {
@@ -346,21 +357,59 @@ impl AgentConnectionStore {
         let shutdown = self.shutdown.as_ref().map(watch::Sender::receiver);
         let connect_task =
             shutdown.map(|shutdown| (server.connect(delegate, self.project.clone(), cx), shutdown));
+        let agent = server.agent_id();
         let connect_task = cx.spawn(async move |this, cx| {
             let owner_released = || LoadError::Other("Agent connection owner was released".into());
             let Some((connect_task, mut shutdown)) = connect_task else {
                 return Err(owner_released());
             };
-            let stopped = shutdown.changed();
+            let started = Instant::now();
+            log::info!("quiet-ui launch: connecting to {agent}");
+            let stopped = shutdown.changed().fuse();
             futures::pin_mut!(stopped);
-            let result = match futures::future::select(connect_task, stopped).await {
-                futures::future::Either::Left((result, _)) => result,
-                futures::future::Either::Right(_) => return Err(owner_released()),
+            let mut connect = connect_task.fuse();
+            let mut deadline = cx.background_executor().timer(LAUNCH_DEADLINE).fuse();
+            let result = futures::select_biased! {
+                result = connect => result,
+                _ = stopped => return Err(owner_released()),
+                _ = deadline => {
+                    log::error!(
+                        "quiet-ui launch: {agent} did not start within {}s; giving up",
+                        LAUNCH_DEADLINE.as_secs()
+                    );
+                    return Err(LoadError::Other(SharedString::from(format!(
+                        "{agent} did not start within {} seconds. \
+                         The log says which step it stopped at.",
+                        LAUNCH_DEADLINE.as_secs()
+                    ))));
+                }
             };
-            let connection = result.map_err(|error| match error.downcast::<LoadError>() {
-                Ok(error) => error,
-                Err(error) => LoadError::Other(error.to_string().into()),
-            })?;
+            let connection = match result {
+                Ok(connection) => {
+                    log::info!(
+                        "quiet-ui launch: {agent} connected in {:?}",
+                        started.elapsed()
+                    );
+                    connection
+                }
+                Err(err) => match err.downcast::<LoadError>() {
+                    Ok(load_error) => {
+                        log::error!(
+                            "quiet-ui launch: {agent} failed after {:?}: {load_error}",
+                            started.elapsed()
+                        );
+                        return Err(load_error);
+                    }
+                    // The cause ("Too many open files") only prints under `{:#}`.
+                    Err(err) => {
+                        log::error!(
+                            "quiet-ui launch: {agent} failed after {:?}: {err:#}",
+                            started.elapsed()
+                        );
+                        return Err(LoadError::Other(SharedString::from(format!("{err:#}"))));
+                    }
+                },
+            };
             let registered = this
                 .update(cx, |this, _| {
                     if this.shutdown.is_none() {
@@ -556,5 +605,65 @@ mod tests {
             "late success cannot outlive its owner"
         );
         assert_eq!(connection.shutdown_calls(), 1);
+    }
+
+    struct NeverConnectingAgentServer;
+
+    impl AgentServer for NeverConnectingAgentServer {
+        fn logo(&self) -> ui::IconName {
+            ui::IconName::ZedAgent
+        }
+
+        fn agent_id(&self) -> project::AgentId {
+            project::AgentId::new("Stuck")
+        }
+
+        fn connect(
+            &self,
+            _delegate: AgentServerDelegate,
+            _project: Entity<Project>,
+            cx: &mut App,
+        ) -> Task<Result<Rc<dyn AgentConnection>>> {
+            cx.spawn(async move |_cx| std::future::pending().await)
+        }
+
+        fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
+            self
+        }
+    }
+
+    #[gpui::test]
+    async fn a_launch_that_never_finishes_gives_up(cx: &mut TestAppContext) {
+        crate::test_support::init_test(cx);
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/project", serde_json::json!({ "file.txt": "" }))
+            .await;
+        let project = Project::test(fs, [std::path::Path::new("/project")], cx).await;
+        let store = cx.new(|cx| AgentConnectionStore::new(project, cx));
+
+        let key = Agent::Stub;
+        store.update(cx, |store, cx| {
+            store.request_connection(key.clone(), Rc::new(NeverConnectingAgentServer), cx);
+        });
+        cx.run_until_parked();
+        store.read_with(cx, |store, cx| {
+            assert_eq!(
+                store.connection_status(&key, cx),
+                AgentConnectionStatus::Connecting,
+                "a launch in flight is connecting"
+            );
+        });
+
+        cx.executor().advance_clock(LAUNCH_DEADLINE * 2);
+        cx.run_until_parked();
+
+        // The entry is gone, so the next thread launches afresh.
+        store.read_with(cx, |store, cx| {
+            assert_eq!(
+                store.connection_status(&key, cx),
+                AgentConnectionStatus::Disconnected
+            );
+            assert!(!store.entries.contains_key(&key));
+        });
     }
 }

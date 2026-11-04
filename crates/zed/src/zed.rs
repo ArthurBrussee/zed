@@ -616,6 +616,12 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             cx.new(|cx| which_key::PendingKeystrokesIndicator::new(window, cx));
         let image_info = cx.new(|_cx| ImageInfo::new(workspace));
 
+        let worktree_language_servers = cx.new(|cx| {
+            git_ui_core::worktree_language_server_switch::WorktreeLanguageServerSwitch::new(
+                workspace, cx,
+            )
+        });
+
         let lsp_button_menu_handle = PopoverMenuHandle::default();
         let lsp_button =
             cx.new(|cx| LspButton::new(workspace, lsp_button_menu_handle.clone(), window, cx));
@@ -635,6 +641,7 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         workspace.status_bar().update(cx, |status_bar, cx| {
             status_bar.add_left_item(search_button, window, cx);
             status_bar.add_left_item(lsp_button, window, cx);
+            status_bar.add_left_item(worktree_language_servers, window, cx);
             status_bar.add_left_item(diagnostic_summary, window, cx);
             status_bar.add_left_item(active_file_name, window, cx);
             status_bar.add_left_item(git_blame_status, window, cx);
@@ -3016,6 +3023,32 @@ mod tests {
         indicator.update(cx, |indicator, cx| {
             assert_eq!(indicator.message_to_render(cx), None);
         });
+    }
+
+    /// A status item reading the workspace from `set_active_pane_item` panics on the first frame.
+    #[gpui::test]
+    async fn test_a_fresh_window_renders_its_status_bar(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(path!("/root"), json!({ "a.txt": "" }))
+            .await;
+
+        let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+        let (_multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        cx.draw(
+            gpui::Point::default(),
+            gpui::size(px(1200.), px(800.)),
+            |_, _| gpui::Empty,
+        );
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("ICON-BoltOutlined").is_some(),
+            "the worktree language-server switch should be in the status bar"
+        );
     }
 
     #[gpui::test]
@@ -6519,6 +6552,7 @@ mod tests {
                 false,
                 cx,
             );
+            gh_status::init(cx);
 
             repl::init(app_state.fs.clone(), cx);
             repl::notebook::init(cx);
@@ -6528,6 +6562,7 @@ mod tests {
             );
             project::debugger::dap_store::DapStore::init(&app_state.client.clone().into(), cx);
             debugger_ui::init(cx);
+            git_ui_core::worktree_language_server_switch::init(cx);
             initialize_workspace(app_state.clone(), cx);
             search::init(cx);
             lsp_locations::init(cx);

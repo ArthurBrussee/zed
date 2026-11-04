@@ -1,3 +1,8 @@
+mod acp_relay_host;
+#[cfg(test)]
+mod acp_relay_tests;
+#[cfg(test)]
+mod remote_agents_tests;
 mod headless_project;
 
 #[cfg(test)]
@@ -89,6 +94,11 @@ pub enum Commands {
     Version,
     #[cfg(unix)]
     Exec,
+    /// quiet-ui: the relay that keeps agents running while Zed is away.
+    AcpRelay {
+        #[arg(long)]
+        dir: PathBuf,
+    },
 }
 
 pub fn run(command: Commands) -> anyhow::Result<()> {
@@ -115,6 +125,7 @@ pub fn run(command: Commands) -> anyhow::Result<()> {
         } => execute_proxy(identifier, reconnect).context("running proxy on the remote server"),
         #[cfg(unix)]
         Commands::Exec => execute_command(),
+        Commands::AcpRelay { dir } => acp_relay_host::run_daemon(dir),
         Commands::Version => {
             let release_channel = *RELEASE_CHANNEL;
             match release_channel {
@@ -506,6 +517,17 @@ impl ServerListeners {
             stderr: UnixListener::bind(stderr_path).context("failed to bind stderr socket")?,
         })
     }
+
+    /// One client's three streams, which its proxy connects in this order.
+    async fn accept(&self) -> std::io::Result<(UnixStream, UnixStream, UnixStream)> {
+        let (stdin, stdout, stderr) = futures::future::join3(
+            self.stdin.accept(),
+            self.stdout.accept(),
+            self.stderr.accept(),
+        )
+        .await;
+        Ok((stdin?.0, stdout?.0, stderr?.0))
+    }
 }
 
 fn start_server(
@@ -515,7 +537,7 @@ fn start_server(
     is_wsl_interop: bool,
 ) -> AnyProtoClient {
     // This is the server idle timeout. If no connection comes in this timeout, the server will shut down.
-    const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+    const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
 
     let (incoming_tx, incoming_rx) = mpsc::unbounded::<Envelope>();
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded::<Envelope>();
@@ -531,42 +553,43 @@ fn start_server(
     .detach();
 
     cx.spawn(async move |cx| {
+        // One accept outlives each connection, so a client half connected
+        // when the current one hangs up keeps the streams it has.
+        let mut next_streams = Box::pin(listeners.accept().fuse());
+        let mut accepted = None;
         loop {
-            let streams = futures::future::join3(
-                listeners.stdin.accept(),
-                listeners.stdout.accept(),
-                listeners.stderr.accept(),
-            );
-
-            log::info!("accepting new connections");
-            let result = select! {
-                streams = streams.fuse() => {
-                    let (Ok((stdin_stream, _)), Ok((stdout_stream, _)), Ok((stderr_stream, _))) = streams else {
-                        log::error!("failed to accept new connections");
-                        break;
-                    };
-                    log::info!("accepted new connections");
-                    anyhow::Ok((stdin_stream, stdout_stream, stderr_stream))
-                }
-                _ = futures::FutureExt::fuse(cx.background_executor().timer(IDLE_TIMEOUT)) => {
-                    log::warn!("timed out waiting for new connections after {:?}. exiting.", IDLE_TIMEOUT);
-                    cx.update(|cx| {
-                        // TODO: This is a hack, because in a headless project, shutdown isn't executed
-                        // when calling quit, but it should be.
-                        cx.shutdown();
-                        cx.quit();
-                    });
-                    break;
-                }
-                _ = app_quit_rx.next().fuse() => {
-                    log::info!("app quit requested");
-                    break;
+            let streams = match accepted.take() {
+                Some(streams) => streams,
+                None => {
+                    log::info!("accepting new connections");
+                    select! {
+                        streams = next_streams.as_mut() => {
+                            let Ok(streams) = streams else {
+                                log::error!("failed to accept new connections");
+                                break;
+                            };
+                            log::info!("accepted new connections");
+                            streams
+                        }
+                        _ = futures::FutureExt::fuse(cx.background_executor().timer(IDLE_TIMEOUT)) => {
+                            log::warn!("timed out waiting for new connections after {:?}. exiting.", IDLE_TIMEOUT);
+                            cx.update(|cx| {
+                                // TODO: This is a hack, because in a headless project, shutdown isn't executed
+                                // when calling quit, but it should be.
+                                cx.shutdown();
+                                cx.quit();
+                            });
+                            break;
+                        }
+                        _ = app_quit_rx.next().fuse() => {
+                            log::info!("app quit requested");
+                            break;
+                        }
+                    }
                 }
             };
-
-            let Ok((mut stdin_stream, mut stdout_stream, mut stderr_stream)) = result else {
-                break;
-            };
+            let (mut stdin_stream, mut stdout_stream, mut stderr_stream) = streams;
+            next_streams = Box::pin(listeners.accept().fuse());
 
             let _log_task = cx.background_spawn({
                 let log_rx = log_rx.clone();
@@ -628,6 +651,10 @@ fn start_server(
                 }
             };
 
+            // quiet-ui: a proxy whose network went away stays connected until
+            // its sshd gives up, which takes minutes. A new connection takes
+            // over at once; dropping the old streams ends the old proxy, and
+            // both sides replay what was in flight (`FlushBufferedMessages`).
             select_biased! {
                 _ = app_quit_rx.next().fuse() => {
                     return anyhow::Ok(());
@@ -636,6 +663,14 @@ fn start_server(
                     result?;
                 }
                 _ = stdout_task.fuse() => {}
+                streams = next_streams.as_mut() => {
+                    let Ok(streams) = streams else {
+                        log::error!("failed to accept new connections");
+                        break;
+                    };
+                    log::info!("a new connection replaces the current one");
+                    accepted = Some(streams);
+                }
             }
         }
         anyhow::Ok(())
@@ -760,6 +795,8 @@ pub fn execute_run(
         gpui_tokio::init(cx);
 
         HeadlessProject::init(cx);
+        // Off until the client's switch turns a worktree on, as on the client.
+        project::worktree_language_servers::init(cx);
 
         let is_wsl_interop = if cfg!(target_os = "linux") {
             // See: https://learn.microsoft.com/en-us/windows/wsl/filesystems#disable-interoperability
@@ -1492,6 +1529,39 @@ mod tests {
 
         // Windows did not reproduce socket backpressure.
         #[gpui::test]
+        async fn a_server_nobody_connects_to_exits_after_two_hours(cx: &mut TestAppContext) {
+            let temp_dir = tempfile::tempdir().expect("create socket directory");
+            let listeners = ServerListeners::new(
+                temp_dir.path().join("stdin.sock"),
+                temp_dir.path().join("stdout.sock"),
+                temp_dir.path().join("stderr.sock"),
+            )
+            .expect("bind server sockets");
+            let (_log_tx, log_rx) = async_channel::unbounded();
+
+            let quit = std::rc::Rc::new(std::cell::Cell::new(false));
+            cx.update(|cx| {
+                let quit = quit.clone();
+                cx.on_app_quit(move |_| {
+                    quit.set(true);
+                    async {}
+                })
+                .detach();
+                start_server(listeners, log_rx, cx, false);
+            });
+
+            cx.executor()
+                .advance_clock(std::time::Duration::from_secs(2 * 60 * 60 - 60));
+            cx.run_until_parked();
+            assert!(!quit.get(), "a nap shorter than two hours keeps the server");
+
+            cx.executor()
+                .advance_clock(std::time::Duration::from_secs(120));
+            cx.run_until_parked();
+            assert!(quit.get(), "two hours with no client shuts it down");
+        }
+
+        #[gpui::test]
         async fn rpc_responds_when_stderr_is_blocked(cx: &mut TestAppContext) {
             cx.executor().allow_parking();
 
@@ -1612,6 +1682,81 @@ mod tests {
 
                 _ = cx.executor().timer(std::time::Duration::from_secs(2)).fuse() => {
                     panic!("Ping handling blocked by an unread stdout stream");
+                }
+            }
+        }
+        /// 2026-10-19: after a network change the old proxy stayed connected
+        /// for twelve minutes and every reconnect waited behind it.
+        #[gpui::test]
+        async fn a_new_connection_takes_over_from_the_current_one(cx: &mut TestAppContext) {
+            cx.executor().allow_parking();
+
+            let temp_dir = tempfile::tempdir().expect("create socket directory");
+            let stdin_path = temp_dir.path().join("stdin.sock");
+            let stdout_path = temp_dir.path().join("stdout.sock");
+            let stderr_path = temp_dir.path().join("stderr.sock");
+            let listeners =
+                ServerListeners::new(stdin_path.clone(), stdout_path.clone(), stderr_path.clone())
+                    .expect("bind server sockets");
+
+            let (_log_tx, log_rx) = async_channel::unbounded();
+            let handler = cx.new(|_| ());
+            let server = cx.update(|cx| start_server(listeners, log_rx, cx, false));
+            server.add_request_handler::<proto::Ping, _, _, _>(
+                handler.downgrade(),
+                |_, _, _| async { Ok(proto::Ack {}) },
+            );
+
+            let connect = || {
+                futures::future::try_join3(
+                    UnixStream::connect(&stdin_path),
+                    UnixStream::connect(&stdout_path),
+                    UnixStream::connect(&stderr_path),
+                )
+            };
+            async fn ping(
+                stdin: &mut UnixStream,
+                stdout: &mut UnixStream,
+                id: u32,
+            ) -> anyhow::Result<()> {
+                let mut buffer = Vec::new();
+                write_message(
+                    stdin,
+                    &mut buffer,
+                    proto::Ping {}.into_envelope(id, None, None),
+                )
+                .await?;
+                loop {
+                    if read_message(stdout, &mut buffer).await?.responding_to == Some(id) {
+                        return Ok(());
+                    }
+                }
+            }
+
+            select! {
+                _ = async {
+                    let (mut old_stdin, mut old_stdout, _old_stderr) =
+                        connect().await.expect("connect the first client");
+                    ping(&mut old_stdin, &mut old_stdout, 1)
+                        .await
+                        .expect("the first client is served");
+
+                    // The first client never hangs up.
+                    let (mut new_stdin, mut new_stdout, _new_stderr) =
+                        connect().await.expect("connect the second client");
+                    ping(&mut new_stdin, &mut new_stdout, 2)
+                        .await
+                        .expect("the second client is served at once");
+
+                    let mut rest = Vec::new();
+                    old_stdout
+                        .read_to_end(&mut rest)
+                        .await
+                        .expect("the first client's stream ends");
+                }.fuse() => {}
+
+                _ = cx.executor().timer(std::time::Duration::from_secs(1)).fuse() => {
+                    panic!("the second connection waited behind the first");
                 }
             }
         }

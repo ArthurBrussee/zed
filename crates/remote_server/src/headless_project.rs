@@ -78,6 +78,7 @@ pub struct HeadlessProject {
     pub kernels: HashMap<String, Child>,
     search_buffer_batches: async_channel::Sender<SearchBufferBatch>,
     _search_buffer_sender: Task<()>,
+    pub(crate) _acp_relay: Entity<crate::acp_relay_host::AcpRelayHost>,
 }
 
 pub struct HeadlessAppState {
@@ -312,6 +313,12 @@ impl HeadlessProject {
         session.add_request_handler(cx.weak_entity(), Self::handle_shutdown_remote_server);
         session.add_request_handler(cx.weak_entity(), Self::handle_ping);
         session.add_request_handler(cx.weak_entity(), Self::handle_get_processes);
+        session.add_request_handler(cx.weak_entity(), Self::handle_get_system_load);
+        session.add_request_handler(
+            cx.weak_entity(),
+            Self::handle_set_worktree_language_servers,
+        );
+        session.add_request_handler(cx.weak_entity(), Self::handle_read_file_tail);
         session.add_request_handler(cx.weak_entity(), Self::handle_get_remote_profiling_data);
 
         session.add_entity_request_handler(Self::handle_add_worktree);
@@ -357,6 +364,7 @@ impl HeadlessProject {
         GitStore::init(&session);
         AgentServerStore::init_headless(&session);
         ContextServerStore::init_headless(&session);
+        let acp_relay = crate::acp_relay_host::init(&session, cx);
 
         let (search_buffer_batches, batches) = async_channel::bounded::<SearchBufferBatch>(1);
         let search_buffer_sender = cx.spawn({
@@ -433,6 +441,7 @@ impl HeadlessProject {
             kernels: Default::default(),
             search_buffer_batches,
             _search_buffer_sender: search_buffer_sender,
+            _acp_relay: acp_relay,
         }
     }
 
@@ -1374,6 +1383,48 @@ impl HeadlessProject {
     ) -> Result<proto::Ack> {
         log::debug!("Received ping from client");
         Ok(proto::Ack {})
+    }
+
+    async fn handle_set_worktree_language_servers(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::SetWorktreeLanguageServers>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::Ack> {
+        this.update(&mut cx, |this, cx| {
+            project::worktree_language_servers::apply_from_client(
+                &this.lsp_store,
+                envelope.payload,
+                cx,
+            );
+        });
+        Ok(proto::Ack {})
+    }
+
+    async fn handle_read_file_tail(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::ReadFileTail>,
+        cx: AsyncApp,
+    ) -> Result<proto::ReadFileTailResponse> {
+        let fs = this.read_with(&cx, |this, _| this.fs.clone());
+        let content = project::file_tail::read_local_tail(
+            fs,
+            PathBuf::from(envelope.payload.path),
+            envelope.payload.max_bytes as usize,
+        )
+        .await?;
+        Ok(proto::ReadFileTailResponse { content })
+    }
+
+    /// What this machine is doing, for the sidebar's per-machine load.
+    async fn handle_get_system_load(
+        _this: Entity<Self>,
+        _envelope: TypedEnvelope<proto::GetSystemLoad>,
+        _cx: AsyncApp,
+    ) -> Result<proto::SystemLoadResponse> {
+        Ok(proto::SystemLoadResponse {
+            load_average_one: System::load_average().one,
+            cpu_count: System::physical_core_count().unwrap_or(0) as u32,
+        })
     }
 
     async fn handle_get_processes(

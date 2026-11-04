@@ -83,6 +83,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "acp_relay"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "futures 0.3.34",
+ "log",
+ "serde",
+ "serde_json",
+ "smol",
+ "tempfile",
+]
+
+[[package]]
 name = "acp_thread"
 version = "0.1.0"
 dependencies = [
@@ -100,6 +114,7 @@ dependencies = [
  "feature_flags",
  "file_icons",
  "futures 0.3.34",
+ "git",
  "gpui",
  "http_proxy",
  "image",
@@ -489,7 +504,9 @@ dependencies = [
  "futures 0.3.34",
  "fuzzy",
  "fuzzy_nucleo",
+ "gh_status",
  "git",
+ "git_ui",
  "git_ui_core",
  "gpui",
  "gpui_tokio",
@@ -498,6 +515,7 @@ dependencies = [
  "http_client",
  "idna",
  "image",
+ "image_viewer",
  "indoc",
  "itertools 0.14.0",
  "jsonschema",
@@ -511,6 +529,7 @@ dependencies = [
  "markdown",
  "menu",
  "multi_buffer",
+ "node_runtime",
  "notifications",
  "ordered-float 5.5.0",
  "parking_lot",
@@ -526,6 +545,7 @@ dependencies = [
  "release_channel",
  "remote",
  "remote_connection",
+ "remote_server",
  "reqwest_client",
  "rope",
  "sandbox",
@@ -4084,16 +4104,21 @@ dependencies = [
 name = "crashes"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-process",
+ "backtrace",
  "crash-handler",
  "libc",
  "log",
  "mach2",
+ "minidump-common",
  "minidumper",
  "parking_lot",
+ "scroll",
  "serde",
  "serde_json",
  "system_specs",
+ "tempfile",
  "windows 0.62.2",
  "zstd",
 ]
@@ -6946,6 +6971,22 @@ dependencies = [
  "heck 0.5.0",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "gh_status"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "collections",
+ "futures 0.3.34",
+ "gpui",
+ "log",
+ "serde",
+ "serde_json",
+ "ui",
+ "util",
 ]
 
 [[package]]
@@ -14989,11 +15030,13 @@ dependencies = [
 name = "remote_server"
 version = "0.1.0"
 dependencies = [
+ "acp_relay",
  "acp_thread",
  "action_log",
  "agent",
  "agent-client-protocol",
  "agent_servers",
+ "agent_settings",
  "anyhow",
  "askpass",
  "async-channel 2.5.0",
@@ -16577,8 +16620,8 @@ dependencies = [
  "db",
  "editor",
  "extension",
- "feature_flags",
  "fs",
+ "gh_status",
  "git",
  "git_ui_core",
  "gpui",
@@ -16594,6 +16637,7 @@ dependencies = [
  "pretty_assertions",
  "project",
  "prompt_store",
+ "proto",
  "recent_projects",
  "release_channel",
  "remote",
@@ -16603,6 +16647,7 @@ dependencies = [
  "serde",
  "serde_json",
  "settings",
+ "sysinfo 0.39.6",
  "telemetry",
  "theme",
  "theme_settings",
@@ -22461,6 +22506,7 @@ dependencies = [
  "file_finder",
  "fs",
  "futures 0.3.34",
+ "gh_status",
  "git",
  "git_hosting_providers",
  "git_ui",
@@ -22488,6 +22534,7 @@ dependencies = [
  "language_selector",
  "language_tools",
  "languages",
+ "libc",
  "line_ending_selector",
  "log",
  "lsp_command_selector",
@@ -22546,6 +22593,7 @@ dependencies = [
  "telemetry",
  "telemetry_events",
  "tempfile",
+ "terminal",
  "terminal_view",
  "theme",
  "theme_extension",

@@ -397,6 +397,9 @@ pub struct LocalLspStore {
     auto_start_language_servers: bool,
     language_server_start_overrides: HashMap<LanguageServerName, bool>,
     language_server_restart_tasks: Vec<Task<()>>,
+    /// How often each server has exited on its own lately, for the backoff
+    /// before starting it again.
+    language_server_exits: HashMap<LanguageServerName, (u32, Instant)>,
 
     buffers_to_refresh_hash_set: HashSet<BufferId>,
     buffers_to_refresh_queue: VecDeque<BufferId>,
@@ -416,6 +419,13 @@ fn workspace_folder_uri(worktree: &Worktree, path: &RelPath) -> Option<Uri> {
             None
         }
     }
+}
+
+/// Exits further apart than this start the backoff over.
+const LANGUAGE_SERVER_EXIT_MEMORY: Duration = Duration::from_secs(5 * 60);
+
+fn language_server_restart_delay(exits: u32) -> Duration {
+    Duration::from_secs(1 << exits.saturating_sub(1).min(6)).min(Duration::from_secs(60))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -5021,6 +5031,7 @@ impl LspStore {
                 auto_start_language_servers: true,
                 language_server_start_overrides: HashMap::default(),
                 language_server_restart_tasks: Vec::new(),
+                language_server_exits: HashMap::default(),
                 watched_manifest_filenames: ManifestProvidersStore::global(cx)
                     .manifest_file_names(),
             }),
@@ -12953,6 +12964,96 @@ impl LspStore {
         }
     }
 
+    /// quiet-ui: a server that exits on its own (rust-analyzer out of memory)
+    /// stayed registered, and diagnostics, highlights and code actions kept
+    /// going to it by the thousand. It is stopped like any other, so nothing is
+    /// routed to it, and started again for its buffers after a backoff; a
+    /// worktree whose language servers are switched off starts nothing.
+    fn language_server_exited(
+        &mut self,
+        server_id: LanguageServerId,
+        server: std::sync::Weak<LanguageServer>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(local) = self.as_local_mut() else {
+            return;
+        };
+        let Some(LanguageServerState::Running {
+            adapter, server: running, ..
+        }) = local.language_servers.get(&server_id)
+        else {
+            return;
+        };
+        // One stopped on purpose is no longer registered.
+        if !server
+            .upgrade()
+            .is_some_and(|server| Arc::ptr_eq(&server, running))
+        {
+            return;
+        }
+        let name = adapter.name();
+        let now = Instant::now();
+        let exits = match local.language_server_exits.get(&name) {
+            Some((exits, last)) if now.duration_since(*last) < LANGUAGE_SERVER_EXIT_MEMORY => {
+                exits + 1
+            }
+            _ => 1,
+        };
+        local.language_server_exits.insert(name.clone(), (exits, now));
+        let delay = language_server_restart_delay(exits);
+        let buffers = self
+            .buffer_store
+            .read(cx)
+            .buffers()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .filter(|buffer| {
+                let Some(local) = self.as_local() else {
+                    return false;
+                };
+                buffer.update(cx, |buffer, cx| {
+                    local
+                        .language_server_ids_for_buffer(buffer, cx)
+                        .contains(&server_id)
+                })
+            })
+            .collect::<Vec<_>>();
+        log::error!(
+            "language server {name} exited unexpectedly; starting it again in {delay:?} \
+             for {} buffers",
+            buffers.len()
+        );
+        if let Some(local) = self.as_local_mut() {
+            local.lsp_tree.remove_nodes(&BTreeSet::from([server_id]));
+        }
+        self.stop_local_language_server(server_id, cx).detach();
+        let restart = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            this.update(cx, |this, cx| {
+                let Some(local) = this.as_local_mut() else {
+                    return;
+                };
+                for buffer in buffers {
+                    if local
+                        .registered_buffers
+                        .contains_key(&buffer.read(cx).remote_id())
+                    {
+                        local.register_buffer_with_language_servers(
+                            &buffer,
+                            HashSet::default(),
+                            LanguageServerStartMode::Automatic,
+                            cx,
+                        );
+                    }
+                }
+            })
+            .ok();
+        });
+        if let Some(local) = self.as_local_mut() {
+            local.language_server_restart_tasks.push(restart);
+        }
+    }
+
     // Returns a list of all of the worktrees which no longer have a language server and the root path
     // for the stopped server
     fn stop_local_language_server(
@@ -13626,6 +13727,16 @@ impl LspStore {
             },
         );
         local.update_binary_status(adapter.name(), BinaryStatus::None);
+        let exited = language_server.exited();
+        let watched = Arc::downgrade(&language_server);
+        cx.spawn(async move |this, cx| {
+            exited.await;
+            this.update(cx, |this, cx| {
+                this.language_server_exited(server_id, watched, cx)
+            })
+            .ok();
+        })
+        .detach();
         if let Some(file_ops_caps) = language_server
             .capabilities()
             .workspace

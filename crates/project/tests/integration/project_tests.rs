@@ -3801,6 +3801,56 @@ async fn test_restarting_server_with_diagnostics_published(cx: &mut gpui::TestAp
     });
 }
 
+/// 2026-10-19: after rust-analyzer ran out of memory, about 3,100 diagnostics
+/// pulls, 1,600 pulls and 1,100 code actions went to it anyway.
+#[gpui::test]
+async fn test_a_language_server_that_exits_is_replaced(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "a.rs": "" })).await;
+    let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    language_registry.add(rust_lang());
+    let mut fake_servers = language_registry.register_fake_lsp("Rust", FakeLspAdapter::default());
+    let (_buffer, _handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/a.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let fake_server = fake_servers.next().await.unwrap();
+    cx.executor().run_until_parked();
+    let mut events = cx.events(&project);
+    let mut drain = || {
+        let mut seen = Vec::new();
+        while let Some(Some(event)) = events.next().now_or_never() {
+            seen.push(event);
+        }
+        seen
+    };
+
+    fake_server.simulate_exit();
+    cx.executor().run_until_parked();
+    assert!(
+        drain().contains(&Event::LanguageServerRemoved(LanguageServerId(0))),
+        "nothing is routed to the server once it has exited"
+    );
+    assert!(fake_servers.next().now_or_never().is_none(), "the restart waits");
+
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.executor().run_until_parked();
+    let _restarted = fake_servers
+        .next()
+        .now_or_never()
+        .flatten()
+        .expect("a new server for the buffer");
+    assert!(drain().iter().any(|event| matches!(
+        event,
+        Event::LanguageServerAdded(LanguageServerId(1), _, _)
+    )));
+}
+
 #[gpui::test]
 async fn test_restarted_server_reporting_invalid_buffer_version(cx: &mut gpui::TestAppContext) {
     init_test(cx);
@@ -4234,6 +4284,75 @@ async fn test_max_buffer_line_length_can_be_overridden(cx: &mut gpui::TestAppCon
             .uri
             .as_str(),
         uri!("file:///dir/minified.js")
+    );
+}
+
+#[gpui::test]
+async fn test_a_worktree_switched_off_runs_no_language_server(cx: &mut gpui::TestAppContext) {
+    use project::worktree_language_servers::WorktreeLanguageServers;
+
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "a.rs": "" })).await;
+
+    let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    let mut fake_rust_servers = language_registry.register_fake_lsp(
+        "Rust",
+        FakeLspAdapter {
+            name: "rust-lsp",
+            ..Default::default()
+        },
+    );
+    language_registry.add(rust_lang());
+
+    cx.update(|cx| {
+        project::worktree_language_servers::init(cx);
+        WorktreeLanguageServers::global(cx).update(cx, |store, cx| {
+            store.set_enabled(Path::new(path!("/dir")), false, cx);
+        });
+    });
+
+    // Held as an editor would: a restart only reaches buffers still registered.
+    let (buffer, _lsp_handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/a.rs"), cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    assert!(
+        fake_rust_servers.try_recv().is_err(),
+        "a worktree switched off started a language server anyway"
+    );
+
+    cx.update(|cx| {
+        WorktreeLanguageServers::global(cx).update(cx, |store, cx| {
+            store.set_enabled(Path::new(path!("/dir")), true, cx);
+        });
+    });
+    project.update(cx, |project, cx| {
+        project.lsp_store().update(cx, |lsp_store, cx| {
+            lsp_store.restart_language_servers_for_buffers(
+                vec![buffer.clone()],
+                Default::default(),
+                cx,
+            );
+        })
+    });
+    let mut server = fake_rust_servers
+        .next()
+        .await
+        .expect("switching a worktree back on starts its servers");
+    assert_eq!(
+        server
+            .receive_notification::<lsp::notification::DidOpenTextDocument>()
+            .await
+            .text_document
+            .uri
+            .as_str(),
+        uri!("file:///dir/a.rs")
     );
 }
 
@@ -9993,6 +10112,48 @@ async fn test_buffer_file_changes_on_disk(cx: &mut gpui::TestAppContext) {
     buffer.update(cx, |buffer, _| {
         assert_eq!(buffer.text(), " ".to_string() + &new_contents);
         assert!(buffer.has_conflict());
+    });
+}
+
+/// 2026-10-19: a reload right after an agent pushed blocked the main thread
+/// for 897ms applying its diff.
+#[gpui::test]
+async fn test_a_thoroughly_rewritten_file_reloads_as_one_edit(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let old_contents = (0..3000).map(|line| format!("line {line}\n")).collect::<String>();
+    let new_contents = (0..3000)
+        .map(|line| {
+            if line % 2 == 0 {
+                format!("changed {line}\n")
+            } else {
+                format!("line {line}\n")
+            }
+        })
+        .collect::<String>();
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "the-file": old_contents }))
+        .await;
+    let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+    let buffer = project
+        .update(cx, |p, cx| p.open_local_buffer(path!("/dir/the-file"), cx))
+        .await
+        .unwrap();
+    let before = buffer.read_with(cx, |buffer, _| buffer.version());
+
+    fs.save(
+        path!("/dir/the-file").as_ref(),
+        &new_contents.as_str().into(),
+        LineEnding::Unix,
+    )
+    .await
+    .unwrap();
+    cx.executor().run_until_parked();
+
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), new_contents);
+        assert!(!buffer.is_dirty());
+        assert_eq!(buffer.edits_since::<usize>(&before).count(), 1);
     });
 }
 

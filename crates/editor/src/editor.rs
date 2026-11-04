@@ -114,7 +114,8 @@ pub use element::{
 pub use git::blame::{BlameRenderer, GitBlame};
 pub use git::{
     DefaultDiffHunkRenderer, DiffHunkRenderer, HiddenDiffHunkRenderer,
-    HiddenUnstagedDiffHunkRenderer, render_diff_hunk_controls, set_blame_renderer,
+    HiddenUnstagedDiffHunkRenderer, TakenReviewComment, render_diff_hunk_controls,
+    set_blame_renderer,
 };
 pub(crate) use git::{DiffHunkKey, StoredReviewComment};
 use git::{DiffReviewDragState, DiffReviewOverlay, InlineBlamePopover};
@@ -792,6 +793,17 @@ pub trait Addon: 'static {
         &self,
         _: &ExcerptBoundaryInfo,
         _: &language::BufferSnapshot,
+        _: &Window,
+        _: &App,
+    ) -> Option<AnyElement> {
+        None
+    }
+
+    /// What is drawn in the rows `Editor::set_buffer_header_extra_rows` makes
+    /// above a buffer's header, across the header's whole width.
+    fn render_above_buffer_header(
+        &self,
+        _: &ExcerptBoundaryInfo,
         _: &Window,
         _: &App,
     ) -> Option<AnyElement> {

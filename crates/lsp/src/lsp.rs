@@ -139,6 +139,8 @@ pub struct LanguageServer {
     #[allow(clippy::type_complexity)]
     io_tasks: Mutex<Option<(Task<Option<()>>, Task<Option<()>>)>>,
     output_done_rx: Mutex<Option<barrier::Receiver>>,
+    /// Released once the server's output has ended and the process is reaped.
+    exited_rx: barrier::Receiver,
     server: Arc<Mutex<Option<Child>>>,
     workspace_folders: Option<Arc<Mutex<BTreeSet<Uri>>>>,
     root_uri: Uri,
@@ -662,9 +664,17 @@ impl LanguageServer {
                 })
             })
             .unwrap_or_else(|| Task::ready(None));
-        let input_task = cx.background_spawn(async move {
-            let (stdout, stderr) = futures::join!(stdout_input_task, stderr_input_task);
-            stdout.or(stderr)
+        let server = Arc::new(Mutex::new(server));
+        let (exited_tx, exited_rx) = barrier::channel();
+        let input_task = cx.background_spawn({
+            let server = server.clone();
+            let executor = cx.background_executor().clone();
+            async move {
+                let (stdout, stderr) = futures::join!(stdout_input_task, stderr_input_task);
+                reap_exited(&server, &executor).await;
+                drop(exited_tx);
+                stdout.or(stderr)
+            }
         });
         let output_task = cx.background_spawn({
             Self::handle_outgoing_messages(
@@ -717,7 +727,8 @@ impl LanguageServer {
             executor: cx.background_executor().clone(),
             io_tasks: Mutex::new(Some((input_task, output_task))),
             output_done_rx: Mutex::new(Some(output_done_rx)),
-            server: Arc::new(Mutex::new(server)),
+            exited_rx,
+            server,
             workspace_folders,
             root_uri,
         }
@@ -1905,6 +1916,17 @@ impl Drop for Subscription {
     }
 }
 
+impl LanguageServer {
+    /// Resolves when the server has stopped producing output, whether it
+    /// exited on its own or was shut down.
+    pub fn exited(&self) -> impl Future<Output = ()> + use<> {
+        let mut exited = self.exited_rx.clone();
+        async move {
+            exited.recv().await;
+        }
+    }
+}
+
 /// Mock language server for use in tests.
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Clone)]
@@ -2000,6 +2022,12 @@ impl FakeLanguageServer {
 
         (server, fake)
     }
+    /// The server's process goes away: its output ends, as when it is killed
+    /// for running out of memory.
+    pub fn simulate_exit(&self) {
+        self.server.io_tasks.lock().take();
+    }
+
     #[cfg(target_os = "windows")]
     fn root_path() -> Uri {
         Uri::from_file_path("C:/").unwrap()
@@ -2166,6 +2194,21 @@ impl FakeLanguageServer {
     }
 }
 
+/// A server whose output has closed is exiting, or was killed (an out-of-memory kill, say). It is
+/// waited for here, so it does not stay a zombie until the `LanguageServer` is dropped.
+async fn reap_exited(server: &Mutex<Option<Child>>, executor: &BackgroundExecutor) -> bool {
+    const ATTEMPTS: usize = 50;
+    for _ in 0..ATTEMPTS {
+        match server.lock().as_mut().map(|child| child.try_status()) {
+            None | Some(Err(_)) => return false,
+            Some(Ok(Some(_))) => return true,
+            Some(Ok(None)) => {}
+        }
+        executor.timer(Duration::from_millis(100)).await;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2175,6 +2218,26 @@ mod tests {
     #[ctor::ctor(unsafe)]
     fn init_logger() {
         zlog::init_test();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    async fn test_an_exited_server_is_reaped_before_it_is_dropped(cx: &mut TestAppContext) {
+        let child = util::command::new_command("true")
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            Path::new(&format!("/proc/{pid}")).exists(),
+            "an exited child nobody waited for is a zombie"
+        );
+
+        let server = Mutex::new(Some(child));
+        assert!(reap_exited(&server, &cx.executor()).await);
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        assert!(server.lock().is_some(), "the handle stays for shutdown");
     }
 
     #[gpui::test]
