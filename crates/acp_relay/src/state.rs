@@ -168,7 +168,9 @@ enum Life {
     Open,
     Closing { waiting: Vec<Waiting> },
     Closed,
-    Resuming { waiting: Vec<Waiting> },
+    /// `by_load` when the agent can only load a session, not resume one: the
+    /// history it replays is already in the log and goes nowhere.
+    Resuming { waiting: Vec<Waiting>, by_load: bool },
 }
 
 struct Waiting {
@@ -502,7 +504,7 @@ impl RelayState {
                 Life::Open => {}
                 Life::Opening { waiting }
                 | Life::Closing { waiting }
-                | Life::Resuming { waiting } => {
+                | Life::Resuming { waiting, .. } => {
                     return waiting.push(Waiting {
                         link,
                         line: value.to_string(),
@@ -889,7 +891,12 @@ impl RelayState {
                         }
                     };
                 }
-                self.session_frame(&session, line, |_| true);
+                let replaying = self.sessions.get(&session).is_some_and(|state| {
+                    matches!(state.life, Life::Resuming { by_load: true, .. })
+                });
+                if !replaying {
+                    self.session_frame(&session, line, |_| true);
+                }
             }
         }
     }
@@ -1604,7 +1611,9 @@ impl RelayState {
             return;
         };
         self.children.retain(|_, root| root != session_id);
-        if let Life::Opening { waiting } | Life::Closing { waiting } | Life::Resuming { waiting } =
+        if let Life::Opening { waiting }
+        | Life::Closing { waiting }
+        | Life::Resuming { waiting, .. } =
             session.life
         {
             self.fail_waiting(waiting, error.as_deref().unwrap_or("the session ended"));
@@ -1777,13 +1786,19 @@ impl RelayState {
             self.fail_waiting(waiting, error);
             return self.end_session(&session_id, Some(error.into()));
         }
+        let by_load = self.loads_instead_of_resuming(&command);
+        let method = if by_load {
+            frame::SESSION_LOAD
+        } else {
+            frame::SESSION_RESUME
+        };
         let process = self.agent_process(command);
         let Some(session) = self.sessions.get_mut(&session_id) else {
             return;
         };
-        log::info!("quiet-ui relay: resuming {session_id} in agent {process}");
+        log::info!("quiet-ui relay: {method} {session_id} in agent {process}");
         session.process = process;
-        session.life = Life::Resuming { waiting };
+        session.life = Life::Resuming { waiting, by_load };
         let mut params = match &session.open_params {
             Value::Object(params) => params.clone(),
             _ => Default::default(),
@@ -1800,17 +1815,26 @@ impl RelayState {
                 process,
                 link: None,
                 client_id: Value::Null,
-                method: frame::SESSION_RESUME.into(),
+                method: method.into(),
                 session: Some(session_id),
                 params: params.clone(),
                 purpose: Purpose::Resume,
             },
         );
-        self.send_open(
-            process,
-            request,
-            frame::request(request, frame::SESSION_RESUME, params),
-        );
+        self.send_open(process, request, frame::request(request, method, params));
+    }
+
+    /// Whether this agent reopens a session with `session/load`: it says it
+    /// loads sessions and does not say it resumes them (Codex, unlike the
+    /// Claude adapter). An agent that says neither is asked to resume, as
+    /// before.
+    fn loads_instead_of_resuming(&self, command: &AgentCommand) -> bool {
+        let Some(init) = self.init_cache.get(&command.key()) else {
+            return false;
+        };
+        let capabilities = &init.result["agentCapabilities"];
+        capabilities["loadSession"].as_bool() == Some(true)
+            && capabilities["sessionCapabilities"]["resume"].is_null()
     }
 
     fn resumed(&mut self, request: ClientRequest, result: Option<Value>) {
@@ -1911,7 +1935,7 @@ impl RelayState {
             return;
         };
         let waiting = match std::mem::replace(&mut session.life, Life::Open) {
-            Life::Opening { waiting } | Life::Resuming { waiting } => waiting,
+            Life::Opening { waiting } | Life::Resuming { waiting, .. } => waiting,
             life => {
                 session.life = life;
                 return;

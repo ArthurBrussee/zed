@@ -690,6 +690,57 @@ fn a_load_of_a_closed_session_resumes_it_in_a_fresh_adapter() {
     assert!(frames.iter().any(|(_, frame)| frame["id"] == json!(1)));
 }
 
+/// 2026-11-04: an agent that loads sessions but cannot resume them (Codex)
+/// lost every session the relay closed while idle or handed over on an
+/// upgrade, since the only way back was `session/resume`.
+#[test]
+fn a_session_of_an_agent_that_only_loads_is_reopened_by_loading_it() {
+    let mut relay = Harness::new(None);
+    let link = relay.open();
+    relay.client(link, request(0, "initialize", json!({ "protocolVersion": 1 })));
+    let (process, _) = relay.spawned.last().cloned().unwrap();
+    let init = relay.take_agent();
+    let capabilities = json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } });
+    relay.agent(process, response(&init[0].1["id"], capabilities.clone()));
+    relay.client(link, request(1, "session/new", json!({ "cwd": "/box/project" })));
+    let new = relay.take_agent();
+    relay.agent(process, response(&new[0].1["id"], json!({ "sessionId": "s1" })));
+    let session = "s1";
+    relay.agent(process, update(session, "history"));
+    relay.state.close_link(link);
+    relay.state.set_idle_timeout(Duration::ZERO);
+    let now = Instant::now();
+    relay.state.close_idle(now);
+    relay.state.close_idle(now);
+    relay.collect();
+    let close = relay.take_agent();
+    assert_eq!(close[0].1["method"], json!("session/close"));
+    relay.agent(process, response(&close[0].1["id"], json!({})));
+
+    let link = relay.open();
+    relay.client(link, request(0, "initialize", json!({ "protocolVersion": 1 })));
+    relay.client(
+        link,
+        request(1, "session/load", json!({ "sessionId": session, "cwd": "/box/project" })),
+    );
+    let (fresh, _) = relay.spawned.last().cloned().unwrap();
+    let init = relay.take_agent();
+    relay.agent(fresh, response(&init[0].1["id"], capabilities));
+    let reopen = relay.take_agent();
+    assert_eq!(reopen[0].1["method"], json!("session/load"));
+    assert_eq!(reopen[0].1["params"]["sessionId"], json!(session));
+    // The agent replays the history the relay already logged.
+    relay.agent(fresh, update(session, "history"));
+    relay.agent(fresh, response(&reopen[0].1["id"], json!({})));
+    let frames = relay.take_link(link);
+    assert_eq!(texts(&frames), ["history"], "the replay is not shown twice");
+    assert!(frames.iter().any(|(_, frame)| frame["id"] == json!(1)));
+
+    // Live again: what the agent says now reaches the client.
+    relay.agent(fresh, update(session, "new"));
+    assert_eq!(texts(&relay.take_link(link)), ["new"]);
+}
+
 #[test]
 fn a_session_with_a_turn_or_background_work_is_not_closed() {
     let mut relay = Harness::new(None);
