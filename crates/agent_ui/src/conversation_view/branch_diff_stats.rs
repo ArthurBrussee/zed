@@ -8,7 +8,7 @@ use git::{
 use gpui::{App, AsyncApp, Context, Entity, SharedString, Subscription, Task, WeakEntity};
 use project::{
     Project,
-    git_store::{GitStoreEvent, Repository, RepositoryEvent},
+    git_store::{GitStoreEvent, Repository, RepositoryEvent, RepositoryId},
 };
 use util::ResultExt as _;
 
@@ -48,6 +48,8 @@ pub struct BranchDiffStats {
     default_branch: Option<SharedString>,
     base: DiffStatsBase,
     stats: DiffStat,
+    /// The repository the stats were last computed for.
+    repository_id: Option<RepositoryId>,
     recheck_when_quiet: bool,
     /// Consecutive failed refreshes, and when the next one may run.
     failures: u32,
@@ -93,6 +95,7 @@ impl BranchDiffStats {
             default_branch: None,
             base: DiffStatsBase::default(),
             stats: DiffStat::default(),
+            repository_id: None,
             recheck_when_quiet: false,
             failures: 0,
             retry_at: None,
@@ -109,6 +112,10 @@ impl BranchDiffStats {
 
     pub fn base(&self) -> &DiffStatsBase {
         &self.base
+    }
+
+    pub fn repository_id(&self) -> Option<RepositoryId> {
+        self.repository_id
     }
 
     pub fn set_work_dirs(&mut self, work_dirs: Vec<PathBuf>, cx: &mut Context<Self>) {
@@ -178,6 +185,11 @@ impl BranchDiffStats {
         let repository = this.read_with(cx, |this, cx| {
             let project = this.project.upgrade()?;
             this.resolve_repository(&project, cx)
+        })?;
+        this.update(cx, |this, cx| {
+            this.repository_id = repository
+                .as_ref()
+                .map(|repository| repository.read(cx).id);
         })?;
         let Some(repository) = repository else {
             return Ok((DiffStatsBase::NoRepository, DiffStat::default()));

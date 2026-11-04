@@ -7870,7 +7870,19 @@ impl ThreadView {
         let branch_diff_stats = self.branch_diff_stats.read(cx);
         let is_generating = self.thread.read(cx).status() != ThreadStatus::Idle;
         let is_draft = !self.has_visible_conversation(cx);
-        let diff_stats = branch_diff_stats.stats();
+        // While the branch diff view is open, its own totals: the chip and
+        // the view count the same files the same way only if they are one count.
+        let open_view_stats = branch_diff_stats.repository_id().and_then(|repository_id| {
+            let workspace = self.workspace.upgrade()?;
+            let workspace = workspace.read(cx);
+            workspace
+                .items_of_type::<git_ui::branch_diff::BranchDiff>(cx)
+                .find_map(|view| view.read(cx).changed_lines_for(repository_id, cx))
+        });
+        let diff_stats = match open_view_stats {
+            Some((added, deleted)) => git::status::DiffStat { added, deleted },
+            None => branch_diff_stats.stats(),
+        };
         let diff_tooltip = match branch_diff_stats.base() {
             DiffStatsBase::DefaultBranch(base) => {
                 format!("Open this worktree's diff since {base}")
