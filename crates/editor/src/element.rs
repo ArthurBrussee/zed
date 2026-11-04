@@ -4,9 +4,7 @@ mod mouse;
 #[cfg(test)]
 pub(crate) use header::StickyHeader;
 pub use header::file_status_label_color;
-pub(crate) use header::{
-    header_jump_data, render_above_buffer_header, render_buffer_header, sticky_header_drop,
-};
+pub(crate) use header::{header_jump_data, render_buffer_header};
 
 use crate::{
     BUFFER_HEADER_PADDING, BlockId, ChunkRendererContext, ChunkReplacement, CodeActionSource,
@@ -3473,14 +3471,8 @@ impl EditorElement {
                             ),
                         ));
                     } else {
-                        result = result
-                            .children(header::render_above_buffer_header(
-                                &self.editor,
-                                excerpt,
-                                window,
-                                cx,
-                            ))
-                            .child(div().h(FILE_HEADER_HEIGHT as f32 * window.line_height()));
+                        result =
+                            result.child(div().h(FILE_HEADER_HEIGHT as f32 * window.line_height()));
                     }
                 } else {
                     result =

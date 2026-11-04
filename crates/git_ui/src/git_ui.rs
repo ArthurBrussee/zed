@@ -43,7 +43,6 @@ mod commit_modal;
 pub mod commit_tooltip;
 pub mod commit_view;
 mod conflict_view;
-mod diff_groups;
 mod diff_multibuffer;
 pub mod git_graph;
 pub mod git_panel;
