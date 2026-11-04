@@ -40,14 +40,15 @@ use gpui::TaskExt;
 use heapless::Vec as ArrayVec;
 use itertools::Itertools;
 use language_model::{
-    FastModeConfirmation, LanguageModel, LanguageModelId, LanguageModelProvider,
-    LanguageModelProviderId, LanguageModelRegistry, Speed,
+    FastModeConfirmation, LanguageModel, LanguageModelEffortLevel, LanguageModelId,
+    LanguageModelProvider, LanguageModelProviderId, LanguageModelRegistry, Speed,
 };
 use notifications::status_toast::StatusToast;
 use project::{ResolvedPath, WorktreeId};
 use settings::{update_settings_file, update_settings_file_with_completion};
 use ui::{
-    ButtonLike, CalloutBorderPosition, Checkbox, SpinnerLabel, SpinnerVariant, Tab, ToggleState,
+    ButtonLike, CalloutBorderPosition, Checkbox, SpinnerLabel, SpinnerVariant, SplitButton,
+    SplitButtonStyle, Tab, ToggleState,
 };
 use url::Url;
 use util::markdown::source_position_from_fragment;
@@ -897,6 +898,7 @@ pub struct ThreadView {
     pub _subscriptions: Vec<Subscription>,
     pub message_editor: Entity<MessageEditor>,
     pub add_context_menu_handle: PopoverMenuHandle<ContextMenu>,
+    pub fast_mode_menu_handle: PopoverMenuHandle<ContextMenu>,
     pub thinking_effort_menu_handle: PopoverMenuHandle<ContextMenu>,
     pub project: WeakEntity<Project>,
     /// Cache + worktree snapshot for resolving paths in markdown code spans.
@@ -2255,6 +2257,7 @@ impl ThreadView {
             submission_reveal_tasks: HashMap::default(),
             message_editor,
             add_context_menu_handle: PopoverMenuHandle::default(),
+            fast_mode_menu_handle: PopoverMenuHandle::default(),
             thinking_effort_menu_handle: PopoverMenuHandle::default(),
             project,
             code_span_resolver,
@@ -7658,62 +7661,122 @@ impl ThreadView {
         )
     }
 
-    fn fast_mode_menu_section(
-        &self,
-        cx: &Context<Self>,
-    ) -> Option<crate::model_selector_popover::FastModeSection> {
-        use crate::model_selector_popover::{FastModeConfirmationRows, FastModeSection};
-
+    fn render_fast_mode_control(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.fast_mode_available(cx) {
             return None;
         }
 
-        let thread = self.as_native_thread(cx)?;
-        let is_fast = matches!(thread.read(cx).speed(), Some(Speed::Fast));
-        let weak_self = cx.weak_entity();
+        let thread = self.as_native_thread(cx)?.read(cx);
+        let is_fast = matches!(thread.speed(), Some(Speed::Fast));
 
-        let toggle: Rc<dyn Fn(&mut Window, &mut App)> = Rc::new({
-            let weak_self = weak_self.clone();
-            move |_window: &mut Window, cx: &mut App| {
-                weak_self
-                    .update(cx, |this, cx| {
-                        let new_speed = if is_fast {
-                            Speed::Standard
-                        } else {
-                            Speed::Fast
-                        };
-                        this.apply_fast_mode_speed(new_speed, cx);
-                    })
-                    .ok();
-            }
-        });
+        let model_identity = thread
+            .model()
+            .map(|model| (model.provider_id(), model.id()));
 
-        let confirmation = (!is_fast)
+        let (tooltip_label, color, icon, new_speed) = if is_fast {
+            (
+                "Disable Fast Mode",
+                Color::Accent,
+                IconName::FastForward,
+                Speed::Standard,
+            )
+        } else {
+            (
+                "Enable Fast Mode",
+                Color::Custom(cx.theme().colors().icon_disabled.opacity(0.8)),
+                IconName::FastForwardOff,
+                Speed::Fast,
+            )
+        };
+
+        let focus_handle = self.message_editor.focus_handle(cx);
+
+        let pending_confirmation = (!is_fast)
             .then(|| self.pending_fast_mode_confirmation(cx))
-            .flatten()
-            .map(|(provider_id, model_id, confirmation)| {
-                let weak_self = weak_self.clone();
-                let enable_and_dismiss: Rc<dyn Fn(&mut Window, &mut App)> =
-                    Rc::new(move |_window: &mut Window, cx: &mut App| {
-                        weak_self
-                            .update(cx, |this, cx| {
-                                this.apply_fast_mode_speed(Speed::Fast, cx);
-                            })
-                            .ok();
-                        set_fast_mode_warning_dismissed(&provider_id, &model_id, cx);
-                    });
-                FastModeConfirmationRows {
-                    title: confirmation.title.clone(),
-                    message: confirmation.message,
-                    enable_and_dismiss,
-                }
-            });
+            .flatten();
 
-        Some(FastModeSection {
-            enabled: is_fast,
-            toggle,
-            confirmation,
-        })
+        let icon_button = IconButton::new("fast-mode", icon)
+            .icon_size(IconSize::Small)
+            .icon_color(color);
+
+        if let Some((provider_id, model_id, confirmation)) = pending_confirmation {
+            let weak_self = cx.entity().downgrade();
+            let tooltip_focus = focus_handle;
+
+            return Some(
+                PopoverMenu::new("fast-mode-warning")
+                    .with_handle(self.fast_mode_menu_handle.clone())
+                    .trigger_with_tooltip(icon_button, move |_, cx| {
+                        Tooltip::for_action_in(tooltip_label, &ToggleFastMode, &tooltip_focus, cx)
+                    })
+                    .menu(move |window, cx| {
+                        let weak_self = weak_self.clone();
+                        let confirmation = confirmation.clone();
+                        let provider_id = provider_id.clone();
+                        let model_id = model_id.clone();
+
+                        Some(ContextMenu::build(window, cx, move |menu, _window, _cx| {
+                            let message = confirmation.message.clone();
+                            menu.custom_row(move |_window, _cx| {
+                                div()
+                                    .max_w_72()
+                                    .child(Label::new(confirmation.title.clone()))
+                                    .child(Label::new(message.clone()).color(Color::Muted))
+                                    .into_any_element()
+                            })
+                            .separator()
+                            .item(ContextMenuEntry::new("Enable Now").handler({
+                                let weak_self = weak_self.clone();
+                                move |_window, cx| {
+                                    weak_self
+                                        .update(cx, |this, cx| {
+                                            this.apply_fast_mode_speed(Speed::Fast, cx);
+                                        })
+                                        .log_err();
+                                }
+                            }))
+                            .item(
+                                ContextMenuEntry::new("Enable and Don't Show Again").handler({
+                                    let weak_self = weak_self.clone();
+                                    let provider_id = provider_id.clone();
+                                    let model_id = model_id;
+                                    move |_window, cx| {
+                                        weak_self
+                                            .update(cx, |this, cx| {
+                                                this.apply_fast_mode_speed(Speed::Fast, cx);
+                                            })
+                                            .log_err();
+                                        set_fast_mode_warning_dismissed(
+                                            &provider_id,
+                                            &model_id,
+                                            cx,
+                                        );
+                                    }
+                                }),
+                            )
+                        }))
+                    })
+                    .offset(gpui::Point {
+                        x: px(0.0),
+                        y: px(-2.0),
+                    })
+                    .anchor(gpui::Anchor::BottomLeft)
+                    .into_any_element(),
+            );
+        }
+
+        let _ = model_identity;
+
+        Some(
+            icon_button
+                .tooltip(move |_, cx| {
+                    Tooltip::for_action_in(tooltip_label, &ToggleFastMode, &focus_handle, cx)
+                })
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    this.apply_fast_mode_speed(new_speed, cx);
+                }))
+                .into_any_element(),
+        )
     }
 
     fn pending_fast_mode_confirmation(
@@ -7737,130 +7800,289 @@ impl ThreadView {
         Some((provider_id, model_id, confirmation))
     }
 
-    fn effort_menu_section(
-        &self,
-        cx: &Context<Self>,
-    ) -> Option<crate::model_selector_popover::EffortMenuSection> {
-        use crate::model_selector_popover::{EffortMenuSection, EffortOption};
+    fn render_thinking_control(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let thread = self.as_native_thread(cx)?.read(cx);
+        let model = thread.model()?;
 
-        let thread = self.as_native_thread(cx)?;
-        let thread_read = thread.read(cx);
-        let model = thread_read.model()?;
-        if !model.supports_thinking() {
+        let supports_thinking = model.supports_thinking();
+        if !supports_thinking {
             return None;
         }
 
         let effort_levels = model.supported_effort_levels();
-        let selected_value = thread_read.thinking_effort().cloned();
-        let can_disable = model.supports_disabling_thinking_at_effort(selected_value.as_deref());
-        let thinking_enabled = thread_read.thinking_enabled() || !can_disable;
-        let show_effort = !effort_levels.is_empty() && thinking_enabled;
+        let selected_effort = thread.thinking_effort().cloned();
+        let supports_disabling_thinking =
+            model.supports_disabling_thinking_at_effort(selected_effort.as_deref());
+        let supports_disabling_thinking_at_any_effort = supports_disabling_thinking
+            || effort_levels.iter().any(|effort_level| {
+                model.supports_disabling_thinking_at_effort(Some(effort_level.value.as_ref()))
+            });
 
-        let selected_level = selected_value
-            .as_ref()
-            .and_then(|value| effort_levels.iter().find(|level| &level.value == value))
-            .or_else(|| effort_levels.iter().find(|level| level.is_default))
-            .cloned();
+        // A toggle would be dishonest for models that always think at every
+        // effort level: only offer the effort selector.
+        if !supports_disabling_thinking_at_any_effort {
+            if effort_levels.is_empty() {
+                return None;
+            }
+            return Some(
+                self.render_effort_selector(effort_levels, selected_effort, true, cx)
+                    .into_any_element(),
+            );
+        }
 
-        let weak_self = cx.weak_entity();
+        let thinking = thread.thinking_enabled() || !supports_disabling_thinking;
 
-        let thinking_toggle = can_disable.then(|| {
-            let weak_self = weak_self.clone();
-            let toggle: Rc<dyn Fn(&mut Window, &mut App)> =
-                Rc::new(move |_window: &mut Window, cx: &mut App| {
-                    weak_self
-                        .update(cx, |this, cx| {
-                            if let Some(thread) = this.as_native_thread(cx) {
-                                let enable = !thread.read(cx).thinking_enabled();
-                                Self::persist_thinking_enabled(&thread, enable, cx);
-                            }
-                        })
-                        .ok();
-                });
-            (thinking_enabled, toggle)
-        });
-
-        let effort_options = if show_effort {
-            effort_levels
-                .iter()
-                .map(|level| EffortOption {
-                    name: level.name.clone(),
-                    value: level.value.clone(),
-                    selected: selected_level
-                        .as_ref()
-                        .is_some_and(|selected| selected.value == level.value),
-                })
-                .collect()
+        let (tooltip_label, icon, color) = if !supports_disabling_thinking {
+            (None, IconName::ThinkingMode, Color::Accent)
+        } else if thinking {
+            (
+                Some("Disable Thinking Mode"),
+                IconName::ThinkingMode,
+                Color::Accent,
+            )
         } else {
-            Vec::new()
+            (
+                Some("Enable Thinking Mode"),
+                IconName::ThinkingModeOff,
+                Color::Custom(cx.theme().colors().icon_disabled.opacity(0.8)),
+            )
         };
 
-        let on_select_effort: Rc<dyn Fn(SharedString, &mut Window, &mut App)> = Rc::new(
-            move |value: SharedString, _window: &mut Window, cx: &mut App| {
-                weak_self
-                    .update(cx, |this, cx| {
-                        if let Some(thread) = this.as_native_thread(cx) {
-                            Self::persist_thinking_effort(&thread, value.to_string(), cx);
-                        }
+        let focus_handle = self.message_editor.focus_handle(cx);
+
+        let thinking_toggle = IconButton::new("thinking-mode", icon)
+            .icon_size(IconSize::Small)
+            .icon_color(color)
+            .map(|this| {
+                if let Some(tooltip_label) = tooltip_label {
+                    this.tooltip(move |_, cx| {
+                        Tooltip::for_action_in(
+                            tooltip_label,
+                            &ToggleThinkingMode,
+                            &focus_handle,
+                            cx,
+                        )
                     })
-                    .ok();
-            },
-        );
-
-        let selected_label = show_effort
-            .then(|| selected_level.as_ref().map(|level| level.name.clone()))
-            .flatten();
-
-        Some(EffortMenuSection {
-            thinking_toggle,
-            effort_options,
-            on_select_effort,
-            selected_label,
-        })
-    }
-
-    fn persist_thinking_enabled(thread: &Entity<agent::Thread>, enable: bool, cx: &mut App) {
-        thread.update(cx, |thread, cx| {
-            thread.set_thinking_enabled(enable, cx);
-            let favorite_key = thread
-                .model()
-                .map(|model| (model.provider_id().0.to_string(), model.id().0.to_string()));
-            let fs = thread.project().read(cx).fs().clone();
-            update_settings_file(fs, cx, move |settings, _| {
-                if let Some(agent) = settings.agent.as_mut() {
-                    if let Some(default_model) = agent.default_model.as_mut() {
-                        default_model.enable_thinking = enable;
-                    }
-                    if let Some((provider_id, model_id)) = &favorite_key {
-                        agent.update_favorite_model(provider_id, model_id, |favorite| {
-                            favorite.enable_thinking = enable
-                        });
-                    }
+                } else {
+                    this.tooltip(Tooltip::text(
+                        "Thinking is always on at this effort level. Select a lower effort level to make it optional.",
+                    ))
                 }
             });
-        });
+        let thinking_toggle = if supports_disabling_thinking {
+            thinking_toggle.on_click(cx.listener(move |this, _, _window, cx| {
+                if let Some(thread) = this.as_native_thread(cx) {
+                    thread.update(cx, |thread, cx| {
+                        let enable_thinking = !thread.thinking_enabled();
+                        thread.set_thinking_enabled(enable_thinking, cx);
+
+                        let favorite_key = thread
+                            .model()
+                            .map(|model| (model.provider_id.0.to_string(), model.id.0.to_string()));
+                        let fs = thread.project().read(cx).fs().clone();
+                        update_settings_file(fs, cx, move |settings, _| {
+                            if let Some(agent) = settings.agent.as_mut() {
+                                if let Some(default_model) = agent.default_model.as_mut() {
+                                    default_model.enable_thinking = enable_thinking;
+                                }
+                                if let Some((provider_id, model_id)) = &favorite_key {
+                                    agent.update_favorite_model(
+                                        provider_id,
+                                        model_id,
+                                        |favorite| favorite.enable_thinking = enable_thinking,
+                                    );
+                                }
+                            }
+                        });
+                    });
+                }
+            }))
+        } else {
+            thinking_toggle.cursor_style(gpui::CursorStyle::Arrow)
+        };
+
+        if effort_levels.is_empty() {
+            return Some(thinking_toggle.into_any_element());
+        }
+
+        if !thinking {
+            return Some(thinking_toggle.into_any_element());
+        }
+
+        let left_btn = thinking_toggle;
+        let right_btn = self.render_effort_selector(effort_levels, selected_effort, false, cx);
+
+        Some(
+            SplitButton::new(left_btn, right_btn.into_any_element())
+                .style(SplitButtonStyle::Transparent)
+                .into_any_element(),
+        )
     }
 
-    fn persist_thinking_effort(thread: &Entity<agent::Thread>, effort: String, cx: &mut App) {
-        thread.update(cx, |thread, cx| {
-            thread.set_thinking_effort(Some(effort.clone()), cx);
-            let favorite_key = thread
-                .model()
-                .map(|model| (model.provider_id().0.to_string(), model.id().0.to_string()));
-            let fs = thread.project().read(cx).fs().clone();
-            update_settings_file(fs, cx, move |settings, _| {
-                if let Some(agent) = settings.agent.as_mut() {
-                    if let Some(default_model) = agent.default_model.as_mut() {
-                        default_model.effort = Some(effort.clone());
-                    }
-                    if let Some((provider_id, model_id)) = &favorite_key {
-                        agent.update_favorite_model(provider_id, model_id, |favorite| {
-                            favorite.effort = Some(effort.clone())
-                        });
-                    }
-                }
-            });
+    fn render_effort_selector(
+        &self,
+        supported_effort_levels: Vec<LanguageModelEffortLevel>,
+        selected_effort: Option<String>,
+        standalone: bool,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let weak_self = cx.weak_entity();
+
+        let default_effort_level = supported_effort_levels
+            .iter()
+            .find(|effort_level| effort_level.is_default)
+            .cloned();
+
+        let selected = selected_effort.and_then(|effort| {
+            supported_effort_levels
+                .iter()
+                .find(|level| level.value == effort)
+                .cloned()
         });
+
+        let label = selected
+            .clone()
+            .or(default_effort_level)
+            .map_or("Select Effort".into(), |effort| effort.name);
+
+        let (label_color, icon) = if self.thinking_effort_menu_handle.is_deployed() {
+            (Color::Accent, IconName::ChevronUp)
+        } else {
+            (Color::Muted, IconName::ChevronDown)
+        };
+
+        let focus_handle = self.message_editor.focus_handle(cx);
+        let show_cycle_row = supported_effort_levels.len() > 1;
+
+        let tooltip = Tooltip::element({
+            move |_, cx| {
+                let mut content = v_flex().gap_1().child(
+                    h_flex()
+                        .gap_2()
+                        .justify_between()
+                        .child(Label::new("Change Thinking Effort"))
+                        .child(KeyBinding::for_action_in(
+                            &ToggleThinkingEffortMenu,
+                            &focus_handle,
+                            cx,
+                        )),
+                );
+
+                if show_cycle_row {
+                    content = content.child(
+                        h_flex()
+                            .pt_1()
+                            .gap_2()
+                            .justify_between()
+                            .border_t_1()
+                            .border_color(cx.theme().colors().border_variant)
+                            .child(Label::new("Cycle Thinking Effort"))
+                            .child(KeyBinding::for_action_in(
+                                &CycleThinkingEffort,
+                                &focus_handle,
+                                cx,
+                            )),
+                    );
+                }
+
+                content.into_any_element()
+            }
+        });
+
+        let trigger = if standalone {
+            ButtonLike::new("effort-selector-trigger").child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Icon::new(IconName::ThinkingMode)
+                            .size(IconSize::Small)
+                            .color(Color::Accent),
+                    )
+                    .child(Label::new(label).size(LabelSize::Small).color(label_color))
+                    .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted)),
+            )
+        } else {
+            ButtonLike::new_rounded_right("effort-selector-trigger")
+                .child(Label::new(label).size(LabelSize::Small).color(label_color))
+                .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
+        };
+
+        PopoverMenu::new("effort-selector")
+            .trigger_with_tooltip(
+                trigger.selected_style(ButtonStyle::Tinted(TintColor::Accent)),
+                tooltip,
+            )
+            .menu(move |window, cx| {
+                Some(ContextMenu::build(window, cx, |mut menu, _window, _cx| {
+                    menu = menu.header("Change Thinking Effort");
+
+                    for effort_level in supported_effort_levels.clone() {
+                        let is_selected = selected
+                            .as_ref()
+                            .is_some_and(|selected| selected.value == effort_level.value);
+                        let entry = ContextMenuEntry::new(effort_level.name)
+                            .toggleable(IconPosition::End, is_selected);
+
+                        menu.push_item(entry.handler({
+                            let effort = effort_level.value.clone();
+                            let weak_self = weak_self.clone();
+                            move |_window, cx| {
+                                let effort = effort.clone();
+                                weak_self
+                                    .update(cx, |this, cx| {
+                                        if let Some(thread) = this.as_native_thread(cx) {
+                                            thread.update(cx, |thread, cx| {
+                                                thread.set_thinking_effort(
+                                                    Some(effort.to_string()),
+                                                    cx,
+                                                );
+
+                                                let favorite_key = thread.model().map(|model| {
+                                                    (
+                                                        model.provider_id().0.to_string(),
+                                                        model.id().0.to_string(),
+                                                    )
+                                                });
+                                                let fs = thread.project().read(cx).fs().clone();
+                                                update_settings_file(fs, cx, move |settings, _| {
+                                                    if let Some(agent) = settings.agent.as_mut() {
+                                                        if let Some(default_model) =
+                                                            agent.default_model.as_mut()
+                                                        {
+                                                            default_model.effort =
+                                                                Some(effort.to_string());
+                                                        }
+                                                        if let Some((provider_id, model_id)) =
+                                                            &favorite_key
+                                                        {
+                                                            agent.update_favorite_model(
+                                                                provider_id,
+                                                                model_id,
+                                                                |favorite| {
+                                                                    favorite.effort =
+                                                                        Some(effort.to_string())
+                                                                },
+                                                            );
+                                                        }
+                                                    }
+                                                });
+                                            });
+                                        }
+                                    })
+                                    .ok();
+                            }
+                        }));
+                    }
+
+                    menu
+                }))
+            })
+            .with_handle(self.thinking_effort_menu_handle.clone())
+            .offset(gpui::Point {
+                x: px(0.0),
+                y: px(-2.0),
+            })
+            .anchor(gpui::Anchor::BottomLeft)
     }
 
     /// The bar below the message input. There is no send button: Enter sends.
@@ -7893,18 +8115,6 @@ impl ThreadView {
             DiffStatsBase::NoRepository => "This worktree is not in a git repository".to_string(),
         };
 
-        // Model, thinking effort and fast mode are one control.
-        if let Some(model_selector) = self.model_selector.clone() {
-            let effort_section = self.effort_menu_section(cx);
-            let fast_mode_section = self.fast_mode_menu_section(cx);
-            let working = self.thread.read(cx).status() != ThreadStatus::Idle;
-            model_selector.update(cx, |selector, cx| {
-                selector.set_effort_section(effort_section, cx);
-                selector.set_fast_mode_section(fast_mode_section, cx);
-                selector.set_working(working, cx);
-            });
-        }
-
         h_flex()
             .w_full()
             .flex_none()
@@ -7918,6 +8128,8 @@ impl ThreadView {
                     .flex_wrap()
                     .gap_0p5()
                     .child(self.render_add_context_button(cx))
+                    .children(self.render_fast_mode_control(cx))
+                    .children(self.render_thinking_control(cx))
                     .children(crate::diff_review::render_review_chip(self, cx))
                     .children(self.profile_selector.clone())
                     .map(|this| match self.config_options_view.clone() {
@@ -16733,11 +16945,10 @@ impl ThreadView {
         let new_speed = current_speed.toggle();
 
         if new_speed == Speed::Fast && self.pending_fast_mode_confirmation(cx).is_some() {
-            if let Some(model_selector) = self.model_selector.clone() {
-                window.defer(cx, move |window, cx| {
-                    model_selector.update(cx, |selector, cx| selector.toggle(window, cx));
-                });
-            }
+            let menu_handle = self.fast_mode_menu_handle.clone();
+            window.defer(cx, move |window, cx| {
+                menu_handle.toggle(window, cx);
+            });
             return;
         }
 
