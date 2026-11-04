@@ -13969,6 +13969,106 @@ mod tests {
         );
     }
 
+    /// 2026-11-04: memory grew all day with 27 threads open of 711, the live
+    /// counts pointing at threads closed, archived and opened again. Each of
+    /// those cycles has to give back the thread it closed.
+    #[gpui::test]
+    async fn test_close_archive_and_reopen_cycles_release_threads(cx: &mut TestAppContext) {
+        use acp_thread::{DisplayTerminalOutput, DisplayTerminalPatch};
+        use agent_client_protocol::{schema::MaybeUndefined, v2::schema as acp_v2};
+
+        const CYCLES: usize = 3;
+        let (panel, mut cx) = setup_panel(cx).await;
+        let terminals = count_live::<terminal::Terminal>(&mut cx);
+        let connection = StubAgentConnection::new()
+            .with_supports_load_session(true)
+            .with_agent_id("loadable-stub".into())
+            .with_telemetry_id("loadable-stub".into());
+        open_thread_with_custom_connection(&panel, connection.clone(), &mut cx);
+        send_message(&panel, &mut cx);
+        let thread_id = active_thread_id(&panel, &cx);
+        let session_id = active_session_id(&panel, &cx);
+
+        let mut threads = Vec::new();
+        for cycle in 0..=CYCLES {
+            let thread = panel.read_with(&cx, |panel, cx| {
+                panel
+                    .active_agent_thread(cx)
+                    .unwrap_or_else(|| panic!("no active thread in cycle {cycle}"))
+            });
+            thread.update(&mut cx, |thread, cx| {
+                let terminal_id = acp_v2::TerminalId::new(format!("terminal-{cycle}"));
+                thread
+                    .upsert_wire_tool_call(
+                        acp_v2::ToolCallUpdate::new(format!("command-{cycle}"))
+                            .title("cargo build")
+                            .kind(acp_v2::ToolKind::Execute)
+                            .status(acp_v2::ToolCallStatus::Completed)
+                            .content(vec![acp_v2::ToolCallContent::Terminal(
+                                acp_v2::Terminal::new(terminal_id.clone()),
+                            )]),
+                        cx,
+                    )
+                    .unwrap();
+                thread
+                    .upsert_display_terminal(
+                        terminal_id,
+                        DisplayTerminalPatch {
+                            command: MaybeUndefined::Value("cargo build".into()),
+                            output: MaybeUndefined::Value(DisplayTerminalOutput {
+                                data: b"   Compiling crate v0.1.0\r\n".to_vec(),
+                                meta: None,
+                            }),
+                            exit_status: MaybeUndefined::Value(
+                                acp_v2::TerminalExitStatus::new().exit_code(0),
+                            ),
+                            ..Default::default()
+                        },
+                        cx,
+                    )
+                    .unwrap();
+            });
+            cx.run_until_parked();
+            threads.push(thread.downgrade());
+            drop(thread);
+
+            close_thread_tab_like_the_user(&panel, &thread_id, &mut cx);
+            cx.update(|_, cx| {
+                ThreadMetadataStore::global(cx)
+                    .update(cx, |store, cx| store.archive(thread_id, None, cx));
+            });
+            cx.run_until_parked();
+            if cycle == CYCLES {
+                break;
+            }
+            cx.update(|_, cx| {
+                ThreadMetadataStore::global(cx).update(cx, |store, cx| store.unarchive(thread_id, cx));
+            });
+            panel.update_in(&mut cx, |panel, window, cx| {
+                panel.open_restored_thread_with_server(
+                    Rc::new(
+                        crate::test_support::StubAgentServer::new(connection.clone())
+                            .with_connection_agent_id(),
+                    ),
+                    session_id.clone(),
+                    window,
+                    cx,
+                );
+            });
+            cx.run_until_parked();
+        }
+        panel.update(&mut cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+
+        for (cycle, thread) in threads.iter().enumerate() {
+            assert!(
+                thread.upgrade().is_none(),
+                "the thread from cycle {cycle} is still alive after it was closed and archived"
+            );
+        }
+        assert_eq!(terminals.get(), 0, "closed and archived threads keep terminals");
+    }
+
     #[gpui::test]
     async fn test_open_thread_tabs_are_never_evicted(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
