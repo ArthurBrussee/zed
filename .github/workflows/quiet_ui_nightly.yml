@@ -33,9 +33,10 @@ jobs:
 
   bundle-mac:
     needs: resolve
-    # Upstream needs the macOS 26 SDK (since its gpui_macos objc2 move, 10-22); the
-    # macos-15 image's default Xcode 16.4 only has the 15.5 SDK.
-    runs-on: macos-26
+    # Upstream needs the macOS 26 SDK (since its gpui_macos objc2 move, 10-22). The
+    # macos-15 image defaults to Xcode 16.4 but also ships Xcode 26, selected below;
+    # macos-26 has too few hosted runners: jobs there often go unacquired and get cancelled.
+    runs-on: macos-15
     timeout-minutes: 300
     permissions:
       # For the marker tag written at the end.
@@ -51,7 +52,8 @@ jobs:
       - name: Select the newest Xcode 26
         run: |
           xcode=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
-          if [ -n "$xcode" ]; then sudo xcode-select -s "$xcode"; fi
+          if [ -z "$xcode" ]; then echo "no Xcode 26 on this image" >&2; exit 1; fi
+          sudo xcode-select -s "$xcode"
           xcode-select -p
           xcrun --sdk macosx --show-sdk-version
 
