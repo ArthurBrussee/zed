@@ -31,8 +31,8 @@ use gpui::{
 use project::{Project, TaskSourceKind, WorktreeId};
 use remote::RemoteClient;
 use task::{TaskContext, TaskTemplate, TaskVariables, VariableName};
-use terminal::Terminal;
-use terminal_view::terminal_panel::TerminalPanel;
+use terminal::{TaskStatus, Terminal};
+use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
 use ui::{Icon, IconName, SharedString};
 use util::rel_path::RelPath;
 use workspace::{Toast, Workspace, notifications::NotificationId};
@@ -253,6 +253,72 @@ struct DevServer {
     )>,
     _output: Option<Subscription>,
     _exit: Option<Task<()>>,
+}
+
+/// quiet-ui: a task Zed started in a workspace, in its terminal panel or
+/// its centre, that is still running: a dev server, or any other task.
+pub struct RunningWorkspaceTask {
+    pub label: SharedString,
+    pub terminal: WeakEntity<Terminal>,
+    /// How long its process has run, where this machine can see it (on a box,
+    /// that is the local `ssh` carrying it, started with it).
+    pub running_for: Option<Duration>,
+    pub is_dev_server: bool,
+}
+
+/// `measure` reads each process's run time, which is for a list being
+/// opened, not for every frame.
+pub fn running_workspace_tasks(
+    workspace: &Entity<Workspace>,
+    measure: bool,
+    cx: &App,
+) -> Vec<RunningWorkspaceTask> {
+    let workspace = workspace.read(cx);
+    let mut views: Vec<Entity<TerminalView>> = workspace.items_of_type::<TerminalView>(cx).collect();
+    if let Some(panel) = workspace.panel::<TerminalPanel>(cx) {
+        for pane in panel.read(cx).panes() {
+            views.extend(
+                pane.read(cx)
+                    .items()
+                    .filter_map(|item| item.downcast::<TerminalView>()),
+            );
+        }
+    }
+    let dev_servers = DevServerStore::try_global(cx);
+    let mut seen = collections::HashSet::default();
+    let mut system = None;
+    views
+        .into_iter()
+        .filter_map(|view| {
+            let terminal = view.read(cx).terminal().clone();
+            if !seen.insert(terminal.entity_id()) {
+                return None;
+            }
+            let read = terminal.read(cx);
+            let task = read.task().filter(|task| task.status == TaskStatus::Running)?;
+            let running_for = read.pid().filter(|_| measure).and_then(|pid| {
+                let system = system.get_or_insert_with(sysinfo::System::new);
+                system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+                system
+                    .process(pid)
+                    .map(|process| Duration::from_secs(process.run_time()))
+            });
+            let is_dev_server = dev_servers.as_ref().is_some_and(|store| {
+                store.read(cx).servers.values().any(|server| {
+                    server
+                        .terminal
+                        .as_ref()
+                        .is_some_and(|server_terminal| server_terminal.entity_id() == terminal.entity_id())
+                })
+            });
+            Some(RunningWorkspaceTask {
+                label: task.spawned_task.label.clone().into(),
+                terminal: terminal.downgrade(),
+                running_for,
+                is_dev_server,
+            })
+        })
+        .collect()
 }
 
 #[derive(Default)]

@@ -538,6 +538,11 @@ fn start_server(
 ) -> AnyProtoClient {
     // This is the server idle timeout. If no connection comes in this timeout, the server will shut down.
     const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
+    // quiet-ui: a client pings every few seconds when it has nothing else to
+    // say, so a connection silent this long has nobody behind it (a proxy
+    // whose sshd never noticed the laptop go). Dropping it starts the idle
+    // timeout above; a server on 11-04 had sat 380 hours on such a one.
+    const SILENT_CLIENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
     let (incoming_tx, incoming_rx) = mpsc::unbounded::<Envelope>();
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded::<Envelope>();
@@ -612,9 +617,19 @@ fn start_server(
 
             let stdin_task = cx.background_spawn({
                 let incoming_tx = incoming_tx.clone();
+                let executor = cx.background_executor().clone();
                 async move {
                     loop {
-                        match read_message(&mut stdin_stream, &mut input_buffer).await {
+                        let message = select! {
+                            message = read_message(&mut stdin_stream, &mut input_buffer).fuse() => message,
+                            _ = executor.timer(SILENT_CLIENT_TIMEOUT).fuse() => {
+                                log::warn!(
+                                    "no message from the client for {SILENT_CLIENT_TIMEOUT:?}; dropping its connection"
+                                );
+                                break;
+                            }
+                        };
+                        match message {
                             Ok(msg) => {
                                 if let Err(error) = incoming_tx.unbounded_send(msg) {
                                     log::error!("failed to send message to application: {error:?}. exiting.");
@@ -1559,6 +1574,77 @@ mod tests {
                 .advance_clock(std::time::Duration::from_secs(120));
             cx.run_until_parked();
             assert!(quit.get(), "two hours with no client shuts it down");
+        }
+
+        /// 2026-11-04: a server sat 380 hours on a connection nothing was
+        /// behind, so its idle exit never started.
+        #[gpui::test]
+        async fn a_silent_connection_is_dropped_and_the_server_exits(cx: &mut TestAppContext) {
+            cx.executor().allow_parking();
+            let temp_dir = tempfile::tempdir().expect("create socket directory");
+            let stdin_path = temp_dir.path().join("stdin.sock");
+            let stdout_path = temp_dir.path().join("stdout.sock");
+            let stderr_path = temp_dir.path().join("stderr.sock");
+            let listeners =
+                ServerListeners::new(stdin_path.clone(), stdout_path.clone(), stderr_path.clone())
+                    .expect("bind server sockets");
+            let (_log_tx, log_rx) = async_channel::unbounded();
+
+            let quit = std::rc::Rc::new(std::cell::Cell::new(false));
+            let handler = cx.new(|_| ());
+            let server = cx.update(|cx| {
+                let quit = quit.clone();
+                cx.on_app_quit(move |_| {
+                    quit.set(true);
+                    async {}
+                })
+                .detach();
+                start_server(listeners, log_rx, cx, false)
+            });
+            server.add_request_handler::<proto::Ping, _, _, _>(
+                handler.downgrade(),
+                |_, _, _| async { Ok(proto::Ack {}) },
+            );
+            let (mut stdin, mut stdout, _stderr) = futures::future::try_join3(
+                UnixStream::connect(&stdin_path),
+                UnixStream::connect(&stdout_path),
+                UnixStream::connect(&stderr_path),
+            )
+            .await
+            .expect("connect to the server");
+            // Served once, so the server holds this connection, and then
+            // nothing more: a proxy whose far end is gone.
+            let mut buffer = Vec::new();
+            write_message(
+                &mut stdin,
+                &mut buffer,
+                proto::Ping {}.into_envelope(1, None, None),
+            )
+            .await
+            .expect("ping the server");
+            while read_message(&mut stdout, &mut buffer)
+                .await
+                .expect("the server answers")
+                .responding_to
+                != Some(1)
+            {}
+            cx.run_until_parked();
+
+            cx.executor()
+                .advance_clock(std::time::Duration::from_secs(2 * 60 * 60 + 60));
+            cx.run_until_parked();
+            assert!(
+                !quit.get(),
+                "a connection keeps the server until it has been silent ten minutes"
+            );
+
+            cx.executor()
+                .advance_clock(std::time::Duration::from_secs(2 * 60 * 60 + 10 * 60));
+            cx.run_until_parked();
+            assert!(
+                quit.get(),
+                "dropped after ten silent minutes, the server exits two hours later"
+            );
         }
 
         #[gpui::test]

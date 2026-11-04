@@ -558,6 +558,7 @@ dependencies = [
  "settings",
  "shlex 2.0.1",
  "streaming_diff",
+ "sysinfo 0.39.6",
  "task",
  "telemetry",
  "tempfile",

@@ -1617,6 +1617,8 @@ pub(super) enum RunningStop {
     AsyncTask(SharedString),
     /// A subagent's own session.
     Subagent(acp_v2::SessionId),
+    /// A task Zed started in this workspace (a dev server among them).
+    WorkspaceTask(WeakEntity<terminal::Terminal>),
 }
 
 fn elapsed_label(elapsed: std::time::Duration) -> String {
@@ -8554,8 +8556,7 @@ impl ThreadView {
         }
 
         for task in thread.async_tasks() {
-            // A service is no work; it gets its own pill.
-            if task.state.is_terminal() || task.is_service() {
+            if task.state.is_terminal() {
                 continue;
             }
             // Already listed beside the command that started it.
@@ -8567,11 +8568,15 @@ impl ThreadView {
                 continue;
             }
             let detail = task.summary.clone().or_else(|| task.description.clone());
+            let noun = match task.service_port {
+                Some(port) => format!("{} :{port}", task.kind.noun()),
+                None => task.kind.noun().to_string(),
+            };
             items.push(RunningItem {
                 label: task.name.clone(),
                 detail: Some(match detail {
-                    Some(detail) => format!("{} · {detail}", task.kind.noun()).into(),
-                    None => task.kind.noun().into(),
+                    Some(detail) => format!("{noun} · {detail}").into(),
+                    None => noun.into(),
                 }),
                 entry_ix: None,
                 stop: task
@@ -8603,6 +8608,41 @@ impl ThreadView {
             });
         }
 
+        if let Some(workspace) = self.workspace.upgrade() {
+            for task in crate::dev_servers::running_workspace_tasks(&workspace, true, cx) {
+                let kind = if task.is_dev_server {
+                    "dev server"
+                } else {
+                    "task"
+                };
+                items.push(RunningItem {
+                    label: task.label,
+                    detail: Some(match task.running_for {
+                        Some(running_for) => format!("{kind} · {}", elapsed_label(running_for)),
+                        None => kind.to_string(),
+                    }
+                    .into()),
+                    entry_ix: None,
+                    stop: Some(RunningStop::WorkspaceTask(task.terminal)),
+                });
+            }
+        }
+
+        // Which machine, where it is not this one.
+        if let Some(host) = self.project.upgrade().and_then(|project| {
+            project
+                .read(cx)
+                .remote_connection_options(cx)
+                .map(|options| options.display_name())
+        }) {
+            for item in &mut items {
+                item.detail = Some(match item.detail.take() {
+                    Some(detail) => format!("{detail} · on {host}").into(),
+                    None => format!("on {host}").into(),
+                });
+            }
+        }
+
         items
     }
 
@@ -8615,6 +8655,11 @@ impl ThreadView {
             RunningStop::Subagent(session_id) => {
                 let connection = self.thread.read(cx).connection().clone();
                 connection.cancel(session_id, cx).log_err();
+            }
+            RunningStop::WorkspaceTask(terminal) => {
+                if let Some(terminal) = terminal.upgrade() {
+                    terminal.update(cx, |terminal, _| terminal.kill_active_task());
+                }
             }
         }
     }
@@ -8636,13 +8681,45 @@ impl ThreadView {
         let work = crate::running_work_counts(running_work);
         let working = thread.status() != ThreadStatus::Idle;
         let services = thread.service_ports();
+        // Tasks Zed started in this workspace are listed with the agent's
+        // work, though nothing the agent waits on.
+        let workspace_tasks = self
+            .workspace
+            .upgrade()
+            .map(|workspace| crate::dev_servers::running_workspace_tasks(&workspace, false, cx).len())
+            .unwrap_or_default();
+        let listable = !work.is_empty() || !services.is_empty() || workspace_tasks > 0;
         let service_pills = self.render_service_pills(services);
-        if !working && work.is_empty() {
+        if !working && !listable {
             return service_pills;
         }
-        let pill = ui::agent_activity_pill("input-activity", work, working, self.agent_icon, cx);
-        let pill = h_flex().gap_1().child(pill).children(service_pills);
-        if work.is_empty() {
+        let pill = (working || !work.is_empty())
+            .then(|| ui::agent_activity_pill("input-activity", work, working, self.agent_icon, cx));
+        let tasks_badge = (workspace_tasks > 0).then(|| {
+            h_flex()
+                .id("input-workspace-tasks")
+                .h_4()
+                .px_1p5()
+                .gap_0p5()
+                .rounded_full()
+                .bg(cx.theme().colors().element_background)
+                .child(
+                    Icon::new(IconName::PlayOutlined)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Label::new(workspace_tasks.to_string())
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+        });
+        let pill = h_flex()
+            .gap_1()
+            .children(pill)
+            .children(tasks_badge)
+            .children(service_pills);
+        if !listable {
             return Some(pill.into_any_element());
         }
         let weak_self = cx.weak_entity();
