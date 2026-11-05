@@ -386,6 +386,22 @@ multibuffer already supports, not a new block kind. If a visible section header 
 without editor changes, ship the ordering and say so in the report rather than touching the
 editor. `tests.rs` counts as tests.
 
+**C. The agent switch in a new thread as buttons; the agent's options back to upstream**
+(2026-11-05). The 11-04 run built the wrong thing (`5f6df20ba`, "lay out the agent's options as
+buttons", +1,127 / -492 in `config_options.rs`): Arthur asked for the choice *between agents* to
+be obvious, not the agent's own options. "I just meant in a new thread make the switch between
+ACPs something without a dropdown. Not the other ACP options." So two parts:
+- Revert `5f6df20ba`: `config_options.rs` goes back to upstream's selectors as they are, no
+  button rows. Mode, effort and model stay upstream's menus.
+- In a thread nobody has sent to yet, `render_unstarted_agent_picker` in
+  `conversation_view.rs` (a `PopoverMenu` behind one muted button) becomes a row of the
+  installed agents, each a button with its logo and name, the current one selected, one click
+  to switch through the existing `rebind_draft_agent`. Why: he picks Codex by accident and
+  forgets to check, so the agent must be readable at a glance before the first send. Once the
+  thread has started the row goes away, as the picker does now.
+Done when `config_options.rs` matches upstream and the new-thread row is the only agent switch
+in an unstarted thread.
+
 **1. Memory still grows all day; find what keeps closed threads alive** (2026-11-04, narrowed
 2026-11-04 night). Arthur: "keep hunting for these, it's very painful". 2,732 MiB at 10:12 to
 3,762 at 14:37 on 11-04, and 4,887 MiB at 23:42 on 11-03 with `live Markdown 28137, Terminal 6638,
