@@ -274,7 +274,8 @@ pub fn running_workspace_tasks(
     cx: &App,
 ) -> Vec<RunningWorkspaceTask> {
     let workspace = workspace.read(cx);
-    let mut views: Vec<Entity<TerminalView>> = workspace.items_of_type::<TerminalView>(cx).collect();
+    let mut views: Vec<Entity<TerminalView>> =
+        workspace.items_of_type::<TerminalView>(cx).collect();
     if let Some(panel) = workspace.panel::<TerminalPanel>(cx) {
         for pane in panel.read(cx).panes() {
             views.extend(
@@ -295,7 +296,9 @@ pub fn running_workspace_tasks(
                 return None;
             }
             let read = terminal.read(cx);
-            let task = read.task().filter(|task| task.status == TaskStatus::Running)?;
+            let task = read
+                .task()
+                .filter(|task| task.status == TaskStatus::Running)?;
             let running_for = read.pid().filter(|_| measure).and_then(|pid| {
                 let system = system.get_or_insert_with(sysinfo::System::new);
                 system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
@@ -305,10 +308,9 @@ pub fn running_workspace_tasks(
             });
             let is_dev_server = dev_servers.as_ref().is_some_and(|store| {
                 store.read(cx).servers.values().any(|server| {
-                    server
-                        .terminal
-                        .as_ref()
-                        .is_some_and(|server_terminal| server_terminal.entity_id() == terminal.entity_id())
+                    server.terminal.as_ref().is_some_and(|server_terminal| {
+                        server_terminal.entity_id() == terminal.entity_id()
+                    })
                 })
             });
             Some(RunningWorkspaceTask {

@@ -14076,7 +14076,8 @@ mod tests {
                 break;
             }
             cx.update(|_, cx| {
-                ThreadMetadataStore::global(cx).update(cx, |store, cx| store.unarchive(thread_id, cx));
+                ThreadMetadataStore::global(cx)
+                    .update(cx, |store, cx| store.unarchive(thread_id, cx));
             });
             panel.update_in(&mut cx, |panel, window, cx| {
                 panel.open_restored_thread_with_server(
@@ -14100,7 +14101,11 @@ mod tests {
                 "the thread from cycle {cycle} is still alive after it was closed and archived"
             );
         }
-        assert_eq!(terminals.get(), 0, "closed and archived threads keep terminals");
+        assert_eq!(
+            terminals.get(),
+            0,
+            "closed and archived threads keep terminals"
+        );
     }
 
     #[gpui::test]

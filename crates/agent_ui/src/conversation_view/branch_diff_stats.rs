@@ -187,9 +187,7 @@ impl BranchDiffStats {
             this.resolve_repository(&project, cx)
         })?;
         this.update(cx, |this, cx| {
-            this.repository_id = repository
-                .as_ref()
-                .map(|repository| repository.read(cx).id);
+            this.repository_id = repository.as_ref().map(|repository| repository.read(cx).id);
         })?;
         let Some(repository) = repository else {
             return Ok((DiffStatsBase::NoRepository, DiffStat::default()));

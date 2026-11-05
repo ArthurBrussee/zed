@@ -1233,7 +1233,11 @@ mod tests {
             })
             .await
             .unwrap();
-        fs.set_head_for_repo(Path::new(path!("/project/.git")), &[("a.txt", "B\n".into())], "sha");
+        fs.set_head_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("a.txt", "B\n".into())],
+            "sha",
+        );
         fs.set_merge_base_content_for_repo(
             Path::new(path!("/project/.git")),
             &[("a.txt", "A\n".into())],
@@ -1241,7 +1245,9 @@ mod tests {
         cx.run_until_parked();
 
         let repository_id = diff.read_with(cx, |diff, cx| diff.repo(cx).unwrap().read(cx).id);
-        let shown = diff.read_with(cx, |diff, cx| diff.diff.read(cx).calculate_changed_lines(cx));
+        let shown = diff.read_with(cx, |diff, cx| {
+            diff.diff.read(cx).calculate_changed_lines(cx)
+        });
         assert_eq!(shown, (2, 1), "-A +C, and the untracked file's line");
         assert_eq!(
             diff.read_with(cx, |diff, cx| diff.changed_lines_for(repository_id, cx)),

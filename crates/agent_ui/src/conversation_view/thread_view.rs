@@ -2174,7 +2174,6 @@ impl ThreadView {
             }
         }));
 
-
         // Submissions that were already in flight when this view was built have had
         // time to settle, so they are shown without a reveal delay.
         let revealed_unsettled_submissions = thread
@@ -8829,11 +8828,13 @@ impl ThreadView {
                 };
                 items.push(RunningItem {
                     label: task.label,
-                    detail: Some(match task.running_for {
-                        Some(running_for) => format!("{kind} · {}", elapsed_label(running_for)),
-                        None => kind.to_string(),
-                    }
-                    .into()),
+                    detail: Some(
+                        match task.running_for {
+                            Some(running_for) => format!("{kind} · {}", elapsed_label(running_for)),
+                            None => kind.to_string(),
+                        }
+                        .into(),
+                    ),
                     entry_ix: None,
                     stop: Some(RunningStop::WorkspaceTask(task.terminal)),
                 });
@@ -8898,7 +8899,9 @@ impl ThreadView {
         let workspace_tasks = self
             .workspace
             .upgrade()
-            .map(|workspace| crate::dev_servers::running_workspace_tasks(&workspace, false, cx).len())
+            .map(|workspace| {
+                crate::dev_servers::running_workspace_tasks(&workspace, false, cx).len()
+            })
             .unwrap_or_default();
         let listable = !work.is_empty() || !services.is_empty() || workspace_tasks > 0;
         let service_pills = self.render_service_pills(services);
@@ -17455,9 +17458,7 @@ pub(crate) fn open_link(
                     if path_style.is_absolute(candidate) {
                         Some(candidate.clone())
                     } else {
-                        roots
-                            .first()
-                            .map(|root| path_style.join(root, candidate))
+                        roots.first().map(|root| path_style.join(root, candidate))
                     }
                 })
                 && let Ok(url) = url::Url::from_file_path(&abs_path)

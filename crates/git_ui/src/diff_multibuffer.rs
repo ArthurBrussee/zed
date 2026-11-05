@@ -1,5 +1,6 @@
 use crate::{
     conflict_view,
+    diff_sections::{DiffSection, DiffSectionAddon, DiffSections},
     git_panel::{GitPanel, GitStatusEntry},
     git_panel_settings::GitPanelSettings,
 };
@@ -58,6 +59,7 @@ pub struct DiffMultibuffer {
     focus_handle: FocusHandle,
     pending_scroll: Option<PathKey>,
     review_comment_count: usize,
+    sections: DiffSections,
     empty_label: SharedString,
     _task: Task<Result<()>>,
     _subscription: Subscription,
@@ -75,6 +77,7 @@ impl DiffMultibuffer {
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
+        let this = cx.weak_entity();
         let multibuffer = cx.new(|cx| {
             let mut multibuffer = MultiBuffer::new(multibuffer_capability);
             multibuffer.set_all_diff_hunks_expanded(cx);
@@ -90,6 +93,7 @@ impl DiffMultibuffer {
                 cx,
             );
             configure_editor(&mut diff_display_editor, cx);
+            DiffSectionAddon::install(&mut diff_display_editor, this, cx);
             diff_display_editor.rhs_editor().update(cx, |editor, cx| {
                 editor.set_show_diff_review_button(true, cx);
             });
@@ -170,6 +174,7 @@ impl DiffMultibuffer {
             buffer_subscriptions: Default::default(),
             pending_scroll: None,
             review_comment_count: 0,
+            sections: DiffSections::new(),
             empty_label: empty_label.into(),
             _task: task,
             _subscription: Subscription::join(
@@ -448,6 +453,7 @@ impl DiffMultibuffer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<BufferId> {
+        let section_is_folded = self.sections.is_folded(DiffSection::of_path(&repo_path));
         let diff_subscription = cx.subscribe_in(&diff, window, {
             let repo_path = repo_path.clone();
             let path_key = path_key.clone();
@@ -566,6 +572,7 @@ impl DiffMultibuffer {
                 }
                 if is_excerpt_newly_added
                     && (file_status.is_deleted()
+                        || section_is_folded
                         || (file_status.is_untracked()
                             && GitPanelSettings::get_global(cx).collapse_untracked_diff))
                 {
@@ -590,6 +597,7 @@ impl DiffMultibuffer {
         if self.pending_scroll.as_ref() == Some(&path_key) {
             self.move_to_path(path_key, window, cx);
         }
+        self.sync_sections(cx);
 
         needs_fold.then_some(buffer_id)
     }
@@ -678,6 +686,7 @@ impl DiffMultibuffer {
 
             this.buffer_subscriptions
                 .retain(|repo_path, _| live_repo_paths.contains(repo_path));
+            this.sync_sections(cx);
 
             entries
         })?;
@@ -970,6 +979,62 @@ impl Render for DiffMultibuffer {
     }
 }
 
+impl DiffMultibuffer {
+    pub(crate) fn sections(&self) -> &DiffSections {
+        &self.sections
+    }
+
+    /// Where each section starts, from the files in the order the diff shows
+    /// them; their path keys carry the section in their sort prefix.
+    fn sync_sections(&mut self, cx: &mut Context<Self>) {
+        let snapshot = self.multibuffer.read(cx).snapshot(cx);
+        let mut files: Vec<(DiffSection, BufferId)> = Vec::new();
+        for excerpt in snapshot.excerpts() {
+            let buffer_id = excerpt.context.start.buffer_id;
+            if files.last().is_some_and(|(_, last)| *last == buffer_id) {
+                continue;
+            }
+            let Some(path_key) = snapshot.path_for_buffer(buffer_id) else {
+                continue;
+            };
+            let section = DiffSection::of_sort_prefix(path_key.sort_prefix.unwrap_or_default());
+            files.push((section, buffer_id));
+        }
+        let changed = self.sections.update(files);
+        if changed {
+            self.editor.update(cx, |editor, cx| {
+                editor.rhs_editor().update(cx, |_, cx| cx.notify());
+            });
+        }
+    }
+
+    pub(crate) fn toggle_section(&mut self, section: DiffSection, cx: &mut Context<Self>) {
+        let folded = self.sections.toggle(section);
+        let buffers: Vec<BufferId> = self
+            .multibuffer
+            .read(cx)
+            .snapshot(cx)
+            .buffers_with_paths()
+            .filter(|(_, path_key)| {
+                DiffSection::of_sort_prefix(path_key.sort_prefix.unwrap_or_default()) == section
+            })
+            .map(|(buffer, _)| buffer.remote_id())
+            .collect();
+        self.editor.update(cx, |editor, cx| {
+            editor.rhs_editor().update(cx, |editor, cx| {
+                if folded {
+                    editor.fold_buffers(buffers, cx);
+                } else {
+                    for buffer_id in buffers {
+                        editor.unfold_buffer(buffer_id, cx);
+                    }
+                }
+            });
+        });
+        cx.notify();
+    }
+}
+
 const CONFLICT_SORT_PREFIX: u64 = 1;
 const TRACKED_SORT_PREFIX: u64 = 2;
 const NEW_SORT_PREFIX: u64 = 3;
@@ -1004,6 +1069,7 @@ pub(crate) fn project_diff_path_key(
         TRACKED_SORT_PREFIX
     };
     let path = project_diff_sort_path(repo_path, settings.tree_view, settings.sort_by);
+    let sort_prefix = DiffSection::of_path(repo_path).sort_prefix(sort_prefix);
     PathKey::with_sort_prefix(sort_prefix, path)
 }
 

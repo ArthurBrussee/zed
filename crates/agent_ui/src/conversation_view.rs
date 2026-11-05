@@ -4860,10 +4860,15 @@ impl ConversationView {
                 let workspace = workspace.clone();
                 let button = Button::new(SharedString::from(selector.clone()), name)
                     .label_size(LabelSize::Small)
-                    .color(if selected { Color::Default } else { Color::Muted })
-                    .start_icon(icon.size(IconSize::XSmall).color(
-                        brand_color.map(Color::Custom).unwrap_or(Color::Muted),
-                    ))
+                    .color(if selected {
+                        Color::Default
+                    } else {
+                        Color::Muted
+                    })
+                    .start_icon(
+                        icon.size(IconSize::XSmall)
+                            .color(brand_color.map(Color::Custom).unwrap_or(Color::Muted)),
+                    )
                     .toggle_state(selected)
                     .selected_style(ButtonStyle::Tinted(TintColor::Accent))
                     .on_click(move |_, window: &mut Window, cx: &mut App| {
