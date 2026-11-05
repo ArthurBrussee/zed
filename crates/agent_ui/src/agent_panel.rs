@@ -10222,6 +10222,40 @@ mod tests {
         });
     }
 
+    /// An unstarted thread shows its agents as buttons, and clicking another
+    /// one rebinds the thread to it.
+    #[gpui::test]
+    async fn test_an_unstarted_thread_switches_agent_with_one_click(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        let cx = &mut cx;
+
+        let _stub_connection =
+            crate::test_support::set_stub_agent_connection(StubAgentConnection::new());
+        panel.update_in(cx, |panel, window, cx| {
+            panel.selected_agent = Agent::Stub;
+            panel.activate_draft(true, AgentThreadSource::AgentPanel, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_resize(gpui::size(gpui::px(1600.), gpui::px(1200.)));
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("unstarted-agent-stub").is_some(),
+            "the current agent is one of the buttons"
+        );
+        assert_eq!(Agent::NativeAgent.id().0, "Zed Agent");
+        let zed_agent = cx
+            .debug_bounds("unstarted-agent-Zed Agent")
+            .expect("every agent is a button, not a menu entry");
+        cx.simulate_click(zed_agent.center(), Modifiers::default());
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, cx| {
+            let draft = panel.draft_thread.as_ref().expect("the draft survives");
+            assert_eq!(*draft.read(cx).agent_key(), Agent::NativeAgent);
+        });
+    }
+
     #[gpui::test]
     async fn test_draft_survives_reload_without_a_session(cx: &mut TestAppContext) {
         init_test(cx);

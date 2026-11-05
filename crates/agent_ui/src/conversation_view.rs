@@ -4826,83 +4826,65 @@ impl ConversationView {
             .into_any_element()
     }
 
+    /// The agents an unstarted thread can start, side by side, so which one the
+    /// first send starts reads at a glance and another is one click away.
     fn render_unstarted_agent_picker(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let agent_label = self.connection_key.label();
-        let agent_logo = self.connection_key.logo();
-        let brand_color = crate::agent_brand_color(&self.connection_key.id());
         let current_agent = self.connection_key.clone();
+        let mut agents = vec![(Agent::NativeAgent, SharedString::from("Zed Agent"), None)];
+        agents.extend(
+            crate::external_agent_menu_entries(&self.project, cx)
+                .into_iter()
+                .map(|entry| (entry.agent, entry.display_name, entry.icon_path)),
+        );
+        if !agents.iter().any(|(agent, _, _)| *agent == current_agent) {
+            agents.insert(0, (current_agent.clone(), current_agent.label(), None));
+        }
         let weak_self = cx.weak_entity();
         let workspace = self.workspace.clone();
-        let project = self.project.clone();
 
-        PopoverMenu::new("unstarted-agent-picker")
-            .trigger(
-                Button::new("unstarted-agent", agent_label)
-                    .label_size(LabelSize::Small)
-                    .color(Color::Muted)
-                    .start_icon(
-                        Icon::new(agent_logo)
-                            .size(IconSize::XSmall)
-                            .color(brand_color.map(Color::Custom).unwrap_or(Color::Muted)),
-                    )
-                    .tooltip(Tooltip::text("Which agent the first send starts")),
-            )
-            .anchor(gpui::Anchor::BottomLeft)
-            .menu(move |window, cx| {
+        h_flex()
+            .flex_wrap()
+            .gap_0p5()
+            .children(agents.into_iter().map(|(agent, name, icon_path)| {
+                let selected = agent == current_agent;
+                let logo = agent.logo();
+                let icon = match icon_path {
+                    Some(icon_path) if logo == IconName::Terminal => {
+                        Icon::from_external_svg(icon_path)
+                    }
+                    _ => Icon::new(logo),
+                };
+                let brand_color = crate::agent_brand_color(&agent.id());
+                let selector = format!("unstarted-agent-{}", agent.id().0);
                 let weak_self = weak_self.clone();
                 let workspace = workspace.clone();
-                let current_agent = current_agent.clone();
-                let mut agent_entries = vec![(
-                    ContextMenuEntry::new("Zed Agent").icon(IconName::ZedAgent),
-                    Agent::NativeAgent,
-                )];
-                for item in crate::external_agent_menu_entries(&project, cx) {
-                    let mut entry = ContextMenuEntry::new(item.display_name.clone());
-                    if let Some(icon_path) = item.icon_path {
-                        entry = entry.custom_icon_svg(icon_path);
-                    } else {
-                        entry = entry.icon(IconName::Sparkle);
-                    }
-                    agent_entries.push((entry, item.agent));
-                }
-                Some(ContextMenu::build(
-                    window,
-                    cx,
-                    move |mut menu, _window, _cx| {
-                        for (entry, agent) in agent_entries {
-                            let is_selected = current_agent == agent;
-                            let entry = entry
-                                .toggleable(IconPosition::End, is_selected)
-                                .icon_color(Color::Muted);
-                            menu = menu.item(entry.handler({
-                                let weak_self = weak_self.clone();
-                                let workspace = workspace.clone();
-                                let agent = agent.clone();
-                                move |window, cx| {
-                                    let Some(conversation_view) = weak_self.upgrade() else {
-                                        return;
-                                    };
-                                    let Some(panel) = workspace
-                                        .upgrade()
-                                        .and_then(|ws| ws.read(cx).panel::<crate::AgentPanel>(cx))
-                                    else {
-                                        return;
-                                    };
-                                    panel.update(cx, |panel, cx| {
-                                        panel.rebind_draft_agent(
-                                            &conversation_view,
-                                            agent.clone(),
-                                            window,
-                                            cx,
-                                        );
-                                    });
-                                }
-                            }));
+                let button = Button::new(SharedString::from(selector.clone()), name)
+                    .label_size(LabelSize::Small)
+                    .color(if selected { Color::Default } else { Color::Muted })
+                    .start_icon(icon.size(IconSize::XSmall).color(
+                        brand_color.map(Color::Custom).unwrap_or(Color::Muted),
+                    ))
+                    .toggle_state(selected)
+                    .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+                    .on_click(move |_, window: &mut Window, cx: &mut App| {
+                        if selected {
+                            return;
                         }
-                        menu
-                    },
-                ))
-            })
+                        let Some(conversation_view) = weak_self.upgrade() else {
+                            return;
+                        };
+                        let Some(panel) = workspace
+                            .upgrade()
+                            .and_then(|ws| ws.read(cx).panel::<crate::AgentPanel>(cx))
+                        else {
+                            return;
+                        };
+                        panel.update(cx, |panel, cx| {
+                            panel.rebind_draft_agent(&conversation_view, agent.clone(), window, cx);
+                        });
+                    });
+                div().debug_selector(move || selector).child(button)
+            }))
             .into_any_element()
     }
 
