@@ -18177,7 +18177,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// The pill counts what the popover lists: a service is in neither.
+    /// The pill counts the work the popover lists; a service is listed, so
+    /// it can be stopped, but is no work and is not counted.
     #[gpui::test]
     async fn test_the_popover_and_the_count_agree(cx: &mut TestAppContext) {
         init_test(cx);
@@ -18217,10 +18218,18 @@ pub(crate) mod tests {
                 view.thread.read(cx).running_work(cx),
             )
         });
-        assert_eq!(items, vec!["tests".to_string(), "review".to_string()]);
+        assert_eq!(
+            items,
+            vec!["tests".to_string(), "review".to_string(), "dev".to_string()]
+        );
         assert_eq!(
             items.len(),
-            work.terminals + work.subagents + work.async_tasks + work.workflows + work.other_tasks
+            work.terminals
+                + work.subagents
+                + work.async_tasks
+                + work.workflows
+                + work.other_tasks
+                + work.services
         );
         assert_eq!(work.services, 1);
     }

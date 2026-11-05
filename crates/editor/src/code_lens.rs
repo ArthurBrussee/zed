@@ -1888,7 +1888,8 @@ mod tests {
             .unwrap()
             .drain(..)
             .collect::<HashSet<_>>();
-        assert_eq!(after_remote_scroll_resolved, HashSet::from_iter([50, 60]));
+        // Row 60 was already resolved by the scroll to the end above.
+        assert_eq!(after_remote_scroll_resolved, HashSet::from_iter([50]));
     }
 
     #[gpui::test]

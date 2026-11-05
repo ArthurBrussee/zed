@@ -73,7 +73,7 @@ fn live_threads(threads: &RefCell<Vec<WeakEntity<AcpThread>>>, cx: &App) -> Stri
             (thread.entries().len(), title)
         })
         .collect();
-    sizes.sort_by(|a, b| b.0.cmp(&a.0));
+    sizes.sort_by_key(|(entries, _)| std::cmp::Reverse(*entries));
     let heaviest = sizes
         .iter()
         .take(HEAVIEST_THREADS)
