@@ -53,8 +53,11 @@ this, it outranks every other section:
 
 ## Upstream first (from 2026-10-01)
 
-The fork stands at +57.1k / -10.4k lines across 154 files against upstream (the exact figures
-after the 2026-11-04 run were +57,148 / -10,436 across 154 files, down from +58,301 / -11,858
+The fork stands at +57.2k / -9.7k lines across 155 files against upstream (the exact figures
+after the 2026-11-05 run were +57,211 / -9,686 across 155 files, up 63 added and down 750 deleted
+from 11-04 for three queue entries: the audit gave upstream's own UI back to the thread view and
+the sidebar, and the diff sections and the agent row came in; after the 2026-11-04 run they were
++57,148 / -10,436 across 154 files, down from +58,301 / -11,858
 across 164 for eight queue entries: the diff groups, the combined config popover and the combined
 model menu went to upstream's, and five fixes came in; after the 2026-11-03 run they were
 +58,301 / -11,858 across 164 files, the same additions as 11-02 and
@@ -223,9 +226,14 @@ click opens it (`open:` a path on the detected URL or a full URL of any scheme, 
 detected port, forwarded first on a dev box) and a stop control sits at its end. `icon:` is an
 icon name or an image file. The sidebar row shows a pill per running server, glyph and port.
 
-**The project diff is upstream's** (2026-11-04). The fork's Code / Tests / Generated groups went,
-and with them every fork change to the editor's block map, display map, element and split view;
-the project and branch diffs are upstream's as they stand. A thread's diff chip
+**The project diff is upstream's, in sections** (2026-11-05). The project and branch diffs are
+upstream's views; the fork only orders their files into Code, Tests and Generated sections and
+names each section in its first file's header (`git_ui/src/diff_sections.rs`, hooked into
+`diff_multibuffer.rs`): the section is the outer part of upstream's sort prefix, the name is drawn
+through upstream's `render_buffer_header_controls` hook (taking over the git panel's controls,
+since the editor draws one addon's), and a click folds the section with the editor's own buffer
+folding; generated files start folded. No fork change touches the editor's block map, display map,
+element or split view (the 10-21 crash). A thread's diff chip
 (`conversation_view/branch_diff_stats.rs`) shows the branch diff view's own totals while one for
 the same repository is open (`BranchDiff::changed_lines_for`), and its own `git diff` count
 otherwise.
@@ -361,47 +369,6 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
-**A. Finish the fork audit of the thread view and the sidebar** (2026-11-05). The 11-04 entry
-asked for every hunk of the fork's changes to upstream-owned files to be justified or reverted,
-starting with the diff view, the thread view and the sidebar. The run did the diff view and the
-model controls and reported "the thread view and the sidebar were not audited hunk by hunk beyond
-the effort controls; that is where the rest of the fork is". That is a deferral, which this
-routine does not do. Arthur: "why does this just ignore my instructions?" Tonight it is the
-first item and it is done when the rebase log lists, for `thread_view.rs` (+5,833 / -1,127) and
-`sidebar.rs`, each fork change by area with the request it serves (quote the queue entry or rebase
-log line), and every change without one is gone. Where a requested feature stays, carry it on
-upstream's code with the smallest extension. Report the before and after size of both files.
-
-**B. Bring back the Code / Tests / Generated sections in the git diff, without the editor
-changes** (2026-11-05). The 11-04 run removed them (`dc63727`, "give the project diff back to
-upstream, without groups"), reading "prefer upstream's similar version" as covering it. It does
-not: grouping diffs into code, tests and generated files was an explicit request (Arthur: "the
-code and tests should be SECTIONS in the git diff, not some header at the top"), and upstream's
-ordering by status does not do that job. The run was right that carrying the sections through the
-editor's block map, display map, element and split view was the wrong way (the 10-21 crash), so
-do not bring those back. Build them on upstream's project diff from outside the editor crate:
-upstream already orders files with `PathKey::with_sort_prefix` (`multi_buffer/src/path_key.rs`),
-so give each file a prefix by section, and mark where a section starts with something upstream's
-multibuffer already supports, not a new block kind. If a visible section header is impossible
-without editor changes, ship the ordering and say so in the report rather than touching the
-editor. `tests.rs` counts as tests.
-
-**C. The agent switch in a new thread as buttons; the agent's options back to upstream**
-(2026-11-05). The 11-04 run built the wrong thing (`5f6df20ba`, "lay out the agent's options as
-buttons", +1,127 / -492 in `config_options.rs`): Arthur asked for the choice *between agents* to
-be obvious, not the agent's own options. "I just meant in a new thread make the switch between
-ACPs something without a dropdown. Not the other ACP options." So two parts:
-- Revert `5f6df20ba`: `config_options.rs` goes back to upstream's selectors as they are, no
-  button rows. Mode, effort and model stay upstream's menus.
-- In a thread nobody has sent to yet, `render_unstarted_agent_picker` in
-  `conversation_view.rs` (a `PopoverMenu` behind one muted button) becomes a row of the
-  installed agents, each a button with its logo and name, the current one selected, one click
-  to switch through the existing `rebind_draft_agent`. Why: he picks Codex by accident and
-  forgets to check, so the agent must be readable at a glance before the first send. Once the
-  thread has started the row goes away, as the picker does now.
-Done when `config_options.rs` matches upstream and the new-thread row is the only agent switch
-in an unstarted thread.
-
 **1. Memory still grows all day; find what keeps closed threads alive** (2026-11-04, narrowed
 2026-11-04 night). Arthur: "keep hunting for these, it's very painful". 2,732 MiB at 10:12 to
 3,762 at 14:37 on 11-04, and 4,887 MiB at 23:42 on 11-03 with `live Markdown 28137, Terminal 6638,
@@ -413,7 +380,9 @@ sessions' threads weakly. Not found: the holder. The `quiet-ui memory:` line now
 day's log names it: workspaces far above the open ones points at the sidebar loading closed
 workspaces (to archive a thread, say) and never dropping them; threads far above 27 with
 archived titles among the heaviest points at whatever restores them. Paste a few of those lines
-here and the next run can go straight to it.
+here and the next run can go straight to it. 11-05 ruled out the sidebar's archive of a thread
+whose workspace is closed: the workspace it opens for that is released afterwards
+(`test_a_workspace_opened_to_archive_a_thread_is_released`). Still waiting on those lines.
 
 ## Verification queue
 
@@ -533,16 +502,14 @@ churn and goes back. Fork-only files are listed last.
 - `crates/agent_ui/src/agent_connection_store.rs` (+124/-6): reliability: launch deadline so a stuck agent launch gives up; launch logs.
 - `crates/agent_ui/src/agent_diff.rs` (+2/-0): matches new `AcpThreadEvent` variants (compile follow-on).
 - `crates/agent_ui/src/agent_panel.rs` (+3155/-1087): threads as tabs: hosts the thread pane, worktree-thread creation, review layout, no drafts.
-- `crates/agent_ui/src/agent_ui.rs` (+110/-4): registers fork modules/actions (bookmarks, review layout, `diff_review::init`); agent logos/tints; `.html` opens in browser.
+- `crates/agent_ui/src/agent_ui.rs`: registers fork modules/actions (bookmarks, review layout, `diff_review::init`); agent logos/tints. (`.html` links opening in the browser went 2026-11-05: never requested.)
 - `crates/agent_ui/src/completion_provider.rs` (+1/-0): follows `Arc<ThreadMetadata>` store change (compile follow-on).
-- `crates/agent_ui/src/config_options.rs` (+140/-0): upstream's selectors, with a short ungrouped select laid out as buttons and the agent's icon leading the row (2026-11-04; the combined popover went to upstream's view).
-- `crates/agent_ui/src/conversation_view.rs` (+2470/-489): thread view: unstarted-thread composer, PR/CI chips, relay reconnect state, tab plumbing; `agent_controls` split out of `new_thread_view` so controls that arrive late are built then (10-22).
+- `crates/agent_ui/src/conversation_view.rs` (+2470/-489): thread view: unstarted-thread composer, whose agents are a row of buttons (`render_unstarted_agent_picker`, 2026-11-05), PR/CI chips, relay reconnect state, tab plumbing; `agent_controls` split out of `new_thread_view` so controls that arrive late are built then (10-22).
 - `crates/agent_ui/src/conversation_view/thread_search_bar.rs` (+1/-1): recorded "conversation" wording request.
-- `crates/agent_ui/src/conversation_view/thread_view.rs` (+10521/-6206): thread view: chips, quiet cards, diff hovers, PR chips, bookmarks, bottom bar, image chips; the pending review comments chip, and `send` taking them in front of the message (`review_on_send`, read in `resolve_message_contents`, 10-22 evening); the running list's workspace tasks, services and host (2026-11-04). Upstream's fast-mode and thinking controls are upstream's again (2026-11-04).
+- `crates/agent_ui/src/conversation_view/thread_view.rs` (+5,400/-591 after the 2026-11-05 audit, whose rebase log entry lists each area and its request): chips and their runs, quiet cards, the terminal chip header, diff hovers, PR chips, bookmarks, image chips, the live thought above the input, the off-screen release, the perf lines; the composer row is upstream's with the fork's chips (`render_thread_chips`: diff stats, PRs, dev servers, retry warning, running pill) and the review chip in it.
 - `crates/agent_ui/src/draft_prompt_store.rs` (+4/-17): no-drafts model: an unsent thread's row reads neutral "New thread".
 - `crates/agent_ui/src/entry_view_state.rs`: reliability: off-screen thread drops/rebuilds view tree; on upstream's lazy materialization (#65444, 10-21), a command already finished when first synced gets no terminal view until opened.
 - `crates/agent_ui/src/mention_set.rs` (+11/-2): image hover card gets a fixed box so tall images don't overflow.
-- `crates/agent_ui/src/message_editor.rs` (+13/-1): thread view: transparent editor background for tinted message bubbles.
 - `crates/agent_ui/src/terminal_thread_metadata_store.rs` (+12/-8): sidebar perf: rows held as `Arc`s, shared across rebuilds.
 - `crates/agent_ui/src/test_support.rs` (+63/-5): test helpers for unstarted threads, spare worktrees, dev servers.
 - `crates/agent_ui/src/thread_metadata_store.rs` (+507/-33): sidebar: `Arc` rows; PR snapshots/watched PRs and bookmarks persisted per thread.
@@ -575,6 +542,7 @@ churn and goes back. Fork-only files are listed last.
 #### git_ui
 
 - `crates/git_ui/src/branch_diff.rs` (+60/-0): `BranchDiff::changed_lines_for`, the view's own totals for a thread's diff chip, and its test (2026-11-04).
+- `crates/git_ui/src/diff_multibuffer.rs` (+66): Code / Tests / Generated sections: the section in the sort prefix (`project_diff_path_key`), `sync_sections`, `toggle_section`, and installing `DiffSectionAddon` (2026-11-05). The logic is the fork's own `git_ui/src/diff_sections.rs`.
 
 #### git_ui_core (worktree threads)
 
@@ -631,7 +599,7 @@ property-test teardown went back to upstream.
 #### sidebar
 
 - `crates/sidebar/Cargo.toml` (+3/-1): gh_status, proto, sysinfo deps; feature_flags dropped with upstream's flag gating.
-- `crates/sidebar/src/sidebar.rs` (+4142/-3520): sidebar as source of truth: live state, machines, PR chips, drag reorder, archive.
+- `crates/sidebar/src/sidebar.rs` (+3,994/-3,268 after the 2026-11-05 audit): sidebar as source of truth: sections, machines and worktree groups, live state, PR chips, drag reorder, archive, the footer; headers fold from the keyboard as upstream's did, rows keep upstream's hover rename and archive, upstream's bottom bar sits under the footer.
 - `crates/sidebar/src/sidebar_tests.rs` (+873/-1879): upstream tests of collapse/drafts/archive-view replaced or adapted to fork behaviour.
 - `crates/sidebar/src/thread_switcher.rs` (+6/-4): follows `Arc` metadata rows (compile follow-on).
 
@@ -659,6 +627,7 @@ property-test teardown went back to upstream.
 - `script/install-quiet-ui`: self-update: manual install fallback.
 - `crates/acp_relay/Cargo.toml`, `src/acp_relay.rs`, `daemon.rs`, `frame.rs`, `log.rs`, `relay.rs`, `state.rs`, `tests.rs`: relay daemon crate; an agent that loads but does not resume sessions (Codex) is reopened with `session/load`, its replay dropped (2026-11-04).
 - `crates/acp_thread/src/command_output.rs`: thread view: reads results from command output.
+- `crates/git_ui/src/diff_sections.rs`: the project and branch diffs in Code / Tests / Generated sections, by file name (2026-11-05).
 - `crates/acp_thread/src/render_release.rs`: memory: an off-screen thread's Markdown parses and finished terminal grids released (10-28).
 - `crates/zed/src/reliability/footprint.rs`: memory: physical footprint and live entity counts in the log (10-28); live workspaces, live threads and the three heaviest by title (2026-11-04).
 - `crates/acp_thread/src/running_work.rs`: running work, async tasks, subagents and session failures on `AcpThread` (out of `acp_thread.rs`, 10-27).
@@ -3577,3 +3546,123 @@ and not a real error; check it alone.
 **Diff size**: 154 files, +57,148 / -10,436 against the merge base, from 164 files,
 +58,301 / -11,858 after 11-03: 1,153 added and 1,422 deleted lines fewer, ten files fewer, with
 five fixes and their tests added in the same night.
+
+**2026-11-05**: onto main 654efae44 (8 upstream commits). A working night on the queue: three
+entries filed that day, one of them the audit 11-04 left half done. The branch carried fourteen
+commits on the merge base (11-04's nine and Arthur's three queue commits among them);
+squash-then-rebase folded them into one, tree-identical to the old tip, and replayed it. Backup at
+`quiet-ui-pre-rebase-2026-11-05`, kept locally and not pushed. **The previous build**: #85, from
+11-04's push, succeeded (11-05 03:16 UTC), so the app is 11-04's code.
+
+**Crash reports**: none in this file tonight. **Conflicts**: none; the one commit replayed clean.
+**Markerless drift**: none; `cargo check --workspace --all-targets` was clean on the replay. The
+8 upstream commits (gpui key equivalents, drag cursors and animated WebP, a JetBrains keymap fix,
+compaction keepalives, docs) touch nothing the fork carries.
+
+**What upstream provides that the fork can delete**: nothing new tonight. The audit below put
+back a good deal of upstream's own UI the fork had removed without being asked.
+
+**Built** (all three entries; item 1 is still open, below):
+- **A, the audit of the thread view and the sidebar.** Every fork change to `thread_view.rs` and
+  `sidebar.rs` by area, with the request it serves:
+  - *Kept in `thread_view.rs`*: command chips, their runs and the parser behind them, the terminal
+    chip as header over upstream's terminal view, edits as one-line rows ("**The thread view**:
+    command chips and the command parser behind them, the quiet one-line cards, diff hover cards,
+    the PR chips with their `+` menu and remove control, and PR mining. A terminal tool call keeps
+    its chip as the header…"); PR chips, mining and the `+` menu (same line); the diff stat chip
+    and the open view's totals (11-04 entry 3); review comments going with the next message
+    ("**Review comments go with the next message.**"); the running list, activity pill and its
+    stop ("*The activity pill lists what it is counting*", 11-04 entry 4); dev server buttons
+    ("*Dev servers in the bottom bar from tagged Zed tasks*"); image chips, remote ones included
+    ("*Every expanded image opens in Zed's viewer.*", the remote image chips paragraph); a draft
+    taking images ("A draft whose agent has not started takes images"); bookmarks ("marks places
+    in a long thread"); the off-screen release ("A thread tab off screen for thirty seconds drops
+    its whole per-entry view tree"); the session retry warning ("*A retry warning shows*"); the
+    "conversation" wording (recorded request); the perf lines ("The instrumentation the entry
+    asked for is in and staying", 10-13). Two fixes stay as fixes: a new error resets the cached
+    error markdown (it showed the previous error), and the error callout's "New Thread" dispatches
+    `NewAdditionalThread` (a plain `NewThread` re-focused the errored tab). The live thought above
+    the input stays, though nobody asked for it, because the chip runs that were asked for absorb
+    thoughts-only messages between tool calls, and without it a thought would show nowhere.
+  - *Gone from `thread_view.rs`*, none of it recorded as requested (several were on 10-15's "For
+    Arthur to decide" list): the composer row's removals (upstream's send button, stop while
+    generating, expand button, follow toggle and "Activity unconfirmed" label are back, with the
+    fork's chips in upstream's row via `render_thread_chips`); the per-turn controls under each
+    finished turn (copy, scroll to the user message, scroll to top, ratings) and the hover copy
+    button that stood in for them; the right-aligned tinted message bubbles and the message
+    editor's transparent background for them; the thinking block in a message with text; the plan
+    as a line in the working indicator (upstream's plan panel is back in the activity bar, with its
+    test); the in-list generating indicator; the "N subagents" chip; the compaction pill and the
+    compaction-as-tool-call barrier; local title generation for agents that send none (and the
+    48-character provisional title); "New Agent" labels; the diff stat chip's tint; agent error
+    payload parsing in the error callout; `.html` links opening in the browser (both halves, and
+    its test); the granularity dropdown computed but never drawn; a swapped field pair; the
+    queued message's `v_flex`; `output.failed()` in place of upstream's inline check.
+    `thread_view.rs` went from +5,833 / -1,127 to +5,400 / -591.
+  - *Kept in `sidebar.rs`*: sections, machine and worktree grouping with each machine's `+`
+    ("Above the worktree grouping sits a machine grouping (2026-10-13)…"); live state on rows
+    ("live state (running — including commands still running after the turn — needs input, unread,
+    error)"); PR and CI chips ("PR and CI state for a thread's branch, on its sidebar row");
+    drag reorder ("Ctrl-tab switching and drag reordering stay"); archive, restore, close and
+    delete ("close and archive from the row"); the archive view and drafts gone (the archive view
+    removal and "there are no drafts to drop"); spares and reclaiming ("The only worktree anything
+    reclaims is a spare nobody was handed"); the footer and relay adoption ("*A sidebar footer.*",
+    `Sidebar::adopt_relay_sessions`, 10-27); dev server pills ("The sidebar row shows a pill per
+    running server"); rename saving on blur (writing per keystroke ended the rename on its first
+    letter, a fork-caused bug).
+  - *Gone from `sidebar.rs`*: unselectable headers and the dead left/right keys (headers are
+    selectable again, and left, right and enter fold and unfold them, on the fork's sections,
+    machines and worktrees; `test_keyboard_folds_and_unfolds_headers` replaces the test that
+    pinned them as no-ops); the rows' missing hover rename and archive (back, beside the fork's
+    restore and delete); the toggle in the header and the lost recent-projects button (upstream's
+    bottom bar is back under the footer, without the history button, since the sidebar is the
+    history); `create_new_entry` ignoring the terminal choice; "worktrees" wording for upstream's
+    "threads"; worktree size labels (`du` per worktree, and `ThreadItem::size`); a draft-era log
+    line, an orphaned doc line, an alias. `sidebar.rs` went from +3,943 / -3,373 to
+    +3,994 / -3,268: fewer of upstream's lines deleted, a few more added, all of it the keyboard
+    folding and hover buttons carried onto the fork's own header kinds.
+- **B, Code / Tests / Generated sections in the git diff.** In `git_ui` only: the section is the
+  outer part of upstream's sort prefix (`DiffSection::sort_prefix`, upstream's status order kept
+  inside each section and code keeping upstream's prefixes), and the first file of each section
+  names it, with its file count, through upstream's header-controls hook; a click folds or unfolds
+  the section with the editor's own buffer folding, and generated files start folded. The editor
+  draws one addon's header controls, so `DiffSectionAddon` takes the git panel's over and draws
+  both. No editor change. Tests: the name rules with `tests.rs` (the complaint's file), the
+  ordering, and `test_the_project_diff_is_in_sections` (order, heads, generated folded, a click on
+  "Tests" folding exactly that section). Tests start unfolded, unlike the 11-04 version, since
+  seeing them was the point.
+- **C, the agent switch as buttons.** `config_options.rs` is upstream's again, agent icon
+  included. In an unstarted thread the agents are a row of buttons with logo and name, the current
+  one selected, one click rebinding through `rebind_draft_agent`; the row goes once the thread
+  starts (`test_an_unstarted_thread_switches_agent_with_one_click`).
+- **1, memory**: not found, and left in the queue. Its own lead, the sidebar opening a closed
+  workspace to archive a thread and never dropping it, does not hold:
+  `test_a_workspace_opened_to_archive_a_thread_is_released`. The entry asks for the day's
+  `quiet-ui memory:` lines, which live on the laptop; none were pasted, so the hunt is blocked on
+  them.
+
+**The gate**: `cargo test` over `acp_thread` 377, `git_ui` 191, `ui` 114 plus 41 doctests,
+`agent_ui` 644 (`-j 2`, 36 `#[ignore]`d left alone) and `sidebar` 215 (`-j 2`), all passing on the
+tree as pushed. Failures found and fixed on the way, all from tonight's own code: seven sidebar
+keyboard tests (five upstream tests the fork had adapted to unselectable headers, re-adapted to
+selectable ones; the fork's no-op test, replaced; and a test whose "index 1 is the thread" had
+been selecting a header, which enter now folds), and a lib-only compile error that the test build
+could not see (`toggle_thinking_block_expansion` was `#[cfg(test)]` in `entry_view_state.rs` once
+the transcript stopped using it; the revert brought its caller back). Nothing from the
+Verification queue (empty) and no upstream drift. `./script/clippy --keep-going` over the five
+crates: clean (the first attempt died fetching WebRTC for `webrtc-sys`, a connection reset, and
+the retry went through). `cargo check -p zed`: clean.
+
+**Environment.** 4 cores, 15G. The `apt-get` and `CARGO_NET_GIT_FETCH_WITH_CLI` steps worked as
+written; the workspace check took 12 minutes. The disk allowance filled twice: once during the
+sidebar tests (the stale-rlib purge freed 12.5G), and again while `agent_ui` and `sidebar` built
+their test binaries, which failed both builds with "No space left on device" in `lsp-types` and
+`remote_server`. `rm -rf target/debug` and `CARGO_PROFILE_DEV_DEBUG=0` for the rest of the gate
+fixed it. Next run: set `CARGO_PROFILE_DEV_DEBUG=0` from the start, as 10-20 already advised.
+`cargo fmt -p` reformats every file of the crate, the fork's unformatted hunks included; tonight
+that touched `branch_diff.rs`, `dev_servers.rs` and three agent_ui files, formatting only.
+
+**Diff size**: 155 files, +57,211 / -9,686 against the merge base, from 154 files,
++57,148 / -10,436 after 11-04 (and the same after tonight's replay): 63 more added lines and
+750 fewer deleted, the deletions mostly upstream UI restored, the additions the sections (+0.6k with their
+tests) and the agent row, net of the audit's removals.
