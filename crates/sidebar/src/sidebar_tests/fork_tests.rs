@@ -4241,3 +4241,113 @@ async fn test_a_running_row_stays_running_while_focus_moves(cx: &mut TestAppCont
         );
     }
 }
+
+/// Memory: archiving a thread whose workspace is closed opens that workspace
+/// to close what is open in it, and nothing may keep it alive afterwards.
+#[gpui::test]
+async fn test_a_workspace_opened_to_archive_a_thread_is_released(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/project",
+        serde_json::json!({
+            ".git": {
+                "worktrees": {
+                    "feature-a": {
+                        "commondir": "../../",
+                        "HEAD": "ref: refs/heads/feature-a",
+                    },
+                },
+            },
+            "src": {},
+        }),
+    )
+    .await;
+    fs.insert_tree(
+        "/worktrees/project/feature-a/project",
+        serde_json::json!({
+            ".git": "gitdir: /project/.git/worktrees/feature-a",
+            "src": {},
+        }),
+    )
+    .await;
+    fs.add_linked_worktree_for_repo(
+        Path::new("/project/.git"),
+        false,
+        git::repository::Worktree {
+            path: PathBuf::from("/worktrees/project/feature-a/project"),
+            ref_name: Some("refs/heads/feature-a".into()),
+            sha: "aaa".into(),
+            is_main: false,
+            is_bare: false,
+        },
+    )
+    .await;
+    agent_ui::test_support::record_zed_created_worktree(
+        fs.as_ref(),
+        Path::new("/worktrees/project/feature-a/project"),
+        None,
+        cx,
+    )
+    .await;
+    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+
+    let main_project = project::Project::test(fs.clone(), ["/project".as_ref()], cx).await;
+    main_project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(main_project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    let opened: std::rc::Rc<std::cell::RefCell<Vec<WeakEntity<Workspace>>>> = Default::default();
+    let _subscription = cx.update(|_, cx| {
+        let opened = opened.clone();
+        cx.subscribe(
+            &multi_workspace,
+            move |_, event: &MultiWorkspaceEvent, _| {
+                if let MultiWorkspaceEvent::WorkspaceAdded(workspace) = event {
+                    opened.borrow_mut().push(workspace.downgrade());
+                }
+            },
+        )
+    });
+
+    let session_id = acp::SessionId::new(Arc::from("worktree-thread"));
+    save_thread_metadata_with_main_paths(
+        "worktree-thread",
+        "Worktree Thread",
+        PathList::new(&[PathBuf::from("/worktrees/project/feature-a/project")]),
+        PathList::new(&[PathBuf::from("/project")]),
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 0).unwrap(),
+        cx,
+    );
+    sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.archive_thread_by_session(&session_id, window, cx);
+    });
+    for _ in 0..8 {
+        cx.run_until_parked();
+    }
+
+    assert!(
+        cx.update(|_, cx| ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry_by_session(&session_id)
+            .is_some_and(|thread| thread.archived)),
+        "the thread is archived"
+    );
+    assert!(
+        !opened.borrow().is_empty(),
+        "archiving opened the thread's workspace, which is what this tests"
+    );
+    for workspace in opened.borrow().iter() {
+        assert!(
+            workspace.upgrade().is_none(),
+            "a workspace opened to archive a thread is released once it is done"
+        );
+    }
+}
