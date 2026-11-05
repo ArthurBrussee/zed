@@ -1456,38 +1456,29 @@ async fn test_keyboard_select_next_and_previous(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     // Entries: [Active header, All Threads header, worktree header, thread3,
-    // thread2, thread1]. Headers are not selectable, so navigation skips
-    // indices 0 through 2.
+    // thread2, thread1]. Headers are selectable, so left and right can fold them.
     focus_sidebar(&sidebar, cx);
     assert_eq!(sidebar.read_with(cx, |s, _| s.selection), None);
 
-    // First SelectNext from None starts at the first thread (index 3)
-    cx.dispatch_action(SelectNext);
-    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(3));
+    // First SelectNext from None starts at index 0
+    for expected in 0..=5 {
+        cx.dispatch_action(SelectNext);
+        assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(expected));
+    }
 
-    // Move down through remaining entries
+    // At the end, wraps back to the first entry
     cx.dispatch_action(SelectNext);
-    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(4));
-
-    cx.dispatch_action(SelectNext);
-    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(5));
-
-    // At the end, wraps back to the first thread
-    cx.dispatch_action(SelectNext);
-    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(3));
+    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(0));
 
     // Navigate back to the end
-    cx.dispatch_action(SelectNext);
-    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(4));
-    cx.dispatch_action(SelectNext);
+    cx.dispatch_action(SelectLast);
     assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(5));
 
     // Move back up
-    cx.dispatch_action(SelectPrevious);
-    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(4));
-
-    cx.dispatch_action(SelectPrevious);
-    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(3));
+    for expected in (0..=4).rev() {
+        cx.dispatch_action(SelectPrevious);
+        assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(expected));
+    }
 
     // At the top, selection clears (focus returns to editor)
     cx.dispatch_action(SelectPrevious);
@@ -1511,9 +1502,9 @@ async fn test_keyboard_select_first_and_last(cx: &mut TestAppContext) {
     cx.dispatch_action(SelectLast);
     assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(5));
 
-    // SelectFirst jumps to the first thread
+    // SelectFirst jumps to the first entry
     cx.dispatch_action(SelectFirst);
-    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(3));
+    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(0));
 }
 
 #[gpui::test]
@@ -1588,10 +1579,15 @@ async fn test_keyboard_navigation_on_empty_list(cx: &mut TestAppContext) {
     focus_sidebar(&sidebar, cx);
     assert_eq!(sidebar.read_with(cx, |s, _| s.selection), None);
 
-    // Navigation on an empty list keeps the selection cleared
+    // Without threads the only rows are headers, which navigation selects.
+    let entry_count = sidebar.read_with(cx, |s, _| s.contents.entries.len());
     cx.dispatch_action(SelectNext);
-    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), None);
+    assert_eq!(
+        sidebar.read_with(cx, |s, _| s.selection),
+        (entry_count > 0).then_some(0)
+    );
 
+    // SelectPrevious from the first entry clears the selection
     cx.dispatch_action(SelectPrevious);
     assert_eq!(sidebar.read_with(cx, |s, _| s.selection), None);
 }
@@ -1646,7 +1642,7 @@ async fn test_selection_clamps_after_entry_removal(cx: &mut TestAppContext) {
 
     // Focus sidebar (selection starts at None), navigate down to the thread (index 2)
     focus_sidebar(&sidebar, cx);
-    cx.dispatch_action(SelectNext);
+    cx.dispatch_action(SelectLast);
     assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(2));
 
     // Delete the thread, which removes it (and its bucket header) from the
@@ -7218,7 +7214,11 @@ async fn test_clicking_worktree_thread_does_not_briefly_render_as_separate_proje
 
     focus_sidebar(&sidebar, cx);
     sidebar.update_in(cx, |sidebar, _window, _cx| {
-        sidebar.selection = Some(1); // index 0 is header, 1 is the thread
+        sidebar.selection = sidebar
+            .contents
+            .entries
+            .iter()
+            .position(|entry| matches!(entry, ListEntry::Thread(_)));
     });
 
     let assert_sidebar_state = |sidebar: &mut Sidebar, _cx: &mut Context<Sidebar>| {

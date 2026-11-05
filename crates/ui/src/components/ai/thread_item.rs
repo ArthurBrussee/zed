@@ -611,7 +611,11 @@ pub fn dev_server_pill(icon: Icon, label: SharedString, starting: bool, cx: &App
         .child(
             Label::new(label)
                 .size(LabelSize::XSmall)
-                .color(if starting { Color::Muted } else { Color::Accent }),
+                .color(if starting {
+                    Color::Muted
+                } else {
+                    Color::Accent
+                }),
         )
         .into_any_element()
 }
@@ -718,7 +722,6 @@ pub struct ThreadItem {
     title_generating: bool,
     highlight_positions: Vec<usize>,
     timestamp: SharedString,
-    size: SharedString,
     notified: bool,
     status: AgentThreadStatus,
     selected: bool,
@@ -765,7 +768,6 @@ impl ThreadItem {
             title_generating: false,
             highlight_positions: Vec::new(),
             timestamp: "".into(),
-            size: "".into(),
             notified: false,
             status: AgentThreadStatus::default(),
             selected: false,
@@ -791,11 +793,6 @@ impl ThreadItem {
             action_slot: None,
             base_bg: None,
         }
-    }
-
-    pub fn size(mut self, size: impl Into<SharedString>) -> Self {
-        self.size = size.into();
-        self
     }
 
     pub fn dev_servers(mut self, dev_servers: Vec<(Icon, SharedString, bool)>) -> Self {
@@ -1080,15 +1077,13 @@ impl RenderOnce for ThreadItem {
             row_state,
             ThreadRowState::NeedsInput | ThreadRowState::Failed
         ) {
-            Some(
-                Icon::new(IconName::Circle)
-                    .size(IconSize::Small)
-                    .color(if row_state == ThreadRowState::Failed {
-                        Color::Error
-                    } else {
-                        Color::Warning
-                    }),
-            )
+            Some(Icon::new(IconName::Circle).size(IconSize::Small).color(
+                if row_state == ThreadRowState::Failed {
+                    Color::Error
+                } else {
+                    Color::Warning
+                },
+            ))
         } else if self.status == AgentThreadStatus::Unconfirmed {
             Some(
                 Icon::new(IconName::Info)
@@ -1108,18 +1103,18 @@ impl RenderOnce for ThreadItem {
         let icon = icon_container().child(agent_icon).into_any_element();
 
         // Always drawn so the row does not change shape when a thread starts.
-        let status_indicator = if matches!(row_state, ThreadRowState::Working | ThreadRowState::Waiting)
-        {
-            Some(agent_activity_pill(
-                format!("status-{}", self.id),
-                running_work,
-                running,
-                self.icon,
-                cx,
-            ))
-        } else {
-            status_icon.map(|icon| icon.into_any_element())
-        };
+        let status_indicator =
+            if matches!(row_state, ThreadRowState::Working | ThreadRowState::Waiting) {
+                Some(agent_activity_pill(
+                    format!("status-{}", self.id),
+                    running_work,
+                    running,
+                    self.icon,
+                    cx,
+                ))
+            } else {
+                status_icon.map(|icon| icon.into_any_element())
+            };
         let status_id = format!("status-{}", self.id);
         let status_slot = h_flex()
             .id(SharedString::from(status_id.clone()))
@@ -1185,8 +1180,6 @@ impl RenderOnce for ThreadItem {
         let dev_servers = std::mem::take(&mut self.dev_servers);
         let has_dev_server = !dev_servers.is_empty() || !services.is_empty();
         let on_open_service = self.on_open_service.take();
-        let has_size = !self.size.is_empty();
-        let size = self.size;
 
         let warning = self.warning.take();
         let show_tooltip = warning.is_some()
@@ -1410,23 +1403,13 @@ impl RenderOnce for ThreadItem {
                             || has_worktree
                             || has_pr_chips
                             || has_dev_server)
-                            && (has_diff_stats || has_size || has_timestamp),
+                            && (has_diff_stats || has_timestamp),
                         |this| this.child(dot_separator()),
                     )
                     .when(has_diff_stats, |this| {
                         this.child(DiffStat::new(diff_stat_id, added_count, removed_count))
                     })
-                    .when(has_diff_stats && (has_size || has_timestamp), |this| {
-                        this.child(dot_separator())
-                    })
-                    .when(has_size, |this| {
-                        this.child(
-                            Label::new(size.clone())
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        )
-                    })
-                    .when(has_size && has_timestamp, |this| {
+                    .when(has_diff_stats && has_timestamp, |this| {
                         this.child(dot_separator())
                     })
                     .when(has_timestamp, |this| {

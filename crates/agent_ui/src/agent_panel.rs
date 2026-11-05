@@ -13052,58 +13052,6 @@ mod tests {
         );
     }
 
-    // Codex (and any other agent that never sends a SessionInfoUpdate title)
-    // used to leave the thread named after its whole first message.
-    #[gpui::test]
-    async fn test_thread_without_an_agent_title_generates_one_locally(cx: &mut TestAppContext) {
-        let (panel, mut cx) = setup_panel(cx).await;
-        let fake = cx.update(|_, cx| language_model::LanguageModelRegistry::test(cx));
-
-        let connection = StubAgentConnection::new();
-        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-            acp::ContentChunk::new("Response".into()),
-        )]);
-        open_thread_with_connection(&panel, connection, &mut cx);
-
-        let long_message = "Please refactor the sidebar so that every row shows a branch chip and \
-             a pull request badge, and while you are there make the archived rows quieter";
-        let thread_view = panel.read_with(&cx, |panel, cx| panel.active_thread_view(cx).unwrap());
-        let message_editor = thread_view.read_with(&cx, |view, _cx| view.message_editor.clone());
-        message_editor.update_in(&mut cx, |editor, window, cx| {
-            editor.set_text(long_message, window, cx);
-        });
-        thread_view.update_in(&mut cx, |view, window, cx| view.send(window, cx));
-        cx.run_until_parked();
-
-        let conversation_view = panel.read_with(&cx, |panel, _cx| {
-            panel.active_conversation_view().unwrap().clone()
-        });
-
-        let provisional = conversation_view.read_with(&cx, |view, cx| view.title(cx));
-        assert!(
-            provisional.chars().count() <= crate::conversation_view::PROVISIONAL_TITLE_LEN + 1,
-            "provisional title should be short, got {provisional:?}"
-        );
-
-        let model = cx.update(|_, cx| {
-            LanguageModelRegistry::read_global(cx)
-                .thread_summary_model(cx)
-                .unwrap()
-        });
-        assert_eq!(
-            fake.pending_completions_for(&model).len(),
-            1,
-            "a thread with no agent-supplied title should ask for one"
-        );
-        fake.send_last_text(&model, "Sidebar PR badges");
-        fake.end_last(&model);
-        cx.run_until_parked();
-
-        conversation_view.read_with(&cx, |view, cx| {
-            assert_eq!(view.title(cx), SharedString::from("Sidebar PR badges"));
-        });
-    }
-
     // An agent that does supply a title (Claude) keeps it: no local generation.
     #[gpui::test]
     async fn test_agent_supplied_title_is_not_regenerated(cx: &mut TestAppContext) {

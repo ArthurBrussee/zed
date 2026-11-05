@@ -1,4 +1,3 @@
-use acp_thread::AgentConnection;
 use acp_thread::{
     AcpThread, AcpThreadEvent, AgentThreadEntry, AssistantMessage, AssistantMessageChunk,
     AuthRequired, ElicitationEntryId, ElicitationStatus, ElicitationStore, ForegroundActivity,
@@ -6,6 +5,7 @@ use acp_thread::{
     PermissionPattern, PermissionRequest, PermissionRequestId, ProtocolErrorInfo, RetryStatus,
     SelectedPermissionOutcome, ThreadStatus, ToolCall, ToolCallContent, ToolCallStatus,
 };
+use acp_thread::{AgentConnection, Plan};
 use action_log::{ActionLog, ActionLogTelemetry, DiffStats};
 use agent::{NativeAgentServer, NoModelConfiguredError, ThreadStore};
 use agent_client_protocol::v2::schema as acp_v2;
@@ -95,7 +95,7 @@ use crate::ui::{AgentNotification, AgentNotificationEvent};
 use crate::{
     Agent, AgentDiffPane, AgentInitialContent, AgentPanel, AgentPanelEvent, AllowAlways, AllowOnce,
     AuthorizeToolCall, ClearMessageQueue, CycleFavoriteModels, CycleModeSelector,
-    CycleThinkingEffort, EditFirstQueuedMessage, ExpandMessageEditor, KeepAll, NewThread,
+    CycleThinkingEffort, EditFirstQueuedMessage, ExpandMessageEditor, Follow, KeepAll, NewThread,
     OpenAddContextMenu, OpenAgentDiff, RejectAll, RejectOnce, RemoveFirstQueuedMessage,
     ScrollOutputLineDown, ScrollOutputLineUp, ScrollOutputPageDown, ScrollOutputPageUp,
     ScrollOutputToBottom, ScrollOutputToNextMessage, ScrollOutputToPreviousMessage,
@@ -5234,6 +5234,47 @@ impl AgentCodeSpanResolver {
         path.extension()
             .and_then(|extension| extension.to_str())
             .is_some_and(|extension| !extension.is_empty())
+    }
+}
+
+fn plan_summary_label(stats: &acp_thread::PlanStats<'_>, entry_count: usize) -> String {
+    if stats.pending == 0 {
+        if stats.cancelled == 0 {
+            "All Done"
+        } else if stats.completed == 0 {
+            "Cancelled"
+        } else {
+            "Finished"
+        }
+        .to_owned()
+    } else if stats.completed == 0 {
+        format!("{entry_count} Tasks")
+    } else {
+        format!("{}/{entry_count}", stats.completed)
+    }
+}
+
+fn plan_label_markdown_style(
+    status: &acp_v2::PlanEntryStatus,
+    window: &Window,
+    cx: &App,
+) -> MarkdownStyle {
+    let default_md_style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+
+    MarkdownStyle {
+        base_text_style: TextStyle {
+            color: cx.theme().colors().text_muted,
+            strikethrough: if matches!(status, acp_v2::PlanEntryStatus::Completed) {
+                Some(gpui::StrikethroughStyle {
+                    thickness: px(1.),
+                    color: Some(cx.theme().colors().text_muted.opacity(0.8)),
+                })
+            } else {
+                None
+            },
+            ..default_md_style.base_text_style
+        },
+        ..default_md_style
     }
 }
 
@@ -11131,21 +11172,14 @@ pub(crate) mod tests {
         cx.run_until_parked();
         active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
             assert_thread_list_item_count_matches_entries(view, cx);
-            assert!(
-                view.thread
-                    .read(cx)
-                    .plan()
-                    .is_none_or(acp_thread::Plan::is_empty)
-            );
+            assert!(view.thread.read(cx).plan().is_none_or(Plan::is_empty));
         });
         connection.end_turn(session_id, acp_v1::StopReason::EndTurn);
         cx.run_until_parked();
     }
 
-    /// The fork has no plan panel (the plan is one line in the working
-    /// indicator), so this asserts the plan model the panel read.
     #[gpui::test]
-    async fn test_plan_dismissal_and_status_updates(cx: &mut TestAppContext) {
+    async fn test_plan_panel_dismissal_and_status_updates(cx: &mut TestAppContext) {
         use agent_client_protocol::v2::schema as acp_v2;
 
         init_test(cx);
@@ -11157,36 +11191,33 @@ pub(crate) mod tests {
         let entry = |status| {
             acp_v2::PlanEntry::new("Unchanged task", acp_v2::PlanEntryPriority::Medium, status)
         };
-        let upsert = |thread: &Entity<acp_thread::AcpThread>,
-                      entries: Vec<acp_v2::PlanEntry>,
-                      cx: &mut VisualTestContext| {
-            thread.update(cx, |thread, cx| {
-                thread.upsert_plan_items(acp_v2::PlanItems::new("status-plan", entries), None, cx);
-            });
-            cx.run_until_parked();
-        };
-
-        upsert(&thread, vec![entry(acp_v2::PlanEntryStatus::Pending)], cx);
+        thread.update(cx, |thread, cx| {
+            thread.upsert_plan_items(
+                acp_v2::PlanItems::new(
+                    "status-plan",
+                    vec![entry(acp_v2::PlanEntryStatus::Pending)],
+                ),
+                None,
+                cx,
+            );
+        });
+        cx.run_until_parked();
         let markdown = thread.read_with(cx, |thread, _| {
             thread.plan().expect("visible plan").entries[0]
                 .content
                 .clone()
         });
-        thread.read_with(cx, |thread, _| {
-            let plan = thread.plan().expect("visible plan");
-            assert_eq!(plan.entries.len(), 1);
-            assert_eq!(plan.stats().pending, 1);
-        });
-
-        // What the panel's Clear Plan button did.
-        thread.update(cx, |thread, cx| thread.clear_plan(cx));
+        assert!(cx.debug_bounds("plan-status-1 Tasks").is_some());
+        let plan_bounds = cx.debug_bounds("plan_summary").expect("visible plan panel");
+        let dismiss = cx.debug_bounds("ICON-Close").expect("Clear Plan button");
+        assert!(plan_bounds.contains(&dismiss.center()));
+        cx.simulate_click(dismiss.center(), gpui::Modifiers::default());
         cx.run_until_parked();
+        assert!(cx.debug_bounds("plan_summary").is_none());
         thread.read_with(cx, |thread, _| {
             assert!(thread.plan().is_none());
             assert!(thread.plan_by_id(&"status-plan".into()).is_some());
         });
-
-        // An update that changes nothing leaves it dismissed.
         thread.update(cx, |thread, cx| {
             for meta in [None, Some(acp_v2::Meta::new())] {
                 thread.upsert_plan_items(
@@ -11201,65 +11232,88 @@ pub(crate) mod tests {
             }
         });
         cx.run_until_parked();
-        thread.read_with(cx, |thread, _| assert!(thread.plan().is_none()));
-
-        // A real change brings it back.
-        upsert(
-            &thread,
-            vec![entry(acp_v2::PlanEntryStatus::InProgress)],
-            cx,
-        );
-        thread.read_with(cx, |thread, _| {
-            assert!(
-                thread
-                    .plan()
-                    .expect("visible again")
-                    .stats()
-                    .in_progress_entry
-                    .is_some()
+        assert!(cx.debug_bounds("plan_summary").is_none());
+        thread.update(cx, |thread, cx| {
+            thread.upsert_plan_items(
+                acp_v2::PlanItems::new(
+                    "status-plan",
+                    vec![entry(acp_v2::PlanEntryStatus::InProgress)],
+                ),
+                None,
+                cx,
             );
         });
+        cx.run_until_parked();
+        let summary = cx.debug_bounds("plan_summary").expect("plan disclosure");
+        cx.simulate_click(summary.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("plan-entry-0-TodoProgress").is_some());
 
-        // The entry's markdown is reused as the status moves.
-        for status in [
-            acp_v2::PlanEntryStatus::Completed,
-            acp_v2::PlanEntryStatus::Cancelled,
-            acp_v2::PlanEntryStatus::Other("_blocked".into()),
+        for (status, summary, row) in [
+            (
+                acp_v2::PlanEntryStatus::Completed,
+                "plan-status-All Done",
+                "plan-entry-0-TodoComplete",
+            ),
+            (
+                acp_v2::PlanEntryStatus::Cancelled,
+                "plan-status-Cancelled",
+                "plan-entry-0-Close",
+            ),
+            (
+                acp_v2::PlanEntryStatus::Other("_blocked".into()),
+                "plan-status-1 Tasks",
+                "plan-entry-0-TodoPending",
+            ),
         ] {
-            upsert(&thread, vec![entry(status.clone())], cx);
+            thread.update(cx, |thread, cx| {
+                thread.upsert_plan_items(
+                    acp_v2::PlanItems::new("status-plan", vec![entry(status)]),
+                    None,
+                    cx,
+                );
+            });
+            cx.run_until_parked();
+            assert!(cx.debug_bounds(summary).is_some(), "{summary}");
+            assert!(cx.debug_bounds(row).is_some(), "{row}");
             thread.read_with(cx, |thread, cx| {
-                let plan = thread.plan().expect("visible plan");
-                assert_eq!(plan.entries[0].source.status, status);
-                assert_eq!(plan.entries[0].content, markdown);
+                assert_eq!(
+                    thread.plan().expect("visible plan").entries[0].content,
+                    markdown
+                );
                 assert_eq!(markdown.read(cx).source(), "Unchanged task");
             });
         }
-
-        upsert(
-            &thread,
-            vec![
-                entry(acp_v2::PlanEntryStatus::Cancelled),
-                acp_v2::PlanEntry::new(
-                    "Finished task",
-                    acp_v2::PlanEntryPriority::Medium,
-                    acp_v2::PlanEntryStatus::Completed,
+        thread.update(cx, |thread, cx| {
+            thread.upsert_plan_items(
+                acp_v2::PlanItems::new(
+                    "status-plan",
+                    vec![
+                        entry(acp_v2::PlanEntryStatus::Cancelled),
+                        acp_v2::PlanEntry::new(
+                            "Finished task",
+                            acp_v2::PlanEntryPriority::Medium,
+                            acp_v2::PlanEntryStatus::Completed,
+                        ),
+                    ],
                 ),
-            ],
-            cx,
-        );
-        thread.read_with(cx, |thread, _| {
-            let stats = thread.plan().expect("visible plan").stats();
-            assert_eq!((stats.pending, stats.completed, stats.cancelled), (0, 1, 1));
+                None,
+                cx,
+            );
         });
-
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("plan-status-Finished").is_some());
+        assert!(cx.debug_bounds("plan-entry-0-Close").is_some());
+        assert!(cx.debug_bounds("plan-entry-1-TodoComplete").is_some());
+        assert!(cx.debug_bounds("plan-status-All Done").is_none());
         thread.update(cx, |thread, cx| {
             thread.upsert_plan_items(acp_v2::PlanItems::new("status-plan", vec![]), None, cx);
             assert!(thread.plan().expect("empty selected plan").is_empty());
             assert!(thread.entries().is_empty());
         });
         cx.run_until_parked();
+        assert!(cx.debug_bounds("plan_summary").is_none());
         thread_view.update_in(cx, |view, window, cx| {
-            assert!(view.render_plan(cx).is_none());
             assert!(view.render_activity_bar(window, cx).is_none());
         });
     }

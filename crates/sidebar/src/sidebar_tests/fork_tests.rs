@@ -537,63 +537,58 @@ async fn test_threads_survive_worktree_key_change(cx: &mut TestAppContext) {
     );
 }
 
+/// Headers are selectable, and left, right and enter fold and unfold them, as
+/// upstream's project headers do.
 #[gpui::test]
-async fn test_keyboard_confirm_on_bucket_header_is_noop(cx: &mut TestAppContext) {
-    let project = init_test_project("/my-project", cx).await;
-    let (multi_workspace, cx) =
-        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
-    let sidebar = setup_sidebar(&multi_workspace, cx);
-
-    save_n_test_threads(1, &project, cx).await;
-    multi_workspace.update_in(cx, |_, _window, cx| cx.notify());
-    cx.run_until_parked();
-
-    assert_eq!(visible_entries_as_strings(&sidebar, cx), vec!["  Thread 1"]);
-
+async fn test_keyboard_folds_and_unfolds_headers(cx: &mut TestAppContext) {
+    let (sidebar, cx) = setup_sidebar_with_two_sections(cx).await;
     focus_sidebar(&sidebar, cx);
-    sidebar.update_in(cx, |sidebar, _window, _cx| {
-        sidebar.selection = Some(0);
-    });
+    let history_shown = |cx: &mut gpui::VisualTestContext| {
+        visible_entries_as_strings(&sidebar, cx)
+            .iter()
+            .any(|row| row.contains("History Thread"))
+    };
+    let select_history_thread = |cx: &mut gpui::VisualTestContext| {
+        sidebar.update_in(cx, |sidebar, _window, cx| {
+            sidebar.selection = sidebar.contents.entries.iter().position(|entry| {
+                matches!(entry, ListEntry::Thread(thread)
+                    if thread.metadata.display_title().as_ref() == "History Thread")
+            });
+            cx.notify();
+        });
+    };
+    assert!(history_shown(cx));
 
-    cx.dispatch_action(Confirm);
-    cx.run_until_parked();
-
-    assert_eq!(visible_entries_as_strings(&sidebar, cx), vec!["  Thread 1"]);
-}
-
-#[gpui::test]
-async fn test_keyboard_expand_and_collapse_are_noops(cx: &mut TestAppContext) {
-    let project = init_test_project("/my-project", cx).await;
-    let (multi_workspace, cx) =
-        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
-    let sidebar = setup_sidebar(&multi_workspace, cx);
-
-    save_n_test_threads(1, &project, cx).await;
-    multi_workspace.update_in(cx, |_, _window, cx| cx.notify());
-    cx.run_until_parked();
-
-    assert_eq!(visible_entries_as_strings(&sidebar, cx), vec!["  Thread 1"]);
-
-    focus_sidebar(&sidebar, cx);
-    cx.dispatch_action(SelectNext);
-    assert_eq!(
-        visible_entries_as_strings(&sidebar, cx),
-        vec!["  Thread 1  <== selected"]
-    );
-
+    // Left on a thread folds the header above it, and selects that header.
+    select_history_thread(cx);
     cx.dispatch_action(menu::SelectParent);
     cx.run_until_parked();
-    assert_eq!(
-        visible_entries_as_strings(&sidebar, cx),
-        vec!["  Thread 1  <== selected"]
-    );
+    assert!(!history_shown(cx), "the thread's header folded");
+    let header = sidebar
+        .read_with(cx, |sidebar, _| sidebar.selection)
+        .unwrap();
+    sidebar.read_with(cx, |sidebar, _| {
+        assert_eq!(sidebar.header_is_collapsed(header), Some(true));
+    });
 
+    // Right unfolds it, and right again steps into it.
     cx.dispatch_action(menu::SelectChild);
     cx.run_until_parked();
+    assert!(history_shown(cx), "right unfolds the selected header");
+    cx.dispatch_action(menu::SelectChild);
     assert_eq!(
-        visible_entries_as_strings(&sidebar, cx),
-        vec!["  Thread 1  <== selected"]
+        sidebar.read_with(cx, |sidebar, _| sidebar.selection),
+        Some(header + 1)
     );
+
+    // Enter on a header toggles it.
+    sidebar.update_in(cx, |sidebar, _window, _cx| sidebar.selection = Some(header));
+    cx.dispatch_action(Confirm);
+    cx.run_until_parked();
+    assert!(!history_shown(cx), "enter folds the selected header");
+    cx.dispatch_action(Confirm);
+    cx.run_until_parked();
+    assert!(history_shown(cx), "and unfolds it");
 }
 
 /// A `+` worktree belongs to its thread, sent or not, until that is archived.
@@ -2591,49 +2586,39 @@ async fn test_keyboard_navigation_skips_collapsed_rows(cx: &mut TestAppContext) 
     let (sidebar, cx) = setup_sidebar_with_two_sections(cx).await;
     focus_sidebar(&sidebar, cx);
 
-    sidebar.update_in(cx, |sidebar, window, cx| {
-        sidebar.select_first(&SelectFirst, window, cx);
-    });
-    assert_eq!(
-        visible_entries_as_strings(&sidebar, cx),
-        vec![
-            "  History Thread  <== selected",
-            "  Archived Thread (archived)",
-        ]
-    );
-
     sidebar.update_in(cx, |sidebar, _window, cx| {
         sidebar.toggle_section(SidebarSection::AllThreads, cx);
     });
     cx.run_until_parked();
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec!["  Archived Thread (archived)"],
+    );
 
+    // Walk the whole list: every stop is a header or a row that is shown.
     sidebar.update_in(cx, |sidebar, window, cx| {
         sidebar.select_first(&SelectFirst, window, cx);
     });
-    assert_eq!(
-        visible_entries_as_strings(&sidebar, cx),
-        vec!["  Archived Thread (archived)  <== selected"],
-        "selection lands on the first row of the expanded section"
-    );
-
-    sidebar.update_in(cx, |sidebar, window, cx| {
-        sidebar.select_next(&SelectNext, window, cx);
-    });
-    assert_eq!(
-        visible_entries_as_strings(&sidebar, cx),
-        vec!["  Archived Thread (archived)  <== selected"],
-        "the collapsed section's rows are never selectable"
-    );
-
-    sidebar.read_with(cx, |sidebar, _cx| {
-        assert!(
-            sidebar
+    let entry_count = sidebar.read_with(cx, |sidebar, _| sidebar.contents.entries.len());
+    let mut reached_archived = false;
+    for _ in 0..entry_count {
+        sidebar.read_with(cx, |sidebar, _cx| {
+            let entry = sidebar
                 .selection
-                .and_then(|ix| sidebar.contents.entries.get(ix))
-                .is_some_and(|entry| matches!(entry, ListEntry::Thread(thread)
-                    if thread.metadata.archived)),
-        );
-    });
+                .and_then(|ix| sidebar.contents.entries.get(ix));
+            if let Some(ListEntry::Thread(thread)) = entry {
+                assert!(
+                    thread.metadata.archived,
+                    "the collapsed section's rows are never selectable"
+                );
+                reached_archived = true;
+            }
+        });
+        sidebar.update_in(cx, |sidebar, window, cx| {
+            sidebar.select_next(&SelectNext, window, cx);
+        });
+    }
+    assert!(reached_archived);
 }
 
 #[gpui::test]

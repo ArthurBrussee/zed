@@ -184,6 +184,10 @@ impl EntryViewState {
         self.auto_expanded_thinking_block = None;
     }
 
+    pub(crate) fn is_auto_expanded_thinking_block(&self, key: (usize, usize)) -> bool {
+        self.auto_expanded_thinking_block == Some(key)
+    }
+
     pub(crate) fn auto_expand_streaming_thought(&mut self, thread: &AcpThread, cx: &App) -> bool {
         let thinking_display = AgentSettings::get_global(cx).thinking_display;
 
@@ -225,8 +229,6 @@ impl EntryViewState {
         false
     }
 
-    // Thoughts no longer expand in the transcript; only tests toggle them.
-    #[cfg(test)]
     pub(crate) fn toggle_thinking_block_expansion(&mut self, key: (usize, usize), cx: &App) {
         match AgentSettings::get_global(cx).thinking_display {
             ThinkingBlockDisplay::Auto => {
@@ -403,8 +405,6 @@ impl EntryViewState {
                         if !is_editable {
                             editor.set_read_only(true, cx);
                         }
-                        // Its own background would paint over the bubble's tint.
-                        editor.set_transparent_background(true, cx);
                         editor.set_source_message(source_blocks, window, cx);
                         editor
                     });

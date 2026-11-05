@@ -39,7 +39,11 @@ pub(crate) fn machine_identity_key(host: Option<&RemoteConnectionOptions>) -> St
             port.map(|port| port.to_string()).unwrap_or_default()
         ),
         RemoteConnectionIdentity::Wsl { distro_name, user } => {
-            format!("wsl:{}@{}", user.as_deref().unwrap_or_default(), distro_name)
+            format!(
+                "wsl:{}@{}",
+                user.as_deref().unwrap_or_default(),
+                distro_name
+            )
         }
         RemoteConnectionIdentity::Docker {
             container_id,
