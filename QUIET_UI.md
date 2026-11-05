@@ -361,6 +361,31 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**A. Finish the fork audit of the thread view and the sidebar** (2026-11-05). The 11-04 entry
+asked for every hunk of the fork's changes to upstream-owned files to be justified or reverted,
+starting with the diff view, the thread view and the sidebar. The run did the diff view and the
+model controls and reported "the thread view and the sidebar were not audited hunk by hunk beyond
+the effort controls; that is where the rest of the fork is". That is a deferral, which this
+routine does not do. Arthur: "why does this just ignore my instructions?" Tonight it is the
+first item and it is done when the rebase log lists, for `thread_view.rs` (+5,833 / -1,127) and
+`sidebar.rs`, each fork change by area with the request it serves (quote the queue entry or rebase
+log line), and every change without one is gone. Where a requested feature stays, carry it on
+upstream's code with the smallest extension. Report the before and after size of both files.
+
+**B. Bring back the Code / Tests / Generated sections in the git diff, without the editor
+changes** (2026-11-05). The 11-04 run removed them (`dc63727`, "give the project diff back to
+upstream, without groups"), reading "prefer upstream's similar version" as covering it. It does
+not: grouping diffs into code, tests and generated files was an explicit request (Arthur: "the
+code and tests should be SECTIONS in the git diff, not some header at the top"), and upstream's
+ordering by status does not do that job. The run was right that carrying the sections through the
+editor's block map, display map, element and split view was the wrong way (the 10-21 crash), so
+do not bring those back. Build them on upstream's project diff from outside the editor crate:
+upstream already orders files with `PathKey::with_sort_prefix` (`multi_buffer/src/path_key.rs`),
+so give each file a prefix by section, and mark where a section starts with something upstream's
+multibuffer already supports, not a new block kind. If a visible section header is impossible
+without editor changes, ship the ordering and say so in the report rather than touching the
+editor. `tests.rs` counts as tests.
+
 **1. Memory still grows all day; find what keeps closed threads alive** (2026-11-04, narrowed
 2026-11-04 night). Arthur: "keep hunting for these, it's very painful". 2,732 MiB at 10:12 to
 3,762 at 14:37 on 11-04, and 4,887 MiB at 23:42 on 11-03 with `live Markdown 28137, Terminal 6638,
