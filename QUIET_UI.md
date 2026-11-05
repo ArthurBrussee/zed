@@ -53,8 +53,8 @@ this, it outranks every other section:
 
 ## Upstream first (from 2026-10-01)
 
-The fork stands at +57.1k / -10.4k lines across 153 files against upstream (the exact figures
-after the 2026-11-04 run were +57,142 / -10,433 across 153 files, down from +58,301 / -11,858
+The fork stands at +57.1k / -10.4k lines across 154 files against upstream (the exact figures
+after the 2026-11-04 run were +57,148 / -10,436 across 154 files, down from +58,301 / -11,858
 across 164 for eight queue entries: the diff groups, the combined config popover and the combined
 model menu went to upstream's, and five fixes came in; after the 2026-11-03 run they were
 +58,301 / -11,858 across 164 files, the same additions as 11-02 and
@@ -3533,6 +3533,6 @@ checking several crates in one `cargo check` unifies features: `title_bar` faile
 `remote`'s `test-support` on (`RemoteConnectionOptions::Mock` not matched), which is upstream's
 and not a real error; check it alone.
 
-**Diff size**: 153 files, +57,142 / -10,433 against the merge base, from 164 files,
-+58,301 / -11,858 after 11-03: 1,159 added and 1,425 deleted lines fewer, eleven files fewer, with
+**Diff size**: 154 files, +57,148 / -10,436 against the merge base, from 164 files,
++58,301 / -11,858 after 11-03: 1,153 added and 1,422 deleted lines fewer, ten files fewer, with
 five fixes and their tests added in the same night.
