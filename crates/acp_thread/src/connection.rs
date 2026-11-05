@@ -1,6 +1,6 @@
 use crate::{AcpThread, ElicitationStore, ReceiptSubmission};
 use agent_client_protocol::{schema::MaybeUndefined, v1::schema as acp_v1, v2::schema as acp_v2};
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use collections::{HashMap, HashSet, IndexMap};
 use gpui::{Context, Entity, SharedString, Task};
@@ -128,6 +128,17 @@ pub trait AgentConnection {
         _cx: &mut App,
     ) -> Task<Result<Entity<AcpThread>>> {
         Task::ready(Err(anyhow::Error::msg("Loading sessions is not supported")))
+    }
+
+    /// The thread an in-flight [`Self::load_session`] or
+    /// [`Self::resume_session`] is filling, so a long replay can be watched
+    /// before the load task resolves.
+    fn loading_thread(
+        &self,
+        _session_id: &acp_v2::SessionId,
+        _cx: &App,
+    ) -> Option<Entity<AcpThread>> {
+        None
     }
 
     /// Whether this agent supports explicitly closing existing sessions.
@@ -283,6 +294,18 @@ pub trait AgentConnection {
     ) -> Task<Result<()>> {
         Task::ready(Err(anyhow::anyhow!(
             "Cancelling terminals is not supported"
+        )))
+    }
+
+    /// Asks the agent to stop one task it detached, leaving the turn alone.
+    fn stop_async_task(
+        &self,
+        _session_id: &acp_v2::SessionId,
+        _async_task_id: SharedString,
+        _cx: &mut App,
+    ) -> Task<Result<()>> {
+        Task::ready(Err(anyhow!(
+            "this agent does not support stopping background tasks"
         )))
     }
 

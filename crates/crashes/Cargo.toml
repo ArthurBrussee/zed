@@ -6,10 +6,14 @@ edition.workspace = true
 license = "GPL-3.0-or-later"
 
 [dependencies]
+anyhow.workspace = true
+backtrace.workspace = true
 crash-handler.workspace = true
 log.workspace = true
+minidump-common.workspace = true
 minidumper.workspace = true
 parking_lot.workspace = true
+scroll.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 system_specs.workspace = true
@@ -17,8 +21,6 @@ zstd.workspace = true
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 async-process.workspace = true
-
-[target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -26,6 +28,9 @@ mach2.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

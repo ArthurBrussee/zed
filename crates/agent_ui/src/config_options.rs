@@ -15,7 +15,7 @@ use picker::{Picker, PickerDelegate};
 use settings::{AgentConfigOptionValue, SettingsStore};
 use ui::{
     ElevationIndex, IconButton, KeyBinding, ListItem, ListItemSpacing, PopoverMenuHandle, Switch,
-    SwitchLabelPosition, ToggleState, Tooltip, prelude::*,
+    SwitchLabelPosition, TintColor, ToggleState, Tooltip, prelude::*,
 };
 use unicode_segmentation::UnicodeSegmentation;
 use util::ResultExt as _;
@@ -281,10 +281,19 @@ impl Render for ConfigOptionsView {
             return div().into_any_element();
         }
 
+        // quiet-ui: which agent this is, so a Codex thread is not taken for Claude.
+        let agent_id = self.agent_server.agent_id();
         h_flex()
             .min_w_0()
             .flex_wrap()
             .gap_1()
+            .child(
+                div()
+                    .id("config-options-agent")
+                    .px_0p5()
+                    .child(Icon::new(self.agent_server.logo()).size(IconSize::Small))
+                    .tooltip(Tooltip::text(agent_id.0.to_string())),
+            )
             .children(self.selectors.iter().cloned())
             .into_any_element()
     }
@@ -451,6 +460,75 @@ impl ConfigOptionSelector {
         .end_icon(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
         .disabled(self.setting_value)
     }
+
+    /// quiet-ui: a short ungrouped list is laid out as buttons, so the current
+    /// choice reads at a glance and another is one click away.
+    fn inline_choices(&self) -> Option<Vec<ConfigOptionValue>> {
+        let option = self.current_option()?;
+        let acp::SessionConfigKind::Select(select) = &option.kind else {
+            return None;
+        };
+        if !matches!(select.options, acp::SessionConfigSelectOptions::Ungrouped(_)) {
+            return None;
+        }
+        let values = extract_options(&self.config_options, &self.config_id);
+        (2..PICKER_THRESHOLD)
+            .contains(&values.len())
+            .then_some(values)
+    }
+
+    fn render_inline_choices(
+        &self,
+        option: &acp::SessionConfigOption,
+        values: Vec<ConfigOptionValue>,
+    ) -> AnyElement {
+        let current = get_current_select_value(&self.config_options, &self.config_id);
+        h_flex()
+            .id(ElementId::Name(
+                format!("config-option-{}", option.config_id.0).into(),
+            ))
+            .gap_0p5()
+            .children(values.into_iter().map(|value| {
+                let selected = current.as_ref() == Some(&value.value);
+                let tooltip: SharedString = value
+                    .description
+                    .clone()
+                    .unwrap_or_else(|| format!("{}: {}", option.name, value.name))
+                    .into();
+                let config_options = self.config_options.clone();
+                let agent_server = self.agent_server.clone();
+                let fs = self.fs.clone();
+                let config_id = self.config_id.clone();
+                let value_id = value.value.clone();
+                Button::new(
+                    ElementId::Name(
+                        format!("config-option-{}-{}", option.config_id.0, value.value.0).into(),
+                    ),
+                    value.name,
+                )
+                .label_size(LabelSize::Small)
+                .color(Color::Muted)
+                .toggle_state(selected)
+                .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+                .disabled(self.setting_value)
+                .tooltip(Tooltip::text(tooltip))
+                .on_click(move |_, _window, cx| {
+                    if selected {
+                        return;
+                    }
+                    set_config_option_and_default(
+                        config_options.clone(),
+                        agent_server.clone(),
+                        config_id.clone(),
+                        acp::SessionConfigOptionValue::id(value_id.clone()),
+                        fs.clone(),
+                        cx,
+                    )
+                    .detach_and_log_err(cx);
+                })
+            }))
+            .into_any_element()
+    }
 }
 
 impl Render for ConfigOptionSelector {
@@ -482,6 +560,9 @@ impl Render for ConfigOptionSelector {
         }
 
         match &option.kind {
+            acp::SessionConfigKind::Select(_) if let Some(values) = self.inline_choices() => {
+                self.render_inline_choices(&option, values)
+            }
             acp::SessionConfigKind::Select(_) => {
                 let (Some(picker), Some(picker_handle)) =
                     (self.picker.clone(), self.picker_handle.clone())
@@ -1647,6 +1728,72 @@ mod tests {
                 "mode".to_string(),
                 Some(AgentConfigOptionValue::ValueId("manual".to_string()))
             )]
+        );
+    }
+
+    #[gpui::test]
+    fn short_option_lists_are_laid_out_as_buttons(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+        });
+        let values = |count: usize| {
+            (0..count)
+                .map(|ix| acp::SessionConfigSelectOption::new(format!("v{ix}"), format!("V{ix}")))
+                .collect::<Vec<_>>()
+        };
+        let config_options = Rc::new(TestSessionConfigOptions::new(vec![
+            acp::SessionConfigOption::select("mode", "Mode", "v0", values(3))
+                .category(acp::SessionConfigOptionCategory::Mode),
+            acp::SessionConfigOption::select("model", "Model", "v0", values(PICKER_THRESHOLD))
+                .category(acp::SessionConfigOptionCategory::Model),
+            acp::SessionConfigOption::select("only", "Only", "v0", values(1)),
+            acp::SessionConfigOption::new(
+                "effort",
+                "Effort",
+                acp::SessionConfigKind::Select(acp::SessionConfigSelect::new(
+                    "v0",
+                    acp::SessionConfigSelectOptions::Grouped(vec![
+                        acp::SessionConfigSelectGroup::new("low", "Low", values(2)),
+                    ]),
+                )),
+            ),
+        ]));
+        let agent_server = Rc::new(TestAgentServer::default());
+        let fs: Arc<dyn Fs> = FakeFs::new(cx.executor());
+        let cx = cx.add_empty_window();
+        let view = cx.update(|window, cx| {
+            let config_options: Rc<dyn AgentSessionConfigOptions> = config_options.clone();
+            let agent_server: Rc<dyn AgentServer> = agent_server.clone();
+            cx.new(|cx| ConfigOptionsView::new(config_options, agent_server, fs, window, cx))
+        });
+        let laid_out = cx.update(|_, cx| {
+            view.read(cx)
+                .selectors
+                .iter()
+                .map(|selector| {
+                    let selector = selector.read(cx);
+                    (
+                        selector.config_id().0.to_string(),
+                        selector.inline_choices().map(option_names),
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            laid_out,
+            vec![
+                (
+                    "mode".to_string(),
+                    Some(vec!["V0".to_string(), "V1".to_string(), "V2".to_string()])
+                ),
+                ("model".to_string(), None),
+                ("only".to_string(), None),
+                ("effort".to_string(), None),
+            ],
+            "only a short ungrouped list becomes buttons; long and grouped ones stay menus"
         );
     }
 
