@@ -369,6 +369,17 @@ bail on time**).
 Anything added after about 20:45 local waits a night: the routine reads this section when it
 starts at 21:00.
 
+**0. A host given up on stays given up after the network comes back** (2026-11-07). The
+11-04 change stops retrying an unreachable host after three minutes ("not retrying until
+asked"). On 11-07 the laptop lost DNS from 14:34 to about 16:23; Zed gave up on the box at 14:35
+and was still not retrying at 16:33, long after the network and the box were fine, so every
+remote thread sat stuck until Arthur noticed. Arthur: "some threads are stuck again". Keep
+the give-up (it stops the retry storm), but come back on its own: retry once when macOS reports
+the network reachable again, and otherwise every few minutes at low cost, without a dialog.
+The title bar's Retry stays for the impatient. Done when a host given up on during an outage
+reconnects without a click within a few minutes of the network returning, with a test that
+drives the give-up and then a later successful probe.
+
 **1. Memory still grows all day; find what keeps closed threads alive** (2026-11-04, narrowed
 2026-11-04 night). Arthur: "keep hunting for these, it's very painful". 2,732 MiB at 10:12 to
 3,762 at 14:37 on 11-04, and 4,887 MiB at 23:42 on 11-03 with `live Markdown 28137, Terminal 6638,
