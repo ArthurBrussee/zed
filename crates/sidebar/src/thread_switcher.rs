@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use action_log::DiffStats;
 #[cfg(test)]
 use agent_ui::TerminalId;
@@ -5,11 +7,11 @@ use agent_ui::{
     terminal_thread_metadata_store::TerminalThreadMetadata, thread_metadata_store::ThreadMetadata,
 };
 use gpui::{
-    Action as _, DismissEvent, EventEmitter, FocusHandle, Focusable, Modifiers,
+    Action as _, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Modifiers,
     ModifiersChangedEvent, Render, ScrollHandle, SharedString, prelude::*,
 };
 use ui::{AgentThreadStatus, ThreadItem, ThreadItemWorktreeInfo, WithScrollbar, prelude::*};
-use workspace::ModalView;
+use workspace::{ModalView, Workspace};
 use zed_actions::agents_sidebar::ToggleThreadSwitcher;
 
 use super::ThreadEntryWorkspace;
@@ -20,8 +22,8 @@ pub(crate) struct ThreadSwitcherThreadEntry {
     pub icon: IconName,
     pub icon_from_external_svg: Option<SharedString>,
     pub status: AgentThreadStatus,
-    pub metadata: ThreadMetadata,
-    pub workspace: ThreadEntryWorkspace,
+    pub metadata: Arc<ThreadMetadata>,
+    pub workspace: Entity<Workspace>,
     pub project_name: Option<SharedString>,
     pub worktrees: Vec<ThreadItemWorktreeInfo>,
     pub diff_stats: DiffStats,
@@ -33,7 +35,7 @@ pub(crate) struct ThreadSwitcherThreadEntry {
 
 #[derive(Clone)]
 pub(crate) struct ThreadSwitcherTerminalEntry {
-    pub metadata: TerminalThreadMetadata,
+    pub metadata: Arc<TerminalThreadMetadata>,
     pub(super) workspace: ThreadEntryWorkspace,
     pub project_name: Option<SharedString>,
     pub worktrees: Vec<ThreadItemWorktreeInfo>,
@@ -50,11 +52,11 @@ pub(crate) enum ThreadSwitcherEntry {
 #[derive(Clone)]
 pub(super) enum ThreadSwitcherSelection {
     Thread {
-        metadata: ThreadMetadata,
-        workspace: ThreadEntryWorkspace,
+        metadata: Arc<ThreadMetadata>,
+        workspace: Entity<Workspace>,
     },
     Terminal {
-        metadata: TerminalThreadMetadata,
+        metadata: Arc<TerminalThreadMetadata>,
         workspace: ThreadEntryWorkspace,
     },
 }

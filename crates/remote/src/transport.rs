@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::{collections::VecDeque, io::Write, sync::Arc, time::Duration};
 
 use crate::{
     RemoteArch, RemoteOs, RemotePlatform,
@@ -160,6 +160,10 @@ fn handle_rpc_messages_over_child_process_stdio(
     let mut stdout_buffer = Vec::new();
     let mut stderr_buffer = Vec::new();
     let mut stderr_offset = 0;
+    // quiet-ui: what the proxy said last, for the error when it exits. An ssh
+    // whose master is gone says so here and nowhere else.
+    let stderr_tail = Arc::new(parking_lot::Mutex::new(VecDeque::<String>::new()));
+    const STDERR_TAIL_LINES: usize = 5;
 
     let stdin_task = cx.background_spawn(async move {
         while let Some(outgoing) = outgoing_rx.next().await {
@@ -193,6 +197,8 @@ fn handle_rpc_messages_over_child_process_stdio(
         }
     });
 
+    let exit_stderr_tail = stderr_tail.clone();
+    let executor = cx.background_executor().clone();
     let stderr_task: Task<anyhow::Result<()>> = cx.background_spawn(async move {
         loop {
             stderr_buffer.resize(stderr_offset + 1024, 0);
@@ -216,12 +222,15 @@ fn handle_rpc_messages_over_child_process_stdio(
                 if let Ok(record) = serde_json::from_slice::<LogRecord>(content) {
                     record.log(log::logger())
                 } else {
+                    let line = String::from_utf8_lossy(content);
                     std::io::stderr()
-                        .write_fmt(format_args!(
-                            "(remote) {}\n",
-                            String::from_utf8_lossy(content)
-                        ))
+                        .write_fmt(format_args!("(remote) {line}\n"))
                         .ok();
+                    let mut tail = stderr_tail.lock();
+                    if tail.len() == STDERR_TAIL_LINES {
+                        tail.pop_front();
+                    }
+                    tail.push_back(line.into_owned());
                 }
             }
             stderr_buffer.drain(0..start_ix);
@@ -232,6 +241,7 @@ fn handle_rpc_messages_over_child_process_stdio(
     });
 
     cx.background_spawn(async move {
+        let mut stderr_task = stderr_task.fuse();
         let result = futures::select! {
             result = stdin_task.fuse() => {
                 result.context("stdin")
@@ -239,7 +249,7 @@ fn handle_rpc_messages_over_child_process_stdio(
             result = stdout_task.fuse() => {
                 result.context("stdout")
             }
-            result = stderr_task.fuse() => {
+            result = stderr_task => {
                 result.context("stderr")
             }
         };
@@ -251,7 +261,23 @@ fn handle_rpc_messages_over_child_process_stdio(
             let status = 1;
             status
         });
+        // What it wrote before exiting is still in the pipe.
+        if !futures::future::FusedFuture::is_terminated(&stderr_task) {
+            futures::select! {
+                _ = stderr_task => {}
+                _ = executor.timer(Duration::from_millis(200)).fuse() => {}
+            }
+        }
+        let tail = exit_stderr_tail.lock().iter().cloned().collect::<Vec<_>>();
         match result {
+            Ok(_)
+                if status != 0
+                    && crate::proxy::ProxyLaunchError::from_exit_code(status).is_none()
+                    && !tail.is_empty() =>
+            {
+                Err(anyhow::anyhow!("{}", tail.join("\n"))
+                    .context(format!("the proxy exited with status {status}")))
+            }
             Ok(_) => Ok(status),
             Err(error) => Err(error),
         }

@@ -71,7 +71,9 @@ fn split_config_options(
         return (options, Vec::new());
     }
 
-    let toolbar = [Speed, ThoughtLevel, Mode, Model]
+    // quiet-ui: the model keeps its picker and every other option is in the one
+    // menu (requested 2026-11-09).
+    let toolbar = [Model]
         .iter()
         .filter_map(|category| {
             let index = options
@@ -161,7 +163,14 @@ impl ConfigOptionsView {
         };
 
         let Some(selector) = self.selector_for_config_id(&config_id, cx) else {
-            return false;
+            // quiet-ui: an option without a selector lives in the menu, whose
+            // builder updates this view, so it opens after this update.
+            if self.is_read_only() || !self.has_overflow {
+                return false;
+            }
+            let overflow_menu = self.overflow_menu.clone();
+            window.defer(cx, move |window, cx| overflow_menu.toggle(window, cx));
+            return true;
         };
 
         selector.update(cx, |selector, cx| selector.toggle_picker(window, cx))
@@ -1443,15 +1452,25 @@ mod tests {
                 .map(|option| option.config_id.to_string())
                 .collect::<Vec<_>>()
         };
-        assert_eq!(ids(toolbar), ["fast-mode", "effort", "mode", "model"]);
+        assert_eq!(ids(toolbar), ["model"]);
         assert_eq!(
             ids(overflow),
-            ["extra-mode", "another-model", "speed-select", "tools"]
+            [
+                "extra-mode",
+                "effort",
+                "another-model",
+                "speed-select",
+                "fast-mode",
+                "tools",
+                "mode"
+            ]
         );
     }
 
+    /// quiet-ui (2026-11-09): the model keeps its picker and every other
+    /// option, effort and fast mode included, is in the one menu.
     #[gpui::test]
-    fn response_controls_render_separately_from_other_options(cx: &mut TestAppContext) {
+    fn the_model_keeps_its_picker_and_the_rest_share_one_menu(cx: &mut TestAppContext) {
         cx.update(init_test_ui);
         let config_options = Rc::new(TestSessionConfigOptions::new(Vec::new()));
         let agent_server = Rc::new(TestAgentServer::default());
@@ -1466,9 +1485,19 @@ mod tests {
             }
         });
         cx.run_until_parked();
-        assert!(cx.debug_bounds("ICON-FastForwardOff").is_none());
 
+        let model = acp::SessionConfigOption::select(
+            "model",
+            "Model",
+            "small",
+            vec![
+                acp::SessionConfigSelectOption::new("small", "Small"),
+                acp::SessionConfigSelectOption::new("large", "Large"),
+            ],
+        )
+        .category(acp::SessionConfigOptionCategory::Model);
         config_options.replace_options(vec![
+            model.clone(),
             acp::SessionConfigOption::boolean("fast", "Fast Mode", false)
                 .category(acp::SessionConfigOptionCategory::Speed),
             acp::SessionConfigOption::select(
@@ -1481,43 +1510,93 @@ mod tests {
                 ],
             )
             .category(acp::SessionConfigOptionCategory::ThoughtLevel),
-            acp::SessionConfigOption::boolean("tools", "Tools", false),
+            acp::SessionConfigOption::select(
+                "mode",
+                "Mode",
+                "default",
+                vec![
+                    acp::SessionConfigSelectOption::new("default", "Default"),
+                    acp::SessionConfigSelectOption::new("plan", "Plan"),
+                ],
+            )
+            .category(acp::SessionConfigOptionCategory::Mode),
         ]);
         cx.run_until_parked();
 
-        let response = cx
-            .debug_bounds("ICON-FastForwardOff")
-            .expect("fast mode control");
-        let overflow = cx
-            .debug_bounds("ICON-Filter")
-            .expect("Agent Options button");
-        assert!(response.right() < overflow.left());
-        cx.simulate_click(response.center(), Modifiers::default());
+        let options = composer.read_with(cx, |composer, _| composer.options.clone());
+        options.read_with(cx, |options, cx| {
+            let selectors = options
+                .selectors
+                .iter()
+                .map(|selector| selector.read(cx).config_id().to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(selectors, ["model"], "only the model has a picker");
+            assert_eq!(options.response_controls(cx).count(), 0);
+        });
+        assert!(
+            cx.debug_bounds("ICON-FastForwardOff").is_none(),
+            "fast mode is in the menu, not beside it"
+        );
+        let menu = cx.debug_bounds("ICON-Filter").expect("the one menu");
+        cx.simulate_click(menu.center(), Modifiers::default());
+        draw_menu_frames(cx);
+        let fast = cx
+            .debug_bounds("MENU_ITEM-Fast Mode")
+            .expect("fast mode in the menu");
+        cx.simulate_click(fast.center(), Modifiers::default());
+        cx.run_until_parked();
         assert_eq!(
             config_options.set_values.borrow().as_slice(),
             &[("fast".into(), acp::SessionConfigOptionValue::boolean(true))]
         );
 
-        let options = composer.read_with(cx, |composer, _| composer.options.clone());
-        let effort_picker_deployed = options.update_in(cx, |options, window, cx| {
+        // The keyboard still reaches the options in the menu.
+        options.update(cx, |options, cx| options.overflow_menu.hide(cx));
+        draw_menu_frames(cx);
+        assert!(options.update_in(cx, |options, window, cx| {
             options.toggle_category_picker(
                 acp::SessionConfigOptionCategory::ThoughtLevel,
                 window,
                 cx,
-            );
-            options
-                .selector_for_config_id(&"effort".into(), cx)
-                .and_then(|selector| selector.read(cx).picker_handle.clone())
-                .is_some_and(|handle| handle.is_deployed())
+            )
+        }));
+        draw_menu_frames(cx);
+        assert!(
+            options.read_with(cx, |options, _| options.overflow_menu.is_deployed()),
+            "the effort toggle opens the menu"
+        );
+        options.update_in(cx, |options, window, cx| {
+            assert!(options.cycle_category_option(
+                acp::SessionConfigOptionCategory::Mode,
+                false,
+                window,
+                cx
+            ));
         });
-        assert!(effort_picker_deployed);
+        cx.run_until_parked();
+        assert_eq!(
+            config_options.set_values.borrow().last(),
+            Some(&("mode".into(), acp::SessionConfigOptionValue::id("plan")))
+        );
+
+        // An agent that offers only a model shows no menu.
+        config_options.replace_options(vec![model]);
+        cx.run_until_parked();
+        draw_menu_frames(cx);
+        assert!(cx.debug_bounds("ICON-Filter").is_none());
     }
 
     #[gpui::test]
     fn overflow_options_stay_editable_after_a_config_update(cx: &mut TestAppContext) {
         cx.update(init_test_ui);
-        let fast_mode = acp::SessionConfigOption::boolean("fast-mode", "Fast Mode", false)
-            .category(acp::SessionConfigOptionCategory::Speed);
+        // quiet-ui: the model is the one option outside the menu.
+        let fast_mode = acp::SessionConfigOption::select(
+            "model",
+            "Model",
+            "small",
+            vec![acp::SessionConfigSelectOption::new("small", "Small")],
+        )
+        .category(acp::SessionConfigOptionCategory::Model);
         let config_options = Rc::new(TestSessionConfigOptions::new(vec![fast_mode.clone()]));
         let agent_server = Rc::new(TestAgentServer::default());
         let fs: Arc<dyn Fs> = FakeFs::new(cx.executor());
@@ -2005,7 +2084,8 @@ mod tests {
     #[gpui::test]
     fn unknown_config_options_survive_live_selector_updates(cx: &mut TestAppContext) {
         cx.update(init_test_ui);
-        let category = acp::SessionConfigOptionCategory::Mode;
+        // quiet-ui: the model, the one option with a selector of its own.
+        let category = acp::SessionConfigOptionCategory::Model;
         let unknown = acp::SessionConfigOption::new(
             "mode",
             "Mode",

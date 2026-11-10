@@ -128,6 +128,7 @@ pub async fn open_remote_project(
     cx: &mut AsyncApp,
 ) -> Result<WindowHandle<MultiWorkspace>> {
     let created_new_window = open_options.requesting_window.is_none();
+    let mut reused_identifier = None;
 
     let existing = find_existing_workspace(
         &paths,
@@ -214,6 +215,16 @@ pub async fn open_remote_project(
         log::info!(
             "existing remote workspace found but connection is dead, starting fresh connection"
         );
+        // quiet-ui: under the dead client's name, so the server it ran is
+        // replaced instead of left running beside the new one.
+        reused_identifier = cx.update(|cx| {
+            existing_workspace
+                .read(cx)
+                .project()
+                .read(cx)
+                .remote_client()
+                .map(|client| client.read(cx).unique_identifier().to_string())
+        });
     }
 
     let (window, initial_workspace) = if let Some(window) = open_options.requesting_window {
@@ -371,6 +382,7 @@ pub async fn open_remote_project(
                     delegate.clone(),
                     app_state.clone(),
                     paths.clone(),
+                    reused_identifier.clone(),
                     cx,
                 )
             })
@@ -550,6 +562,7 @@ mod tests {
     use remote_server::{HeadlessAppState, HeadlessProject};
     use rpc::proto;
     use serde_json::json;
+    use std::{cell::RefCell, rc::Rc};
     use util::path;
     use workspace::find_existing_workspace;
 
@@ -1280,6 +1293,7 @@ mod tests {
                         .remote_client()
                         .expect("should have remote client");
                     client.update(cx, |client, cx| {
+                        client.set_unique_identifier_for_test("setup-test-7");
                         client.force_server_not_running(cx);
                     });
                 });
@@ -1343,6 +1357,12 @@ mod tests {
                     assert!(
                         workspace.project().read(cx).is_remote(),
                         "project should be remote after reconnect"
+                    );
+                    let client = workspace.project().read(cx).remote_client().unwrap();
+                    assert_eq!(
+                        client.read(cx).unique_identifier(),
+                        "setup-test-7",
+                        "the new server replaces the old one under its name"
                     );
                 });
             })
@@ -1413,6 +1433,188 @@ mod tests {
             window_remote_client(new_window, cx)
                 .read_with(cx, |client, _| client.connection_state()),
             ConnectionState::Connected
+        );
+    }
+
+    /// quiet-ui: a client that a newer one took the server from says so as a
+    /// lost connection, not as a server that is gone, which its window would
+    /// answer by starting a fresh server and taking it back.
+    #[gpui::test]
+    async fn test_a_superseded_client_does_not_reconnect_by_itself(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let (opts, paths, app_state, window, _headless) =
+            open_connected_remote_project(cx, server_cx).await;
+        let old_client = window_remote_client(window, cx);
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = cx.update(|cx| {
+            let events = events.clone();
+            cx.subscribe(&old_client, move |_, event, _| {
+                if let remote::RemoteClientEvent::Disconnected { server_not_running } = event {
+                    events.borrow_mut().push(*server_not_running);
+                }
+            })
+        });
+
+        let new_window = open_remote_project(
+            opts,
+            paths,
+            app_state,
+            workspace::OpenOptions {
+                workspace_matching: workspace::WorkspaceMatching::None,
+                ..Default::default()
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(*events.borrow(), [false]);
+        assert_eq!(
+            old_client.read_with(cx, |client, _| client.connection_state()),
+            ConnectionState::Disconnected
+        );
+        assert_eq!(
+            window_remote_client(window, cx).entity_id(),
+            old_client.entity_id(),
+            "the old window started no client of its own"
+        );
+        assert_eq!(
+            window_remote_client(new_window, cx)
+                .read_with(cx, |client, _| client.connection_state()),
+            ConnectionState::Connected
+        );
+    }
+
+    /// quiet-ui: a box whose server has gone gets a fresh one without anyone
+    /// clicking Reconnect, and the agents it lists are known straight away,
+    /// before the list it pushes on its own (a second after connecting) lands.
+    #[gpui::test]
+    async fn test_a_window_whose_server_is_gone_reconnects_by_itself(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let app_state = init_test(cx);
+        let executor = cx.executor();
+        cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+        server_cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+
+        let (opts, server_session, connect_guard) = RemoteClient::fake_server(cx, server_cx);
+        let remote_fs = FakeFs::new(server_cx.executor());
+        remote_fs
+            .insert_tree(path!("/project"), json!({ "main.rs": "fn main() {}" }))
+            .await;
+        server_cx.update(HeadlessProject::init);
+        let headless = |session, server_cx: &mut TestAppContext| {
+            let fs = remote_fs.clone();
+            server_cx.new(|cx| {
+                HeadlessProject::new(
+                    HeadlessAppState {
+                        session,
+                        fs,
+                        http_client: Arc::new(BlockedHttpClient),
+                        node_runtime: NodeRuntime::unavailable(),
+                        languages: Arc::new(language::LanguageRegistry::new(
+                            cx.background_executor().clone(),
+                        )),
+                        extension_host_proxy: Arc::new(ExtensionHostProxy::new()),
+                        startup_time: std::time::Instant::now(),
+                    },
+                    false,
+                    cx,
+                )
+            })
+        };
+        let _headless = headless(server_session, server_cx);
+        drop(connect_guard);
+
+        let paths = vec![PathBuf::from(path!("/project"))];
+        let mut async_cx = cx.to_async();
+        open_remote_project(
+            opts.clone(),
+            paths,
+            app_state,
+            workspace::OpenOptions::default(),
+            &mut async_cx,
+        )
+        .await
+        .expect("initial open should succeed");
+        executor.run_until_parked();
+        let window = cx.update(|cx| cx.windows()[0].downcast::<MultiWorkspace>().unwrap());
+        let project_of = |cx: &mut TestAppContext| {
+            window
+                .update(cx, |multi_workspace, _, cx| {
+                    multi_workspace.workspace().read(cx).project().clone()
+                })
+                .unwrap()
+        };
+        let old_project = project_of(cx);
+
+        // The replacement server the reconnect will find, with an agent set
+        // up on the box.
+        server_cx.update(|cx| {
+            use gpui::UpdateGlobal as _;
+            settings::SettingsStore::update_global(cx, |store, cx| {
+                store
+                    .set_server_settings(
+                        &json!({ "agent_servers": { "claude-acp": { "type": "custom", "command": "claude-acp" } } })
+                            .to_string(),
+                        cx,
+                    )
+                    .unwrap();
+            })
+        });
+        let (server_session_2, connect_guard_2) =
+            RemoteClient::fake_server_with_opts(&opts, cx, server_cx);
+        let _headless_2 = headless(server_session_2, server_cx);
+        drop(connect_guard_2);
+
+        window
+            .update(cx, |multi_workspace, _, cx| {
+                let client = multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .project()
+                    .read(cx)
+                    .remote_client()
+                    .unwrap();
+                client.update(cx, |client, cx| client.force_server_not_running(cx));
+            })
+            .unwrap();
+        executor.run_until_parked();
+
+        let new_project = project_of(cx);
+        assert_ne!(
+            new_project.entity_id(),
+            old_project.entity_id(),
+            "the window reopened its project on a fresh server by itself"
+        );
+        window
+            .update(cx, |multi_workspace, _, cx| {
+                let workspace = multi_workspace.workspace().read(cx);
+                assert!(workspace.project().read(cx).is_remote());
+                assert!(
+                    workspace
+                        .active_modal::<crate::disconnected_overlay::DisconnectedOverlay>(cx)
+                        .is_none(),
+                    "nothing waits on a click"
+                );
+            })
+            .unwrap();
+        let agents = new_project.read_with(cx, |project, cx| {
+            project
+                .agent_server_store()
+                .read(cx)
+                .external_agents()
+                .map(|agent| agent.to_string())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            agents,
+            ["claude-acp"],
+            "the agents are asked for rather than left to a push that can be missed"
         );
     }
 

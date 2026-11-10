@@ -1,4 +1,6 @@
 pub mod auth_methods;
+mod command_output;
+mod command_parse;
 pub mod commands;
 pub mod compaction;
 pub mod config_options;
@@ -8,16 +10,23 @@ mod diff;
 pub mod elicitation;
 mod mention;
 pub mod notices;
+pub mod plan_usage;
+mod pr_mentions;
 pub mod prompt_capabilities;
+mod render_release;
+mod running_work;
 pub mod subagents;
 mod submission;
 mod terminal;
+mod tool_labels;
 pub use ::terminal::HeadlessTerminal;
 use action_log::{ActionLog, ActionLogTelemetry};
 use agent_client_protocol::{schema::MaybeUndefined, v1::schema as acp_v1, v2::schema as acp_v2};
 use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result, anyhow};
 use collections::{HashSet, IndexMap};
+pub use command_output::*;
+pub use command_parse::*;
 pub use connection::*;
 pub use diff::*;
 use feature_flags::{AcpBetaFeatureFlag, FeatureFlagAppExt as _};
@@ -35,8 +44,11 @@ use language::{
 };
 use markdown::{Markdown, MarkdownOptions};
 pub use mention::*;
+pub use pr_mentions::*;
 use project::lsp_store::{FormatTrigger, LspFormatTarget};
 use project::{AgentLocation, Project};
+pub use render_release::*;
+pub use running_work::*;
 use serde::{Deserialize, Serialize};
 use serde_json::to_string_pretty;
 use settings::{Settings, SettingsStore};
@@ -53,6 +65,7 @@ pub use submission::*;
 use task::{Shell, ShellBuilder};
 pub use terminal::*;
 use text::Bias;
+pub use tool_labels::*;
 use ui::App;
 use util::markdown::{MarkdownCodeBlock, MarkdownEscaped};
 use util::path_list::PathList;
@@ -116,6 +129,22 @@ pub fn tool_name_from_meta(meta: &Option<acp_v2::Meta>) -> Option<SharedString> 
 /// Creates ACP metadata containing the legacy tool-name field.
 pub fn meta_with_tool_name(tool_name: &str) -> acp_v2::Meta {
     acp_v2::Meta::from_iter([(TOOL_NAME_META_KEY.into(), tool_name.into())])
+}
+
+const CLAUDE_CODE_META_KEY: &str = "claudeCode";
+
+/// The Claude adapter reports tool names only in its own meta namespace.
+fn claude_tool_name_from_meta(meta: &Option<acp_v1::Meta>) -> Option<SharedString> {
+    meta.as_ref()
+        .and_then(|meta| meta.get(CLAUDE_CODE_META_KEY))
+        .and_then(|claude| claude.get("toolName"))
+        .and_then(|name| name.as_str())
+        .map(|name| SharedString::from(name.to_owned()))
+}
+
+/// `spawn_agent` is Codex's; `Agent` and `Task` (older versions) are Claude's.
+fn is_subagent_tool_name(name: &str) -> bool {
+    matches!(name, "spawn_agent" | "Agent" | "Task")
 }
 
 /// Key used in ACP `AvailableCommand` meta to record which source produced a
@@ -1272,8 +1301,9 @@ enum ToolCallOrigin {
 }
 
 impl ToolCallOrigin {
-    fn plain_label(self, title: Option<&SharedString>, kind: &acp_v2::ToolKind) -> bool {
-        self == Self::AcpV2 || title.is_none() || *kind == acp_v2::ToolKind::Execute
+    /// quiet-ui: a command's label is Markdown, its command in a code span.
+    fn plain_label(self, title: Option<&SharedString>) -> bool {
+        self == Self::AcpV2 || title.is_none()
     }
 }
 
@@ -1416,7 +1446,15 @@ impl ToolCallPatch {
     }
 }
 
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
 impl ToolCall {
+    #[cfg(any(test, feature = "test-support"))]
     fn from_acp(
         tool_call: acp_v1::ToolCall,
         status: Option<ToolCallStatus>,
@@ -1477,11 +1515,13 @@ impl ToolCall {
         let sandbox_fallback_authorization_details =
             sandbox_fallback_authorization_details_from_meta(&meta);
         let sandbox_not_applied = sandbox_not_applied_from_meta(&meta);
+        let locations = patch.locations.take().unwrap_or_default();
         let label = Self::new_label(
             origin,
             title.as_ref().filter(|title| !title.trim().is_empty()),
             tool_name.as_ref(),
             kind.as_ref().unwrap_or(&acp_v2::ToolKind::Other),
+            &locations,
             language_registry.clone(),
             cx,
         );
@@ -1496,7 +1536,7 @@ impl ToolCall {
             reported_status: patch.status.take(),
             meta,
             structured_content: content,
-            locations: patch.locations.take().unwrap_or_default(),
+            locations,
             resolved_locations: Vec::default(),
             local_status: None,
             authorization: None,
@@ -1580,6 +1620,7 @@ impl ToolCall {
         title: Option<&SharedString>,
         tool_name: Option<&SharedString>,
         kind: &acp_v2::ToolKind,
+        locations: &[ToolCallLocation],
     ) -> SharedString {
         let Some(title) = title else {
             return tool_name
@@ -1588,10 +1629,12 @@ impl ToolCall {
                 .unwrap_or_else(|| "Tool call".into());
         };
 
-        if origin == ToolCallOrigin::AcpV2 || kind == &acp_v2::ToolKind::Execute {
+        if origin == ToolCallOrigin::AcpV2 {
             title.clone()
+        } else if kind == &acp_v2::ToolKind::Execute {
+            execute_command_label_source(title).into()
         } else if kind == &acp_v2::ToolKind::Edit {
-            MarkdownEscaped(title).to_string().into()
+            edit_label_source(title, locations).into()
         } else if let Some((first_line, _)) = title.split_once('\n') {
             (first_line.to_owned() + "…").into()
         } else {
@@ -1604,12 +1647,13 @@ impl ToolCall {
         title: Option<&SharedString>,
         tool_name: Option<&SharedString>,
         kind: &acp_v2::ToolKind,
+        locations: &[ToolCallLocation],
         language_registry: Arc<LanguageRegistry>,
         cx: &mut App,
     ) -> Entity<Markdown> {
-        let text = Self::label_text(origin, title, tool_name, kind);
+        let text = Self::label_text(origin, title, tool_name, kind, locations);
         cx.new(|cx| {
-            if origin.plain_label(title, kind) {
+            if origin.plain_label(title) {
                 Markdown::new_text(text, cx)
             } else {
                 Markdown::new(text, Some(language_registry), None, cx)
@@ -1652,8 +1696,10 @@ impl ToolCall {
             MaybeUndefined::Null => Some(Vec::new()),
             MaybeUndefined::Value(content) => Some(content.prepare(self.origin, terminals, cx)?),
         };
-        let was_plain_text = self.origin.plain_label(self.effective_title(), self.kind());
-        let mut label_changed = !title.is_undefined() || !kind.is_undefined();
+        let was_plain_text = self.origin.plain_label(self.effective_title());
+        // An edit's label is derived from its locations.
+        let mut label_changed =
+            !title.is_undefined() || !kind.is_undefined() || !locations.is_undefined();
         if !kind.is_undefined() {
             self.reported_kind = kind.take();
         }
@@ -1723,14 +1769,23 @@ impl ToolCall {
                 }
             }
         }
+        if !locations.is_undefined() {
+            let locations = locations.take().unwrap_or_default();
+            if self.locations != locations {
+                self.locations = locations;
+                self.resolved_locations.clear();
+            }
+        }
+
         if label_changed {
-            let is_plain_text = self.origin.plain_label(self.effective_title(), self.kind());
+            let is_plain_text = self.origin.plain_label(self.effective_title());
             if was_plain_text != is_plain_text {
                 self.label = Self::new_label(
                     self.origin,
                     self.effective_title(),
                     self.tool_name.as_ref(),
                     self.kind(),
+                    &self.locations,
                     language_registry.clone(),
                     cx,
                 );
@@ -1740,6 +1795,7 @@ impl ToolCall {
                     self.effective_title(),
                     self.tool_name.as_ref(),
                     self.kind(),
+                    &self.locations,
                 );
                 if self.label.read(cx).source() != &text {
                     self.label.update(cx, |label, cx| label.replace(text, cx));
@@ -1762,14 +1818,6 @@ impl ToolCall {
                 ));
             }
             self.structured_content.truncate(new_content_len);
-        }
-
-        if !locations.is_undefined() {
-            let locations = locations.take().unwrap_or_default();
-            if self.locations != locations {
-                self.locations = locations;
-                self.resolved_locations.clear();
-            }
         }
 
         if !raw_input.is_undefined() {
@@ -1912,7 +1960,9 @@ impl ToolCall {
     }
 
     pub fn is_subagent(&self) -> bool {
-        self.tool_name.as_ref().is_some_and(|s| s == "spawn_agent")
+        self.tool_name.as_deref().is_some_and(is_subagent_tool_name)
+            || claude_tool_name_from_meta(&self.meta)
+                .is_some_and(|name| is_subagent_tool_name(&name))
             || self.subagent_session_info.is_some()
     }
 
@@ -1936,15 +1986,20 @@ impl ToolCall {
         project: WeakEntity<Project>,
         cx: &mut AsyncApp,
     ) -> Option<ResolvedLocation> {
+        // quiet-ui: only a file in one of the project's own worktrees. Opening
+        // anything else (an agent's memory file, a skill, a plot) made an
+        // invisible worktree and a file watcher for it, one per file.
         let buffer = project
             .update(cx, |project, cx| {
-                if let Some(path) = project.project_path_for_absolute_path(&location.path, cx) {
-                    Some(project.open_buffer(path, cx))
-                } else if project.path_style(cx).is_absolute(&location.path) {
-                    Some(project.open_local_buffer(&location.path, cx))
-                } else {
-                    None
+                let path = project.project_path_for_absolute_path(&location.path, cx)?;
+                let visible = project
+                    .worktree_for_id(path.worktree_id, cx)
+                    .is_some_and(|worktree| worktree.read(cx).is_visible());
+                if !visible || command_output::has_image_extension(&location.path.to_string_lossy())
+                {
+                    return None;
                 }
+                Some(project.open_buffer(path, cx))
             })
             .ok()??;
         let buffer = buffer.await.log_err()?;
@@ -1961,6 +2016,33 @@ impl ToolCall {
         });
 
         Some(ResolvedLocation { buffer, position })
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_test(
+        tool_call: acp_v1::ToolCall,
+        status: ToolCallStatus,
+        language_registry: Arc<LanguageRegistry>,
+        cx: &mut App,
+    ) -> Self {
+        Self::from_acp(
+            tool_call,
+            Some(status),
+            language_registry,
+            &HashMap::default(),
+            cx,
+        )
+        .expect("a tool call with no terminal content to resolve")
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_content_for_test(&mut self, content: Vec<ToolCallContent>) {
+        self.structured_content = content;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_status_for_test(&mut self, status: ToolCallStatus) {
+        self.set_legacy_status(status);
     }
 
     fn resolve_locations(
@@ -2644,8 +2726,7 @@ impl ContentBlock {
         }
     }
 
-    #[cfg(test)]
-    fn plain_markdown(&self) -> Option<&Entity<Markdown>> {
+    pub fn plain_markdown(&self) -> Option<&Entity<Markdown>> {
         match &self.render {
             RenderBlock::Markdown { markdown } => Some(markdown),
             _ => None,
@@ -2856,7 +2937,7 @@ impl ContentBlock {
         Some((Arc::new(gpui::Image::from_bytes(format, bytes)), dimensions))
     }
 
-    fn image_dimensions(bytes: &[u8], format: gpui::ImageFormat) -> Option<gpui::Size<u32>> {
+    pub fn image_dimensions(bytes: &[u8], format: gpui::ImageFormat) -> Option<gpui::Size<u32>> {
         let format = match format {
             gpui::ImageFormat::Png => image::ImageFormat::Png,
             gpui::ImageFormat::Jpeg => image::ImageFormat::Jpeg,
@@ -3864,6 +3945,7 @@ pub struct AcpThread {
     shared_buffers: HashMap<Entity<Buffer>, BufferSnapshot>,
     turn_id: u32,
     running_turn: Option<RunningTurn>,
+    relay_reconnecting: bool,
     connection: Rc<dyn AgentConnection>,
     submissions: SessionSubmissions,
     activity: SessionActivity,
@@ -3884,6 +3966,12 @@ pub struct AcpThread {
     pending_terminal_output: HashMap<acp_v2::TerminalId, Vec<Vec<u8>>>,
     pending_terminal_exit: HashMap<acp_v2::TerminalId, acp_v1::TerminalExitStatus>,
     had_error: bool,
+    /// Why the agent said the session stopped. Nothing on the wire takes it
+    /// back, so it is this side that drops it when a turn starts.
+    session_failure: Option<SessionFailure>,
+    /// A retry the agent is making, such as a reconnect to its API. The next
+    /// update that is not session info takes it back.
+    session_warning: Option<SharedString>,
     local_execution_error: Option<Arc<anyhow::Error>>,
     /// The user's unsent prompt text, persisted so it can be restored when reloading the thread.
     draft_prompt: Option<Vec<acp_v2::ContentBlock>>,
@@ -3895,6 +3983,12 @@ pub struct AcpThread {
     /// reveal text gradually without changing the authoritative message.
     streaming_text_buffer: Option<StreamingTextBuffer>,
     idle_sleep_prevention: IdleSleepPrevention,
+    async_tasks: Vec<AsyncTask>,
+    /// Only populated for an agent that reports subagent lifecycles.
+    reported_subagents: Vec<Subagent>,
+    /// The task carrying a command's lifecycle can name its call late or
+    /// never, so the call's own backgrounded marker is kept as well.
+    backgrounded_tool_calls: HashSet<acp_v2::ToolCallId>,
 }
 
 enum IdleSleepPrevention {
@@ -4039,6 +4133,12 @@ pub enum AcpThreadEvent {
     Retry(RetryStatus),
     /// A child session was registered; read it with [`AcpThread::subagent`].
     SubagentSpawned(acp_v2::SessionId),
+    /// An input to [`AcpThread::running_work`] moved. `cx.notify()` reaches the
+    /// thread's own views; nothing watching the thread from outside it, such as
+    /// the sidebar row, learns of a command that detached or finished.
+    RunningWorkChanged,
+    /// Why the thread stopped changed, for the same reason and the same readers.
+    StopReasonChanged,
     Stopped {
         activity_generation: u64,
         activity_duration: Option<Duration>,
@@ -4173,6 +4273,8 @@ impl AcpThread {
                 | AcpThreadEvent::Retry(_)
                 | AcpThreadEvent::SubagentSpawned(_)
                 | AcpThreadEvent::SubagentAssociationUpdated
+                | AcpThreadEvent::RunningWorkChanged
+                | AcpThreadEvent::StopReasonChanged
                 | AcpThreadEvent::Stopped { .. }
                 | AcpThreadEvent::Error
                 | AcpThreadEvent::ConnectionLost
@@ -4211,6 +4313,7 @@ impl AcpThread {
             provisional_title: None,
             project,
             running_turn: None,
+            relay_reconnecting: false,
             turn_id: 0,
             submissions: SessionSubmissions::new(
                 receipt_submissions.map_or(SubmissionTransport::Completion, |transport| {
@@ -4236,12 +4339,17 @@ impl AcpThread {
             pending_terminal_output: HashMap::default(),
             pending_terminal_exit: HashMap::default(),
             had_error: false,
+            session_failure: None,
+            session_warning: None,
             local_execution_error: None,
             draft_prompt: None,
             draft_prompt_revision: 0,
             ui_scroll_position: None,
             streaming_text_buffer: None,
             idle_sleep_prevention: IdleSleepPrevention::Inactive,
+            async_tasks: Vec::new(),
+            reported_subagents: Vec::new(),
+            backgrounded_tool_calls: HashSet::default(),
         }
     }
 
@@ -4928,13 +5036,25 @@ impl AcpThread {
 
     fn set_foreground_state(&mut self, state: acp_v2::StateUpdate, cx: &mut Context<Self>) {
         let previous_generation = self.activity.generation();
+        let previous = self.foreground_activity();
         self.activity
             .update(state, self.entries.len().saturating_sub(1));
+        let current = self.foreground_activity();
         if self.activity.generation() != previous_generation {
             self.had_error = false;
             self.local_execution_error = None;
+            self.clear_session_failure(cx);
         }
-        cx.notify();
+        // Whether a turn is running decides which in-flight calls count.
+        if (previous == ForegroundActivity::Idle) != (current == ForegroundActivity::Idle) {
+            if current == ForegroundActivity::Idle {
+                self.release_orphan_backgrounded_tool_calls();
+                self.clear_session_warning(cx);
+            }
+            self.running_work_changed(cx);
+        } else {
+            cx.notify();
+        }
     }
 
     pub fn sync_local_action_state(&mut self, cx: &mut Context<Self>) {
@@ -4981,6 +5101,31 @@ impl AcpThread {
             self.uses_reported_activity(),
             "Session does not report foreground state"
         );
+        self.apply_reported_state(state, cx);
+        Ok(())
+    }
+
+    /// quiet-ui: the turn state the relay on a remote project's box reports
+    /// after a reattach. A turn this side started settles through its own
+    /// prompt, so the report only speaks for one it did not.
+    pub fn apply_relay_state(&mut self, state: acp_v2::StateUpdate, cx: &mut Context<Self>) {
+        if self.running_turn.is_none() {
+            self.apply_reported_state(state, cx);
+        }
+    }
+
+    pub fn set_relay_reconnecting(&mut self, reconnecting: bool, cx: &mut Context<Self>) {
+        if self.relay_reconnecting != reconnecting {
+            self.relay_reconnecting = reconnecting;
+            cx.notify();
+        }
+    }
+
+    pub fn relay_reconnecting(&self) -> bool {
+        self.relay_reconnecting
+    }
+
+    fn apply_reported_state(&mut self, state: acp_v2::StateUpdate, cx: &mut Context<Self>) {
         let previous = self.foreground_activity();
         let was_in_progress = self.activity.in_progress();
         self.received_session_state = true;
@@ -5064,7 +5209,6 @@ impl AcpThread {
         {
             cx.emit(AcpThreadEvent::ActivityConfirmedIdle);
         }
-        Ok(())
     }
 
     /// Forgets the reported foreground state without implying idle, as when an ACP
@@ -5152,6 +5296,9 @@ impl AcpThread {
         update: acp_v1::SessionUpdate,
         cx: &mut Context<Self>,
     ) -> Result<(), acp_v1::Error> {
+        if !matches!(update, acp_v1::SessionUpdate::SessionInfoUpdate(_)) {
+            self.clear_session_warning(cx);
+        }
         match update {
             acp_v1::SessionUpdate::UserMessageChunk(acp_v1::ContentChunk {
                 content,
@@ -5896,6 +6043,25 @@ impl AcpThread {
     ) {
         let path_style = self.project.read(cx).path_style(cx);
 
+        // External agents announce native compaction as an assistant message.
+        if let acp_v2::ContentBlock::Text(text_content) = &chunk
+            && !is_thought
+            && is_context_compaction_notice(&text_content.text)
+        {
+            let id = ContextCompactionId(format!("agent-notice-{}", self.entries.len()).into());
+            self.push_context_compaction(
+                ContextCompaction {
+                    id,
+                    status: ContextCompactionStatus::Completed,
+                    error: None,
+                    summary: MessageContent::default(),
+                    meta: None,
+                },
+                cx,
+            );
+            return;
+        }
+
         // For text chunks going to an existing Markdown block, buffer for smooth
         // streaming instead of appending all at once which may feel more choppy.
         let chunk = match chunk {
@@ -6127,7 +6293,6 @@ impl AcpThread {
                         valid
                     })
                     .unwrap_or(false);
-
                 if !should_continue {
                     break;
                 }
@@ -6380,6 +6545,8 @@ impl AcpThread {
     }
 
     pub fn update_usage(&mut self, update: acp_v2::UsageUpdate, cx: &mut Context<Self>) {
+        // A rate-limit report rides along on the same update.
+        plan_usage::note_usage_update(update.meta.as_opt_ref().flatten(), cx);
         MetadataUpdate::V2(update.meta).apply(&mut self.usage_meta);
         let usage = self.token_usage.get_or_insert_with(Default::default);
         usage.max_tokens = update.size;
@@ -6461,23 +6628,13 @@ impl AcpThread {
     fn tool_call_index_for_update(
         &mut self,
         id: &acp_v2::ToolCallId,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) -> Result<Option<usize>> {
         if let Some(index) = self.index_for_tool_call(id) {
             return Ok(Some(index));
         }
-        let languages = self.project.read(cx).languages().clone();
-        let failed_tool_call = ToolCall::from_acp(
-            acp_v1::ToolCall::new(acp_v1::ToolCallId::new(id.0.clone()), "Tool call not found")
-                .kind(acp_v1::ToolKind::Fetch)
-                .status(acp_v1::ToolCallStatus::Failed)
-                .content(vec!["Tool call not found".into()]),
-            Some(ToolCallStatus::Failed),
-            languages,
-            &self.terminals,
-            cx,
-        )?;
-        self.push_entry(AgentThreadEntry::ToolCall(failed_tool_call), cx);
+        // A placeholder entry would render as a useless chip.
+        log::warn!("ignoring update for unknown tool call {id:?}");
         Ok(None)
     }
 
@@ -7741,6 +7898,7 @@ impl AcpThread {
         self.clear_completed_plan_entries(cx);
         self.had_error = false;
         self.local_execution_error = None;
+        self.clear_session_failure(cx);
 
         let (tx, rx) = oneshot::channel();
 
@@ -7891,6 +8049,7 @@ impl AcpThread {
                             this.cancel_pending_turn_entries(cx);
                         }
                         this.had_error = true;
+                        this.stop_background_work(cx);
                         cx.emit(AcpThreadEvent::Error);
                         log::error!("Error in run turn: {:?}", e);
                         Err(e)
@@ -8009,6 +8168,11 @@ impl AcpThread {
             let request_ids = self.permission_requests.keys().copied().collect::<Vec<_>>();
             for id in request_ids {
                 self.cancel_permission_request_with_outcome(id, permission_outcome.clone(), cx);
+            }
+            // quiet-ui: a turn the relay reported running was started from
+            // another connection; stopping it still goes through the agent.
+            if self.foreground_activity() != ForegroundActivity::Idle {
+                self.connection.cancel(self.session_id(), cx)?;
             }
             return Ok(Task::ready(Ok(())));
         };
@@ -8153,6 +8317,17 @@ impl AcpThread {
         permission_outcome: RequestPermissionOutcome,
         cx: &mut Context<Self>,
     ) {
+        // The agent stopped, so it will not correct an in-progress entry itself.
+        for plan in self.plans.values_mut() {
+            if let PlanContent::Items(entries) = &mut plan.content {
+                for entry in entries {
+                    if entry.source.status == acp_v2::PlanEntryStatus::InProgress {
+                        entry.source.status = acp_v2::PlanEntryStatus::Pending;
+                    }
+                }
+            }
+        }
+
         let mut canceled_requests = Vec::new();
         for (ix, entry) in self.entries.iter_mut().enumerate() {
             match entry {
@@ -8546,7 +8721,11 @@ impl AcpThread {
 
         cx.spawn(async move |this, cx| {
             let terminal = terminal_task.await?;
-            this.update(cx, |this, _cx| {
+            this.update(cx, |this, cx| {
+                terminal.update(cx, |terminal, cx| {
+                    terminal.watch_repository(this.project.clone(), cx)
+                });
+                this.watch_terminal_lifecycle(&terminal, cx);
                 this.terminals.insert(terminal_id, terminal.clone());
                 terminal
             })
@@ -8607,6 +8786,8 @@ impl AcpThread {
     }
 
     pub fn emit_load_error(&mut self, error: LoadError, cx: &mut Context<Self>) {
+        self.clear_async_tasks(cx);
+        self.clear_subagents(cx);
         cx.emit(AcpThreadEvent::LoadError(error));
     }
 
@@ -8635,8 +8816,21 @@ impl AcpThread {
                 cx,
             )
         });
+        entity.update(cx, |terminal, cx| {
+            terminal.watch_repository(self.project.clone(), cx)
+        });
+        self.watch_terminal_lifecycle(&entity, cx);
         self.terminals.insert(terminal_id.clone(), entity.clone());
         entity
+    }
+
+    /// A terminal we own caches its output on itself when its process exits,
+    /// which is a notify on the terminal and nothing on the thread.
+    fn watch_terminal_lifecycle(&self, terminal: &Entity<Terminal>, cx: &mut Context<Self>) {
+        cx.observe(terminal, |this, _terminal, cx| {
+            this.running_work_changed(cx);
+        })
+        .detach();
     }
 
     pub fn mark_as_subagent_output(&mut self, cx: &mut Context<Self>) {
@@ -8720,7 +8914,7 @@ impl AcpThread {
                     cx.emit(AcpThreadEvent::EntryUpdated(index));
                 }
             }
-            cx.notify();
+            this.running_work_changed(cx);
         })
         .detach();
         self.terminals.insert(terminal_id.clone(), entity.clone());
@@ -8852,6 +9046,8 @@ fn update_markdown_in_place(markdown: &Entity<Markdown>, text: &str, cx: &mut Ap
 
 #[cfg(test)]
 mod tests {
+    mod fork_tests;
+
     use super::*;
     use agent_client_protocol::schema::IndexMap as AcpIndexMap;
     use anyhow::anyhow;
@@ -11357,7 +11553,7 @@ mod tests {
                 assert_eq!(reused.read(cx).inner().entity_id(), lower.entity_id());
                 assert_eq!(
                     reused.read(cx).command().read(cx).source(),
-                    "```\nactual command\n```"
+                    "```bash\nactual command\n```"
                 );
                 assert!(lower.read(cx).get_content().contains("early"));
                 let (_, tool) = thread.tool_call(&tool_id).expect("tool");
@@ -11378,7 +11574,7 @@ mod tests {
             terminal.read_with(cx, |terminal, cx| {
                 assert_eq!(
                     terminal.command().read(cx).source(),
-                    "```\nactual command\n```"
+                    "```bash\nactual command\n```"
                 );
             });
             thread
@@ -11402,7 +11598,10 @@ mod tests {
                 })
                 .expect("explicit command clear remains authoritative");
             terminal.read_with(cx, |terminal, cx| {
-                assert_eq!(terminal.command().read(cx).source(), "```\nTerminal\n```");
+                assert_eq!(
+                    terminal.command().read(cx).source(),
+                    "```bash\nTerminal\n```"
+                );
             });
             thread
                 .update(cx, |thread, cx| {
@@ -11767,7 +11966,7 @@ mod tests {
             assert!(terminal.inner().read(cx).get_content().contains("fresh"));
             assert_eq!(
                 terminal.command().read(cx).source(),
-                "```\nfirst command\n```"
+                "```bash\nfirst command\n```"
             );
         });
         thread
@@ -11868,7 +12067,7 @@ mod tests {
             assert!(terminal.display_state().is_none());
             assert_eq!(
                 terminal.command().read(cx).source(),
-                "```\nnative command\n```"
+                "```bash\nnative command\n```"
             );
             assert!(terminal.output().is_none());
             assert_eq!(lower.read(cx).get_content(), before);
@@ -12099,7 +12298,8 @@ mod tests {
                 .expect("v2 title update changes the client-managed command label");
             assert_eq!(
                 terminal.read(cx).command().read(cx).source().as_ref(),
-                "```\nUpdated native command\n```"
+                // The command chips tag the fence for shell highlighting.
+                "```bash\nUpdated native command\n```"
             );
         });
 
@@ -16999,36 +17199,6 @@ mod tests {
         });
     }
 
-    #[gpui::test]
-    async fn test_legacy_tool_update_id_shares_backing_arc(cx: &mut TestAppContext) {
-        init_test(cx);
-        for value in ["", "tool/ \0 雪 😀"] {
-            let thread = new_test_thread(cx).await;
-            thread.update(cx, |thread, cx| {
-                let backing: Arc<str> = value.into();
-                let wire_id = acp_v1::ToolCallId::new(backing.clone());
-                thread
-                    .update_tool_call(
-                        acp_v1::ToolCallUpdate::new(
-                            wire_id.clone(),
-                            acp_v1::ToolCallUpdateFields::new(),
-                        ),
-                        cx,
-                    )
-                    .expect("legacy update creates the failed placeholder");
-                let (_, call) = thread
-                    .tool_call(&acp_v2::ToolCallId::new(value))
-                    .expect("canonical tool");
-                assert_eq!(&call.id, &acp_v2::ToolCallId::new(value));
-                assert!(Arc::ptr_eq(&call.id.0, &backing));
-                assert_eq!(
-                    serde_json::to_value(&call.id).expect("canonical ID"),
-                    serde_json::to_value(&wire_id).expect("wire ID"),
-                );
-            });
-        }
-    }
-
     #[test]
     fn test_subagent_session_info_preserves_legacy_serialization() {
         for value in ["", "session/ \0 雪 😀"] {
@@ -18880,7 +19050,7 @@ mod tests {
             ),
             (
                 acp_v1::ToolCallUpdateFields::new().kind(acp_v1::ToolKind::Execute),
-                "**Readable title**",
+                "```bash\n**Readable title**\n```",
                 false,
             ),
             (
@@ -19314,27 +19484,14 @@ mod tests {
 
         cx.run_until_parked();
 
-        thread.read_with(cx, |thread, cx| {
+        // quiet-ui: a file outside the project keeps its path but opens no
+        // buffer, which would take a worktree and a watcher of its own.
+        thread.read_with(cx, |thread, _| {
             let (tool_call_location, agent_location) = thread.entries[0]
                 .location(0)
                 .expect("external tool-call location");
             assert_eq!(tool_call_location.path, skill_path);
-            let agent_location =
-                agent_location.expect("external tool-call location should resolve");
-
-            let buffer = agent_location
-                .buffer
-                .upgrade()
-                .expect("resolved location should keep an open buffer");
-            assert_eq!(buffer.read(cx).text(), "skill body\nsecond line");
-            // ACP numbers lines from 1, so line 2 is the buffer's second row.
-            assert_eq!(
-                agent_location
-                    .position
-                    .to_point(&buffer.read(cx).snapshot())
-                    .row,
-                1
-            );
+            assert!(agent_location.is_none());
         });
     }
 
@@ -19520,9 +19677,9 @@ mod tests {
                     )
                     .is_err()
             );
-            assert_eq!(command.read(cx).source(), "```\noriginal command\n```");
+            assert_eq!(command.read(cx).source(), "```bash\noriginal command\n```");
             let (_, call) = thread.tool_call(&id).expect("unchanged tool");
-            assert_eq!(call.label.read(cx).source(), "Tool caption");
+            assert_eq!(call.label.read(cx).source(), "```bash\nTool caption\n```");
             assert_eq!(call.terminals().next(), Some(&terminal));
             assert_eq!(call.content().len(), 1);
             thread
@@ -19538,7 +19695,7 @@ mod tests {
                     cx,
                 )
                 .expect("valid terminal update");
-            assert_eq!(command.read(cx).source(), "```\nchanged command\n```");
+            assert_eq!(command.read(cx).source(), "```bash\nchanged command\n```");
             assert_eq!(
                 thread.tool_call(&id).expect("tool").1.terminals().next(),
                 Some(&terminal)
@@ -19745,7 +19902,10 @@ mod tests {
             let (_, tool_call) = thread
                 .tool_call(&tool_call_id)
                 .expect("tool call should exist");
-            assert_eq!(tool_call.label.read(cx).source(), "Updated title");
+            assert_eq!(
+                tool_call.label.read(cx).source(),
+                "```bash\nUpdated title\n```"
+            );
             assert!(matches!(
                 tool_call.status(),
                 ToolCallStatus::WaitingForConfirmation
@@ -19773,7 +19933,10 @@ mod tests {
             let (_, tool_call) = thread
                 .tool_call(&tool_call_id)
                 .expect("tool call should exist");
-            assert_eq!(tool_call.label.read(cx).source(), "Updated again");
+            assert_eq!(
+                tool_call.label.read(cx).source(),
+                "```bash\nUpdated again\n```"
+            );
             assert!(matches!(
                 tool_call.status(),
                 ToolCallStatus::WaitingForConfirmation
@@ -19827,7 +19990,7 @@ mod tests {
             let (_, tool_call) = thread
                 .tool_call(&tool_call_id)
                 .expect("tool call should exist");
-            assert_eq!(tool_call.label.read(cx).source(), "Completed");
+            assert_eq!(tool_call.label.read(cx).source(), "```bash\nCompleted\n```");
             assert!(matches!(tool_call.status(), ToolCallStatus::Completed));
             assert_eq!(tool_call.content().len(), 1);
             assert_eq!(tool_call.content()[0].to_markdown(cx), "done");
@@ -19982,7 +20145,10 @@ mod tests {
             let (_, tool_call) = thread
                 .tool_call(&tool_call_id)
                 .expect("tool call should exist");
-            assert_eq!(tool_call.label.read(cx).source(), "Needs permission");
+            assert_eq!(
+                tool_call.label.read(cx).source(),
+                "```bash\nNeeds permission\n```"
+            );
             assert_eq!(tool_call.status(), ToolCallStatus::WaitingForConfirmation);
             assert_eq!(
                 tool_call.permission_status(),
@@ -22182,31 +22348,7 @@ mod tests {
 
             // The update should succeed (not return an error)
             assert!(result.is_ok());
-
-            // There should now be exactly one entry in the thread
-            assert_eq!(thread.entries.len(), 1);
-
-            // The entry should be a failed tool call
-            if let AgentThreadEntry::ToolCall(tool_call) = &thread.entries[0] {
-                assert_eq!(tool_call.id, nonexistent_id);
-                assert!(matches!(tool_call.status(), ToolCallStatus::Failed));
-                assert_eq!(tool_call.kind(), &acp_v2::ToolKind::Fetch);
-
-                // Check that the content contains the error message
-                assert_eq!(tool_call.content().len(), 1);
-                if let ToolCallContent::ContentBlock {
-                    block: content_block,
-                    ..
-                } = &tool_call.content()[0]
-                {
-                    let markdown = content_block.plain_markdown().expect("expected markdown");
-                    assert!(markdown.read(cx).source().contains("Tool call not found"));
-                } else {
-                    panic!("Expected ContentBlock, got: {:?}", tool_call.content()[0]);
-                }
-            } else {
-                panic!("Expected ToolCall entry, got: {:?}", thread.entries[0]);
-            }
+            assert_eq!(thread.entries.len(), 0);
         });
     }
 

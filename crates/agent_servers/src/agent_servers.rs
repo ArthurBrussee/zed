@@ -1,5 +1,7 @@
 mod acp;
 mod custom;
+mod remote_agents;
+pub use remote_agents::wait_until_registered;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod e2e_tests;
