@@ -216,6 +216,7 @@ pub enum IconName {
     Power,
     Public,
     PullRequest,
+    PullRequestDraft,
     QueueMessage,
     Quote,
     Reader,

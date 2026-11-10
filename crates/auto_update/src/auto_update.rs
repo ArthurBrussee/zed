@@ -189,6 +189,9 @@ pub struct AutoUpdater {
     dismissed_status: Option<AutoUpdateStatus>,
 }
 
+mod quiet_ui_update;
+pub use quiet_ui_update::is_quiet_ui_build;
+
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct ReleaseAsset {
     pub version: String,
@@ -264,6 +267,15 @@ struct GlobalAutoUpdate(Option<Entity<AutoUpdater>>);
 
 impl Global for GlobalAutoUpdate {}
 
+/// Release builds of the fork (Dev channel) poll the fork's own releases; debug builds don't.
+fn polls_for_updates(cx: &App) -> bool {
+    ReleaseChannel::try_global(cx)
+        .map(|channel| {
+            channel.poll_for_updates() || quiet_ui_update::is_quiet_ui_build(channel)
+        })
+        .unwrap_or(false)
+}
+
 pub fn init(client: Arc<Client>, cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         workspace.register_action(|_, action, window, cx| check(action, window, cx));
@@ -278,9 +290,7 @@ pub fn init(client: Arc<Client>, cx: &mut App) {
     let auto_updater = cx.new(|cx| {
         let updater = AutoUpdater::new(version, client, cx);
 
-        let poll_for_updates = ReleaseChannel::try_global(cx)
-            .map(|channel| channel.poll_for_updates())
-            .unwrap_or(false);
+        let poll_for_updates = polls_for_updates(cx);
 
         if option_env!("ZED_UPDATE_EXPLANATION").is_none()
             && env::var("ZED_UPDATE_EXPLANATION").is_err()
@@ -322,10 +332,7 @@ pub fn check(_: &Check, window: &mut Window, cx: &mut App) {
         return;
     }
 
-    if !ReleaseChannel::try_global(cx)
-        .map(|channel| channel.poll_for_updates())
-        .unwrap_or(false)
-    {
+    if !polls_for_updates(cx) {
         return;
     }
 
@@ -612,16 +619,9 @@ impl AutoUpdater {
         })?;
 
         set_status("Fetching remote server release", cx);
-        let release = Self::get_release_asset(
-            &this,
-            release_channel,
-            version,
-            "zed-remote-server",
-            os,
-            arch,
-            cx,
-        )
-        .await?;
+        let release =
+            Self::remote_server_release_asset(&this, release_channel, version, os, arch, cx)
+                .await?;
 
         let servers_dir = paths::remote_servers_dir();
         let channel_dir = servers_dir.join(release_channel.dev_name());
@@ -668,10 +668,28 @@ impl AutoUpdater {
         })?;
 
         let release =
-            Self::get_release_asset(&this, channel, version, "zed-remote-server", os, arch, cx)
-                .await?;
+            Self::remote_server_release_asset(&this, channel, version, os, arch, cx).await?;
 
         Ok(Some(release.url))
+    }
+
+    /// quiet-ui serves its own remote server from the fork's release, matched to the commit the
+    /// running client was built from. Every other channel asks zed.dev as upstream does.
+    async fn remote_server_release_asset(
+        this: &Entity<Self>,
+        release_channel: ReleaseChannel,
+        version: Option<Version>,
+        os: &str,
+        arch: &str,
+        cx: &mut AsyncApp,
+    ) -> Result<ReleaseAsset> {
+        if quiet_ui_update::is_quiet_ui_build(release_channel) {
+            let http = this.read_with(cx, |this, _| this.client.http_client());
+            let sha = cx.update(|cx| AppCommitSha::try_global(cx).map(|sha| sha.full()));
+            return quiet_ui_update::fetch_remote_server_release(http, os, arch, sha).await;
+        }
+        Self::get_release_asset(this, release_channel, version, "zed-remote-server", os, arch, cx)
+            .await
     }
 
     async fn get_release_asset(
@@ -756,8 +774,11 @@ impl AutoUpdater {
             cx.notify();
         });
 
-        let fetched_release_data =
-            Self::get_release_asset(&this, release_channel, None, "zed", OS, ARCH, cx).await?;
+        let fetched_release_data = if quiet_ui_update::is_quiet_ui_build(release_channel) {
+            quiet_ui_update::fetch_release(client.clone(), &installed_version).await?
+        } else {
+            Self::get_release_asset(&this, release_channel, None, "zed", OS, ARCH, cx).await?
+        };
         let fetched_version = fetched_release_data.clone().version;
         let app_commit_sha = Ok(cx.update(|cx| AppCommitSha::try_global(cx).map(|sha| sha.full())));
         let newer_version = Self::check_if_fetched_version_is_newer(
@@ -875,7 +896,8 @@ impl AutoUpdater {
         let fetched_version = fetched_version.parse::<Version>()?;
 
         match release_channel {
-            ReleaseChannel::Nightly => {
+            // The fork's version never moves, so compare commits as Nightly does.
+            ReleaseChannel::Nightly | ReleaseChannel::Dev => {
                 let should_download = if let AutoUpdateStatus::Updated { version } = status {
                     fetched_version != version
                 } else {

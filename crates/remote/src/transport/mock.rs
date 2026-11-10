@@ -53,8 +53,9 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::Duration,
 };
 use util::paths::{PathStyle, RemotePathBuf};
 
@@ -72,6 +73,18 @@ pub struct MockRemoteConnection {
     message_interceptors: parking_lot::Mutex<Option<MessageInterceptors>>,
     path_style: parking_lot::Mutex<PathStyle>,
     reported_options: parking_lot::Mutex<Option<RemoteConnectionOptions>>,
+    /// How often `kill` was called, so a test can see whether a connection
+    /// other clients share was taken down. The mock stays usable after one.
+    kills: AtomicU64,
+    /// Set when a test has the connection die by itself, as an SSH
+    /// connection does when its master exits.
+    dead: AtomicBool,
+    /// When set, a proxy started through `proxy_tx` exits with this code a
+    /// moment after it starts, as a proxy that finds no server does.
+    pub(crate) proxy_exit_code: parking_lot::Mutex<Option<i32>>,
+    /// When set, a proxy started through `proxy_tx` hands its activity sender
+    /// here, so a test can say the server sent something.
+    pub(crate) proxy_activity_tx: parking_lot::Mutex<Option<mpsc::UnboundedSender<Sender<()>>>>,
     pub(crate) proxy_tx: parking_lot::Mutex<
         Option<
             mpsc::UnboundedSender<(
@@ -113,11 +126,22 @@ unsafe impl Sync for SendableCx {}
 #[derive(Default)]
 pub struct MockConnectionRegistry {
     pending: HashMap<u64, (oneshot::Receiver<()>, Arc<MockRemoteConnection>)>,
+    /// What a connect to these options fails with when no connection is
+    /// pending, and how many have failed.
+    pub(crate) connect_errors: HashMap<u64, (String, usize)>,
 }
 
 impl Global for MockConnectionRegistry {}
 
 impl MockConnectionRegistry {
+    /// The connection the next `ConnectionPool::connect` for `opts` gets.
+    #[cfg(test)]
+    pub(crate) fn peek(&self, opts: &MockConnectionOptions) -> Option<Arc<MockRemoteConnection>> {
+        self.pending
+            .get(&opts.id)
+            .map(|(_, connection)| connection.clone())
+    }
+
     /// Called by `ConnectionPool::connect` to retrieve a pre-registered mock connection.
     pub fn take(
         &mut self,
@@ -228,6 +252,10 @@ impl MockConnection {
             message_interceptors: parking_lot::Mutex::new(None),
             path_style: parking_lot::Mutex::new(PathStyle::local()),
             reported_options: parking_lot::Mutex::new(None),
+            kills: Default::default(),
+            dead: Default::default(),
+            proxy_exit_code: Default::default(),
+            proxy_activity_tx: Default::default(),
             proxy_tx: Default::default(),
         });
 
@@ -249,14 +277,26 @@ struct MessageInterceptors {
     server_to_client: Arc<dyn Fn(&mut Envelope) + Send + Sync>,
 }
 
+#[cfg(test)]
+impl MockRemoteConnection {
+    pub(crate) fn kill_count(&self) -> u64 {
+        self.kills.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn simulate_master_exit(&self) {
+        self.dead.store(true, Ordering::SeqCst);
+    }
+}
+
 #[async_trait(?Send)]
 impl RemoteConnection for MockRemoteConnection {
     async fn kill(&self) -> Result<()> {
+        self.kills.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
     fn has_been_killed(&self) -> bool {
-        false
+        self.dead.load(Ordering::SeqCst)
     }
 
     fn build_command(
@@ -341,9 +381,22 @@ impl RemoteConnection for MockRemoteConnection {
             proxy_tx
                 .unbounded_send((client_incoming_tx, client_outgoing_rx))
                 .unwrap();
+            if let Some(activity_tx) = self.proxy_activity_tx.lock().as_ref() {
+                activity_tx
+                    .unbounded_send(connection_activity_tx.clone())
+                    .ok();
+            }
+            let exit_code = *self.proxy_exit_code.lock();
+            let executor = cx.background_executor().clone();
             return cx.background_spawn(async move {
                 let _connection_activity_tx = connection_activity_tx;
-                futures::future::pending().await
+                match exit_code {
+                    Some(exit_code) => {
+                        executor.timer(Duration::from_millis(100)).await;
+                        Ok(exit_code)
+                    }
+                    None => futures::future::pending().await,
+                }
             });
         }
 

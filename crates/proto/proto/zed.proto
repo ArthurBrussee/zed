@@ -526,7 +526,23 @@ message Envelope {
     TrashGlobalSkill trash_global_skill = 501;
     ResolveGlobalSkillPath resolve_global_skill_path = 502;
     ResolveGlobalSkillPathResponse resolve_global_skill_path_response = 503;
-    ApplyGlobalSkillFileOperation apply_global_skill_file_operation = 504; // current max
+    ApplyGlobalSkillFileOperation apply_global_skill_file_operation = 504;
+    GetSystemLoad get_system_load = 505;
+    SystemLoadResponse system_load_response = 506;
+    AcpRelayOpen acp_relay_open = 507;
+    AcpRelayOpened acp_relay_opened = 508;
+    AcpRelayAttach acp_relay_attach = 509;
+    AcpRelayAttached acp_relay_attached = 510;
+    AcpRelaySend acp_relay_send = 511;
+    AcpRelayAck acp_relay_ack = 512;
+    AcpRelayClose acp_relay_close = 513;
+    AcpRelayFrame acp_relay_frame = 514;
+    AcpRelayListSessions acp_relay_list_sessions = 515;
+    AcpRelaySessions acp_relay_sessions = 516;
+    GetExternalAgents get_external_agents = 517;
+    SetWorktreeLanguageServers set_worktree_language_servers = 518;
+    ReadFileTail read_file_tail = 519;
+    ReadFileTailResponse read_file_tail_response = 520; // current max
   }
 
   reserved 87 to 88;

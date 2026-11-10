@@ -1,4 +1,6 @@
-use gpui::{ClickEvent, DismissEvent, EventEmitter, FocusHandle, Focusable, Render, WeakEntity};
+use gpui::{
+    ClickEvent, DismissEvent, EventEmitter, FocusHandle, Focusable, Render, Task, WeakEntity,
+};
 use project::project_settings::ProjectSettings;
 use remote::RemoteConnectionOptions;
 use settings::Settings;
@@ -78,6 +80,51 @@ impl DisconnectedOverlay {
                     Host::CollabGuestProject
                 };
 
+                // quiet-ui: the box is reachable and only its server is gone, so
+                // start a fresh one the way the Reconnect button would, without
+                // waiting for a click. The overlay is for when that fails.
+                if let Host::RemoteServerProject(options, true) = &host {
+                    log::info!(
+                        "quiet-ui reconnect: the server on {} is gone; starting a fresh one",
+                        options.display_name()
+                    );
+                    let paths = workspace
+                        .root_paths(cx)
+                        .iter()
+                        .map(|path| path.to_path_buf())
+                        .collect();
+                    let task = reconnect_to_remote_project(
+                        options.clone(),
+                        paths,
+                        workspace.app_state().clone(),
+                        window,
+                        cx,
+                    );
+                    let overlay_workspace = handle.clone();
+                    cx.spawn_in(window, async move |workspace, cx| {
+                        let Some(task) = task else {
+                            return;
+                        };
+                        if let Err(error) = task.await {
+                            log::warn!("quiet-ui reconnect: failed: {error:#}");
+                            workspace
+                                .update_in(cx, |workspace, window, cx| {
+                                    workspace.toggle_modal(window, cx, |_, cx| {
+                                        DisconnectedOverlay {
+                                            finished: false,
+                                            workspace: overlay_workspace,
+                                            host,
+                                            focus_handle: cx.focus_handle(),
+                                        }
+                                    });
+                                })
+                                .ok();
+                        }
+                    })
+                    .detach();
+                    return;
+                }
+
                 workspace.toggle_modal(window, cx, |_, cx| DisconnectedOverlay {
                     finished: false,
                     workspace: handle,
@@ -107,11 +154,6 @@ impl DisconnectedOverlay {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
-
-        let Some(window_handle) = window.window_handle().downcast::<MultiWorkspace>() else {
-            return;
-        };
-
         let app_state = workspace.read(cx).app_state().clone();
         let paths = workspace
             .read(cx)
@@ -119,22 +161,11 @@ impl DisconnectedOverlay {
             .iter()
             .map(|path| path.to_path_buf())
             .collect();
-
-        cx.spawn_in(window, async move |_, cx| {
-            open_remote_project(
-                connection_options,
-                paths,
-                app_state,
-                OpenOptions {
-                    requesting_window: Some(window_handle),
-                    ..Default::default()
-                },
-                cx,
-            )
-            .await?;
-            Ok(())
-        })
-        .detach_and_prompt_err("Failed to reconnect", window, cx, |_, _, _| None);
+        if let Some(task) =
+            reconnect_to_remote_project(connection_options, paths, app_state, window, cx)
+        {
+            task.detach_and_prompt_err("Failed to reconnect", window, cx, |_, _, _| None);
+        }
     }
 
     fn cancel(&mut self, _: &menu::Cancel, _: &mut Window, cx: &mut Context<Self>) {
@@ -212,4 +243,30 @@ impl Render for DisconnectedOverlay {
                     ),
             )
     }
+}
+
+/// Reopens the window's project on the same host, which starts a fresh server
+/// there if the last one is gone.
+fn reconnect_to_remote_project(
+    connection_options: RemoteConnectionOptions,
+    paths: Vec<std::path::PathBuf>,
+    app_state: std::sync::Arc<workspace::AppState>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<Task<anyhow::Result<()>>> {
+    let window_handle = window.window_handle().downcast::<MultiWorkspace>()?;
+    Some(window.spawn(cx, async move |cx| {
+        open_remote_project(
+            connection_options,
+            paths,
+            app_state,
+            OpenOptions {
+                requesting_window: Some(window_handle),
+                ..Default::default()
+            },
+            cx,
+        )
+        .await?;
+        Ok(())
+    }))
 }

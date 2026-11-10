@@ -90,6 +90,7 @@ pub struct FakeGitRepositoryState {
     pub fetches: Arc<Mutex<Vec<FetchOptions>>>,
     pub commit_template: Option<GitCommitTemplate>,
     pub blob_read_gate: Option<FakeBlobReadGate>,
+    pub simulated_fetch_error: Option<String>,
 }
 
 impl FakeGitRepositoryState {
@@ -123,6 +124,7 @@ impl FakeGitRepositoryState {
             stash_entries: Default::default(),
             fetches: Arc::default(),
             commit_template: None,
+            simulated_fetch_error: None,
         }
     }
 }
@@ -428,8 +430,19 @@ impl GitRepository for FakeGitRepository {
 
     fn show(&self, commit: String) -> BoxFuture<'_, Result<CommitDetails>> {
         self.with_state_async(false, move |state| {
-            let sha = match state.refs.get(&commit) {
-                Some(sha) => sha.clone(),
+            // A branch the test inserted by name resolves under its full ref
+            // name, as `branches()` reports it.
+            let branch_sha = state
+                .branches
+                .iter()
+                .any(|branch| {
+                    branch == &commit
+                        || format!("refs/remotes/{branch}") == commit
+                        || format!("refs/heads/{branch}") == commit
+                })
+                .then(|| format!("{:040x}", commit.len()));
+            let sha = match state.refs.get(&commit).cloned().or(branch_sha) {
+                Some(sha) => sha,
                 // Real git fails to show an unresolvable revision (e.g. HEAD on an
                 // unborn branch), so only fall back to treating the input as a sha.
                 None => {
@@ -1353,6 +1366,9 @@ impl GitRepository for FakeGitRepository {
     ) -> BoxFuture<'_, Result<git::repository::RemoteCommandOutput>> {
         self.with_state_async(true, move |state| {
             state.fetches.lock().push(fetch_options);
+            if let Some(message) = state.simulated_fetch_error.clone() {
+                bail!("{message}");
+            }
             Ok(git::repository::RemoteCommandOutput {
                 stdout: String::new(),
                 stderr: String::new(),
