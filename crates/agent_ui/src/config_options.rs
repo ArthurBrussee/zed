@@ -14,8 +14,8 @@ use picker::popover_menu::PickerPopoverMenu;
 use picker::{Picker, PickerDelegate};
 use settings::{AgentConfigOptionValue, SettingsStore};
 use ui::{
-    ElevationIndex, IconButton, KeyBinding, ListItem, ListItemSpacing, PopoverMenuHandle, Switch,
-    SwitchLabelPosition, ToggleState, Tooltip, prelude::*,
+    ContextMenu, ElevationIndex, IconButton, KeyBinding, ListItem, ListItemSpacing, PopoverMenu,
+    PopoverMenuHandle, Switch, SwitchLabelPosition, ToggleState, Tooltip, prelude::*,
 };
 use unicode_segmentation::UnicodeSegmentation;
 use util::ResultExt as _;
@@ -36,6 +36,8 @@ pub struct ConfigOptionsView {
     agent_server: Rc<dyn AgentServer>,
     fs: Arc<dyn Fs>,
     config_option_ids: Vec<acp::SessionConfigId>,
+    /// Every option but the model sits in this one menu.
+    options_menu_handle: PopoverMenuHandle<ContextMenu>,
     _refresh_task: Task<()>,
 }
 
@@ -69,6 +71,7 @@ impl ConfigOptionsView {
             agent_server,
             fs,
             config_option_ids,
+            options_menu_handle: PopoverMenuHandle::default(),
             _refresh_task: refresh_task,
         }
     }
@@ -83,11 +86,19 @@ impl ConfigOptionsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(config_id) = self.first_config_option_id_matching(category, |option| {
+        let Some(config_id) = self.first_config_option_id_matching(category.clone(), |option| {
             matches!(&option.kind, acp::SessionConfigKind::Select(_))
         }) else {
             return false;
         };
+
+        if category != acp::SessionConfigOptionCategory::Model {
+            if self.config_options.is_read_only() {
+                return false;
+            }
+            self.options_menu_handle.toggle(window, cx);
+            return true;
+        }
 
         let Some(selector) = self.selector_for_config_id(&config_id, cx) else {
             return false;
@@ -276,19 +287,167 @@ impl ConfigOptionsView {
 }
 
 impl Render for ConfigOptionsView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.selectors.is_empty() {
             return div().into_any_element();
         }
 
+        let (model_selectors, has_menu) = self.shown_selectors(cx);
         h_flex()
             .min_w_0()
             .flex_wrap()
             .gap_1()
-            // Options read right to left in the order the agent sent them, so the
-            // first one sits next to the send button.
-            .children(self.selectors.iter().rev().cloned())
+            .when(has_menu, |this| this.child(self.render_options_menu(cx)))
+            .children(model_selectors.into_iter().rev())
             .into_any_element()
+    }
+}
+
+impl ConfigOptionsView {
+    /// The model's selectors, drawn as upstream draws them, and whether any
+    /// other option needs the menu.
+    fn shown_selectors(&self, cx: &App) -> (Vec<Entity<ConfigOptionSelector>>, bool) {
+        let (model_selectors, other_selectors): (Vec<_>, Vec<_>) =
+            self.selectors.iter().cloned().partition(|selector| {
+                selector.read(cx).current_option().is_some_and(|option| {
+                    option.category == Some(acp::SessionConfigOptionCategory::Model)
+                })
+            });
+        (model_selectors, !other_selectors.is_empty())
+    }
+
+    fn non_model_options(
+        config_options: &Rc<dyn AgentSessionConfigOptions>,
+    ) -> Vec<acp::SessionConfigOption> {
+        config_options
+            .config_options()
+            .into_iter()
+            .filter(|option| {
+                option.category != Some(acp::SessionConfigOptionCategory::Model)
+                    && matches!(
+                        &option.kind,
+                        acp::SessionConfigKind::Select(_) | acp::SessionConfigKind::Boolean(_)
+                    )
+            })
+            .collect()
+    }
+
+    fn render_options_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let options = Self::non_model_options(&self.config_options);
+        let summary = options
+            .iter()
+            .filter_map(|option| match &option.kind {
+                acp::SessionConfigKind::Select(select) => {
+                    find_option_name(&select.options, &select.current_value)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let label = if summary.is_empty() {
+            "Options".to_string()
+        } else {
+            summary
+        };
+        let icon = if self.options_menu_handle.is_deployed() {
+            IconName::ChevronUp
+        } else {
+            IconName::ChevronDown
+        };
+
+        let config_options = self.config_options.clone();
+        let agent_server = self.agent_server.clone();
+        let fs = self.fs.clone();
+        let focus_handle = cx.focus_handle();
+        let menu = PopoverMenu::new("config-options-menu")
+            .trigger_with_tooltip(
+                Button::new("config-options-menu-trigger", label)
+                    .label_size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .end_icon(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted)),
+                Tooltip::text("Agent Options"),
+            )
+            .anchor(gpui::Anchor::BottomRight)
+            .with_handle(self.options_menu_handle.clone())
+            .menu(move |window, cx| {
+                let config_options = config_options.clone();
+                let agent_server = agent_server.clone();
+                let fs = fs.clone();
+                Some(ContextMenu::build(window, cx, |mut menu, _window, _cx| {
+                    let read_only = config_options.is_read_only();
+                    menu = menu.context(focus_handle.clone());
+                    for (ix, option) in Self::non_model_options(&config_options)
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let set = {
+                            let config_options = config_options.clone();
+                            let agent_server = agent_server.clone();
+                            let fs = fs.clone();
+                            let config_id = option.config_id.clone();
+                            move |value: acp::SessionConfigOptionValue, cx: &mut App| {
+                                set_config_option_and_default(
+                                    config_options.clone(),
+                                    agent_server.clone(),
+                                    config_id.clone(),
+                                    value,
+                                    fs.clone(),
+                                    cx,
+                                )
+                                .detach_and_log_err(cx);
+                            }
+                        };
+                        match &option.kind {
+                            acp::SessionConfigKind::Select(select) => {
+                                if ix > 0 {
+                                    menu = menu.separator();
+                                }
+                                menu = menu.header(option.name.clone());
+                                for value in extract_options(&config_options, &option.config_id) {
+                                    let set = set.clone();
+                                    let selected = value.value == select.current_value;
+                                    menu = menu.toggleable_entry_disabled_when(
+                                        value.name,
+                                        selected,
+                                        read_only,
+                                        IconPosition::End,
+                                        None,
+                                        move |_window, cx| {
+                                            set(
+                                                acp::SessionConfigOptionValue::id(
+                                                    value.value.clone(),
+                                                ),
+                                                cx,
+                                            )
+                                        },
+                                    );
+                                }
+                            }
+                            acp::SessionConfigKind::Boolean(boolean) => {
+                                if ix > 0 {
+                                    menu = menu.separator();
+                                }
+                                let next = !boolean.current_value;
+                                menu = menu.toggleable_entry_disabled_when(
+                                    option.name.clone(),
+                                    boolean.current_value,
+                                    read_only,
+                                    IconPosition::End,
+                                    None,
+                                    move |_window, cx| {
+                                        set(acp::SessionConfigOptionValue::boolean(next), cx)
+                                    },
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                    menu
+                }))
+            });
+        div()
+            .debug_selector(|| "config-options-menu".into())
+            .child(menu)
     }
 }
 
@@ -1313,6 +1472,7 @@ mod tests {
                     selectors: Vec::new(),
                     agent_server,
                     fs,
+                    options_menu_handle: PopoverMenuHandle::default(),
                     _refresh_task: Task::ready(()),
                 })
             });
@@ -1406,6 +1566,7 @@ mod tests {
                 selectors: Vec::new(),
                 agent_server,
                 fs,
+                options_menu_handle: PopoverMenuHandle::default(),
                 _refresh_task: Task::ready(()),
             });
 
@@ -1450,6 +1611,7 @@ mod tests {
                 selectors: Vec::new(),
                 agent_server,
                 fs,
+                options_menu_handle: PopoverMenuHandle::default(),
                 _refresh_task: Task::ready(()),
             });
 
@@ -1504,6 +1666,7 @@ mod tests {
                 selectors: Vec::new(),
                 agent_server,
                 fs,
+                options_menu_handle: PopoverMenuHandle::default(),
                 _refresh_task: Task::ready(()),
             });
 
@@ -1527,6 +1690,136 @@ mod tests {
                 acp::SessionConfigOptionValue::boolean(true)
             )]
         );
+    }
+
+    /// 2026-11-09: "I want just one picker for the model, then the regular
+    /// menu for other detailed options."
+    #[gpui::test]
+    fn the_model_keeps_its_picker_and_the_rest_share_one_menu(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let select = |id: &'static str, name: &'static str, current: &'static str, values| {
+            acp::SessionConfigOption::select(
+                id,
+                name,
+                current,
+                Vec::from_iter(values)
+                    .into_iter()
+                    .map(|(value, name)| acp::SessionConfigSelectOption::new(value, name))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let model = select(
+            "model",
+            "Model",
+            "small",
+            [("small", "Small"), ("large", "Large")],
+        )
+        .category(acp::SessionConfigOptionCategory::Model);
+        let agent_server = Rc::new(TestAgentServer::default());
+        let config_options = Rc::new(TestSessionConfigOptions::new(vec![
+            model.clone(),
+            select(
+                "effort",
+                "Effort",
+                "low",
+                [("low", "Low"), ("high", "High")],
+            )
+            .category(acp::SessionConfigOptionCategory::ThoughtLevel),
+            select(
+                "mode",
+                "Mode",
+                "default",
+                [("default", "Default"), ("plan", "Plan")],
+            )
+            .category(acp::SessionConfigOptionCategory::Mode),
+        ]));
+        let fs: Arc<dyn Fs> = FakeFs::new(cx.executor());
+        let (view, cx) = cx.add_window_view({
+            let config_options: Rc<dyn AgentSessionConfigOptions> = config_options.clone();
+            let agent_server: Rc<dyn AgentServer> = agent_server;
+            move |window, cx| ConfigOptionsView::new(config_options, agent_server, fs, window, cx)
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, cx| {
+            let (models, has_menu) = view.shown_selectors(cx);
+            assert_eq!(models.len(), 1);
+            assert_eq!(models[0].read(cx).config_id().0.as_ref(), "model");
+            assert!(has_menu);
+        });
+
+        let trigger = cx
+            .debug_bounds("config-options-menu")
+            .expect("one menu trigger beside the model picker");
+        cx.simulate_click(trigger.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        for listed in [
+            "MENU_ITEM-Low",
+            "MENU_ITEM-High",
+            "MENU_ITEM-Default",
+            "MENU_ITEM-Plan",
+        ] {
+            assert!(cx.debug_bounds(listed).is_some(), "the menu lists {listed}",);
+        }
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Large").is_none(),
+            "not the model"
+        );
+        let high = cx.debug_bounds("MENU_ITEM-High").unwrap();
+        cx.simulate_click(high.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            config_options.set_values.borrow().last(),
+            Some(&(
+                "effort".to_string(),
+                acp::SessionConfigOptionValue::id("high")
+            ))
+        );
+
+        // The keyboard still reaches the options that moved into the menu.
+        view.update(cx, |view, cx| {
+            assert!(view.cycle_category_option(
+                acp::SessionConfigOptionCategory::ThoughtLevel,
+                false,
+                cx
+            ));
+            assert!(view.cycle_category_option(acp::SessionConfigOptionCategory::Mode, false, cx));
+        });
+        cx.run_until_parked();
+        let current = |id: &str| {
+            config_options
+                .config_options()
+                .into_iter()
+                .find(|option| option.config_id.0.as_ref() == id)
+                .and_then(|option| match option.kind {
+                    acp::SessionConfigKind::Select(select) => Some(select.current_value.0),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(current("effort").as_ref(), "low");
+        assert_eq!(current("mode").as_ref(), "plan");
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.toggle_category_picker(
+                acp::SessionConfigOptionCategory::ThoughtLevel,
+                window,
+                cx
+            ));
+            assert!(view.options_menu_handle.is_deployed());
+        });
+
+        // An agent that offers only a model shows no menu.
+        config_options.replace_options(vec![model]);
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            let (models, has_menu) = view.shown_selectors(cx);
+            assert_eq!(models.len(), 1);
+            assert!(!has_menu);
+        });
     }
 
     #[gpui::test]

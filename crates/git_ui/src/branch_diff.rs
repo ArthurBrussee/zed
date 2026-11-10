@@ -374,6 +374,18 @@ impl BranchDiff {
         self.diff.update(cx, |diff, cx| diff.autoscroll(cx));
     }
 
+    /// quiet-ui: the totals this view shows, when it diffs `repository_id`
+    /// against a merge base, so a thread's diff chip can show the same ones.
+    pub fn changed_lines_for(
+        &self,
+        repository_id: project::git_store::RepositoryId,
+        cx: &App,
+    ) -> Option<(u32, u32)> {
+        let repo = self.repo(cx)?;
+        (repo.read(cx).id == repository_id && self.diff_base(cx).is_merge_base())
+            .then(|| self.diff.read(cx).calculate_changed_lines(cx))
+    }
+
     fn set_merge_base(&mut self, base_ref: SharedString, cx: &mut Context<Self>) {
         self.diff.update(cx, |diff, cx| {
             diff.branch_diff().update(cx, |branch_diff, cx| {
@@ -1186,6 +1198,62 @@ mod tests {
                     }))
                 )
             ])
+        );
+    }
+
+    /// quiet-ui: a thread's diff chip reads these, so it cannot disagree
+    /// with the view beside it.
+    #[gpui::test]
+    async fn test_branch_diff_reports_its_totals_for_its_repository(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "a.txt": "C\n",
+                "b.txt": "new\n",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let diff = cx
+            .update(|window, cx| {
+                BranchDiff::new_with_default_branch(project.clone(), workspace, window, cx)
+            })
+            .await
+            .unwrap();
+        fs.set_head_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("a.txt", "B\n".into())],
+            "sha",
+        );
+        fs.set_merge_base_content_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("a.txt", "A\n".into())],
+        );
+        cx.run_until_parked();
+
+        let repository_id = diff.read_with(cx, |diff, cx| diff.repo(cx).unwrap().read(cx).id);
+        let shown = diff.read_with(cx, |diff, cx| {
+            diff.diff.read(cx).calculate_changed_lines(cx)
+        });
+        assert_eq!(shown, (2, 1), "-A +C, and the untracked file's line");
+        assert_eq!(
+            diff.read_with(cx, |diff, cx| diff.changed_lines_for(repository_id, cx)),
+            Some(shown),
+            "the totals the toolbar shows"
+        );
+        assert_eq!(
+            diff.read_with(cx, |diff, cx| {
+                diff.changed_lines_for(project::git_store::RepositoryId(u64::MAX), cx)
+            }),
+            None,
+            "another repository's thread does not take these"
         );
     }
 

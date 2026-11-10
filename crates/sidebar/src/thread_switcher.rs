@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use action_log::DiffStats;
 #[cfg(test)]
 use agent_ui::TerminalId;
@@ -20,7 +22,7 @@ pub(crate) struct ThreadSwitcherThreadEntry {
     pub icon: IconName,
     pub icon_from_external_svg: Option<SharedString>,
     pub status: AgentThreadStatus,
-    pub metadata: ThreadMetadata,
+    pub metadata: Arc<ThreadMetadata>,
     pub workspace: Entity<Workspace>,
     pub project_name: Option<SharedString>,
     pub worktrees: Vec<ThreadItemWorktreeInfo>,
@@ -33,7 +35,7 @@ pub(crate) struct ThreadSwitcherThreadEntry {
 
 #[derive(Clone)]
 pub(crate) struct ThreadSwitcherTerminalEntry {
-    pub metadata: TerminalThreadMetadata,
+    pub metadata: Arc<TerminalThreadMetadata>,
     pub(super) workspace: ThreadEntryWorkspace,
     pub project_name: Option<SharedString>,
     pub worktrees: Vec<ThreadItemWorktreeInfo>,
@@ -50,11 +52,11 @@ pub(crate) enum ThreadSwitcherEntry {
 #[derive(Clone)]
 pub(super) enum ThreadSwitcherSelection {
     Thread {
-        metadata: ThreadMetadata,
+        metadata: Arc<ThreadMetadata>,
         workspace: Entity<Workspace>,
     },
     Terminal {
-        metadata: TerminalThreadMetadata,
+        metadata: Arc<TerminalThreadMetadata>,
         workspace: ThreadEntryWorkspace,
     },
 }

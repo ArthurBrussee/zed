@@ -196,6 +196,13 @@ impl ElicitationFormState {
         self.snapshot(cx).validate(schema)
     }
 
+    #[cfg(test)]
+    pub(crate) fn field_names(&self) -> Vec<&str> {
+        let mut names: Vec<_> = self.fields.keys().map(String::as_str).collect();
+        names.sort();
+        names
+    }
+
     pub(crate) fn set_errors(&mut self, errors: HashMap<String, SharedString>) {
         self.field_errors = errors;
         self.is_submitting = false;
